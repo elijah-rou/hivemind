@@ -76,21 +76,15 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
     tc.network.partitioned = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.REPLICA_COUNT_MAX]bool);
 
     for (0..config.replica_count) |i| {
+        // Clear transient disk faults first. Production/systemd restart does not
+        // wipe durable state; only an explicit operator action would. Retrying
+        // recovery with faults disabled models the healed network phase.
         tc.disks[i].read_fault_rate = Ratio.zero();
         tc.disks[i].write_fault_rate = Ratio.zero();
         tc.disks[i].fail_next_write = false;
         tc.disks[i].fail_next_sync = false;
-        // Restart storage-failed / offline replicas. If local durable state is
-        // corrupt, wipe once and rejoin empty under a healed network.
         if (!tc.replica_running[i] or tc.replicas[i].storage_failed) {
-            if (!tc.replica_running[i] and tc.replicas[i].storage_failed) {
-                tc.disks[i].wipe();
-            }
             tc.crashReplica(@intCast(i));
-            if (!tc.replica_running[i]) {
-                tc.disks[i].wipe();
-                tc.crashReplica(@intCast(i));
-            }
         }
     }
 }

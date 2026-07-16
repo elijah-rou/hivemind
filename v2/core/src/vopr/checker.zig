@@ -14,6 +14,8 @@ pub const StateChecker = struct {
 
     comptime {
         std.debug.assert(MAX_HISTORY == replica_mod.LOG_SIZE_MAX);
+        // committed_by must cover every supported replica ID (0..REPLICA_COUNT_MAX-1).
+        std.debug.assert(@bitSizeOf(u16) >= msg.REPLICA_COUNT_MAX);
     }
 
     /// Canonical commit record: the complete entry identity at each op.
@@ -23,7 +25,7 @@ pub const StateChecker = struct {
         client_id: u128,
         request_id: msg.RequestId,
         /// Which replicas have committed this op (bitset).
-        committed_by: u8,
+        committed_by: u16,
     };
 
     history: [MAX_HISTORY]CommitRecord,
@@ -168,7 +170,7 @@ pub const StateChecker = struct {
                 );
                 return;
             }
-            record.committed_by |= @as(u8, 1) << @intCast(replica_id);
+            record.committed_by |= @as(u16, 1) << @intCast(replica_id);
         } else {
             if (self.history_len >= MAX_HISTORY) {
                 self.recordViolation(
@@ -182,7 +184,7 @@ pub const StateChecker = struct {
                 .checksum = entry.checksum,
                 .client_id = entry.client_id,
                 .request_id = entry.request_id,
-                .committed_by = @as(u8, 1) << @intCast(replica_id),
+                .committed_by = @as(u16, 1) << @intCast(replica_id),
             };
             self.history_len += 1;
         }
@@ -459,4 +461,36 @@ test "checker rejects: history capacity exhaustion" {
     checker.replica_commit_max[0] = 0;
     checker.check(0, tc.replicas[0]);
     try std.testing.expect(checker.safety_violations >= 1);
+}
+
+test "checker records commits across maximum replica topology" {
+    comptime {
+        std.debug.assert(msg.REPLICA_COUNT_MAX > 8);
+    }
+    var checker = StateChecker.init(msg.REPLICA_COUNT_MAX);
+    checker.silent = true;
+
+    var entry = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+
+    // Directly exercise the high replica IDs that do not fit in a u8 bitset.
+    const high_id: u8 = msg.REPLICA_COUNT_MAX - 1;
+    checker.history[0] = .{
+        .op = 1,
+        .checksum = entry.checksum,
+        .client_id = entry.client_id,
+        .request_id = entry.request_id,
+        .committed_by = 0,
+    };
+    checker.history_len = 1;
+    checker.history[0].committed_by |= @as(u16, 1) << @intCast(high_id);
+    try std.testing.expect((checker.history[0].committed_by & (@as(u16, 1) << @intCast(high_id))) != 0);
+    try std.testing.expectEqual(@as(u64, 0), checker.safety_violations);
 }

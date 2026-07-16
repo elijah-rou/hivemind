@@ -601,6 +601,9 @@ pub const Replica = struct {
 
     pub fn onMessage(self: *Replica, from: u8, message: msg.Message) void {
         if (self.storage_failed) return;
+        // Peer-sourced `from` must be a live cluster member. Out-of-range IDs
+        // would OOB-index vote/status arrays or forge quorum identity.
+        if (from >= self.replica_count) return;
         switch (message) {
             .request => |m| self.onRequest(from, m),
             .prepare => |m| self.onPrepare(from, m),
@@ -615,6 +618,27 @@ pub const Replica = struct {
             .send_status => |m| self.onSendStatus(from, m),
             .reply => {},
         }
+    }
+
+    fn peerLogBoundsOk(commit_min: msg.OpNumber, op_number: msg.OpNumber) bool {
+        return commit_min <= op_number and op_number <= LOG_SIZE_MAX;
+    }
+
+    fn peerOpInRetainedLog(op: msg.OpNumber) bool {
+        return op >= 1 and op <= LOG_SIZE_MAX;
+    }
+
+    fn peerCommitInRetainedLog(commit_min: msg.OpNumber) bool {
+        return commit_min <= LOG_SIZE_MAX;
+    }
+
+    fn peerLogEntriesOk(entries: []const msg.LogEntry, count: usize, max_count: usize) bool {
+        if (count > max_count) return false;
+        for (entries[0..count]) |entry| {
+            if (!peerOpInRetainedLog(entry.op_number)) return false;
+            if (!entry.valid()) return false;
+        }
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -780,6 +804,11 @@ pub const Replica = struct {
         if (self.status != .normal) return;
         if (!self.isLeader()) return;
         if (ok.view_number != self.view_number) return;
+        if (ok.replica_id != from) return;
+        // commit_min is the sender watermark and may exceed the acked op
+        // (late PrepareOk after the follower has already committed further).
+        if (!peerOpInRetainedLog(ok.op_number)) return;
+        if (!peerCommitInRetainedLog(ok.commit_min)) return;
 
         self.noteReplicaCommitMin(from, ok.commit_min);
 
@@ -896,7 +925,8 @@ pub const Replica = struct {
         self.maybeDoViewChange();
     }
 
-    fn onStartViewChange(self: *Replica, _: u8, svc: msg.StartViewChangeMsg) void {
+    fn onStartViewChange(self: *Replica, from: u8, svc: msg.StartViewChangeMsg) void {
+        if (svc.replica_id != from) return;
         if (svc.view_number < self.view_number) return;
 
         if (svc.view_number > self.view_number) {
@@ -943,9 +973,13 @@ pub const Replica = struct {
         }
     }
 
-    fn onDoViewChange(self: *Replica, _: u8, dvc: msg.DoViewChangeMsg) void {
+    fn onDoViewChange(self: *Replica, from: u8, dvc: msg.DoViewChangeMsg) void {
         if (self.status != .view_change) return;
         if (dvc.view_number != self.view_number) return;
+        if (dvc.replica_id != from) return;
+        if (!peerLogBoundsOk(dvc.commit_min, dvc.op_number)) return;
+        if (dvc.retention_floor > dvc.commit_min) return;
+        if (!peerLogEntriesOk(&dvc.log_entries, dvc.log_entry_count, msg.DVC_LOG_MAX)) return;
 
         const new_leader: u8 = @intCast(self.view_number % self.replica_count);
         if (new_leader != self.replica_id) return;
@@ -1657,6 +1691,7 @@ pub const Replica = struct {
     fn onSendStatus(self: *Replica, from: u8, ss: msg.SendStatusMsg) void {
         if (self.status != .normal) return;
         if (ss.view_number != self.view_number) return;
+        if (!peerLogBoundsOk(ss.commit_min, ss.op_number)) return;
 
         if (self.isLeader()) {
             self.noteReplicaCommitMin(from, ss.commit_min);
@@ -1699,6 +1734,7 @@ pub const Replica = struct {
 
     fn onRequestPrepare(self: *Replica, from: u8, rp: msg.RequestPrepareMsg) void {
         if (rp.view_number != self.view_number) return;
+        if (rp.op_number == 0 or rp.op_number > LOG_SIZE_MAX) return;
 
         if (self.journalGet(rp.op_number)) |entry| {
             // Only the leader may source uncommitted suffix entries. Followers
@@ -1717,6 +1753,7 @@ pub const Replica = struct {
         if (self.status != .normal) return;
         if (sp.view_number != self.view_number) return;
         if (!sp.entry.valid()) return;
+        if (sp.entry.op_number == 0 or sp.entry.op_number > LOG_SIZE_MAX) return;
 
         const entry = sp.entry;
         const sender_committed = entry.op_number <= self.replica_commit_min[from];
@@ -1808,11 +1845,13 @@ pub const Replica = struct {
     fn onStartView(self: *Replica, from: u8, sv: msg.StartViewMsg) void {
         if (from != self.leaderForView(sv.view_number)) return;
         if (sv.view_number < self.view_number) return;
+        if (!peerLogBoundsOk(sv.commit_min, sv.op_number)) return;
+        if (sv.retention_floor > sv.commit_min) return;
+        if (!peerLogEntriesOk(&sv.log_entries, sv.log_entry_count, msg.SV_LOG_MAX)) return;
 
         // Preflight: StartView must not conflict with the locally committed
         // prefix. Reject the message without mutating local state.
         for (sv.log_entries[0..sv.log_entry_count]) |entry| {
-            if (!entry.valid()) continue;
             if (entry.op_number == 0 or entry.op_number > self.commit_min) continue;
             if (self.journalGet(entry.op_number)) |existing| {
                 if (existing.checksum != entry.checksum) return;
@@ -2282,9 +2321,9 @@ pub const Replica = struct {
     }
 
     pub fn journalPut(self: *Replica, entry: msg.LogEntry) void {
-        std.debug.assert(entry.op_number > 0);
-        // Without a snapshot floor, never replace an occupied slot with a different op.
-        std.debug.assert(entry.op_number <= LOG_SIZE_MAX);
+        // Peer-validated paths must already enforce these bounds; soft-drop
+        // here so a missed check cannot assert/trap on adversarial input.
+        if (entry.op_number == 0 or entry.op_number > LOG_SIZE_MAX) return;
         const slot = journalSlot(entry.op_number);
         if (self.journal_occupied[slot] and
             (self.journal[slot].op_number != entry.op_number or
@@ -2294,7 +2333,6 @@ pub const Replica = struct {
             // holding a newer one). Different-op replacement is forbidden
             // until snapshots exist.
             if (entry.op_number != self.journal[slot].op_number) {
-                std.debug.assert(false);
                 return;
             }
             if (entry.op_number < self.journal[slot].op_number) return;
@@ -2302,7 +2340,6 @@ pub const Replica = struct {
             // below commit_min is adversarial or corrupt input — reject without
             // panicking. Uncommitted suffix replacement remains allowed.
             if (entry.op_number <= self.commit_min) {
-                std.debug.assert(entry.checksum != self.journal[slot].checksum);
                 return;
             }
             self.prepare_ok_counts[slot] = 0;
@@ -3119,4 +3156,138 @@ test "committed batch bind dispatches all bound pods to worker" {
     try std.testing.expectEqual(sm.pods[0].id, capture.records[0].pod_id);
     try std.testing.expectEqual(sm.pods[1].id, capture.records[1].pod_id);
     try std.testing.expectEqual(sm.pods[2].id, capture.records[2].pod_id);
+}
+
+
+test "onMessage drops out-of-range from" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7001);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7001, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7001);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+
+    replica.onMessage(99, .{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 99,
+    } });
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
+}
+
+test "onStartViewChange rejects spoofed replica_id" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7002);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7002, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7002);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.start_vc_count[0] = true;
+    replica.start_vc_total = 1;
+
+    replica.onMessage(1, .{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 2,
+    } });
+    try std.testing.expectEqual(@as(u8, 1), replica.start_vc_total);
+    try std.testing.expect(!replica.start_vc_count[2]);
+}
+
+test "onDoViewChange rejects unbounded op_number" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7003);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7003, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7003);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+
+    replica.onMessage(0, .{ .do_view_change = .{
+        .view_number = 1,
+        .replica_id = 0,
+        .op_number = LOG_SIZE_MAX + 1,
+        .commit_min = 0,
+    } });
+    try std.testing.expectEqual(@as(u8, 0), replica.do_vc_total);
+}
+
+test "journalPut soft-drops zero and oversize op" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7004);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7004, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7004);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+
+    var zero = msg.LogEntry{ .op_number = 0, .command = .{ .noop = {} } };
+    zero.checksum = zero.computeChecksum();
+    replica.journalPut(zero);
+    try std.testing.expect(!replica.journalHas(0));
+
+    var huge = msg.LogEntry{ .op_number = LOG_SIZE_MAX + 1, .command = .{ .noop = {} } };
+    huge.checksum = huge.computeChecksum();
+    replica.journalPut(huge);
+    for (replica.journal_occupied) |occ| {
+        try std.testing.expect(!occ);
+    }
 }

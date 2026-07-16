@@ -218,8 +218,9 @@ pub const TestCluster = struct {
 
         const recovered = self.replicas[i].recoverFromDisk() catch {
             // Corrupt local durable prefix: production exits nonzero. Keep this
-            // simulated replica offline until an operator/liveness restart wipes it.
-            // Preserve checker watermark/canonical history across the failed incarnation.
+            // simulated replica offline. Liveness clears transient faults and
+            // retries recovery without wiping; an operator wipe is a separate
+            // explicit outcome, not the default healed-network path.
             self.replicas[i].storage_failed = true;
             self.replica_running[i] = false;
             self.network.queues[i].count = 0;

@@ -925,6 +925,7 @@ pub const ConnectionManager = struct {
 
             if (frame_payload.len < 2) continue;
             const from_id = frame_payload[0];
+            if (from_id >= self.replica.replica_count) continue;
             const vrr_data = frame_payload[1..];
             if (!self.identifyPeerConnection(peer_idx, from_id)) continue;
 
@@ -1702,4 +1703,92 @@ test "shiftBuffer saturates when consumed exceeds current position" {
     ConnectionManager.shiftBuffer(&buf, &pos, 8);
 
     try std.testing.expectEqual(@as(usize, 0), pos);
+}
+
+test "processPeerFrames drops malformed VRR plaintext without trapping" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4242);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4242, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4242);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{ .connected = true, .frame_pos = 0 };
+
+    // Frame: [4B len][flags=0][from_id=1][tag=0xFF] — invalid VRR tag.
+    const inner_len: u32 = 1 + 1; // from_id + bad tag
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 1;
+    cm.peers[0].frame_buf[6] = 0xFF;
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expectEqual(@as(usize, 0), cm.peers[0].frame_pos);
+    try std.testing.expect(cm.peers[0].connected);
+}
+
+test "processPeerFrames drops out-of-range from_id" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4243);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4243, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4243);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{ .connected = true };
+
+    var vrr_buf: [64]u8 = undefined;
+    const vrr_len = msg.serialize(.{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 99,
+    } }, &vrr_buf);
+    const inner_len: u32 = @intCast(1 + vrr_len);
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 99; // from_id >= replica_count
+    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expect(!cm.peers[0].peer_id_known);
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
 }

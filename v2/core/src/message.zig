@@ -463,24 +463,49 @@ pub fn serialize(msg: Message, buf: []u8) usize {
     return 1 + payload_len;
 }
 
+fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) !E {
+    inline for (@typeInfo(E).@"enum".fields) |field| {
+        if (value == field.value) return @enumFromInt(value);
+    }
+    return error.InvalidEnumTag;
+}
+
 pub fn deserialize(buf: []const u8) !Message {
     if (buf.len < 1) return error.MessageTooShort;
-    const tag: Tag = @enumFromInt(buf[0]);
+    const tag = enumFromIntChecked(Tag, buf[0]) catch return error.InvalidMessageTag;
     const data = buf[1..];
-    return switch (tag) {
-        .request => .{ .request = bytesAs(RequestMsg, data) },
-        .prepare => .{ .prepare = bytesAs(PrepareMsg, data) },
-        .prepare_ok => .{ .prepare_ok = bytesAs(PrepareOkMsg, data) },
-        .commit => .{ .commit = bytesAs(CommitMsg, data) },
-        .reply => .{ .reply = bytesAs(ReplyMsg, data) },
-        .start_view_change => .{ .start_view_change = bytesAs(StartViewChangeMsg, data) },
-        .do_view_change => .{ .do_view_change = bytesAs(DoViewChangeMsg, data) },
-        .start_view => .{ .start_view = bytesAs(StartViewMsg, data) },
-        .request_prepare => .{ .request_prepare = bytesAs(RequestPrepareMsg, data) },
-        .send_prepare => .{ .send_prepare = bytesAs(SendPrepareMsg, data) },
-        .request_status => .{ .request_status = bytesAs(RequestStatusMsg, data) },
-        .send_status => .{ .send_status = bytesAs(SendStatusMsg, data) },
+    const decoded: Message = switch (tag) {
+        .request => .{ .request = try bytesAs(RequestMsg, data) },
+        .prepare => .{ .prepare = try bytesAs(PrepareMsg, data) },
+        .prepare_ok => .{ .prepare_ok = try bytesAs(PrepareOkMsg, data) },
+        .commit => .{ .commit = try bytesAs(CommitMsg, data) },
+        .reply => .{ .reply = try bytesAs(ReplyMsg, data) },
+        .start_view_change => .{ .start_view_change = try bytesAs(StartViewChangeMsg, data) },
+        .do_view_change => .{ .do_view_change = try bytesAs(DoViewChangeMsg, data) },
+        .start_view => .{ .start_view = try bytesAs(StartViewMsg, data) },
+        .request_prepare => .{ .request_prepare = try bytesAs(RequestPrepareMsg, data) },
+        .send_prepare => .{ .send_prepare = try bytesAs(SendPrepareMsg, data) },
+        .request_status => .{ .request_status = try bytesAs(RequestStatusMsg, data) },
+        .send_status => .{ .send_status = try bytesAs(SendStatusMsg, data) },
     };
+    try validateDecodedMessage(decoded);
+    return decoded;
+}
+
+fn validateDecodedMessage(decoded: Message) !void {
+    // Nested Command/Result tags are not at a stable asBytes offset in Zig's
+    // large tagged-union layout, so peer handlers must keep rejecting via
+    // LogEntry.valid() / apply-time checks. Here we only enforce counts that
+    // would otherwise OOB-slice message-local arrays.
+    switch (decoded) {
+        .do_view_change => |m| {
+            if (m.log_entry_count > DVC_LOG_MAX) return error.InvalidLogEntryCount;
+        },
+        .start_view => |m| {
+            if (m.log_entry_count > SV_LOG_MAX) return error.InvalidLogEntryCount;
+        },
+        else => {},
+    }
 }
 
 fn payloadBytes(msg: Message) []const u8 {
@@ -508,8 +533,8 @@ fn serializePayload(msg: Message, dst: []u8) usize {
     }
 }
 
-fn bytesAs(comptime T: type, data: []const u8) T {
-    std.debug.assert(data.len >= @sizeOf(T));
+fn bytesAs(comptime T: type, data: []const u8) !T {
+    if (data.len < @sizeOf(T)) return error.MessageTooShort;
     return std.mem.bytesToValue(T, data[0..@sizeOf(T)]);
 }
 
@@ -556,6 +581,49 @@ test "serialize/deserialize round-trip" {
     try std.testing.expectEqual(decoded.prepare_ok.op_number, 42);
     try std.testing.expectEqual(decoded.prepare_ok.replica_id, 2);
     try std.testing.expectEqual(decoded.prepare_ok.commit_min, 11);
+}
+
+test "deserialize rejects unknown tag" {
+    const buf = [_]u8{0xFF};
+    try std.testing.expectError(error.InvalidMessageTag, deserialize(&buf));
+}
+
+test "deserialize rejects truncated prepare_ok" {
+    var buf: [8]u8 = undefined;
+    buf[0] = @intFromEnum(Tag.prepare_ok);
+    @memset(buf[1..], 0);
+    try std.testing.expectError(error.MessageTooShort, deserialize(&buf));
+}
+
+test "deserialize rejects oversized DVC log_entry_count" {
+    var buf: [1 + @sizeOf(DoViewChangeMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.do_view_change);
+    const count_off = 1 + @offsetOf(DoViewChangeMsg, "log_entry_count");
+    buf[count_off] = @as(u8, DVC_LOG_MAX) + 1;
+    try std.testing.expectError(error.InvalidLogEntryCount, deserialize(&buf));
+}
+
+test "deserialize round-trip preserves prepare entry validity" {
+    var buf: [16384]u8 = undefined;
+    var entry = LogEntry{
+        .view_number = 1,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 9,
+        .request_id = 3,
+    };
+    entry.checksum = entry.computeChecksum();
+    try std.testing.expect(entry.valid());
+
+    const prep = Message{ .prepare = .{
+        .view_number = 1,
+        .op_number = 1,
+        .entry = entry,
+    } };
+    const plen = serialize(prep, &buf);
+    const pd = try deserialize(buf[0..plen]);
+    try std.testing.expect(pd.prepare.entry.valid());
 }
 
 test "strToFixed" {
