@@ -982,8 +982,10 @@ pub const Replica = struct {
         // report an op as committed may contribute its value here. Otherwise a
         // higher-view but uncommitted suffix entry could overwrite a value that
         // another replica proved committed via commit_min.
+        // Conflicting committed identities fail closed: remain in view_change.
         var committed_source_lnv = std.mem.zeroes([LOG_SIZE_MAX]msg.ViewNumber);
         var committed_source_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
+        var committed_source_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
         var committed_source_set = std.mem.zeroes([LOG_SIZE_MAX]bool);
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
@@ -994,6 +996,19 @@ pub const Replica = struct {
                 if (entry.op_number > dvc.commit_min) continue;
 
                 const slot = journalSlot(entry.op_number);
+                if (committed_source_set[slot] and
+                    committed_source_op[slot] == entry.op_number and
+                    committed_source_checksum[slot] != entry.checksum)
+                {
+                    return;
+                }
+                // Local committed prefix must also agree.
+                if (entry.op_number <= self.commit_min) {
+                    if (self.journalGet(entry.op_number)) |local| {
+                        if (local.checksum != entry.checksum) return;
+                    }
+                }
+
                 const should_install = !committed_source_set[slot] or
                     committed_source_op[slot] != entry.op_number or
                     dvc.last_normal_view >= committed_source_lnv[slot];
@@ -1002,6 +1017,7 @@ pub const Replica = struct {
                 self.journalPut(entry);
                 committed_source_set[slot] = true;
                 committed_source_op[slot] = entry.op_number;
+                committed_source_checksum[slot] = entry.checksum;
                 committed_source_lnv[slot] = dvc.last_normal_view;
             }
         }
@@ -1793,6 +1809,16 @@ pub const Replica = struct {
         if (from != self.leaderForView(sv.view_number)) return;
         if (sv.view_number < self.view_number) return;
 
+        // Preflight: StartView must not conflict with the locally committed
+        // prefix. Reject the message without mutating local state.
+        for (sv.log_entries[0..sv.log_entry_count]) |entry| {
+            if (!entry.valid()) continue;
+            if (entry.op_number == 0 or entry.op_number > self.commit_min) continue;
+            if (self.journalGet(entry.op_number)) |existing| {
+                if (existing.checksum != entry.checksum) return;
+            }
+        }
+
         self.view_number = sv.view_number;
         self.retention_floor = sv.retention_floor;
 
@@ -2272,6 +2298,13 @@ pub const Replica = struct {
                 return;
             }
             if (entry.op_number < self.journal[slot].op_number) return;
+            // Committed prefix is immutable: same-op/different-checksum at or
+            // below commit_min is adversarial or corrupt input — reject without
+            // panicking. Uncommitted suffix replacement remains allowed.
+            if (entry.op_number <= self.commit_min) {
+                std.debug.assert(entry.checksum != self.journal[slot].checksum);
+                return;
+            }
             self.prepare_ok_counts[slot] = 0;
             self.prepare_ok_from[slot] = 0;
         }

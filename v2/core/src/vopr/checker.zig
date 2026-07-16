@@ -77,18 +77,16 @@ pub const StateChecker = struct {
         // Check protocol invariants on the replica itself
         self.checkReplicaInvariants(replica_id, r);
 
+        // Commit watermarks track durable history only. In-memory commit_min may
+        // advance before the metadata barrier; observing it would false-positive
+        // as durable regression after a crash that discards pending sync.
+        if (r.storage_failed or r.metadata_dirty) return;
+
         // Check new commits
         const prev_commit = self.replica_commit_max[replica_id];
         const curr_commit = r.commit_min;
 
         if (curr_commit < prev_commit) {
-            // After crash recovery the in-memory commit point may be behind the
-            // last observed value until catch-up. Reset tracking; do not treat
-            // process restart as a durability regression.
-            if (r.recovered_from_disk) {
-                self.replica_commit_max[replica_id] = curr_commit;
-                return;
-            }
             self.recordViolation(
                 "replica {d}: durable commit point regressed from {d} to {d}",
                 .{ replica_id, prev_commit, curr_commit },
@@ -101,6 +99,35 @@ pub const StateChecker = struct {
 
         // Replica committed new operations. Validate each one.
         var op = prev_commit + 1;
+        while (op <= curr_commit) : (op += 1) {
+            self.validateCommit(replica_id, r, op);
+        }
+
+        self.replica_commit_max[replica_id] = curr_commit;
+    }
+
+    /// Observe a replica after successful disk recovery.
+    /// Validates the entire recovered committed prefix against canonical history
+    /// before advancing the per-replica watermark. Rejects durable regression.
+    pub fn observeRecovery(
+        self: *StateChecker,
+        replica_id: u8,
+        r: *const replica_mod.Replica,
+    ) void {
+        std.debug.assert(replica_id < self.replica_count);
+
+        const prev_commit = self.replica_commit_max[replica_id];
+        const curr_commit = r.commit_min;
+
+        if (curr_commit < prev_commit) {
+            self.recordViolation(
+                "replica {d}: recovered commit point regressed from {d} to {d}",
+                .{ replica_id, prev_commit, curr_commit },
+            );
+            return;
+        }
+
+        var op: msg.OpNumber = 1;
         while (op <= curr_commit) : (op += 1) {
             self.validateCommit(replica_id, r, op);
         }
@@ -349,6 +376,71 @@ test "checker rejects: commit regression after recovery" {
     tc.replicas[0].recovered_from_disk = false;
     const before = checker.safety_violations;
     checker.check(0, tc.replicas[0]);
+    try std.testing.expectEqual(@as(u64, 1), checker.safety_violations - before);
+}
+
+test "checker rejects: recovered commit regression" {
+    // Recovered commit_min below a previously observed watermark is a durable
+    // regression; observeRecovery must record it (not silently reset).
+    var checker = StateChecker.init(1);
+    checker.silent = true;
+    checker.replica_commit_max[0] = 5;
+
+    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0x4EC1);
+    defer tc.deinit();
+    tc.replicas[0].commit_min = 2;
+    tc.replicas[0].commit_max = 2;
+    tc.replicas[0].op_number = 2;
+    tc.replicas[0].recovered_from_disk = true;
+
+    const before = checker.safety_violations;
+    checker.observeRecovery(0, tc.replicas[0]);
+    try std.testing.expectEqual(@as(u64, 1), checker.safety_violations - before);
+    try std.testing.expectEqual(@as(msg.OpNumber, 5), checker.replica_commit_max[0]);
+}
+
+test "checker rejects: divergent recovered canonical prefix" {
+    // Recovered journal identity at a previously canonical op must match.
+    var entry_a = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 7,
+        .request_id = 3,
+        .parent_checksum = 0,
+    };
+    entry_a.checksum = entry_a.computeChecksum();
+
+    var entry_b = entry_a;
+    entry_b.client_id = 99;
+    entry_b.request_id = 99;
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    var checker = StateChecker.init(1);
+    checker.silent = true;
+    checker.history[0] = .{
+        .op = 1,
+        .checksum = entry_a.checksum,
+        .client_id = entry_a.client_id,
+        .request_id = entry_a.request_id,
+        .committed_by = 0b01,
+    };
+    checker.history_len = 1;
+    checker.replica_commit_max[0] = 1;
+
+    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0x4EC2);
+    defer tc.deinit();
+    const slot = replica_mod.journalSlot(1);
+    tc.replicas[0].journal[slot] = entry_b;
+    tc.replicas[0].journal_occupied[slot] = true;
+    tc.replicas[0].commit_min = 1;
+    tc.replicas[0].commit_max = 1;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].recovered_from_disk = true;
+
+    const before = checker.safety_violations;
+    checker.observeRecovery(0, tc.replicas[0]);
     try std.testing.expectEqual(@as(u64, 1), checker.safety_violations - before);
 }
 

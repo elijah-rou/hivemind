@@ -219,16 +219,18 @@ pub const TestCluster = struct {
         const recovered = self.replicas[i].recoverFromDisk() catch {
             // Corrupt local durable prefix: production exits nonzero. Keep this
             // simulated replica offline until an operator/liveness restart wipes it.
+            // Preserve checker watermark/canonical history across the failed incarnation.
             self.replicas[i].storage_failed = true;
             self.replica_running[i] = false;
             self.network.queues[i].count = 0;
-            self.checker.replica_commit_max[id] = 0;
             return;
         };
-        _ = recovered;
 
-        // Reset checker watermark across process restart.
-        self.checker.replica_commit_max[id] = self.replicas[i].commit_min;
+        // Validate recovered committed prefix against canonical history before
+        // advancing the checker watermark (no direct reset).
+        if (recovered) {
+            self.checker.observeRecovery(id, self.replicas[i]);
+        }
 
         // After crash, multi-node replicas must enter view_change to rejoin
         // safely, even if disk recovery failed and initInPlace left status=normal.
@@ -1418,4 +1420,144 @@ test "recovery rejects metadata commit_max above op_number" {
         .disk = tc.disks[0].diskInterface(),
     });
     try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
+}
+
+test "StartView rejects conflicting committed prefix" {
+    // A StartView that conflicts with a locally committed op must not replace it.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x57C0);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var committed = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+
+    // Install a locally committed prefix on follower 1.
+    tc.replicas[1].journalPut(committed);
+    tc.replicas[1].journal_dirty[replica_mod.journalSlot(1)] = false;
+    tc.replicas[1].op_number = 1;
+    tc.replicas[1].commit_min = 1;
+    tc.replicas[1].commit_max = 1;
+    tc.replicas[1].status = .view_change;
+    tc.replicas[1].view_number = 0;
+
+    var conflicting = committed;
+    conflicting.client_id = 42;
+    conflicting.request_id = 42;
+    conflicting.view_number = 3;
+    conflicting.checksum = conflicting.computeChecksum();
+    try std.testing.expect(conflicting.checksum != committed.checksum);
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = conflicting;
+
+    tc.deliver(1, 0, .{ .start_view = sv });
+
+    try std.testing.expectEqual(committed.checksum, tc.replicas[1].journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].commit_min);
+    try std.testing.expect(tc.replicas[1].status == .view_change);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[1].view_number);
+}
+
+test "view change rejects conflicting committed DVC values" {
+    // Two DVCs reporting different committed identities for the same op must
+    // not let the new leader install either value and leave view_change.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD7C1);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var entry_a = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry_a.checksum = entry_a.computeChecksum();
+
+    var entry_b = entry_a;
+    entry_b.client_id = 99;
+    entry_b.request_id = 99;
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    // Local committed prefix on the prospective new leader (view 3 → replica 0).
+    tc.replicas[0].journalPut(entry_a);
+    tc.replicas[0].journal_dirty[replica_mod.journalSlot(1)] = false;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].commit_min = 1;
+    tc.replicas[0].commit_max = 1;
+    tc.replicas[0].view_number = 3;
+    tc.replicas[0].last_normal_view = 0;
+    tc.replicas[0].status = .view_change;
+    tc.replicas[0].do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+    tc.replicas[0].do_vc_total = 0;
+
+    var dvc0 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 0,
+        .last_normal_view = 0,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc0.log_entries[0] = entry_a;
+
+    var dvc1 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 1,
+        .last_normal_view = 2,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc1.log_entries[0] = entry_b;
+
+    var dvc2 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 2,
+        .last_normal_view = 0,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc2.log_entries[0] = entry_a;
+
+    // Quorum of DVCs with a committed-identity conflict between 0 and 1.
+    tc.replicas[0].do_vc_msgs[0] = dvc0;
+    tc.replicas[0].do_vc_received[0] = true;
+    tc.replicas[0].do_vc_msgs[1] = dvc1;
+    tc.replicas[0].do_vc_received[1] = true;
+    tc.replicas[0].do_vc_msgs[2] = dvc2;
+    tc.replicas[0].do_vc_received[2] = true;
+    tc.replicas[0].do_vc_total = 3;
+
+    // Trigger selection via a duplicate DVC delivery (already counted).
+    tc.deliver(0, 1, .{ .do_view_change = dvc1 });
+
+    try std.testing.expect(tc.replicas[0].status == .view_change);
+    try std.testing.expectEqual(entry_a.checksum, tc.replicas[0].journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].commit_min);
 }
