@@ -234,6 +234,49 @@ case_bounded_timeout() {
   (( status_calls >= 2 && status_calls <= 5 ))
 }
 
+
+# shellcheck disable=SC2329
+case_timeout_diagnostics_no_deadline_overrun() {
+  # After wall-clock timeout, diagnostics must not spend extra AWS budget past deadline,
+  # but must still emit useful terminal identity/status lines.
+  yes Pending | head -n 50 > "$STUB_STATE/cmd-overrun.seq"
+  FAKE_NOW=1000000
+  local start_now=$FAKE_NOW
+  local timeout_sec=5
+  if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=$timeout_sec \
+    hivemind_ssm_wait_invocation "us-east-1" "cmd-overrun" "i-overrun" 2>"$TMP_DIR/overrun.err"; then
+    echo "expected poll timeout" >&2
+    return 1
+  fi
+  grep -q 'SSM poll timeout after 5s' "$TMP_DIR/overrun.err" || {
+    echo "missing poll timeout message" >&2
+    return 1
+  }
+  # Useful terminal diagnostics without requiring a post-deadline AWS dump.
+  grep -q 'command_id=cmd-overrun' "$TMP_DIR/overrun.err" || {
+    echo "missing command_id diagnostic" >&2
+    return 1
+  }
+  grep -q 'instance_id=i-overrun' "$TMP_DIR/overrun.err" || {
+    echo "missing instance_id diagnostic" >&2
+    return 1
+  }
+  # No diagnostic dump AWS call after deadline: dump uses --output json without Status query.
+  local dump_calls
+  dump_calls=$(grep -cE 'get-command-invocation.*--output json' "$STUB_STATE/calls.log" || true)
+  if (( dump_calls != 0 )); then
+    echo "deadline-exhausted path must not call diagnostic AWS dump (got $dump_calls)" >&2
+    return 1
+  fi
+  # Wall clock must not advance past start+timeout due to post-deadline dump work.
+  local deadline=$((start_now + timeout_sec))
+  if (( FAKE_NOW > deadline )); then
+    echo "deadline overrun: FAKE_NOW=$FAKE_NOW deadline=$deadline" >&2
+    return 1
+  fi
+  return 0
+}
+
 # shellcheck disable=SC2329
 case_per_node_command_ids() {
   printf '%s\n' Success > "$STUB_STATE/cmd-node0.seq"
@@ -288,6 +331,7 @@ run_case "terminal TimedOut" case_timedout
 run_case "terminal Cancelled" case_cancelled
 run_case "API error" case_api_error
 run_case "bounded timeout" case_bounded_timeout
+run_case "timeout diagnostics no deadline overrun" case_timeout_diagnostics_no_deadline_overrun
 run_case "per-node command IDs" case_per_node_command_ids
 run_case "invalid poll bounds" case_invalid_bounds
 run_case "deploy dead-process fail-closed" case_deploy_dead_process_fail_closed

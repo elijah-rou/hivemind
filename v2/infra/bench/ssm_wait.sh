@@ -45,9 +45,14 @@ hivemind_ssm_aws() {
 }
 
 hivemind_ssm_dump_invocation() {
-  local region="$1" command_id="$2" instance_id="$3" remaining="${4:-5}"
+  local region="$1" command_id="$2" instance_id="$3" remaining="${4:-0}"
   echo "--- SSM invocation diagnostics ---" >&2
   echo "region=$region command_id=$command_id instance_id=$instance_id" >&2
+  # Never extend past the caller wall-clock budget for AWS diagnostics.
+  if (( remaining < 1 )); then
+    echo "diagnostics AWS dump skipped (deadline exhausted)" >&2
+    return 0
+  fi
   hivemind_ssm_aws "$remaining" ssm get-command-invocation \
     --region "$region" \
     --command-id "$command_id" \
@@ -128,7 +133,6 @@ hivemind_ssm_wait_invocation() {
 
   echo "FAIL: SSM poll timeout after ${SSM_POLL_TIMEOUT_SEC}s status=${status:-unknown} command_id=$command_id instance_id=$instance_id" >&2
   remaining="$(hivemind_ssm_remaining "$deadline")"
-  if (( remaining < 1 )); then remaining=1; fi
   hivemind_ssm_dump_invocation "$region" "$command_id" "$instance_id" "$remaining"
   return 1
 }

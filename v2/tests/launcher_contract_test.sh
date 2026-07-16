@@ -135,6 +135,14 @@ if grep -E 'cargo[[:space:]]+test' "$GPU_TEST" | grep -qF '||'; then
     FAIL=$((FAIL + 1))
 fi
 assert_contains "$GPU_TEST" 'trap[[:space:]]+cleanup[[:space:]]+EXIT'
+assert_contains "$GPU_TEST" 'KEEP_INFRA'
+# Trap must be installed before terraform apply (source order).
+apply_line="$(grep -nE 'terraform[[:space:]]+apply' "$GPU_TEST" | head -n1 | cut -d: -f1 || true)"
+trap_line="$(grep -nE 'trap[[:space:]]+cleanup[[:space:]]+EXIT' "$GPU_TEST" | head -n1 | cut -d: -f1 || true)"
+if [[ -z "$apply_line" || -z "$trap_line" || "$trap_line" -ge "$apply_line" ]]; then
+    echo "FAIL: $GPU_TEST must install cleanup trap before terraform apply (trap=$trap_line apply=$apply_line)" >&2
+    FAIL=$((FAIL + 1))
+fi
 
 if [[ "$FAIL" -ne 0 ]]; then
     echo "FAIL: launcher contract ($FAIL assertion(s))"

@@ -109,9 +109,9 @@ This repo’s operational surface is the **Hivemind replica** (Zig), the **Go AP
 | Location | Note |
 |----------|------|
 | `docs/legacy/Edge Routing.md` | **Legacy** (not `core/` in-repo): edge/Thalamus sketch; see top banner + `docs/legacy/README.md` |
-| `v1/` | Removed old implementation; `core/` is now the only Zig control-plane implementation in-tree |
-| `hivemind/` | Removed zero-byte skeleton files |
-| `honeybee/` | Removed inactive prototype component |
+| repo-root `v1/` | Frozen POC V1 snapshot; active Zig control plane is `v2/core/` |
+| `hivemind/` | Removed zero-byte skeleton files from the active line |
+| `honeybee/` | Removed inactive prototype component from the active line |
 
 ## Recently completed (context)
 
@@ -123,7 +123,7 @@ This repo’s operational surface is the **Hivemind replica** (Zig), the **Go AP
 | Item | Status |
 |------|--------|
 | Optional API gateway token (`HIVEMIND_API_TOKEN` + `Authorization: Bearer`) | Landed — see `api/main.go`; `GET /v1/health` stays unauthenticated when token is set (load balancer / probe friendly). Trailing slashes are stripped before auth so `/v1/health/` matches the health exemption. |
-| Agent SIGTERM drain (`I5` slice) | Landed — `Agent::shutdown` now unmounts JuiceFS, uses 30s default stop grace (or pod `grace_period_ms`), calls `remove_pod` after stop for container cleanup, avoids duplicate GPU decrements / status spam for already-terminal pods; see `agent/src/agent.rs` |
+| Agent SIGTERM drain (`I5` slice) | Landed — worker shutdown now unmounts JuiceFS, uses 30s default stop grace (or pod `grace_period_ms`), calls `remove_pod` after stop for container cleanup, avoids duplicate GPU decrements / status spam for already-terminal pods; see `worker/src/worker.rs` |
 | Image pull credentials (`I3` slice) | Landed — `CreateDeployment` wire extension (optional 449 bytes after the 398-byte base) carries `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`; replica appends StartPod trailer (`0x01` + fields); agent resolves secret-named passwords via Doppler like env vars and passes `ctr images pull --user user:pass` in `containerd` runtime. JSON fields on `POST /v1/deployments`: `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`. |
 | Reconnecting nodes / agents | Landed — `handleRegisterNode` dedupes by active hostname (returns existing `node_id`); `AgentConnection.register_seq` makes each agent (re)registration a fresh VRR `request_id`; `Replica.onAgentDisconnect` + `ConnectionManager` reuse agent TCP slots and sync disconnect; Rust agent calls `on_connection_lost()` so `NodeRegister` is resent after TCP loss. |
 | Simulation coverage for this session | Landed — Zig: `state_machine` tests for hostname dedupe + image-pull fields; VOPR tests for simulated agent reconnect + deployment image-pull retention; `TestCluster.request` now works for single-replica clusters; `disconnectSimAgent` + `getAgentNodeId` sync in harness. Rust: `protocol` trailer test (existing), `sim::runtime` pull with `ImagePullAuth`, `Agent::on_connection_lost` unit test. |
@@ -157,8 +157,8 @@ Potential Hivemind-side addenda from that repo:
 
 ## Repo cleanup decisions landed
 
-- `v2/` was renamed to `core/` because the old name encoded history, not purpose.
-- `v1/`, `hivemind/`, and `honeybee/` were removed from active tree.
+- At repo root, `v1/` is the frozen POC V1 snapshot and `v2/` is the active development line.
+- Within `v2/`, the historical nested `v2/` directory was renamed to `core/` because the old name encoded history, not purpose; `hivemind/` and `honeybee/` were removed from the active tree.
 - Build outputs and deploy binaries remain ignored; local generated artifacts should not be committed.
 - Historical/aspirational docs were moved under `docs/legacy/` or `docs/frozen/` so active truth is limited to `STATUS`, `POC_ACCEPTANCE`, `POC_CHANGELOG`, `FINDINGS_AND_ISSUES`, and `ENGINEERING`.
 

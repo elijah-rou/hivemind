@@ -50,17 +50,16 @@ echo "will compile on-instance (cross-compiling test binaries is unreliable)"
 echo ""
 echo "=== Step 2: Terraform apply ==="
 cd "$SCRIPT_DIR"
+# Install cleanup before terraform mutation so apply-time failures still destroy.
+if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
+  trap cleanup EXIT
+  CLEANUP_INSTALLED=1
+fi
 terraform init -input=false 2>/dev/null
 terraform apply -auto-approve
 
 INSTANCE_ID=$(terraform output -raw instance_id)
 echo "instance: $INSTANCE_ID"
-
-# Install cleanup as soon as paid resources exist.
-if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
-  trap cleanup EXIT
-  CLEANUP_INSTALLED=1
-fi
 
 echo ""
 echo "=== Step 3: Wait for SSM ==="

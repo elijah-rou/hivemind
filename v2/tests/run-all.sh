@@ -64,6 +64,14 @@ run_phase "Launcher contract (smoke/bench/infra)" \
 run_phase "Bench deploy SSM wait fixtures" \
     bash -c "'$SCRIPT_DIR/deploy_ssm_wait_test.sh'"
 
+# --- Phase 4e: GPU-test cleanup trap fixture (stub terraform, no live infra) ---
+run_phase "GPU-test cleanup trap fixture" \
+    bash -c "'$SCRIPT_DIR/gpu_test_cleanup_trap_test.sh'"
+
+# --- Phase 4f: Active docs layout path contract ---
+run_phase "Active docs layout path contract" \
+    bash -c "'$SCRIPT_DIR/docs_layout_paths_test.sh'"
+
 # --- Phase 5: Containerd integration (Docker/OrbStack) ---
 if [ "$SKIP_CONTAINERD" = false ]; then
     if command -v docker &>/dev/null; then

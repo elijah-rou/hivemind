@@ -53,8 +53,9 @@ Latest state after the fresh AWS redeploy, corrected smoke pass, POC acceptance 
   - localhost multi-origin smoke exercised four Hivemind origins via `/v1/internal/federation` and the actual Thalamus resolver on branch `feat/hivemind-poc-locality`
   - stale-peer detection was demonstrated by killing `crusoe-texas` and observing `stale=true` from `aws-us-east-1`
 - Repo scope has been trimmed for production-hardening work:
-  - Zig control plane path is now `core/`, not `v2/`
-  - old `v1/`, zero-byte `hivemind/`, and inactive `honeybee/` are removed
+  - At repo root, `v1/` is the frozen POC V1 snapshot and `v2/` is the active development line
+  - Within `v2/`, Zig control plane path is `core/` (historical in-tree rename away from a nested `v2/` name)
+  - Zero-byte `hivemind/` skeleton and inactive `honeybee/` prototype were removed from the active line
   - frozen/legacy docs are isolated under `docs/frozen/` and `docs/legacy/`
 - Live execution remains scripted, not manual. `scripts/poc-runbook.sh` can build/push ECR images, apply isolated `infra/poc`, deploy Hivemind, run smoke, run real workload validation, run operator workflow proof, run failure drills, and optionally run isolated EKS baseline under `infra/poc-eks`.
 - Final POC evidence and verdict are refreshed but benchmark/economic status remains provisional:
@@ -389,10 +390,10 @@ Active source of truth:
 - `docs/FINDINGS_AND_ISSUES.md` for production gaps/backlog
 
 Recently trimmed/frozen:
-- removed old `v1/` implementation
-- removed zero-byte `hivemind/` skeleton
-- removed prototype `honeybee/`
-- renamed `v2/` to `core/`
+- repo-root `v1/` is the frozen POC V1 snapshot; `v2/` is the active development line
+- within `v2/`, Zig control plane lives in `core/` (historical in-tree rename from a nested `v2/` name)
+- removed zero-byte `hivemind/` skeleton from the active line
+- removed prototype `honeybee/` from the active line
 - moved aspirational/superseded docs to `docs/frozen/`
 - moved legacy Thalamus/edge-routing docs to `docs/legacy/`
 
