@@ -44,6 +44,24 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Exact /run request-response length contract
+
+What changed:
+- Go API, Zig core/RequestQueue, and Rust worker now require exact declared run payload length with shared `MAX_PAYLOAD = 512`
+- Oversized, short/long declared lengths, trailing bytes, and truncated/extra response bodies are rejected (no clamp)
+- Go run responses require request-id match; gateway 9-byte errors remain valid
+
+Why it matters:
+- closes a fail-open wire contract gap on the POC `/run` path before publish
+
+Current acceptance progress:
+- publish-gate blocker on run-length clamping addressed in this worktree; remaining blockers unchanged
+
+Next steps:
+- re-run readiness/publish gate on updated HEAD
+
+Live infra status: unchanged by this change
+
 ### 2026-07-16 — FileDisk journal layout v2 with explicit LogEntry codec
 
 What changed:

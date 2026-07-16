@@ -332,13 +332,20 @@ pub const ConnectionManager = struct {
 
     fn handleRunRequest(self: *ConnectionManager, client: *Conn, payload: []const u8) void {
         // Payload: request_id(u64) + deployment_name(64 bytes) + payload_len(u32) + payload_data
+        // Contract: declared length must exactly match trailing body bytes (no clamp/truncation),
+        // and body must be <= rq.MAX_PAYLOAD. Overflow-safe via body.len comparison.
         if (payload.len < 76) return;
 
         const now = @import("vopr/simulated_io.zig").nowTick(self.replica.io);
         const request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
         const dep_name = msg.fixedToSlice(payload[8..72]);
-        const payload_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[72..76]));
-        const req_payload = payload[76..@min(76 + payload_len, payload.len)];
+        const declared_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[72..76]));
+        const body = payload[76..];
+        if (declared_len > rq.MAX_PAYLOAD or body.len != @as(usize, declared_len)) {
+            self.sendRunError(client, request_id, 3); // invalid payload length
+            return;
+        }
+        const req_payload = body;
         latency.record(.{ .phase = "core_run_request_receive", .op = "run_request", .name = dep_name, .start_ms = now, .end_ms = now, .source = "core/src/connection.zig" });
 
         // Look up deployment by name
@@ -2028,4 +2035,107 @@ test "processPeerFrames malformed spoof cannot evict healthy peer socket" {
     try std.testing.expect(cm.peers[1].connected);
     try std.testing.expect(!cm.peers[1].peer_id_known);
     try std.testing.expectEqual(@as(usize, 0), cm.peers[1].frame_pos);
+}
+
+fn buildClientRunRequestPayload(request_id: u64, dep_name: []const u8, declared_len: u32, body: []const u8) []u8 {
+    const total = 76 + body.len;
+    const buf = std.testing.allocator.alloc(u8, total) catch unreachable;
+    @memset(buf, 0);
+    @memcpy(buf[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+    const name_copy_len = @min(dep_name.len, 64);
+    @memcpy(buf[8..][0..name_copy_len], dep_name[0..name_copy_len]);
+    @memcpy(buf[72..76], &std.mem.toBytes(std.mem.nativeToLittle(u32, declared_len)));
+    if (body.len > 0) @memcpy(buf[76..][0..body.len], body);
+    return buf;
+}
+
+test "handleRunRequest enforces exact declared payload length" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4242);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4242, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4242);
+    _ = sm.apply(.{ .create_deployment = .{
+        .name = msg.strToFixed(64, "echo"),
+        .image = msg.strToFixed(256, "img:v1"),
+        .replicas = 1,
+        .cpu_millicores = 100,
+        .memory_megabytes = 128,
+    } });
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.client_count = 1;
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    ConnectionManager.setNonBlocking(fds[1]);
+    cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 55 };
+
+    const Case = struct {
+        name: []const u8,
+        declared: u32,
+        body_len: usize,
+        expect_queued: bool,
+        expect_status: ?u8,
+    };
+
+    const cases = [_]Case{
+        .{ .name = "exact zero", .declared = 0, .body_len = 0, .expect_queued = true, .expect_status = null },
+        .{ .name = "exact max", .declared = rq.MAX_PAYLOAD, .body_len = rq.MAX_PAYLOAD, .expect_queued = true, .expect_status = null },
+        .{ .name = "declared short", .declared = 8, .body_len = 4, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "declared long / trailing", .declared = 2, .body_len = 4, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "513 byte payload", .declared = rq.MAX_PAYLOAD + 1, .body_len = rq.MAX_PAYLOAD + 1, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "integer overflow size", .declared = std.math.maxInt(u32), .body_len = 4, .expect_queued = false, .expect_status = 3 },
+    };
+
+    for (cases, 0..) |tc, i| {
+        _ = tc.name;
+        // Drain any prior error frame.
+        var drain: [256]u8 = undefined;
+        _ = std.posix.read(fds[1], &drain) catch {};
+
+        var body_buf: [rq.MAX_PAYLOAD + 1]u8 = undefined;
+        @memset(body_buf[0..tc.body_len], 0x11);
+        const payload = buildClientRunRequestPayload(@intCast(1000 + i), "echo", tc.declared, body_buf[0..tc.body_len]);
+        defer allocator.free(payload);
+
+        const depth_before = cm.request_queue.totalDepth();
+        cm.handleRunRequest(&cm.clients[0], payload);
+
+        if (tc.expect_queued) {
+            try std.testing.expectEqual(depth_before + 1, cm.request_queue.totalDepth());
+            var err_buf: [64]u8 = undefined;
+            const n = std.posix.read(fds[1], &err_buf) catch |err| switch (err) {
+                error.WouldBlock => @as(usize, 0),
+                else => return err,
+            };
+            try std.testing.expectEqual(@as(usize, 0), n);
+        } else {
+            try std.testing.expectEqual(depth_before, cm.request_queue.totalDepth());
+            var err_buf: [64]u8 = undefined;
+            const n = try std.posix.read(fds[1], &err_buf);
+            try std.testing.expect(n >= 17);
+            try std.testing.expectEqual(@as(u8, 0x23), err_buf[7]);
+            try std.testing.expectEqual(tc.expect_status.?, err_buf[16]);
+        }
+    }
 }

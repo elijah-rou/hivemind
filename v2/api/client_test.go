@@ -182,3 +182,141 @@ func TestParseResultRejectsMismatchedRequestID(t *testing.T) {
 		t.Fatalf("expected request_id mismatch error")
 	}
 }
+
+func buildRunResponseRaw(requestID uint64, status byte, body []byte, extraTrailing bool) []byte {
+	if body == nil && status != RunStatusOK {
+		raw := make([]byte, 9)
+		binary.LittleEndian.PutUint64(raw[0:8], requestID)
+		raw[8] = status
+		return raw
+	}
+	raw := make([]byte, 13+len(body))
+	binary.LittleEndian.PutUint64(raw[0:8], requestID)
+	raw[8] = status
+	binary.LittleEndian.PutUint32(raw[9:13], uint32(len(body)))
+	copy(raw[13:], body)
+	if extraTrailing {
+		raw = append(raw, 0xff)
+	}
+	return raw
+}
+
+func TestParseRunResponseExactLengthContract(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		raw     []byte
+		wantErr string
+		wantLen int
+	}{
+		{
+			name:    "ok empty body",
+			raw:     buildRunResponseRaw(7, RunStatusOK, nil, false),
+			wantLen: 0,
+		},
+		{
+			name:    "ok max body",
+			raw:     buildRunResponseRaw(7, RunStatusOK, bytes.Repeat([]byte{1}, MaxRunPayload), false),
+			wantLen: MaxRunPayload,
+		},
+		{
+			name: "gateway error without length",
+			raw:  buildRunResponseRaw(7, RunStatusNotFound, nil, false),
+		},
+		{
+			name:    "missing response length",
+			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, RunStatusOK},
+			wantErr: "missing length",
+		},
+		{
+			name:    "truncated response body",
+			raw:     buildRunResponseRaw(7, RunStatusOK, []byte("hi"), false)[:14],
+			wantErr: "length mismatch",
+		},
+		{
+			name:    "extra response body",
+			raw:     buildRunResponseRaw(7, RunStatusOK, []byte("hi"), true),
+			wantErr: "length mismatch",
+		},
+		{
+			name:    "partial length field",
+			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, RunStatusOK, 1, 0},
+			wantErr: "missing length",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := parseRunResponse(tc.raw)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q", tc.wantErr)
+				}
+				if !bytes.Contains([]byte(err.Error()), []byte(tc.wantErr)) {
+					t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(resp.Body) != tc.wantLen {
+				t.Fatalf("body len = %d, want %d", len(resp.Body), tc.wantLen)
+			}
+		})
+	}
+}
+
+func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient([]string{"127.0.0.1:1"}, nil)
+	if _, err := client.SendRunRequest("dep", make([]byte, MaxRunPayload+1)); err == nil {
+		t.Fatalf("expected oversized payload rejection")
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		// Leader probe first (dialLeader / reconnect).
+		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil || len(frame) < 3 || frame[2] != TagClusterStateRequest {
+			return
+		}
+		if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
+			return
+		}
+		if _, err := readFrameGeneric(conn, buf, time.Second, nil); err != nil {
+			return
+		}
+		// Reply with mismatched request_id.
+		raw := buildRunResponseRaw(999, RunStatusOK, []byte("x"), false)
+		inner := make([]byte, 3+len(raw))
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+		inner[2] = TagRunResponse
+		copy(inner[3:], raw)
+		out := make([]byte, 5+len(inner))
+		binary.LittleEndian.PutUint32(out[0:4], uint32(1+len(inner)))
+		out[4] = 0x00
+		copy(out[5:], inner)
+		_, _ = conn.Write(out)
+	}()
+
+	client = NewClient([]string{listener.Addr().String()}, nil)
+	if _, err := client.SendRunRequest("dep", []byte("ok")); err == nil {
+		t.Fatalf("expected request_id mismatch error")
+	} else if !bytes.Contains([]byte(err.Error()), []byte("request_id mismatch")) {
+		t.Fatalf("error = %v, want request_id mismatch", err)
+	}
+}

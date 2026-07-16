@@ -225,15 +225,16 @@ mod tests {
         let mut io = RealIo::connect(&addr.to_string(), None).unwrap();
         let (mut server, _) = listener.accept().unwrap();
 
-        let body = vec![0x5a; 1024];
+        // Stay within MAX_RUN_PAYLOAD while still exceeding the TCP read staging buffer.
+        let body = vec![0x5a; protocol::MAX_RUN_PAYLOAD];
         let mut burst = Vec::new();
-        for request_id in 0..50 {
+        for request_id in 0..80 {
             burst.extend_from_slice(&run_request_frame(request_id, 99, &body));
         }
         assert!(burst.len() > READ_BUFFER_SIZE);
         server.write_all(&burst).unwrap();
 
-        for request_id in 0..50 {
+        for request_id in 0..80 {
             match recv_until(&mut io) {
                 ControlMessage::RunRequest(cmd) => {
                     assert_eq!(cmd.request_id, request_id);

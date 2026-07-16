@@ -10,6 +10,8 @@ const MSG_START_POD: u8 = 0x02;
 const MSG_STOP_POD: u8 = 0x03;
 const MSG_PROBE_POD: u8 = 0x05;
 const MSG_RUN_REQUEST: u8 = 0x04;
+/// Must match v2/core/src/request_queue.zig MAX_PAYLOAD.
+pub const MAX_RUN_PAYLOAD: usize = 512;
 
 const MSG_NODE_REGISTER: u8 = 0x10;
 const MSG_NODE_HEARTBEAT: u8 = 0x11;
@@ -482,7 +484,9 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
 
         MSG_RUN_REQUEST => {
             // Payload: request_id(u64) + deployment_id(u64) + payload_len(u32) + payload
-            if payload.len() < 20 {
+            // Exact length contract: declared len must match trailing bytes; <= MAX_RUN_PAYLOAD.
+            const HEADER: usize = 20;
+            if payload.len() < HEADER {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "RunRequest payload too short",
@@ -490,16 +494,18 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             }
             let request_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             let deployment_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
-            let data = if payload.len() >= 20 + payload_len {
-                payload[20..20 + payload_len].to_vec()
-            } else {
-                payload[20..].to_vec()
-            };
+            let declared_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let body = &payload[HEADER..];
+            if declared_len > MAX_RUN_PAYLOAD || body.len() != declared_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RunRequest payload length mismatch",
+                ));
+            }
             Ok(ControlMessage::RunRequest(RunRequestCmd {
                 request_id,
                 deployment_id,
-                payload: data,
+                payload: body.to_vec(),
             }))
         }
 
@@ -1085,5 +1091,55 @@ mod tests {
             u32::from_le_bytes(bytes[532..536].try_into().unwrap()),
             4000
         );
+    }
+
+    fn build_run_request_payload(
+        request_id: u64,
+        deployment_id: u64,
+        declared_len: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(20 + body.len());
+        payload.extend_from_slice(&request_id.to_le_bytes());
+        payload.extend_from_slice(&deployment_id.to_le_bytes());
+        payload.extend_from_slice(&declared_len.to_le_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    #[test]
+    fn run_request_requires_exact_declared_payload_length() {
+        let cases = [
+            ("exact zero", 0u32, 0usize, true),
+            ("exact max", MAX_RUN_PAYLOAD as u32, MAX_RUN_PAYLOAD, true),
+            ("declared short", 8u32, 4usize, false),
+            ("declared long trailing", 2u32, 4usize, false),
+            (
+                "513 byte payload",
+                (MAX_RUN_PAYLOAD + 1) as u32,
+                MAX_RUN_PAYLOAD + 1,
+                false,
+            ),
+            ("integer overflow size", u32::MAX, 4usize, false),
+        ];
+
+        for (name, declared, body_len, expect_ok) in cases {
+            let body = vec![0x22u8; body_len];
+            let payload = build_run_request_payload(9, 3, declared, &body);
+            let result = decode_control_message(MSG_RUN_REQUEST, &payload);
+            if expect_ok {
+                let msg = result.unwrap_or_else(|e| panic!("{name}: unexpected err {e}"));
+                match msg {
+                    ControlMessage::RunRequest(cmd) => {
+                        assert_eq!(cmd.request_id, 9, "{name}");
+                        assert_eq!(cmd.deployment_id, 3, "{name}");
+                        assert_eq!(cmd.payload.len(), body_len, "{name}");
+                    }
+                    _ => panic!("{name}: expected RunRequest"),
+                }
+            } else {
+                assert!(result.is_err(), "{name}: expected rejection");
+            }
+        }
     }
 }

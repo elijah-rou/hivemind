@@ -1,6 +1,7 @@
 const std = @import("std");
 const msg = @import("message.zig");
-pub const MAX_PAYLOAD: usize = 512; // keep small for stack-friendliness; production uses heap
+/// Shared run-request body bound (Go MaxRunPayload, Rust MAX_RUN_PAYLOAD). Reject oversize; never clamp.
+pub const MAX_PAYLOAD: usize = 512;
 pub const MAX_QUEUE_DEPTH: usize = 64;
 pub const MAX_QUEUES: usize = 16;
 pub const MAX_IN_FLIGHT: usize = 1024;
@@ -110,11 +111,12 @@ pub const RequestQueue = struct {
         payload: []const u8,
     ) bool {
         const q = self.getOrCreateQueue(deployment_id) orelse return false;
+        if (payload.len > MAX_PAYLOAD) return false;
         var req = PendingRequest{
             .request_id = request_id,
             .client_id = client_id,
             .deployment_id = deployment_id,
-            .payload_len = @min(payload.len, MAX_PAYLOAD),
+            .payload_len = payload.len,
             .active = true,
         };
         @memcpy(req.payload[0..req.payload_len], payload[0..req.payload_len]);
@@ -295,4 +297,28 @@ test "request queue: cancel client clears queued and in-flight requests only for
     const remaining = rq.queues[0].dequeue().?;
     try std.testing.expectEqual(@as(u64, 11), remaining.request_id);
     try std.testing.expectEqual(@as(u128, 200), remaining.client_id);
+}
+
+test "request queue: rejects oversized payload instead of clamping" {
+    var queue = RequestQueue.init();
+    var over: [MAX_PAYLOAD + 1]u8 = undefined;
+    @memset(&over, 0xab);
+    try std.testing.expect(!queue.enqueue(1, 1, 100, &over));
+    try std.testing.expectEqual(@as(usize, 0), queue.totalDepth());
+    try std.testing.expectEqual(@as(u64, 0), queue.enqueue_total);
+}
+
+test "request queue: accepts zero and max payload boundaries" {
+    var queue = RequestQueue.init();
+    try std.testing.expect(queue.enqueue(1, 1, 100, ""));
+    var max_buf: [MAX_PAYLOAD]u8 = undefined;
+    @memset(&max_buf, 0xcd);
+    try std.testing.expect(queue.enqueue(1, 2, 100, &max_buf));
+    try std.testing.expectEqual(@as(usize, 2), queue.totalDepth());
+
+    const zero = queue.queues[0].dequeue().?;
+    try std.testing.expectEqual(@as(usize, 0), zero.payload_len);
+    const max_req = queue.queues[0].dequeue().?;
+    try std.testing.expectEqual(@as(usize, MAX_PAYLOAD), max_req.payload_len);
+    try std.testing.expect(std.mem.eql(u8, max_req.payload[0..MAX_PAYLOAD], &max_buf));
 }

@@ -166,9 +166,13 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 			return
 		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+		body, err := io.ReadAll(io.LimitReader(r.Body, int64(MaxRunPayload)+1))
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "failed to read body: "+err.Error())
+			return
+		}
+		if len(body) > MaxRunPayload {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("run payload exceeds max %d bytes", MaxRunPayload))
 			return
 		}
 
@@ -208,6 +212,8 @@ func runStatusToHTTP(status byte) (int, string) {
 		return http.StatusNotFound, "deployment_not_found"
 	case RunStatusQueueFull:
 		return http.StatusServiceUnavailable, "queue_full"
+	case RunStatusInvalidPayload:
+		return http.StatusBadRequest, "invalid_payload"
 	default:
 		return http.StatusBadGateway, "worker_error"
 	}

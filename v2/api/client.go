@@ -269,10 +269,14 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 
 // Run-request error codes (match v2/src/connection.zig handleRunRequest + sendRunError).
 const (
-	RunStatusOK        byte = 0
-	RunStatusNotFound  byte = 1 // deployment not found
-	RunStatusQueueFull byte = 2
+	RunStatusOK             byte = 0
+	RunStatusNotFound       byte = 1 // deployment not found
+	RunStatusQueueFull      byte = 2
+	RunStatusInvalidPayload byte = 3 // declared length mismatch / over MAX_PAYLOAD
 )
+
+// MaxRunPayload is the shared run-request body bound (matches core request_queue.MAX_PAYLOAD).
+const MaxRunPayload = 512
 
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
@@ -288,6 +292,10 @@ type RunResponse struct {
 func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if len(payload) > MaxRunPayload {
+		return nil, fmt.Errorf("run payload exceeds max %d bytes", MaxRunPayload)
+	}
 
 	reqID := c.requestID.Add(1)
 
@@ -321,14 +329,22 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 			continue
 		}
 
-		return parseRunResponse(raw)
+		resp, err := parseRunResponse(raw)
+		if err != nil {
+			return nil, err
+		}
+		if resp.RequestID != reqID {
+			return nil, fmt.Errorf("run response request_id mismatch: got %d want %d", resp.RequestID, reqID)
+		}
+		return resp, nil
 	}
 
 	return nil, lastErr
 }
 
 // parseRunResponse decodes a run_response payload: [request_id(8)][status(1)][len(4)?][data?].
-// Short replies from sendRunError (9 bytes, no length/body) are allowed.
+// Gateway sendRunError replies are exactly 9 bytes (no length/body) and require nonzero status.
+// All other replies require an exact length prefix: declared body length == trailing bytes.
 func parseRunResponse(raw []byte) (*RunResponse, error) {
 	if len(raw) < 9 {
 		return nil, fmt.Errorf("run response too short: %d", len(raw))
@@ -337,16 +353,24 @@ func parseRunResponse(raw []byte) (*RunResponse, error) {
 		RequestID: binary.LittleEndian.Uint64(raw[0:8]),
 		Status:    raw[8],
 	}
-	if len(raw) >= 13 {
-		bodyLen := binary.LittleEndian.Uint32(raw[9:13])
-		end := 13 + int(bodyLen)
-		if end > len(raw) {
-			end = len(raw)
+	if len(raw) == 9 {
+		if resp.Status == RunStatusOK {
+			return nil, fmt.Errorf("run response missing length")
 		}
-		if end > 13 {
-			// Copy out so the caller can outlive the shared read buffer.
-			resp.Body = append([]byte(nil), raw[13:end]...)
-		}
+		return resp, nil
+	}
+	if len(raw) < 13 {
+		return nil, fmt.Errorf("run response missing length")
+	}
+	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
+	// Overflow-safe exact equality: compare body slice length to declared length.
+	body := raw[13:]
+	if uint64(len(body)) != uint64(bodyLen) {
+		return nil, fmt.Errorf("run response length mismatch: declared %d have %d", bodyLen, len(body))
+	}
+	if bodyLen > 0 {
+		// Copy out so the caller can outlive the shared read buffer.
+		resp.Body = append([]byte(nil), body...)
 	}
 	return resp, nil
 }
