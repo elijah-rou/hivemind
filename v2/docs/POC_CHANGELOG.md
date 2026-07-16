@@ -44,6 +44,26 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — GPU cleanup ownership and explicit journal upgrade disposition
+
+What changed:
+- GPU test launcher records whether Terraform state was empty before apply and auto-destroys only resources created from an initially empty state by this invocation
+- pre-existing nonempty Terraform state survives apply failures; `KEEP_INFRA=1` still explicitly retains invocation-owned resources; the current-run S3 bucket is cleaned independently after successful creation
+- active storage docs now require a full-cluster stop and fresh or explicitly archived/replaced data for the layout-v2 POC change
+- mixed-version peer clusters, legacy-v1 journal upgrades, rolling migration, and an incarnation protocol are explicitly unsupported and unclaimed
+
+Why it matters:
+- failure cleanup no longer risks destroying infrastructure owned before the GPU test invocation
+- the POC storage-format change has an explicit operational boundary without implying a rolling upgrade protocol
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. keep GPU integration runs isolated or explicitly retain resources with `KEEP_INFRA=1`
+2. design a version/incarnation protocol before any rolling-upgrade claim
+
+Live infra status: unchanged (`up` from prior entries; offline stubs and docs only)
+
 ### 2026-07-16 — Exact /run request-response length contract
 
 What changed:

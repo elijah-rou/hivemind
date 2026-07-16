@@ -17,7 +17,12 @@ KEEP_INFRA="${KEEP_INFRA:-0}"
 BUCKET=""
 INSTANCE_ID=""
 CLEANUP_INSTALLED=0
+TERRAFORM_OWNED_BY_RUN=0
 
+if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
+  echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
+  exit 2
+fi
 if [[ ! -d "$WORKER_DIR" ]]; then
   echo "FAIL: worker source not found at $WORKER_DIR" >&2
   exit 1
@@ -25,18 +30,23 @@ fi
 
 cleanup() {
   local status=$?
+  trap - EXIT INT TERM
   set +e
   if [[ "$KEEP_INFRA" == "1" ]]; then
-    echo "KEEP_INFRA=1: leaving instance/bucket for debugging"
+    echo "KEEP_INFRA=1: leaving resources for debugging"
     [[ -n "$INSTANCE_ID" ]] && echo "instance: $INSTANCE_ID"
     [[ -n "$BUCKET" ]] && echo "s3: s3://$BUCKET"
-    return
+    exit "$status"
   fi
   if [[ -n "$BUCKET" ]]; then
     aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null || true
   fi
-  cd "$SCRIPT_DIR"
-  terraform destroy -auto-approve 2>/dev/null || true
+  if [[ "$TERRAFORM_OWNED_BY_RUN" == "1" ]]; then
+    cd "$SCRIPT_DIR"
+    terraform destroy -auto-approve 2>/dev/null || true
+  else
+    echo "preserving Terraform resources not owned by this invocation"
+  fi
   exit "$status"
 }
 
@@ -50,12 +60,20 @@ echo "will compile on-instance (cross-compiling test binaries is unreliable)"
 echo ""
 echo "=== Step 2: Terraform apply ==="
 cd "$SCRIPT_DIR"
-# Install cleanup before terraform mutation so apply-time failures still destroy.
+terraform init -input=false 2>/dev/null
+INITIAL_TERRAFORM_STATE="$(terraform state list)"
+if [[ -z "$INITIAL_TERRAFORM_STATE" ]]; then
+  TERRAFORM_OWNED_BY_RUN=1
+else
+  echo "Terraform state is nonempty; this invocation will not auto-destroy it"
+fi
+# Install cleanup after ownership inspection and before Terraform mutation.
 if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
   trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   CLEANUP_INSTALLED=1
 fi
-terraform init -input=false 2>/dev/null
 terraform apply -auto-approve
 
 INSTANCE_ID=$(terraform output -raw instance_id)
@@ -64,7 +82,7 @@ echo "instance: $INSTANCE_ID"
 echo ""
 echo "=== Step 3: Wait for SSM ==="
 SSM_READY=0
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   status=$(aws ssm describe-instance-information --region "$REGION" \
     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
     --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
@@ -83,8 +101,9 @@ fi
 echo ""
 echo "=== Step 4: Setup instance ==="
 # Upload worker source and build on-instance (avoids cross-compilation issues)
-BUCKET="hivemind-gpu-test-$(date +%s)"
-aws s3 mb "s3://$BUCKET" --region "$REGION"
+BUCKET_CANDIDATE="hivemind-gpu-test-$(date +%s)"
+aws s3 mb "s3://$BUCKET_CANDIDATE" --region "$REGION"
+BUCKET="$BUCKET_CANDIDATE"
 
 # Package the worker source
 cd "$WORKER_DIR"
@@ -113,7 +132,7 @@ echo "=== Step 5: Wait for tests ==="
 echo "(this may take 5-10 minutes for first build)"
 
 FINAL_STATUS="Pending"
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
   status=$(aws ssm list-command-invocations --region "$REGION" \
     --command-id "$CMD_ID" \
     --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
