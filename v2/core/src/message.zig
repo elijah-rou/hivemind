@@ -470,6 +470,108 @@ fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) !E
     return error.InvalidEnumTag;
 }
 
+fn zeroPayload(comptime T: type) T {
+    if (T == void) return {};
+    return std.mem.zeroes(T);
+}
+
+/// Zig auto-layout tagged unions place the tag at a layout-dependent offset.
+/// Discover it at runtime from two zeroed variants (Command/Result are not
+/// well-defined-layout types, so this cannot be comptime).
+fn taggedUnionTagOffset(comptime U: type) usize {
+    const fields = std.meta.fields(U);
+    std.debug.assert(fields.len >= 2);
+    const a = @unionInit(U, fields[0].name, zeroPayload(fields[0].type));
+    const b = @unionInit(U, fields[1].name, zeroPayload(fields[1].type));
+    const ab = std.mem.asBytes(&a);
+    const bb = std.mem.asBytes(&b);
+    const tag_a: u8 = @intFromEnum(std.meta.activeTag(a));
+    const tag_b: u8 = @intFromEnum(std.meta.activeTag(b));
+    var found: ?usize = null;
+    for (ab, bb, 0..) |ba, bbyte, i| {
+        if (ba == tag_a and bbyte == tag_b and ba != bbyte) {
+            std.debug.assert(found == null);
+            found = i;
+        }
+    }
+    const off = found orelse unreachable;
+    inline for (fields) |field| {
+        const v = @unionInit(U, field.name, zeroPayload(field.type));
+        const expect: u8 = @intFromEnum(std.meta.activeTag(v));
+        std.debug.assert(std.mem.asBytes(&v)[off] == expect);
+    }
+    return off;
+}
+
+fn commandTagOffset() usize {
+    const S = struct {
+        var off: usize = std.math.maxInt(usize);
+    };
+    if (S.off == std.math.maxInt(usize)) {
+        S.off = taggedUnionTagOffset(Command);
+    }
+    return S.off;
+}
+
+fn resultTagOffset() usize {
+    const S = struct {
+        var off: usize = std.math.maxInt(usize);
+    };
+    if (S.off == std.math.maxInt(usize)) {
+        S.off = taggedUnionTagOffset(Result);
+    }
+    return S.off;
+}
+
+fn validateTaggedUnionTag(comptime U: type, value: U, comptime err: anyerror) !void {
+    const off = if (U == Command) commandTagOffset() else if (U == Result) resultTagOffset() else taggedUnionTagOffset(U);
+    const tag_byte = std.mem.asBytes(&value)[off];
+    _ = enumFromIntChecked(std.meta.Tag(U), tag_byte) catch return err;
+}
+
+fn validateEnumValue(comptime E: type, value: E) !void {
+    const raw: @typeInfo(E).@"enum".tag_type = std.mem.asBytes(&value)[0];
+    _ = enumFromIntChecked(E, raw) catch return error.InvalidEnumTag;
+}
+
+fn validateCommand(command: Command) !void {
+    try validateTaggedUnionTag(Command, command, error.InvalidCommandTag);
+    switch (command) {
+        .register_node => |c| try validateEnumValue(GpuType, c.gpu_type),
+        .update_node_status => |c| try validateEnumValue(NodeStatus, c.new_status),
+        .create_deployment => |c| {
+            try validateEnumValue(GpuType, c.gpu_type);
+        },
+        .update_pod_status => |c| try validateEnumValue(PodPhase, c.new_phase),
+        .update_deployment => |c| try validateEnumValue(GpuType, c.gpu_type),
+        .deregister_node,
+        .bind_pod_to_node,
+        .scale_deployment,
+        .unbind_pod,
+        .set_killswitch,
+        .noop,
+        .set_traffic_split,
+        .rollback_deployment,
+        .delete_deployment,
+        .pause_deployment,
+        .resume_deployment,
+        .bind_pods_to_nodes,
+        => {},
+    }
+}
+
+fn validateResult(result: Result) !void {
+    try validateTaggedUnionTag(Result, result, error.InvalidResultTag);
+    switch (result) {
+        .ok => {},
+        .err => |code| try validateEnumValue(ErrorCode, code),
+    }
+}
+
+fn validateLogEntry(entry: LogEntry) !void {
+    try validateCommand(entry.command);
+}
+
 pub fn deserialize(buf: []const u8) !Message {
     if (buf.len < 1) return error.MessageTooShort;
     const tag = enumFromIntChecked(Tag, buf[0]) catch return error.InvalidMessageTag;
@@ -493,18 +595,30 @@ pub fn deserialize(buf: []const u8) !Message {
 }
 
 fn validateDecodedMessage(decoded: Message) !void {
-    // Nested Command/Result tags are not at a stable asBytes offset in Zig's
-    // large tagged-union layout, so peer handlers must keep rejecting via
-    // LogEntry.valid() / apply-time checks. Here we only enforce counts that
-    // would otherwise OOB-slice message-local arrays.
     switch (decoded) {
+        .request => |m| try validateCommand(m.command),
+        .prepare => |m| try validateLogEntry(m.entry),
+        .reply => |m| try validateResult(m.result),
         .do_view_change => |m| {
             if (m.log_entry_count > DVC_LOG_MAX) return error.InvalidLogEntryCount;
+            for (m.log_entries[0..m.log_entry_count]) |entry| {
+                try validateLogEntry(entry);
+            }
         },
         .start_view => |m| {
             if (m.log_entry_count > SV_LOG_MAX) return error.InvalidLogEntryCount;
+            for (m.log_entries[0..m.log_entry_count]) |entry| {
+                try validateLogEntry(entry);
+            }
         },
-        else => {},
+        .send_prepare => |m| try validateLogEntry(m.entry),
+        .prepare_ok,
+        .commit,
+        .start_view_change,
+        .request_prepare,
+        .request_status,
+        .send_status,
+        => {},
     }
 }
 
@@ -586,6 +700,108 @@ test "serialize/deserialize round-trip" {
 test "deserialize rejects unknown tag" {
     const buf = [_]u8{0xFF};
     try std.testing.expectError(error.InvalidMessageTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid command tag in request" {
+    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.request);
+    const off = 1 + @offsetOf(RequestMsg, "command") + commandTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid command tag in prepare" {
+    var buf: [1 + @sizeOf(PrepareMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.prepare);
+    const off = 1 + @offsetOf(PrepareMsg, "entry") + @offsetOf(LogEntry, "command") + commandTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid command tag in send_prepare" {
+    var buf: [1 + @sizeOf(SendPrepareMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.send_prepare);
+    const off = 1 + @offsetOf(SendPrepareMsg, "entry") + @offsetOf(LogEntry, "command") + commandTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid command tag in do_view_change entry" {
+    var buf: [1 + @sizeOf(DoViewChangeMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.do_view_change);
+    const count_off = 1 + @offsetOf(DoViewChangeMsg, "log_entry_count");
+    buf[count_off] = 1;
+    const off = 1 + @offsetOf(DoViewChangeMsg, "log_entries") + @offsetOf(LogEntry, "command") + commandTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid command tag in start_view entry" {
+    var buf: [1 + @sizeOf(StartViewMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.start_view);
+    const count_off = 1 + @offsetOf(StartViewMsg, "log_entry_count");
+    buf[count_off] = 1;
+    const off = 1 + @offsetOf(StartViewMsg, "log_entries") + @offsetOf(LogEntry, "command") + commandTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid result tag in reply" {
+    var buf: [1 + @sizeOf(ReplyMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.reply);
+    const off = 1 + @offsetOf(ReplyMsg, "result") + resultTagOffset();
+    buf[off] = 0xFF;
+    try std.testing.expectError(error.InvalidResultTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid ErrorCode in reply err" {
+    var buf: [1 + @sizeOf(ReplyMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.reply);
+    const result_base = 1 + @offsetOf(ReplyMsg, "result");
+    buf[result_base + resultTagOffset()] = @intFromEnum(std.meta.Tag(Result).err);
+    // ErrorCode payload sits at the start of Result for this layout.
+    buf[result_base] = 0xFF;
+    try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid GpuType in request command" {
+    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.request);
+    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    buf[cmd_base + commandTagOffset()] = @intFromEnum(std.meta.Tag(Command).register_node);
+    const gpu_off = cmd_base + @offsetOf(RegisterNodeCmd, "gpu_type");
+    buf[gpu_off] = 0xFF;
+    try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid NodeStatus in request command" {
+    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.request);
+    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    buf[cmd_base + commandTagOffset()] = @intFromEnum(std.meta.Tag(Command).update_node_status);
+    const status_off = cmd_base + @offsetOf(UpdateNodeStatusCmd, "new_status");
+    buf[status_off] = 0xFF;
+    try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
+}
+
+test "deserialize rejects invalid PodPhase in request command" {
+    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.request);
+    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    buf[cmd_base + commandTagOffset()] = @intFromEnum(std.meta.Tag(Command).update_pod_status);
+    const phase_off = cmd_base + @offsetOf(UpdatePodStatusCmd, "new_phase");
+    buf[phase_off] = 0xFF;
+    try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
 }
 
 test "deserialize rejects truncated prepare_ok" {

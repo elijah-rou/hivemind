@@ -1001,7 +1001,8 @@ pub const ConnectionManager = struct {
         const peer = &self.peers[peer_idx];
         if (!peer.connected) return false;
 
-        if (peer.peer_id_known and peer.worker_idx == from_id) return true;
+        // Bound socket identity is immutable: reject spoof/rebind attempts.
+        if (peer.peer_id_known) return peer.worker_idx == from_id;
 
         for (0..self.peer_count) |other_idx| {
             if (other_idx == peer_idx) continue;
@@ -1653,6 +1654,32 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
     try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponse(13).?);
 }
 
+test "identifyPeerConnection rejects rebind to different replica id" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .fd = fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+
+    try std.testing.expect(!cm.identifyPeerConnection(0, 2));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expect(cm.peers[0].peer_id_known);
+    try std.testing.expect(cm.peers[0].connected);
+    try std.testing.expectEqual(fds[0], cm.peers[0].fd);
+
+    try std.testing.expect(cm.identifyPeerConnection(0, 1));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+}
+
 test "identifyPeerConnection drops older duplicate peer socket" {
     var duplicate_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &duplicate_fds));
@@ -1746,6 +1773,58 @@ test "processPeerFrames drops malformed VRR plaintext without trapping" {
     cm.processPeerFrames(0);
     try std.testing.expectEqual(@as(usize, 0), cm.peers[0].frame_pos);
     try std.testing.expect(cm.peers[0].connected);
+}
+
+test "processPeerFrames drops spoofed from_id on bound peer socket" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4244);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4244, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4244);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+
+    var vrr_buf: [64]u8 = undefined;
+    const vrr_len = msg.serialize(.{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 2,
+    } }, &vrr_buf);
+    const inner_len: u32 = @intCast(1 + vrr_len);
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 2; // spoof: claim replica 2 on socket bound to 1
+    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expect(cm.peers[0].peer_id_known);
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
 }
 
 test "processPeerFrames drops out-of-range from_id" {
