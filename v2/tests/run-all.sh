@@ -56,6 +56,10 @@ run_phase "Infra POC script tests" \
 run_phase "Storage-mode smoke (volatile + experimental)" \
     bash -c "'$SCRIPT_DIR/storage_mode_smoke_test.sh'"
 
+# --- Phase 4c: Launcher contract (static HM-BLK-04/05 checks) ---
+run_phase "Launcher contract (smoke/bench/infra)" \
+    bash -c "'$SCRIPT_DIR/launcher_contract_test.sh'"
+
 # --- Phase 5: Containerd integration (Docker/OrbStack) ---
 if [ "$SKIP_CONTAINERD" = false ]; then
     if command -v docker &>/dev/null; then

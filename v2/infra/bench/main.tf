@@ -144,7 +144,7 @@ output "start_commands" {
   description = "Commands to start each hivemind node"
   value = [
     for i in range(local.node_count) :
-    "mkdir -m 700 -p /var/lib/hivemind && ./hivemind --node-id ${i} --replica-count ${local.node_count} --agent-port ${local.agent_base_port + i} --client-port ${local.client_base_port + i} --replica-port ${local.replica_base_port + i} --peers '${join(",", [for j in range(local.node_count) : "${j}@${aws_instance.node[j].private_ip}:${local.replica_base_port + j}" if j != i])}' --data-dir /var/lib/hivemind"
+    "mkdir -m 700 -p /var/lib/hivemind && ./hivemind --node-id ${i} --replica-count ${local.node_count} --worker-port ${local.agent_base_port + i} --client-port ${local.client_base_port + i} --replica-port ${local.replica_base_port + i} --peers '${join(",", [for j in range(local.node_count) : "${j}@${aws_instance.node[j].private_ip}:${local.replica_base_port + j}" if j != i])}' --data-dir /var/lib/hivemind"
   ]
 }
 

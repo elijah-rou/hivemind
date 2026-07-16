@@ -1,11 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Side-by-side Hivemind vs Kubernetes scheduling latency comparison.
+# Set HIVEMIND_ONLY=1 to run the three-node Hivemind path without kind.
 #
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NUM=${1:-20}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$ROOT/core"
+BENCH_DIR="$ROOT/bench"
+REPLICA_BIN="$CORE_DIR/zig-out/bin/hivemind"
+BENCH_BIN="$BENCH_DIR/hivemind-bench"
+NUM="${1:-20}"
+HIVEMIND_ONLY="${HIVEMIND_ONLY:-0}"
+PIDS=()
+BENCH_DATA=""
+
+cleanup() {
+    local pid
+    for pid in "${PIDS[@]:-}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    if [[ -n "$BENCH_DATA" ]]; then
+        rm -rf "$BENCH_DATA"
+    fi
+}
+trap cleanup EXIT
 
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  Hivemind vs Kubernetes Scheduling Latency Benchmark ║"
@@ -13,47 +34,91 @@ echo "║  Deployments: $NUM                                       ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-# --- Hivemind ---
 echo "━━━ HIVEMIND (3-node VRR cluster) ━━━"
 echo ""
 
-cd "$ROOT"
-zig build 2>/dev/null
+echo "==> Building core..."
+(cd "$CORE_DIR" && zig build -Doptimize=ReleaseFast)
 
-pkill -f "hivemind cluster" 2>/dev/null; sleep 1
+echo "==> Building bench client..."
+(cd "$BENCH_DIR" && go build -o "$BENCH_BIN" .)
 
-BENCH_DATA="${TMPDIR:-/tmp}/hivemind-bench-$$"
-mkdir -p "$BENCH_DATA"
-trap 'pkill -f "hivemind cluster" 2>/dev/null || true; rm -rf "$BENCH_DATA"' EXIT
+if [[ ! -x "$REPLICA_BIN" ]]; then
+    echo "FAIL: missing replica binary: $REPLICA_BIN" >&2
+    exit 1
+fi
+if [[ ! -x "$BENCH_BIN" ]]; then
+    echo "FAIL: missing bench binary: $BENCH_BIN" >&2
+    exit 1
+fi
+
+BENCH_DATA="$(mktemp -d "${TMPDIR:-/tmp}/hivemind-bench.XXXXXX")"
+BASE_REPLICA_PORT=55000
+BASE_CLIENT_PORT=55060
+BASE_WORKER_PORT=55120
 
 for i in 0 1 2; do
-    RPORT=$((55000 + $i))
-    CPORT=$((55060 + $i))
-    PEERS=""
+    rport=$((BASE_REPLICA_PORT + i))
+    cport=$((BASE_CLIENT_PORT + i))
+    wport=$((BASE_WORKER_PORT + i))
+    peers=""
     for j in 0 1 2; do
-        [ "$j" = "$i" ] && continue
-        [ -n "$PEERS" ] && PEERS="$PEERS,"
-        PEERS="${PEERS}${j}@127.0.0.1:$((55000 + $j))"
+        [[ "$j" == "$i" ]] && continue
+        [[ -n "$peers" ]] && peers+=","
+        peers+="${j}@127.0.0.1:$((BASE_REPLICA_PORT + j))"
     done
-    DD="$BENCH_DATA/replica-$i"
-    mkdir -m 700 -p "$DD"
-    ./zig-out/bin/hivemind cluster --node-id $i --replica-count 3 --replica-port $RPORT --client-port $CPORT --peers "$PEERS" --data-dir "$DD" 2>/dev/null &
+    dd="$BENCH_DATA/replica-$i"
+    mkdir -m 700 -p "$dd"
+    "$REPLICA_BIN" \
+        --node-id "$i" \
+        --replica-count 3 \
+        --worker-port "$wport" \
+        --replica-port "$rport" \
+        --client-port "$cport" \
+        --peers "$peers" \
+        --data-dir "$dd" \
+        >"$BENCH_DATA/replica-$i.log" 2>&1 &
+    PIDS+=("$!")
 done
 
 sleep 10
 
-./bench/hivemind-bench --addrs "127.0.0.1:55060,127.0.0.1:55061,127.0.0.1:55062" --n "$NUM" --replicas 1 --gpus 0 2>&1
+for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "FAIL: replica process $pid exited early" >&2
+        for i in 0 1 2; do
+            echo "--- replica-$i.log ---" >&2
+            cat "$BENCH_DATA/replica-$i.log" >&2 || true
+        done
+        exit 1
+    fi
+done
 
-pkill -f "hivemind cluster" 2>/dev/null; wait 2>/dev/null; sleep 1
+"$BENCH_BIN" \
+    --addrs "127.0.0.1:$((BASE_CLIENT_PORT + 0)),127.0.0.1:$((BASE_CLIENT_PORT + 1)),127.0.0.1:$((BASE_CLIENT_PORT + 2))" \
+    --n "$NUM" \
+    --replicas 1 \
+    --gpus 0
+
+# Tear down Hivemind children before optional k8s path.
+for pid in "${PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+done
+wait 2>/dev/null || true
+PIDS=()
+
+if [[ "$HIVEMIND_ONLY" == "1" ]]; then
+    echo ""
+    echo "HIVEMIND_ONLY=1: skipping Kubernetes/kind path."
+    exit 0
+fi
 
 echo ""
 echo ""
-
-# --- Kubernetes ---
 echo "━━━ KUBERNETES (3-node kind cluster) ━━━"
 echo ""
 
-bash "$ROOT/bench/k8s_bench.sh" "$NUM" 2>&1
+bash "$BENCH_DIR/k8s_bench.sh" "$NUM"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

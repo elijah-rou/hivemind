@@ -2,21 +2,24 @@
 set -euo pipefail
 
 # Deploy hivemind binary to EC2 instances and start 5-node cluster.
-# Usage: ./deploy.sh [path-to-hivemind-binary]
+# Usage: ./deploy.sh [path-to-hivemind-binary] [path-to-bench-binary]
+#
+# Defaults resolve relative to this script, not the caller CWD.
 
-BINARY="${1:-../../core/zig-out/bin/hivemind}"
-BENCH="${2:-../../bench/bench-linux}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="${1:-$SCRIPT_DIR/../../core/zig-out/bin/hivemind}"
+BENCH="${2:-$SCRIPT_DIR/../../bench/hivemind-bench}"
 REGION="us-east-1"
 
 if [[ ! -f "$BINARY" ]]; then
   echo "binary not found: $BINARY"
-  echo "build with: cd core && zig build -Dtarget=x86_64-linux -Doptimize=ReleaseFast"
+  echo "build with: cd \"$SCRIPT_DIR/../../core\" && zig build -Dtarget=x86_64-linux -Doptimize=ReleaseFast"
   exit 1
 fi
 
 # Get terraform outputs
-INSTANCE_IDS=($(terraform output -json instance_ids | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]"))
-PRIVATE_IPS=($(terraform output -json private_ips | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]"))
+mapfile -t INSTANCE_IDS < <(terraform output -json instance_ids | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+mapfile -t PRIVATE_IPS < <(terraform output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 BENCH_ADDRS=$(terraform output -raw bench_addrs)
 
 NODE_COUNT=${#INSTANCE_IDS[@]}
@@ -47,14 +50,23 @@ fi
 
 echo "uploaded binary to s3://$BUCKET"
 
-# Download binary on each instance and start hivemind
-START_COMMANDS=($(terraform output -json start_commands | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]"))
+# Preserve each start command as a single line (commands contain spaces).
+mapfile -t START_COMMANDS < <(terraform output -json start_commands | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+
+if [[ ${#START_COMMANDS[@]} -ne $NODE_COUNT ]]; then
+  echo "FAIL: start_commands count (${#START_COMMANDS[@]}) != node count ($NODE_COUNT)" >&2
+  exit 1
+fi
 
 for i in $(seq 0 $((NODE_COUNT - 1))); do
   id="${INSTANCE_IDS[$i]}"
   cmd="${START_COMMANDS[$i]}"
 
   echo "starting node $i on $id (${PRIVATE_IPS[$i]})"
+
+  # Escape for JSON string embedding: backslash and double-quote.
+  cmd_json=${cmd//\\/\\\\}
+  cmd_json=${cmd_json//\"/\\\"}
 
   aws ssm send-command --region "$REGION" \
     --instance-ids "$id" \
@@ -65,7 +77,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
       \"aws s3 cp s3://$BUCKET/bench /tmp/bench --region $REGION 2>/dev/null || true\",
       \"chmod +x /tmp/bench 2>/dev/null || true\",
       \"pkill -f hivemind || true\",
-      \"cd /tmp && nohup $cmd > /tmp/hivemind.log 2>&1 &\",
+      \"cd /tmp && nohup $cmd_json > /tmp/hivemind.log 2>&1 &\",
       \"sleep 3\",
       \"pgrep -f hivemind && echo 'hivemind running' || echo 'FAILED TO START'\"
     ]" \

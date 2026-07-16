@@ -10,7 +10,7 @@ EnvironmentFile=-/etc/hivemind/replica.env
 ExecStart=/usr/local/bin/hivemind \
     --node-id ${HIVEMIND_NODE_ID} \
     --replica-count ${HIVEMIND_REPLICA_COUNT} \
-    --agent-port ${HIVEMIND_AGENT_PORT} \
+    --worker-port ${HIVEMIND_AGENT_PORT} \
     --client-port ${HIVEMIND_CLIENT_PORT} \
     --replica-port ${HIVEMIND_PEER_PORT} \
     --peers ${HIVEMIND_PEERS} \
