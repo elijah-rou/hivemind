@@ -102,6 +102,12 @@ assert_contains "$DEPLOY" 'mapfile[[:space:]]+-t[[:space:]]+START_COMMANDS'
 assert_contains "$DEPLOY" '-chdir="\$SCRIPT_DIR"|-chdir=\$SCRIPT_DIR'
 # Broad pkill must not appear in this launcher.
 assert_lacks "$DEPLOY" 'pkill[[:space:]]+-f[[:space:]]+hivemind'
+# SSM start commands must be polled to terminal Success (not fire-and-forget).
+assert_file "$REPO_ROOT/infra/bench/ssm_wait.sh"
+assert_contains "$DEPLOY" 'source[[:space:]].*ssm_wait\.sh'
+assert_contains "$DEPLOY" 'hivemind_ssm_wait_invocation'
+assert_contains "$DEPLOY" 'Command\.CommandId'
+assert_lacks "$DEPLOY" 'Command\.CommandId.*&[[:space:]]*$'
 
 echo "==> infra/poc/replica-init.sh secret file modes"
 INIT="$REPO_ROOT/infra/poc/replica-init.sh"

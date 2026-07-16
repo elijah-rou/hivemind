@@ -5,12 +5,18 @@ set -euo pipefail
 # Usage: ./deploy.sh [path-to-hivemind-binary] [path-to-bench-binary]
 #
 # Defaults resolve relative to this script, not the caller CWD.
+# SSM start commands are polled to terminal Success (see ssm_wait.sh).
+# Override bounds with SSM_POLL_INTERVAL_SEC / SSM_POLL_TIMEOUT_SEC.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="${1:-$SCRIPT_DIR/../../core/zig-out/bin/hivemind}"
 BENCH="${2:-$SCRIPT_DIR/../../bench/hivemind-bench}"
 REGION="us-east-1"
 TF=(terraform -chdir="$SCRIPT_DIR")
+
+# shellcheck source=ssm_wait.sh disable=SC1091
+source "$SCRIPT_DIR/ssm_wait.sh"
+hivemind_ssm_assert_poll_bounds
 
 if [[ ! -f "$BINARY" ]]; then
   echo "binary not found: $BINARY"
@@ -59,6 +65,7 @@ if [[ ${#START_COMMANDS[@]} -ne $NODE_COUNT ]]; then
   exit 1
 fi
 
+declare -a COMMAND_IDS=()
 for i in $(seq 0 $((NODE_COUNT - 1))); do
   id="${INSTANCE_IDS[$i]}"
   cmd="${START_COMMANDS[$i]}"
@@ -69,7 +76,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
   cmd_json=${cmd//\\/\\\\}
   cmd_json=${cmd_json//\"/\\\"}
 
-  aws ssm send-command --region "$REGION" \
+  cmd_id=$(aws ssm send-command --region "$REGION" \
     --instance-ids "$id" \
     --document-name "AWS-RunShellScript" \
     --parameters commands="[
@@ -82,12 +89,29 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
       \"sleep 3\",
       \"kill -0 \\\$(cat /tmp/hivemind.pid) 2>/dev/null && echo 'hivemind running' || echo 'FAILED TO START'\"
     ]" \
-    --output text --query 'Command.CommandId' &
+    --output text --query 'Command.CommandId')
+  if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then
+    echo "FAIL: empty CommandId from send-command for instance $id" >&2
+    exit 1
+  fi
+  COMMAND_IDS+=("$cmd_id")
+  echo "  submitted command: $cmd_id"
 done
 
-wait
+if [[ ${#COMMAND_IDS[@]} -ne $NODE_COUNT ]]; then
+  echo "FAIL: command id count (${#COMMAND_IDS[@]}) != node count ($NODE_COUNT)" >&2
+  exit 1
+fi
+
+echo "waiting for SSM start commands..."
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+  echo "waiting for node $i (${INSTANCE_IDS[$i]}) command ${COMMAND_IDS[$i]}"
+  hivemind_ssm_wait_invocation "$REGION" "${COMMAND_IDS[$i]}" "${INSTANCE_IDS[$i]}"
+done
+
 echo ""
-echo "cluster starting. wait ~10s for peers to connect."
+echo "cluster started on all $NODE_COUNT nodes."
+echo "wait ~10s for peers to connect."
 echo ""
 echo "bench command (run from any instance or a box in the VPC):"
 echo "  ./bench -addrs $BENCH_ADDRS -n 100"
