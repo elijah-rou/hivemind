@@ -1,0 +1,10 @@
+hivemind;bench;benchmark;deployment_ready_observed 32593
+hivemind;bench;benchmark;deployment_zero_observed 447
+hivemind;bench;benchmark;pods_created_observed 11539
+hivemind;bench;benchmark;pods_running_observed 32593
+hivemind;bench;benchmark;pods_scheduled_observed 12846
+hivemind;bench;create_deployment;create_50_submit 10254
+hivemind;bench;create_deployment;create_submit 293
+hivemind;bench;scale_deployment;scale_0_to_50_submit 136
+hivemind;bench;scale_deployment;scale_50_to_1_submit 184
+hivemind;bench;scale_deployment;scale_to_zero_submit 191

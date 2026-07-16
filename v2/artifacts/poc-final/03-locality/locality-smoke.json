@@ -1,0 +1,320 @@
+{
+  "fetched_at": "2026-04-24T18:14:09.515557Z",
+  "origins": {
+    "aws-eu-west-2": {
+      "origin": {
+        "origin_id": "aws-eu-west-2",
+        "provider": "aws",
+        "region": "eu-west-2",
+        "locality": "europe",
+        "continent": "eu",
+        "active": true,
+        "stale": false,
+        "last_seen_seconds": 0,
+        "cpu_available_millicores": 0,
+        "cpu_total_millicores": 0,
+        "queue_depth": 0,
+        "active_deployments": 0,
+        "running_pods": 0,
+        "node_count": 0,
+        "gpu": []
+      },
+      "peers": [
+        {
+          "origin_id": "crusoe-texas",
+          "provider": "crusoe",
+          "region": "texas",
+          "locality": "us-central",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "crusoe-us-east-1",
+          "provider": "crusoe",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "aws-us-east-1",
+          "provider": "aws",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        }
+      ]
+    },
+    "aws-us-east-1": {
+      "origin": {
+        "origin_id": "aws-us-east-1",
+        "provider": "aws",
+        "region": "us-east-1",
+        "locality": "us-east",
+        "continent": "na",
+        "active": true,
+        "stale": false,
+        "last_seen_seconds": 0,
+        "cpu_available_millicores": 0,
+        "cpu_total_millicores": 0,
+        "queue_depth": 0,
+        "active_deployments": 0,
+        "running_pods": 0,
+        "node_count": 0,
+        "gpu": []
+      },
+      "peers": [
+        {
+          "origin_id": "crusoe-us-east-1",
+          "provider": "crusoe",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "aws-eu-west-2",
+          "provider": "aws",
+          "region": "eu-west-2",
+          "locality": "europe",
+          "continent": "eu",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "crusoe-texas",
+          "provider": "crusoe",
+          "region": "texas",
+          "locality": "us-central",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        }
+      ]
+    },
+    "crusoe-texas": {
+      "origin": {
+        "origin_id": "crusoe-texas",
+        "provider": "crusoe",
+        "region": "texas",
+        "locality": "us-central",
+        "continent": "na",
+        "active": true,
+        "stale": false,
+        "last_seen_seconds": 0,
+        "cpu_available_millicores": 0,
+        "cpu_total_millicores": 0,
+        "queue_depth": 0,
+        "active_deployments": 0,
+        "running_pods": 0,
+        "node_count": 0,
+        "gpu": []
+      },
+      "peers": [
+        {
+          "origin_id": "aws-eu-west-2",
+          "provider": "aws",
+          "region": "eu-west-2",
+          "locality": "europe",
+          "continent": "eu",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "crusoe-us-east-1",
+          "provider": "crusoe",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "aws-us-east-1",
+          "provider": "aws",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        }
+      ]
+    },
+    "crusoe-us-east-1": {
+      "origin": {
+        "origin_id": "crusoe-us-east-1",
+        "provider": "crusoe",
+        "region": "us-east-1",
+        "locality": "us-east",
+        "continent": "na",
+        "active": true,
+        "stale": false,
+        "last_seen_seconds": 0,
+        "cpu_available_millicores": 0,
+        "cpu_total_millicores": 0,
+        "queue_depth": 0,
+        "active_deployments": 0,
+        "running_pods": 0,
+        "node_count": 0,
+        "gpu": []
+      },
+      "peers": [
+        {
+          "origin_id": "aws-us-east-1",
+          "provider": "aws",
+          "region": "us-east-1",
+          "locality": "us-east",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "aws-eu-west-2",
+          "provider": "aws",
+          "region": "eu-west-2",
+          "locality": "europe",
+          "continent": "eu",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        },
+        {
+          "origin_id": "crusoe-texas",
+          "provider": "crusoe",
+          "region": "texas",
+          "locality": "us-central",
+          "continent": "na",
+          "active": true,
+          "stale": false,
+          "last_seen_seconds": 3,
+          "cpu_available_millicores": 0,
+          "cpu_total_millicores": 0,
+          "queue_depth": 0,
+          "active_deployments": 0,
+          "running_pods": 0,
+          "node_count": 0,
+          "gpu": []
+        }
+      ]
+    }
+  },
+  "route_trace": [
+    {
+      "scenario": "same-locality-best",
+      "target": "http://127.0.0.1:9022",
+      "reason": "same-locality-best"
+    },
+    {
+      "scenario": "same-locality-failover",
+      "target": "http://127.0.0.1:9022",
+      "reason": "same-locality-failover"
+    },
+    {
+      "scenario": "cross-locality-fallback",
+      "target": "http://127.0.0.1:9023",
+      "reason": "cross-locality-fallback"
+    },
+    {
+      "scenario": "europe-fallback-allowed",
+      "target": "http://127.0.0.1:9024",
+      "reason": "cross-locality-fallback"
+    },
+    {
+      "scenario": "residency-restricted",
+      "target": "http://fallback.local",
+      "reason": "residency-restricted"
+    }
+  ]
+}

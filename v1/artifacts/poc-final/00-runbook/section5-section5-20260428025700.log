@@ -1,0 +1,41 @@
+section5_tag=section5-20260428025700
+api_url=http://98.92.107.247:8080
+replica_public_ips=98.92.107.247,44.192.54.33,44.220.252.103,32.193.0.212,13.223.229.14
+worker_cpu_public_ip=98.81.32.229
+worker_gpu_public_ip=3.239.118.215
+cpu_image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-section5-20260428025419
+timeout_seconds=900
+out_dir=/Users/elijahrou/Projects/hivemind/v1/artifacts/poc-final/05-failure-drills
+log=/Users/elijahrou/Projects/hivemind/v1/artifacts/poc-final/00-runbook/section5-section5-20260428025700.log
+=== Drill A: Leader loss during traffic ===
+
+[A1] Create deployment for drill traffic...
+{"id":11177516664432764457,"name":"drill-cpu-1777359421-46820"}
+
+[A2] Wait for deployment ready...
+  ready at attempt 2
+[A3] Verify /run works before kill...
+  PASS: pre-kill run succeeds (attempt 1)
+[A4] Current leader: 172.31.78.1:9001 public_ip=98.92.107.247
+     Killing hivemind on leader...
+     Leader stopped.
+[A5] Wait for new leader election + API reconnect...
+  PASS: api reconnects after leader loss (attempt 1)
+[Diagnostics] Capturing replica state: leader-loss-recovered-1777359421-46820 -> /Users/elijahrou/Projects/hivemind/v1/artifacts/poc-final/05-failure-drills/diagnostics-leader-loss-recovered-1777359421-46820
+  capture 98.92.107.247
+  capture 44.192.54.33
+  capture 44.220.252.103
+  capture 32.193.0.212
+  capture 13.223.229.14
+     New leader: 172.31.70.241:9001
+  PASS: new leader different from killed
+[A6] Verify /run works after failover...
+  FAIL: post-kill run succeeds (expected field 'model', got '')
+[Diagnostics] Capturing replica state: leader-loss-post-run-failed-1777359421-46820 -> /Users/elijahrou/Projects/hivemind/v1/artifacts/poc-final/05-failure-drills/diagnostics-leader-loss-post-run-failed-1777359421-46820
+  capture 98.92.107.247
+  capture 44.192.54.33
+  capture 44.220.252.103
+  capture 32.193.0.212
+  capture 13.223.229.14
+[Cleanup] Restarting stopped leader replica 98.92.107.247...
+[Cleanup] Deleting drill deployment 11177516664432764457...

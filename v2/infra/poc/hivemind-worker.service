@@ -1,0 +1,25 @@
+[Unit]
+Description=Hivemind Worker
+After=network-online.target containerd.service
+Wants=network-online.target containerd.service
+
+[Service]
+Type=simple
+# Agent needs root for containerd socket and cgroup writes
+User=root
+EnvironmentFile=-/etc/hivemind/worker.env
+ExecStart=/usr/local/bin/hivemind-worker run ${HIVEMIND_REPLICA_ADDR} \
+    --runtime containerd \
+    --snapshotter ${HIVEMIND_SNAPSHOTTER} \
+    --metrics-port ${HIVEMIND_AGENT_METRICS_PORT}
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+OOMScoreAdjust=-400
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

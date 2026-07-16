@@ -1,0 +1,1089 @@
+use std::io::{self, Read, Write};
+
+use crate::message::*;
+use crate::types::GpuType;
+
+// -- Message type constants --
+
+const MSG_REGISTER_ACK: u8 = 0x01;
+const MSG_START_POD: u8 = 0x02;
+const MSG_STOP_POD: u8 = 0x03;
+const MSG_PROBE_POD: u8 = 0x05;
+const MSG_RUN_REQUEST: u8 = 0x04;
+
+const MSG_NODE_REGISTER: u8 = 0x10;
+const MSG_NODE_HEARTBEAT: u8 = 0x11;
+const MSG_POD_STATUS_EVENT: u8 = 0x12;
+const MSG_RUN_RESPONSE: u8 = 0x13;
+
+// -- Wire structs: fixed-size, packed, little-endian byte-copy --
+
+// StartPod is parsed field-by-field (no packed struct) to match the Zig
+// dispatchPodToAgent layout which includes entrypoint, port, juicefs_path,
+// probe paths, and env vars.
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct WireStopPod {
+    pod_id: u64,
+    grace_period_ms: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct WireProbePod {
+    pod_id: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct WireNodeRegister {
+    hostname: [u8; 64],
+    cpu_millicores: u32,
+    memory_megabytes: u32,
+    gpu_type: u8,
+    gpu_count: u8,
+    provider: [u8; 32],
+    region: [u8; 32],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct WireNodeHeartbeat {
+    timestamp: u64,
+    cpu_usage_pct: u8,
+    memory_used_mb: u32,
+    gpu_utilization: [u8; 8],
+    pods_running: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct WirePodStatusEvent {
+    pod_id: u64,
+    old_phase: u8,
+    new_phase: u8,
+    timestamp: u64,
+    exit_code: i32,
+    message: [u8; 128],
+}
+
+// -- Frame I/O --
+// Frame format: [4B LE len][2B LE version][1B tag][payload...]
+// len = 2 (version) + 1 (tag) + payload_len
+
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
+pub const PROTOCOL_VERSION: u16 = 1;
+
+pub fn write_frame(w: &mut impl Write, msg_type: u8, payload: &[u8]) -> io::Result<()> {
+    write_frame_encrypted(w, msg_type, payload, None)
+}
+
+pub fn write_frame_encrypted(
+    w: &mut impl Write,
+    msg_type: u8,
+    payload: &[u8],
+    key: Option<&[u8; crate::crypto::KEY_LEN]>,
+) -> io::Result<()> {
+    // Build inner: [version(2)][tag(1)][payload...]
+    let inner_len = 2 + 1 + payload.len();
+    let mut inner = vec![0u8; inner_len];
+    inner[0..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    inner[2] = msg_type;
+    inner[3..].copy_from_slice(payload);
+
+    if let Some(k) = key {
+        // Build header first for AAD (must match Zig decodeFrame)
+        let enc_payload_len = crate::crypto::NONCE_LEN + inner.len() + crate::crypto::TAG_LEN;
+        let frame_len = (1 + enc_payload_len) as u32; // flags + encrypted
+        let mut header = [0u8; 5];
+        header[0..4].copy_from_slice(&frame_len.to_le_bytes());
+        header[4] = 0x01; // encrypted
+
+        let encrypted = crate::crypto::encrypt_frame(k, &inner, &header);
+        w.write_all(&header)?;
+        w.write_all(&encrypted)?;
+    } else {
+        let frame_len = (1 + inner_len) as u32; // flags + inner
+        w.write_all(&frame_len.to_le_bytes())?;
+        w.write_all(&[0x00])?; // flags: plaintext
+        w.write_all(&inner)?;
+    }
+    w.flush()
+}
+
+pub fn read_frame(r: &mut impl Read, buf: &mut [u8]) -> io::Result<(u8, usize)> {
+    read_frame_encrypted(r, buf, None)
+}
+
+pub fn try_decode_frame(
+    data: &[u8],
+    buf: &mut [u8],
+    key: Option<&[u8; crate::crypto::KEY_LEN]>,
+) -> io::Result<Option<(u8, usize, usize)>> {
+    if data.len() < 5 {
+        return Ok(None);
+    }
+
+    let total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if total_len < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+
+    let frame_len = 4 + total_len;
+    if data.len() < frame_len {
+        return Ok(None);
+    }
+
+    let flags = data[4];
+    let remaining = total_len - 1;
+    let payload = &data[5..frame_len];
+
+    if flags & 0x01 != 0 {
+        let k = key.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
+        })?;
+
+        let plaintext = crate::crypto::decrypt_frame(k, payload, &data[0..5])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if plaintext.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decrypted frame too short",
+            ));
+        }
+        let msg_type = plaintext[2];
+        let payload_len = plaintext.len() - 3;
+        if payload_len > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame too large: payload={payload_len} buffer={}",
+                    buf.len()
+                ),
+            ));
+        }
+        buf[..payload_len].copy_from_slice(&plaintext[3..]);
+        return Ok(Some((msg_type, payload_len, frame_len)));
+    }
+
+    if remaining < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+    let msg_type = payload[2];
+    let payload_len = remaining - 3;
+    if payload_len > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame too large: payload={payload_len} buffer={}",
+                buf.len()
+            ),
+        ));
+    }
+    if payload_len > 0 {
+        buf[..payload_len].copy_from_slice(&payload[3..]);
+    }
+    Ok(Some((msg_type, payload_len, frame_len)))
+}
+
+pub fn read_frame_encrypted(
+    r: &mut impl Read,
+    buf: &mut [u8],
+    key: Option<&[u8; crate::crypto::KEY_LEN]>,
+) -> io::Result<(u8, usize)> {
+    let mut len_bytes = [0u8; 4];
+    r.read_exact(&mut len_bytes)?;
+    let total_len = u32::from_le_bytes(len_bytes) as usize;
+
+    if total_len < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+
+    // Read flags byte
+    let mut flags = [0u8; 1];
+    r.read_exact(&mut flags)?;
+    let remaining = total_len - 1;
+
+    if flags[0] & 0x01 != 0 {
+        // Encrypted frame
+        let k = key.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
+        })?;
+        let mut enc_buf = vec![0u8; remaining];
+        r.read_exact(&mut enc_buf)?;
+
+        // AAD = len_bytes + flags
+        let mut aad = [0u8; 5];
+        aad[0..4].copy_from_slice(&len_bytes);
+        aad[4] = flags[0];
+
+        let plaintext = crate::crypto::decrypt_frame(k, &enc_buf, &aad)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // plaintext = [version(2)][tag(1)][payload...]
+        if plaintext.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decrypted frame too short",
+            ));
+        }
+        let msg_type = plaintext[2];
+        let payload_len = plaintext.len() - 3;
+        if payload_len > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame too large: payload={payload_len} buffer={}",
+                    buf.len()
+                ),
+            ));
+        }
+        buf[..payload_len].copy_from_slice(&plaintext[3..]);
+        Ok((msg_type, payload_len))
+    } else {
+        // Plaintext frame: remaining = [version(2)][tag(1)][payload...]
+        if remaining < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too short",
+            ));
+        }
+        let mut ver_bytes = [0u8; 2];
+        r.read_exact(&mut ver_bytes)?;
+        let mut type_byte = [0u8; 1];
+        r.read_exact(&mut type_byte)?;
+        let payload_len = remaining - 3;
+        if payload_len > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame too large: payload={payload_len} buffer={}",
+                    buf.len()
+                ),
+            ));
+        }
+        if payload_len > 0 {
+            r.read_exact(&mut buf[..payload_len])?;
+        }
+        Ok((type_byte[0], payload_len))
+    }
+}
+
+// -- Encode agent messages to wire bytes --
+
+pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(u8, usize)> {
+    match msg {
+        WorkerMessage::NodeRegister(m) => {
+            let wire = WireNodeRegister {
+                hostname: str_to_fixed(&m.node_name),
+                cpu_millicores: m.cpu_millicores,
+                memory_megabytes: m.memory_megabytes,
+                gpu_type: m.gpu_type as u8,
+                gpu_count: m.gpu_count,
+                provider: [0u8; 32],
+                region: [0u8; 32],
+            };
+            let bytes = as_bytes(&wire);
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok((MSG_NODE_REGISTER, bytes.len()))
+        }
+
+        WorkerMessage::NodeHeartbeat(m) => {
+            let wire = WireNodeHeartbeat {
+                timestamp: m.tick,
+                cpu_usage_pct: 0,
+                memory_used_mb: 0,
+                gpu_utilization: [0u8; 8],
+                pods_running: m.active_pods as u16,
+            };
+            let bytes = as_bytes(&wire);
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok((MSG_NODE_HEARTBEAT, bytes.len()))
+        }
+
+        WorkerMessage::PodStatusEvent(m) => {
+            let (new_phase, exit_code, message) = match &m.status {
+                PodStatusReport::ImagePulling => (0u8, 0i32, "pulling"),
+                PodStatusReport::Creating => (1, 0, "creating"),
+                PodStatusReport::Running => (2, 0, "running"),
+                PodStatusReport::Stopped { exit_code } => (3, *exit_code, "stopped"),
+                PodStatusReport::Failed { reason } => (4, 1, reason.as_str()),
+            };
+
+            let wire = WirePodStatusEvent {
+                pod_id: m.pod_id,
+                old_phase: 0,
+                new_phase,
+                timestamp: 0,
+                exit_code,
+                message: str_to_fixed(message),
+            };
+            let bytes = as_bytes(&wire);
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok((MSG_POD_STATUS_EVENT, bytes.len()))
+        }
+
+        WorkerMessage::RunResponse(m) => {
+            // Payload: request_id(u64) + status(u8) + response_data
+            let mut pos = 0;
+            buf[pos..pos + 8].copy_from_slice(&m.request_id.to_le_bytes());
+            pos += 8;
+            buf[pos] = m.status;
+            pos += 1;
+            let copy_len = m.payload.len().min(buf.len() - pos);
+            buf[pos..pos + copy_len].copy_from_slice(&m.payload[..copy_len]);
+            pos += copy_len;
+            Ok((MSG_RUN_RESPONSE, pos))
+        }
+    }
+}
+
+// -- Decode control plane messages from wire bytes --
+
+pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<ControlMessage> {
+    match msg_type {
+        MSG_START_POD => {
+            // Fixed header: pod_id(8) + dep_id(8) + image(256) + entrypoint(256) +
+            //   port(2) + gpu_count(1) + gpu_type(1) + cpu(4) + mem(4) +
+            //   juicefs_path(128) + liveness_path(64) + readiness_path(64) + env_count(1)
+            const FIXED_SIZE: usize = 8 + 8 + 256 + 256 + 2 + 1 + 1 + 4 + 4 + 128 + 64 + 64 + 1;
+            if payload.len() < FIXED_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StartPod payload too short",
+                ));
+            }
+            let mut pos = 0;
+            let pod_id = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let deployment_id = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let image = fixed_to_string(&payload[pos..pos + 256]);
+            pos += 256;
+            let entrypoint = fixed_to_string(&payload[pos..pos + 256]);
+            pos += 256;
+            let port = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let gpu_count = payload[pos];
+            pos += 1;
+            let gpu_type = u8_to_gpu_type(payload[pos]);
+            pos += 1;
+            let cpu_millicores = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let memory_megabytes = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let juicefs_path = fixed_to_string(&payload[pos..pos + 128]);
+            pos += 128;
+            let liveness_path = fixed_to_string(&payload[pos..pos + 64]);
+            pos += 64;
+            let readiness_path = fixed_to_string(&payload[pos..pos + 64]);
+            pos += 64;
+            let env_count = payload[pos] as usize;
+            pos += 1;
+            let mut env_vars = Vec::with_capacity(env_count);
+            const ENV_ENTRY_SIZE: usize = 64 + 256 + 1; // name + value + is_secret
+            for _ in 0..env_count {
+                if pos + ENV_ENTRY_SIZE > payload.len() {
+                    break;
+                }
+                let name = fixed_to_string(&payload[pos..pos + 64]);
+                pos += 64;
+                let value = fixed_to_string(&payload[pos..pos + 256]);
+                pos += 256;
+                let is_secret_ref = payload[pos] != 0;
+                pos += 1;
+                env_vars.push(EnvEntry {
+                    name,
+                    value,
+                    is_secret_ref,
+                });
+            }
+
+            let mut image_pull_registry = String::new();
+            let mut image_pull_username = String::new();
+            let mut image_pull_password = String::new();
+            let mut image_pull_password_is_secret = false;
+
+            if pos < payload.len() && payload[pos] == 0x01 {
+                pos += 1;
+                const REGISTRY_AUTH_TAIL: usize = 128 + 64 + 256 + 1;
+                if pos + REGISTRY_AUTH_TAIL > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "StartPod registry auth truncated",
+                    ));
+                }
+                image_pull_registry = fixed_to_string(&payload[pos..pos + 128]);
+                pos += 128;
+                image_pull_username = fixed_to_string(&payload[pos..pos + 64]);
+                pos += 64;
+                image_pull_password = fixed_to_string(&payload[pos..pos + 256]);
+                pos += 256;
+                image_pull_password_is_secret = payload[pos] != 0;
+            }
+
+            Ok(ControlMessage::StartPod(StartPodCmd {
+                pod_id,
+                deployment_id,
+                image,
+                entrypoint,
+                port,
+                gpu_count,
+                gpu_type,
+                cpu_millicores,
+                memory_megabytes,
+                juicefs_path,
+                liveness_path,
+                readiness_path,
+                env_vars,
+                image_pull_registry,
+                image_pull_username,
+                image_pull_password,
+                image_pull_password_is_secret,
+            }))
+        }
+
+        MSG_STOP_POD => {
+            if payload.len() < std::mem::size_of::<WireStopPod>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StopPod payload too short",
+                ));
+            }
+            let wire: WireStopPod = from_bytes(payload);
+            Ok(ControlMessage::StopPod(StopPodCmd {
+                pod_id: wire.pod_id,
+                grace_period_ms: wire.grace_period_ms,
+            }))
+        }
+
+        MSG_PROBE_POD => {
+            if payload.len() < std::mem::size_of::<WireProbePod>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ProbePod payload too short",
+                ));
+            }
+            let wire: WireProbePod = from_bytes(payload);
+            Ok(ControlMessage::ProbePod(ProbePodCmd {
+                pod_id: wire.pod_id,
+            }))
+        }
+
+        MSG_RUN_REQUEST => {
+            // Payload: request_id(u64) + deployment_id(u64) + payload_len(u32) + payload
+            if payload.len() < 20 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RunRequest payload too short",
+                ));
+            }
+            let request_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let deployment_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let data = if payload.len() >= 20 + payload_len {
+                payload[20..20 + payload_len].to_vec()
+            } else {
+                payload[20..].to_vec()
+            };
+            Ok(ControlMessage::RunRequest(RunRequestCmd {
+                request_id,
+                deployment_id,
+                payload: data,
+            }))
+        }
+
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown message type: 0x{msg_type:02x}"),
+        )),
+    }
+}
+
+// -- Helpers --
+
+fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let len = s.len().min(N);
+    buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+    buf
+}
+
+fn fixed_to_string(buf: &[u8]) -> String {
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+fn u8_to_gpu_type(v: u8) -> GpuType {
+    // SAFETY: GpuType is repr(u8) with values 0-8
+    if v <= 8 {
+        unsafe { std::mem::transmute(v) }
+    } else {
+        GpuType::None
+    }
+}
+
+fn as_bytes<T: Copy>(val: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>()) }
+}
+
+fn from_bytes<T: Copy>(data: &[u8]) -> T {
+    assert!(data.len() >= std::mem::size_of::<T>());
+    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const T) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_struct_sizes() {
+        assert_eq!(std::mem::size_of::<WireStopPod>(), 16);
+        assert_eq!(std::mem::size_of::<WireProbePod>(), 8);
+        assert_eq!(std::mem::size_of::<WireNodeRegister>(), 138);
+        assert_eq!(std::mem::size_of::<WireNodeHeartbeat>(), 23);
+        assert_eq!(std::mem::size_of::<WirePodStatusEvent>(), 150);
+    }
+
+    #[test]
+    fn frame_round_trip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 0x42, b"hello").unwrap();
+
+        let mut read_buf = [0u8; 256];
+        let mut cursor = std::io::Cursor::new(&buf);
+        let (msg_type, len) = read_frame(&mut cursor, &mut read_buf).unwrap();
+
+        assert_eq!(msg_type, 0x42);
+        assert_eq!(len, 5);
+        assert_eq!(&read_buf[..5], b"hello");
+    }
+
+    #[test]
+    fn frame_empty_payload() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, MSG_REGISTER_ACK, &[]).unwrap();
+
+        let mut read_buf = [0u8; 256];
+        let mut cursor = std::io::Cursor::new(&buf);
+        let (msg_type, len) = read_frame(&mut cursor, &mut read_buf).unwrap();
+
+        assert_eq!(msg_type, MSG_REGISTER_ACK);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn control_message_tags_match_zig_worker_tags() {
+        assert_eq!(MSG_REGISTER_ACK, 0x01);
+        assert_eq!(MSG_START_POD, 0x02);
+        assert_eq!(MSG_STOP_POD, 0x03);
+        assert_eq!(MSG_RUN_REQUEST, 0x04);
+    }
+
+    #[test]
+    fn encode_decode_node_register() {
+        let msg = WorkerMessage::NodeRegister(NodeRegisterMsg {
+            node_name: "gpu-worker-01".into(),
+            cpu_millicores: 64000,
+            memory_megabytes: 512000,
+            gpu_type: GpuType::H100Sxm,
+            gpu_count: 8,
+        });
+
+        let mut buf = [0u8; 256];
+        let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
+
+        assert_eq!(msg_type, MSG_NODE_REGISTER);
+        assert_eq!(len, 138);
+
+        // Verify hostname at offset 0
+        assert_eq!(&buf[..13], b"gpu-worker-01");
+        assert_eq!(buf[13], 0); // null terminated
+    }
+
+    fn build_start_pod_payload(
+        pod_id: u64,
+        deployment_id: u64,
+        image: &str,
+        entrypoint: &str,
+        port: u16,
+        gpu_count: u8,
+        gpu_type: u8,
+        cpu_millicores: u32,
+        memory_megabytes: u32,
+        juicefs_path: &str,
+        liveness_path: &str,
+        readiness_path: &str,
+        env_vars: &[(String, String, bool)],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pod_id.to_le_bytes());
+        buf.extend_from_slice(&deployment_id.to_le_bytes());
+        let mut img = [0u8; 256];
+        let len = image.len().min(256);
+        img[..len].copy_from_slice(&image.as_bytes()[..len]);
+        buf.extend_from_slice(&img);
+        let mut ep = [0u8; 256];
+        let len = entrypoint.len().min(256);
+        ep[..len].copy_from_slice(&entrypoint.as_bytes()[..len]);
+        buf.extend_from_slice(&ep);
+        buf.extend_from_slice(&port.to_le_bytes());
+        buf.push(gpu_count);
+        buf.push(gpu_type);
+        buf.extend_from_slice(&cpu_millicores.to_le_bytes());
+        buf.extend_from_slice(&memory_megabytes.to_le_bytes());
+        let mut jfs = [0u8; 128];
+        let len = juicefs_path.len().min(128);
+        jfs[..len].copy_from_slice(&juicefs_path.as_bytes()[..len]);
+        buf.extend_from_slice(&jfs);
+        let mut lp = [0u8; 64];
+        let len = liveness_path.len().min(64);
+        lp[..len].copy_from_slice(&liveness_path.as_bytes()[..len]);
+        buf.extend_from_slice(&lp);
+        let mut rp = [0u8; 64];
+        let len = readiness_path.len().min(64);
+        rp[..len].copy_from_slice(&readiness_path.as_bytes()[..len]);
+        buf.extend_from_slice(&rp);
+        buf.push(env_vars.len() as u8);
+        for (name, value, is_secret) in env_vars {
+            let mut n = [0u8; 64];
+            let len = name.len().min(64);
+            n[..len].copy_from_slice(&name.as_bytes()[..len]);
+            buf.extend_from_slice(&n);
+            let mut v = [0u8; 256];
+            let len = value.len().min(256);
+            v[..len].copy_from_slice(&value.as_bytes()[..len]);
+            buf.extend_from_slice(&v);
+            buf.push(if *is_secret { 1 } else { 0 });
+        }
+        buf
+    }
+
+    fn append_start_pod_registry_trailer(
+        buf: &mut Vec<u8>,
+        registry: &str,
+        username: &str,
+        password: &str,
+        password_is_secret: bool,
+    ) {
+        buf.push(0x01);
+        let mut reg = [0u8; 128];
+        let len = registry.len().min(128);
+        reg[..len].copy_from_slice(&registry.as_bytes()[..len]);
+        buf.extend_from_slice(&reg);
+        let mut user = [0u8; 64];
+        let len = username.len().min(64);
+        user[..len].copy_from_slice(&username.as_bytes()[..len]);
+        buf.extend_from_slice(&user);
+        let mut pw = [0u8; 256];
+        let len = password.len().min(256);
+        pw[..len].copy_from_slice(&password.as_bytes()[..len]);
+        buf.extend_from_slice(&pw);
+        buf.push(if password_is_secret { 1 } else { 0 });
+    }
+
+    #[test]
+    fn decode_start_pod() {
+        let payload = build_start_pod_payload(
+            42,
+            100,
+            "nginx:latest",
+            "serve",
+            8080,
+            2,
+            GpuType::H100Sxm as u8,
+            4000,
+            8192,
+            "/data",
+            "/health",
+            "/ready",
+            &[],
+        );
+
+        let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
+
+        match msg {
+            ControlMessage::StartPod(cmd) => {
+                assert_eq!(cmd.pod_id, 42);
+                assert_eq!(cmd.deployment_id, 100);
+                assert_eq!(cmd.image, "nginx:latest");
+                assert_eq!(cmd.entrypoint, "serve");
+                assert_eq!(cmd.port, 8080);
+                assert_eq!(cmd.gpu_count, 2);
+                assert_eq!(cmd.gpu_type, GpuType::H100Sxm);
+                assert_eq!(cmd.cpu_millicores, 4000);
+                assert_eq!(cmd.memory_megabytes, 8192);
+                assert_eq!(cmd.juicefs_path, "/data");
+                assert_eq!(cmd.liveness_path, "/health");
+                assert_eq!(cmd.readiness_path, "/ready");
+                assert_eq!(cmd.env_vars.len(), 0);
+                assert!(cmd.image_pull_registry.is_empty());
+                assert!(cmd.image_pull_username.is_empty());
+                assert!(cmd.image_pull_password.is_empty());
+                assert!(!cmd.image_pull_password_is_secret);
+            }
+            _ => panic!("expected StartPod"),
+        }
+    }
+
+    #[test]
+    fn decode_start_pod_registry_auth_trailer() {
+        let mut payload = build_start_pod_payload(
+            7,
+            200,
+            "registry.io/app:1",
+            "",
+            9090,
+            1,
+            GpuType::None as u8,
+            1000,
+            512,
+            "",
+            "",
+            "",
+            &[],
+        );
+        append_start_pod_registry_trailer(&mut payload, "registry.io", "alice", "s3cr3t", false);
+        assert_eq!(payload.len(), 797 + 450);
+
+        let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
+        match msg {
+            ControlMessage::StartPod(cmd) => {
+                assert_eq!(cmd.pod_id, 7);
+                assert_eq!(cmd.deployment_id, 200);
+                assert_eq!(cmd.image_pull_registry, "registry.io");
+                assert_eq!(cmd.image_pull_username, "alice");
+                assert_eq!(cmd.image_pull_password, "s3cr3t");
+                assert!(!cmd.image_pull_password_is_secret);
+            }
+            _ => panic!("expected StartPod"),
+        }
+    }
+
+    #[test]
+    fn decode_stop_pod() {
+        let wire = WireStopPod {
+            pod_id: 99,
+            grace_period_ms: 5000,
+        };
+
+        let bytes = as_bytes(&wire);
+        let msg = decode_control_message(MSG_STOP_POD, bytes).unwrap();
+
+        match msg {
+            ControlMessage::StopPod(cmd) => {
+                assert_eq!(cmd.pod_id, 99);
+                assert_eq!(cmd.grace_period_ms, 5000);
+            }
+            _ => panic!("expected StopPod"),
+        }
+    }
+
+    #[test]
+    fn zig_start_pod_tag_decodes_as_start_pod() {
+        let payload = build_start_pod_payload(
+            42,
+            100,
+            "nginx:latest",
+            "serve",
+            8080,
+            0,
+            GpuType::None as u8,
+            1000,
+            512,
+            "",
+            "",
+            "",
+            &[],
+        );
+
+        let msg = decode_control_message(0x02, &payload).unwrap();
+        match msg {
+            ControlMessage::StartPod(cmd) => {
+                assert_eq!(cmd.pod_id, 42);
+                assert_eq!(cmd.deployment_id, 100);
+            }
+            _ => panic!("expected StartPod"),
+        }
+    }
+
+    #[test]
+    fn zig_stop_pod_tag_decodes_as_stop_pod() {
+        let wire = WireStopPod {
+            pod_id: 77,
+            grace_period_ms: 1234,
+        };
+
+        let msg = decode_control_message(0x03, as_bytes(&wire)).unwrap();
+        match msg {
+            ControlMessage::StopPod(cmd) => {
+                assert_eq!(cmd.pod_id, 77);
+                assert_eq!(cmd.grace_period_ms, 1234);
+            }
+            _ => panic!("expected StopPod"),
+        }
+    }
+
+    #[test]
+    fn encode_pod_status_event() {
+        let msg = WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+            pod_id: 7,
+            status: PodStatusReport::Running,
+        });
+
+        let mut buf = [0u8; 256];
+        let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
+
+        assert_eq!(msg_type, MSG_POD_STATUS_EVENT);
+        assert_eq!(len, 150);
+
+        // pod_id at offset 0
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 7);
+        // new_phase at offset 9
+        assert_eq!(buf[9], 2); // Running
+    }
+
+    #[test]
+    fn encode_heartbeat() {
+        let msg = WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+            tick: 12345,
+            active_pods: 3,
+            gpu_free: 5,
+        });
+
+        let mut buf = [0u8; 64];
+        let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
+
+        assert_eq!(msg_type, MSG_NODE_HEARTBEAT);
+        assert_eq!(len, 23);
+
+        // timestamp at offset 0
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 12345);
+    }
+
+    #[test]
+    fn str_to_fixed_truncates() {
+        let long = "a".repeat(300);
+        let fixed: [u8; 64] = str_to_fixed(&long);
+        assert_eq!(&fixed[..64], &[b'a'; 64]);
+    }
+
+    #[test]
+    fn fixed_to_string_strips_nulls() {
+        let mut buf = [0u8; 64];
+        buf[..5].copy_from_slice(b"hello");
+        assert_eq!(fixed_to_string(&buf), "hello");
+    }
+
+    #[test]
+    fn gpu_type_round_trip() {
+        for v in 0u8..=8 {
+            let gt = u8_to_gpu_type(v);
+            assert_eq!(gt as u8, v);
+        }
+        assert_eq!(u8_to_gpu_type(99), GpuType::None);
+    }
+
+    #[test]
+    fn full_write_read_round_trip() {
+        let msg = WorkerMessage::NodeRegister(NodeRegisterMsg {
+            node_name: "test-node".into(),
+            cpu_millicores: 8000,
+            memory_megabytes: 16384,
+            gpu_type: GpuType::T4,
+            gpu_count: 1,
+        });
+
+        let mut payload_buf = [0u8; 256];
+        let (msg_type, payload_len) = encode_agent_message(&msg, &mut payload_buf).unwrap();
+
+        let mut frame_buf = Vec::new();
+        write_frame(&mut frame_buf, msg_type, &payload_buf[..payload_len]).unwrap();
+
+        let mut read_buf = [0u8; 256];
+        let mut cursor = std::io::Cursor::new(&frame_buf);
+        let (read_type, read_len) = read_frame(&mut cursor, &mut read_buf).unwrap();
+
+        assert_eq!(read_type, MSG_NODE_REGISTER);
+        assert_eq!(read_len, 138);
+    }
+
+    #[test]
+    fn encrypted_frame_round_trip_large_payload() {
+        let key_state = crate::crypto::EncryptionState::from_hex(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        let payload = vec![0x5a; 8192];
+
+        let mut frame_buf = Vec::new();
+        write_frame_encrypted(
+            &mut frame_buf,
+            MSG_RUN_REQUEST,
+            &payload,
+            Some(&key_state.worker_key),
+        )
+        .unwrap();
+
+        let mut read_buf = [0u8; MAX_FRAME_PAYLOAD];
+        let mut cursor = std::io::Cursor::new(&frame_buf);
+        let (read_type, read_len) =
+            read_frame_encrypted(&mut cursor, &mut read_buf, Some(&key_state.worker_key)).unwrap();
+
+        assert_eq!(read_type, MSG_RUN_REQUEST);
+        assert_eq!(read_len, payload.len());
+        assert_eq!(&read_buf[..read_len], payload.as_slice());
+    }
+
+    // =================================================================
+    // Cross-language golden byte tests
+    //
+    // These use the same known values as src/wire_compat_test.zig.
+    // Both sides produce identical packed bytes for the same input.
+    // =================================================================
+
+    fn golden_register_msg() -> WorkerMessage {
+        WorkerMessage::NodeRegister(NodeRegisterMsg {
+            node_name: "test-agent-01".into(),
+            cpu_millicores: 32000,
+            memory_megabytes: 65536,
+            gpu_type: GpuType::H100Sxm,
+            gpu_count: 8,
+        })
+    }
+
+    fn golden_heartbeat_msg() -> WorkerMessage {
+        WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+            tick: 1234567890,
+            active_pods: 4,
+            gpu_free: 0,
+        })
+    }
+
+    fn golden_start_pod_payload() -> Vec<u8> {
+        build_start_pod_payload(
+            42,
+            100,
+            "registry.io/model:v1",
+            "",
+            8080,
+            2,
+            GpuType::H100Sxm as u8,
+            4000,
+            8192,
+            "",
+            "",
+            "",
+            &[],
+        )
+    }
+
+    #[test]
+    fn golden_register_payload_matches_zig() {
+        let msg = golden_register_msg();
+        let mut buf = [0u8; 256];
+        let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
+
+        assert_eq!(msg_type, MSG_NODE_REGISTER);
+        assert_eq!(len, 138);
+
+        // Hostname at offset 0: "test-agent-01"
+        assert_eq!(&buf[..13], b"test-agent-01");
+        assert_eq!(buf[13], 0);
+
+        // cpu_millicores at offset 64: 32000 = 0x00007D00 LE
+        assert_eq!(buf[64], 0x00);
+        assert_eq!(buf[65], 0x7D);
+        assert_eq!(buf[66], 0x00);
+        assert_eq!(buf[67], 0x00);
+
+        // gpu_type at offset 72: h100_sxm = 3
+        assert_eq!(buf[72], 3);
+        // gpu_count at offset 73: 8
+        assert_eq!(buf[73], 8);
+    }
+
+    #[test]
+    fn golden_heartbeat_payload_matches_zig() {
+        let msg = golden_heartbeat_msg();
+        let mut buf = [0u8; 64];
+        let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
+
+        assert_eq!(msg_type, MSG_NODE_HEARTBEAT);
+        assert_eq!(len, 23);
+
+        // timestamp at offset 0: 1234567890
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 1234567890);
+
+        // cpu_usage_pct at offset 8: 0 (we don't expose this field yet)
+        assert_eq!(buf[8], 0);
+
+        // pods_running at offset 21: 4 (u16 LE)
+        assert_eq!(u16::from_le_bytes(buf[21..23].try_into().unwrap()), 4);
+    }
+
+    #[test]
+    fn golden_start_pod_decode_matches_zig() {
+        let payload = golden_start_pod_payload();
+
+        let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
+        match msg {
+            ControlMessage::StartPod(cmd) => {
+                assert_eq!(cmd.pod_id, 42);
+                assert_eq!(cmd.deployment_id, 100);
+                assert_eq!(cmd.image, "registry.io/model:v1");
+                assert_eq!(cmd.gpu_count, 2);
+                assert_eq!(cmd.gpu_type, GpuType::H100Sxm);
+                assert_eq!(cmd.cpu_millicores, 4000);
+                assert_eq!(cmd.memory_megabytes, 8192);
+                assert!(cmd.image_pull_registry.is_empty());
+                assert!(cmd.image_pull_username.is_empty());
+                assert!(cmd.image_pull_password.is_empty());
+                assert!(!cmd.image_pull_password_is_secret);
+            }
+            _ => panic!("expected StartPod"),
+        }
+    }
+
+    #[test]
+    fn golden_start_pod_bytes_match_zig() {
+        let bytes = golden_start_pod_payload();
+
+        // Fixed header: 8+8+256+256+2+1+1+4+4+128+64+64+1 = 797 + 0 env entries
+        assert_eq!(bytes.len(), 797);
+
+        // pod_id at offset 0: 42
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 42);
+        // deployment_id at offset 8: 100
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 100);
+        // image at offset 16: "registry.io/model:v1"
+        assert_eq!(&bytes[16..36], b"registry.io/model:v1");
+        assert_eq!(bytes[36], 0);
+        // entrypoint at offset 272: empty
+        assert_eq!(bytes[272], 0);
+        // port at offset 528: 8080 LE
+        assert_eq!(
+            u16::from_le_bytes(bytes[528..530].try_into().unwrap()),
+            8080
+        );
+        // gpu_count at offset 530: 2
+        assert_eq!(bytes[530], 2);
+        // gpu_type at offset 531: h100_sxm = 3
+        assert_eq!(bytes[531], 3);
+        // cpu_millicores at offset 532: 4000
+        assert_eq!(
+            u32::from_le_bytes(bytes[532..536].try_into().unwrap()),
+            4000
+        );
+    }
+}

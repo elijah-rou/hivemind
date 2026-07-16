@@ -1,0 +1,1 @@
+peer=crusoe-texas stale=True last_seen_seconds=34

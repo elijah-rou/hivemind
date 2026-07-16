@@ -1,0 +1,107 @@
+Warning: Permanently added '44.212.96.101' (ED25519) to the list of known hosts.
+ip-172-31-73-3.ec2.internal
+Mon Apr 27 00:25:57 UTC 2026
+ 00:25:57 up 35 min,  0 users,  load average: 0.00, 0.00, 0.00
+● hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-04-27 00:04:14 UTC; 21min ago
+   Main PID: 2525 (hivemind)
+      Tasks: 1 (limit: 9204)
+     Memory: 5.4M
+        CPU: 22.575s
+     CGroup: /system.slice/hivemind.service
+             └─2525 /usr/local/bin/hivemind --node-id 4 --replica-count 5 --agent-port 9000 --client-port 9001 --replica-port 9102 --peers 0@172.31.66.55:9102,1@172.31.78.80:9102,2@172.31.65.80:9102,3@172.31.70.229:9102,4@172.31.73.3:9102 --data-dir /var/lib/hivemind --metrics-port 9200 --s3-backup "" --gossip-port 9300 --gossip-peers "" --region us-east-1
+
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: node=4 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: metrics on :9200
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 0 at 172.31.66.55:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 0 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 1 at 172.31.78.80:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 1 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 2 at 172.31.65.80:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 2 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 3 at 172.31.70.229:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 3 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 4 at 172.31.73.3:9102
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=smoke-cpu-1777249224-40729 replicas=1 deployment_count=1 pod_count=1
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1082269761 pod_id=17678023832001937445
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 27 00:20:29 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 27 00:20:29 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=smoke-gpu-1777249224-40729 replicas=1 deployment_count=2 pod_count=2
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=17775799001133815809 node_id=1152992998833853505 phase=scheduled
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1152992998833853505 pod_id=17775799001133815809
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=pending active=true
+Apr 27 00:20:34 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=pending new=scheduled active=true
+Apr 27 00:20:34 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=running active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=poc-cpu-1777249238 replicas=1 deployment_count=3 pod_count=3
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=14279964170112293133 node_id=1082269761 phase=scheduled
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1082269761 pod_id=14279964170112293133
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=pending active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=pending new=scheduled active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=running active=true
+Apr 27 00:20:44 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=poc-gpu-1777249238 replicas=1 deployment_count=4 pod_count=4
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-04-27 00:04:14 UTC; 21min ago
+   Main PID: 2526 (hivemind-api)
+      Tasks: 7 (limit: 9204)
+     Memory: 1.4M
+        CPU: 9ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2526 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.66.55:9001,172.31.78.80:9001,172.31.65.80:9001,172.31.70.229:9001,172.31.73.3:9001 --dns-targets
+
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: connecting to hivemind at [172.31.66.55:9001 172.31.78.80:9001 172.31.65.80:9001 172.31.70.229:9001 172.31.73.3:9001]
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: connected to leader at 172.31.66.55:9001
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: listening on :8080
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: node=4 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: connecting to hivemind at [172.31.66.55:9001 172.31.78.80:9001 172.31.65.80:9001 172.31.70.229:9001 172.31.73.3:9001]
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: metrics on :9200
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: connected to leader at 172.31.66.55:9001
+Apr 27 00:04:14 ip-172-31-73-3.ec2.internal hivemind-api[2526]: 2026/04/27 00:04:14 hivemind-api: listening on :8080
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 0 at 172.31.66.55:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 0 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 1 at 172.31.78.80:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 1 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 2 at 172.31.65.80:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 2 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 3 at 172.31.70.229:9102
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: peer 3 connected
+Apr 27 00:04:16 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind core: connecting to peer 4 at 172.31.73.3:9102
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=smoke-cpu-1777249224-40729 replicas=1 deployment_count=1 pod_count=1
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1082269761 pod_id=17678023832001937445
+Apr 27 00:20:26 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 27 00:20:29 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 27 00:20:29 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=smoke-gpu-1777249224-40729 replicas=1 deployment_count=2 pod_count=2
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=17775799001133815809 node_id=1152992998833853505 phase=scheduled
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1152992998833853505 pod_id=17775799001133815809
+Apr 27 00:20:31 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=pending active=true
+Apr 27 00:20:34 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=pending new=scheduled active=true
+Apr 27 00:20:34 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=running active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=poc-cpu-1777249238 replicas=1 deployment_count=3 pod_count=3
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: bind_pod pod_id=14279964170112293133 node_id=1082269761 phase=scheduled
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind replica: no worker for node_id=1082269761 pod_id=14279964170112293133
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=pending active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=pending new=scheduled active=true
+Apr 27 00:20:39 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=running active=true
+Apr 27 00:20:44 ip-172-31-73-3.ec2.internal hivemind[2525]: hivemind sm: create_deployment name=poc-gpu-1777249238 replicas=1 deployment_count=4 pod_count=4
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                                
+LISTEN 0      128          0.0.0.0:9000      0.0.0.0:*    users:(("hivemind",pid=2525,fd=4))    
+LISTEN 0      128          0.0.0.0:9001      0.0.0.0:*    users:(("hivemind",pid=2525,fd=5))    
+LISTEN 0      8            0.0.0.0:9200      0.0.0.0:*    users:(("hivemind",pid=2525,fd=7))    
+LISTEN 0      128          0.0.0.0:9102      0.0.0.0:*    users:(("hivemind",pid=2525,fd=6))    
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1831,fd=3))        
+LISTEN 0      128             [::]:22           [::]:*    users:(("sshd",pid=1831,fd=4))        
+LISTEN 0      4096               *:8080            *:*    users:(("hivemind-api",pid=2526,fd=7))
+-rwxr-xr-x. 1 ec2-user ec2-user 8804400 Apr 27 00:04 /usr/local/bin/hivemind
+-rwxr-xr-x. 1 ec2-user ec2-user 9696314 Apr 27 00:04 /usr/local/bin/hivemind-api

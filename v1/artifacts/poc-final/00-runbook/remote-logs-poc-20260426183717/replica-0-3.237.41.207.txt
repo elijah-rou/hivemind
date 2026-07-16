@@ -1,0 +1,73 @@
+Warning: Permanently added '3.237.41.207' (ED25519) to the list of known hosts.
+ip-172-31-70-242.ec2.internal
+Sun Apr 26 22:54:25 UTC 2026
+ 22:54:25 up 16 min,  0 users,  load average: 0.00, 0.01, 0.00
+● hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: active (running) since Sun 2026-04-26 22:53:07 UTC; 1min 18s ago
+   Main PID: 2546 (hivemind)
+      Tasks: 1 (limit: 9204)
+     Memory: 4.8M
+        CPU: 1.313s
+     CGroup: /system.slice/hivemind.service
+             └─2546 /usr/local/bin/hivemind --node-id 0 --replica-count 5 --agent-port 9000 --client-port 9001 --replica-port 9102 --peers 0@172.31.70.242:9102,1@172.31.67.222:9102,2@172.31.69.24:9102,3@172.31.65.207:9102,4@172.31.67.132:9102 --data-dir /var/lib/hivemind --metrics-port 9200 --s3-backup "" --gossip-port 9300 --gossip-peers "" --region us-east-1
+
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: node=0 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: metrics on :9200
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 0 at 172.31.70.242:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 1 at 172.31.67.222:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 2 at 172.31.69.24:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 3 at 172.31.65.207:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 4 at 172.31.67.132:9102
+Apr 26 22:53:19 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 1 connected
+Apr 26 22:53:30 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 2 connected
+Apr 26 22:53:41 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 3 connected
+Apr 26 22:53:51 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 4 connected
+Apr 26 22:54:05 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind replica: worker_idx=0 hostname=ip-172-31-68-146 assigned node_id=1082269761
+Apr 26 22:54:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind replica: worker_idx=1 hostname=ip-172-31-69-114 assigned node_id=1152992998833853505
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Sun 2026-04-26 22:53:07 UTC; 1min 18s ago
+   Main PID: 2547 (hivemind-api)
+      Tasks: 7 (limit: 9204)
+     Memory: 1.4M
+        CPU: 9ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2547 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.70.242:9001,172.31.67.222:9001,172.31.69.24:9001,172.31.65.207:9001,172.31.67.132:9001 --dns-targets
+
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:07 hivemind-api: connecting to hivemind at [172.31.70.242:9001 172.31.67.222:9001 172.31.69.24:9001 172.31.65.207:9001 172.31.67.132:9001]
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:09 hivemind-api: initial connect failed: no leader found among [172.31.70.242:9001 172.31.67.222:9001 172.31.69.24:9001 172.31.65.207:9001 172.31.67.132:9001] (will retry on first request)
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:09 hivemind-api: listening on :8080
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: node=0 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:07 hivemind-api: connecting to hivemind at [172.31.70.242:9001 172.31.67.222:9001 172.31.69.24:9001 172.31.65.207:9001 172.31.67.132:9001]
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: metrics on :9200
+Apr 26 22:53:07 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 0 at 172.31.70.242:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 1 at 172.31.67.222:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 2 at 172.31.69.24:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 3 at 172.31.65.207:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: connecting to peer 4 at 172.31.67.132:9102
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:09 hivemind-api: initial connect failed: no leader found among [172.31.70.242:9001 172.31.67.222:9001 172.31.69.24:9001 172.31.65.207:9001 172.31.67.132:9001] (will retry on first request)
+Apr 26 22:53:09 ip-172-31-70-242.ec2.internal hivemind-api[2547]: 2026/04/26 22:53:09 hivemind-api: listening on :8080
+Apr 26 22:53:19 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 1 connected
+Apr 26 22:53:30 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 2 connected
+Apr 26 22:53:41 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 3 connected
+Apr 26 22:53:51 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind core: peer 4 connected
+Apr 26 22:54:05 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind replica: worker_idx=0 hostname=ip-172-31-68-146 assigned node_id=1082269761
+Apr 26 22:54:09 ip-172-31-70-242.ec2.internal hivemind[2546]: hivemind replica: worker_idx=1 hostname=ip-172-31-69-114 assigned node_id=1152992998833853505
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                                
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1774,fd=3))        
+LISTEN 0      8            0.0.0.0:9200      0.0.0.0:*    users:(("hivemind",pid=2546,fd=7))    
+LISTEN 0      128          0.0.0.0:9102      0.0.0.0:*    users:(("hivemind",pid=2546,fd=6))    
+LISTEN 0      128          0.0.0.0:9001      0.0.0.0:*    users:(("hivemind",pid=2546,fd=5))    
+LISTEN 0      128          0.0.0.0:9000      0.0.0.0:*    users:(("hivemind",pid=2546,fd=4))    
+LISTEN 0      4096               *:8080            *:*    users:(("hivemind-api",pid=2547,fd=6))
+LISTEN 0      128             [::]:22           [::]:*    users:(("sshd",pid=1774,fd=4))        
+-rwxr-xr-x. 1 ec2-user ec2-user 8804400 Apr 26 22:53 /usr/local/bin/hivemind
+-rwxr-xr-x. 1 ec2-user ec2-user 9696314 Apr 26 22:53 /usr/local/bin/hivemind-api

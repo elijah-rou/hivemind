@@ -1,0 +1,270 @@
+Warning: Permanently added '13.220.191.77' (ED25519) to the list of known hosts.
+ip-172-31-66-55.ec2.internal
+Mon Apr 27 00:25:53 UTC 2026
+ 00:25:53 up 35 min,  0 users,  load average: 0.00, 0.00, 0.00
+● hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-04-27 00:03:34 UTC; 22min ago
+   Main PID: 2513 (hivemind)
+      Tasks: 1 (limit: 9204)
+     Memory: 5.2M
+        CPU: 26.482s
+     CGroup: /system.slice/hivemind.service
+             └─2513 /usr/local/bin/hivemind --node-id 0 --replica-count 5 --agent-port 9000 --client-port 9001 --replica-port 9102 --peers 0@172.31.66.55:9102,1@172.31.78.80:9102,2@172.31.65.80:9102,3@172.31.70.229:9102,4@172.31.73.3:9102 --data-dir /var/lib/hivemind --metrics-port 9200 --s3-backup "" --gossip-port 9300 --gossip-peers "" --region us-east-1
+
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: node=0 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: metrics on :9200
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 0 at 172.31.66.55:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 1 at 172.31.78.80:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 2 at 172.31.65.80:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 3 at 172.31.70.229:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 4 at 172.31.73.3:9102
+Apr 27 00:03:45 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 1 connected
+Apr 27 00:03:55 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 2 connected
+Apr 27 00:04:06 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 3 connected
+Apr 27 00:04:15 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 4 connected
+Apr 27 00:04:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: worker_idx=0 hostname=ip-172-31-72-240 assigned node_id=1082269761
+Apr 27 00:04:33 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: worker_idx=1 hostname=ip-172-31-65-227 assigned node_id=1152992998833853505
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=smoke-cpu-1777249224-40729 replicas=1 deployment_count=1 pod_count=1
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=17678023832001937445 dep_id=11177516664432764457 node_id=1082269761 worker_idx=0
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 27 00:20:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 27 00:20:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=smoke-gpu-1777249224-40729 replicas=1 deployment_count=2 pod_count=2
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=17775799001133815809 node_id=1152992998833853505 phase=scheduled
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=17775799001133815809 dep_id=9659130143999365733 node_id=1152992998833853505 worker_idx=1
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=pending active=true
+Apr 27 00:20:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=pending new=scheduled active=true
+Apr 27 00:20:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=running active=true
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=poc-cpu-1777249238 replicas=1 deployment_count=3 pod_count=3
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=14279964170112293133 node_id=1082269761 phase=scheduled
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=14279964170112293133 dep_id=11693034620340510321 node_id=1082269761 worker_idx=0
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=pending active=true
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=pending new=scheduled active=true
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=running active=true
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=poc-gpu-1777249238 replicas=1 deployment_count=4 pod_count=4
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-04-27 00:03:34 UTC; 22min ago
+   Main PID: 2514 (hivemind-api)
+      Tasks: 9 (limit: 9204)
+     Memory: 6.2M
+        CPU: 66ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2514 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.66.55:9001,172.31.78.80:9001,172.31.65.80:9001,172.31.70.229:9001,172.31.73.3:9001 --dns-targets
+
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard/nodes
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard/workers
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 POST /v1/deployments
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 GET /dashboard/deployments
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 GET /dashboard/deployments
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 GET /dashboard/deployments
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 POST /v1/deployments/smoke-cpu-1777249224-40729/run
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 POST /v1/deployments
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 GET /dashboard/deployments
+Apr 27 00:20:32 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:32 GET /dashboard/deployments
+Apr 27 00:20:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:37 GET /dashboard/deployments
+Apr 27 00:20:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:37 POST /v1/deployments/smoke-gpu-1777249224-40729/run
+Apr 27 00:20:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:38 GET /dashboard/deployments
+Apr 27 00:20:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:38 GET /dashboard/pods
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:39 POST /v1/deployments
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:39 GET /dashboard/deployments
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 GET /dashboard/deployments
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments/poc-cpu-1777249238/run
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments/poc-cpu-1777249238/run
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments
+Apr 27 00:20:45 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:45 GET /dashboard/deployments
+Apr 27 00:20:50 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:50 GET /dashboard/deployments
+Apr 27 00:20:55 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:55 GET /dashboard/deployments
+Apr 27 00:21:00 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:00 GET /dashboard/deployments
+Apr 27 00:21:05 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:05 GET /dashboard/deployments
+Apr 27 00:21:10 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:10 GET /dashboard/deployments
+Apr 27 00:21:15 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:15 GET /dashboard/deployments
+Apr 27 00:21:21 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:21 GET /dashboard/deployments
+Apr 27 00:21:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:26 GET /dashboard/deployments
+Apr 27 00:21:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:31 GET /dashboard/deployments
+Apr 27 00:21:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:36 GET /dashboard/deployments
+Apr 27 00:21:41 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:41 GET /dashboard/deployments
+Apr 27 00:21:46 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:46 GET /dashboard/deployments
+Apr 27 00:21:51 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:51 GET /dashboard/deployments
+Apr 27 00:21:56 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:56 GET /dashboard/deployments
+Apr 27 00:22:02 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:02 GET /dashboard/deployments
+Apr 27 00:22:07 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:07 GET /dashboard/deployments
+Apr 27 00:22:12 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:12 GET /dashboard/deployments
+Apr 27 00:22:17 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:17 GET /dashboard/deployments
+Apr 27 00:22:22 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:22 GET /dashboard/deployments
+Apr 27 00:22:27 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:27 GET /dashboard/deployments
+Apr 27 00:22:33 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:33 GET /dashboard/deployments
+Apr 27 00:22:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:38 GET /dashboard/deployments
+Apr 27 00:22:43 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:43 GET /dashboard/deployments
+Apr 27 00:22:48 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:48 GET /dashboard/deployments
+Apr 27 00:22:53 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:53 GET /dashboard/deployments
+Apr 27 00:22:58 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:58 GET /dashboard/deployments
+Apr 27 00:23:03 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:03 GET /dashboard/deployments
+Apr 27 00:23:08 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:08 GET /dashboard/deployments
+Apr 27 00:23:14 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:14 GET /dashboard/deployments
+Apr 27 00:23:19 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:19 GET /dashboard/deployments
+Apr 27 00:23:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:24 GET /dashboard/deployments
+Apr 27 00:23:29 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:29 GET /dashboard/deployments
+Apr 27 00:23:34 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:34 GET /dashboard/deployments
+Apr 27 00:23:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:39 GET /dashboard/deployments
+Apr 27 00:23:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:44 GET /dashboard/deployments
+Apr 27 00:23:49 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:49 GET /dashboard/deployments
+Apr 27 00:23:55 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:55 GET /dashboard/deployments
+Apr 27 00:24:00 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:00 GET /dashboard/deployments
+Apr 27 00:24:05 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:05 GET /dashboard/deployments
+Apr 27 00:24:10 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:10 GET /dashboard/deployments
+Apr 27 00:24:15 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:15 GET /dashboard/deployments
+Apr 27 00:24:20 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:20 GET /dashboard/deployments
+Apr 27 00:24:25 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:25 GET /dashboard/deployments
+Apr 27 00:24:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:31 GET /dashboard/deployments
+Apr 27 00:24:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:36 GET /dashboard/deployments
+Apr 27 00:24:41 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:41 GET /dashboard/deployments
+Apr 27 00:24:46 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:46 GET /dashboard/deployments
+Apr 27 00:24:51 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:51 GET /dashboard/deployments
+Apr 27 00:24:56 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:56 GET /dashboard/deployments
+Apr 27 00:25:01 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:01 GET /dashboard/deployments
+Apr 27 00:25:06 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:06 GET /dashboard/deployments
+Apr 27 00:25:12 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:12 GET /dashboard/deployments
+Apr 27 00:25:17 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:17 GET /dashboard/deployments
+Apr 27 00:25:22 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:22 GET /dashboard/deployments
+Apr 27 00:25:27 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:27 GET /dashboard/deployments
+Apr 27 00:25:32 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:32 GET /dashboard/deployments
+Apr 27 00:25:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:37 GET /dashboard/deployments
+Apr 27 00:25:42 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:42 GET /dashboard/deployments
+Apr 27 00:25:47 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:47 GET /dashboard/deployments
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: node=0 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:03:34 hivemind-api: connecting to hivemind at [172.31.66.55:9001 172.31.78.80:9001 172.31.65.80:9001 172.31.70.229:9001 172.31.73.3:9001]
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: metrics on :9200
+Apr 27 00:03:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 0 at 172.31.66.55:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 1 at 172.31.78.80:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 2 at 172.31.65.80:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 3 at 172.31.70.229:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: connecting to peer 4 at 172.31.73.3:9102
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:03:36 hivemind-api: initial connect failed: no leader found among [172.31.66.55:9001 172.31.78.80:9001 172.31.65.80:9001 172.31.70.229:9001 172.31.73.3:9001] (will retry on first request)
+Apr 27 00:03:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:03:36 hivemind-api: listening on :8080
+Apr 27 00:03:45 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 1 connected
+Apr 27 00:03:55 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 2 connected
+Apr 27 00:04:06 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 3 connected
+Apr 27 00:04:15 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind core: peer 4 connected
+Apr 27 00:04:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: worker_idx=0 hostname=ip-172-31-72-240 assigned node_id=1082269761
+Apr 27 00:04:33 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: worker_idx=1 hostname=ip-172-31-65-227 assigned node_id=1152992998833853505
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /v1/health
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard/cluster
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard/nodes
+Apr 27 00:20:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:24 GET /dashboard/workers
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 POST /v1/deployments
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=smoke-cpu-1777249224-40729 replicas=1 deployment_count=1 pod_count=1
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=17678023832001937445 dep_id=11177516664432764457 node_id=1082269761 worker_idx=0
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 GET /dashboard/deployments
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 27 00:20:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:26 GET /dashboard/deployments
+Apr 27 00:20:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 27 00:20:29 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 GET /dashboard/deployments
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 POST /v1/deployments/smoke-cpu-1777249224-40729/run
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 POST /v1/deployments
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=smoke-gpu-1777249224-40729 replicas=1 deployment_count=2 pod_count=2
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=17775799001133815809 node_id=1152992998833853505 phase=scheduled
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=17775799001133815809 dep_id=9659130143999365733 node_id=1152992998833853505 worker_idx=1
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=pending active=true
+Apr 27 00:20:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:31 GET /dashboard/deployments
+Apr 27 00:20:32 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:32 GET /dashboard/deployments
+Apr 27 00:20:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=pending new=scheduled active=true
+Apr 27 00:20:34 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=running active=true
+Apr 27 00:20:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:37 GET /dashboard/deployments
+Apr 27 00:20:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:37 POST /v1/deployments/smoke-gpu-1777249224-40729/run
+Apr 27 00:20:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:38 GET /dashboard/deployments
+Apr 27 00:20:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:38 GET /dashboard/pods
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:39 POST /v1/deployments
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=poc-cpu-1777249238 replicas=1 deployment_count=3 pod_count=3
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: bind_pod pod_id=14279964170112293133 node_id=1082269761 phase=scheduled
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind replica: dispatch pod_id=14279964170112293133 dep_id=11693034620340510321 node_id=1082269761 worker_idx=0
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=pending active=true
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:39 GET /dashboard/deployments
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=pending new=scheduled active=true
+Apr 27 00:20:39 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=running active=true
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 GET /dashboard/deployments
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments/poc-cpu-1777249238/run
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments/poc-cpu-1777249238/run
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:44 POST /v1/deployments
+Apr 27 00:20:44 ip-172-31-66-55.ec2.internal hivemind[2513]: hivemind sm: create_deployment name=poc-gpu-1777249238 replicas=1 deployment_count=4 pod_count=4
+Apr 27 00:20:45 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:45 GET /dashboard/deployments
+Apr 27 00:20:50 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:50 GET /dashboard/deployments
+Apr 27 00:20:55 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:20:55 GET /dashboard/deployments
+Apr 27 00:21:00 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:00 GET /dashboard/deployments
+Apr 27 00:21:05 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:05 GET /dashboard/deployments
+Apr 27 00:21:10 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:10 GET /dashboard/deployments
+Apr 27 00:21:15 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:15 GET /dashboard/deployments
+Apr 27 00:21:21 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:21 GET /dashboard/deployments
+Apr 27 00:21:26 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:26 GET /dashboard/deployments
+Apr 27 00:21:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:31 GET /dashboard/deployments
+Apr 27 00:21:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:36 GET /dashboard/deployments
+Apr 27 00:21:41 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:41 GET /dashboard/deployments
+Apr 27 00:21:46 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:46 GET /dashboard/deployments
+Apr 27 00:21:51 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:51 GET /dashboard/deployments
+Apr 27 00:21:56 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:21:56 GET /dashboard/deployments
+Apr 27 00:22:02 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:02 GET /dashboard/deployments
+Apr 27 00:22:07 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:07 GET /dashboard/deployments
+Apr 27 00:22:12 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:12 GET /dashboard/deployments
+Apr 27 00:22:17 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:17 GET /dashboard/deployments
+Apr 27 00:22:22 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:22 GET /dashboard/deployments
+Apr 27 00:22:27 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:27 GET /dashboard/deployments
+Apr 27 00:22:33 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:33 GET /dashboard/deployments
+Apr 27 00:22:38 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:38 GET /dashboard/deployments
+Apr 27 00:22:43 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:43 GET /dashboard/deployments
+Apr 27 00:22:48 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:48 GET /dashboard/deployments
+Apr 27 00:22:53 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:53 GET /dashboard/deployments
+Apr 27 00:22:58 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:22:58 GET /dashboard/deployments
+Apr 27 00:23:03 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:03 GET /dashboard/deployments
+Apr 27 00:23:08 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:08 GET /dashboard/deployments
+Apr 27 00:23:14 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:14 GET /dashboard/deployments
+Apr 27 00:23:19 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:19 GET /dashboard/deployments
+Apr 27 00:23:24 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:24 GET /dashboard/deployments
+Apr 27 00:23:29 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:29 GET /dashboard/deployments
+Apr 27 00:23:34 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:34 GET /dashboard/deployments
+Apr 27 00:23:39 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:39 GET /dashboard/deployments
+Apr 27 00:23:44 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:44 GET /dashboard/deployments
+Apr 27 00:23:49 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:49 GET /dashboard/deployments
+Apr 27 00:23:55 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:23:55 GET /dashboard/deployments
+Apr 27 00:24:00 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:00 GET /dashboard/deployments
+Apr 27 00:24:05 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:05 GET /dashboard/deployments
+Apr 27 00:24:10 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:10 GET /dashboard/deployments
+Apr 27 00:24:15 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:15 GET /dashboard/deployments
+Apr 27 00:24:20 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:20 GET /dashboard/deployments
+Apr 27 00:24:25 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:25 GET /dashboard/deployments
+Apr 27 00:24:31 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:31 GET /dashboard/deployments
+Apr 27 00:24:36 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:36 GET /dashboard/deployments
+Apr 27 00:24:41 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:41 GET /dashboard/deployments
+Apr 27 00:24:46 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:46 GET /dashboard/deployments
+Apr 27 00:24:51 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:51 GET /dashboard/deployments
+Apr 27 00:24:56 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:24:56 GET /dashboard/deployments
+Apr 27 00:25:01 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:01 GET /dashboard/deployments
+Apr 27 00:25:06 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:06 GET /dashboard/deployments
+Apr 27 00:25:12 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:12 GET /dashboard/deployments
+Apr 27 00:25:17 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:17 GET /dashboard/deployments
+Apr 27 00:25:22 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:22 GET /dashboard/deployments
+Apr 27 00:25:27 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:27 GET /dashboard/deployments
+Apr 27 00:25:32 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:32 GET /dashboard/deployments
+Apr 27 00:25:37 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:37 GET /dashboard/deployments
+Apr 27 00:25:42 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:42 GET /dashboard/deployments
+Apr 27 00:25:47 ip-172-31-66-55.ec2.internal hivemind-api[2514]: 2026/04/27 00:25:47 GET /dashboard/deployments
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                                
+LISTEN 0      8            0.0.0.0:9200      0.0.0.0:*    users:(("hivemind",pid=2513,fd=7))    
+LISTEN 0      128          0.0.0.0:9102      0.0.0.0:*    users:(("hivemind",pid=2513,fd=6))    
+LISTEN 0      128          0.0.0.0:9000      0.0.0.0:*    users:(("hivemind",pid=2513,fd=4))    
+LISTEN 0      128          0.0.0.0:9001      0.0.0.0:*    users:(("hivemind",pid=2513,fd=5))    
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1818,fd=3))        
+LISTEN 0      128             [::]:22           [::]:*    users:(("sshd",pid=1818,fd=4))        
+LISTEN 0      4096               *:8080            *:*    users:(("hivemind-api",pid=2514,fd=6))
+-rwxr-xr-x. 1 ec2-user ec2-user 8804400 Apr 27 00:03 /usr/local/bin/hivemind
+-rwxr-xr-x. 1 ec2-user ec2-user 9696314 Apr 27 00:03 /usr/local/bin/hivemind-api

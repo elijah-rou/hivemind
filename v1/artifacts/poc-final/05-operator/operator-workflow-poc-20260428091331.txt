@@ -1,0 +1,15 @@
+{"id":2074683623940568804,"name":"op-cpu-1777384063"}
+pass: create-cpu attempt=7
+{"id":5632491372296299238,"name":"op-gpu-1777384063"}
+pass: create-gpu attempt=2
+{"ok":true}
+{"ok":true}
+{"ok":true}
+pass: scale-up attempt=2
+{"ok":true}
+pass: scale-zero attempt=1
+pass: run op-cpu-1777384063 attempt=2
+{"model":"poc-cpu-hash-embedder-v1","device":"cpu","input_chars":14,"embedding":[0.112703,-0.292677,-0.27171,0.072514,0.304909,0.095229,0.089987,0.007863,-0.36956,-0.032326,0.352087,-0.565261,0.034073,0.177354,0.301414,0.08824],"classification":{"label":"cpu","score":0.53361,"scores":{"inference":0.069547,"routing":0.173601,"gpu":0.04558,"cpu":0.53361,"serverless":0.118886,"model":0.165903}}}pass: wake-from-zero attempt=1
+{"ok":true}
+{"ok":true}
+evidence=/Users/elijahrou/Projects/hivemind/v1/artifacts/poc-final/05-operator

@@ -1,0 +1,36 @@
+=== Hivemind one deployment 0 -> 50 -> 1 ===
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/1 pods_running=0 scheduled=1 total=1 op=14192 commit=14192 attempt=1/900
+ready scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 expected=1 attempt=2 op=14193 commit=14193 pods=1/1/1
+zero_ready scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 attempt=1 op=14195 commit=14195
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14247 commit=14247 attempt=1/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=2/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=3/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=4/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=5/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=6/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=7/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=8/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=9/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=10/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=11/1500
+waiting scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 ready=0/50 pods_running=0 scheduled=50 total=50 op=14297 commit=14297 attempt=12/1500
+ready scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 expected=50 attempt=13 op=14347 commit=14347 pods=50/50/50
+ready scenario=single entity=hm-scale-single-hmtailfix2-20260503010614 expected=1 attempt=1 op=14348 commit=14348 pods=1/1/1
+single create submit: 333ms
+single 0->50 submit: 140ms
+single 0->50 ready: 5174ms
+single 50->1 submit: 148ms
+single 50->1 ready: 502ms
+
+=== Hivemind 50 deployments x 1 replica ===
+curl: (22) The requested URL returned error: 503
+create retry name=hm-scale-many-hmtailfix2-20260503010614-12 attempt=1/5
+curl: (22) The requested URL returned error: 503
+create retry name=hm-scale-many-hmtailfix2-20260503010614-12 attempt=2/5
+curl: (22) The requested URL returned error: 503
+create retry name=hm-scale-many-hmtailfix2-20260503010614-12 attempt=3/5
+curl: (22) The requested URL returned error: 503
+create retry name=hm-scale-many-hmtailfix2-20260503010614-12 attempt=4/5
+curl: (22) The requested URL returned error: 503
+create retry name=hm-scale-many-hmtailfix2-20260503010614-12 attempt=5/5
+create failed name=hm-scale-many-hmtailfix2-20260503010614-12

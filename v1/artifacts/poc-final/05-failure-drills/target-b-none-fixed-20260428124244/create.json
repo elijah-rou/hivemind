@@ -1,0 +1,1 @@
+{"name":"drill-b-target-b-none-fixed-20260428124244","image":"288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428115836","replicas":1,"cpu":500,"memory":512,"gpu_type":"none","gpu_count":0}

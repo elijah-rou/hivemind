@@ -1,0 +1,500 @@
+Warning: Permanently added '3.234.252.136' (ED25519) to the list of known hosts.
+ip-172-31-69-17
+Tue Apr 28 15:51:49 UTC 2026
+ 15:51:49 up  1:01,  1 user,  load average: 0.03, 0.01, 0.03
+● hivemind-worker.service - Hivemind Worker
+     Loaded: loaded (/etc/systemd/system/hivemind-worker.service; enabled; preset: enabled)
+     Active: active (running) since Tue 2026-04-28 15:08:14 UTC; 43min ago
+   Main PID: 2071 (hivemind-worker)
+      Tasks: 2 (limit: 18921)
+     Memory: 2.7M (peak: 15.7M)
+        CPU: 55.648s
+     CGroup: /system.slice/hivemind-worker.service
+             └─2071 /usr/local/bin/hivemind-worker run 172.31.68.176:9000,172.31.72.61:9000,172.31.66.38:9000,172.31.65.63:9000,172.31.74.48:9000 --runtime containerd --snapshotter overlayfs --metrics-port 8081
+
+Apr 28 15:08:14 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.68.176:9000
+Apr 28 15:25:52 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=17775799001133815809 deployment_id=9659130143999365733 image=docker.io/mendhak/http-https-echo:31 port=8080 gpu_count=1
+Apr 28 15:26:30 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=14279964170112293133 deployment_id=11693034620340510321 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019 port=8080 gpu_count=0
+Apr 28 15:26:32 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=8332670729032836398 deployment_id=9024654201992055039 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019 port=8080 gpu_count=1
+Apr 28 15:27:09 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=17270571163283330953 deployment_id=2074683623940568804 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019 port=8080 gpu_count=0
+Apr 28 15:27:42 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=10440568676385178531 deployment_id=5632491372296299238 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019 port=8080 gpu_count=1
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.68.176:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+
+● containerd.service - containerd container runtime
+     Loaded: loaded (/usr/lib/systemd/system/containerd.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/containerd.service.d
+             └─10-compat-symlink.conf
+     Active: active (running) since Tue 2026-04-28 14:50:59 UTC; 1h 0min ago
+       Docs: https://containerd.io
+   Main PID: 1481 (containerd)
+      Tasks: 67
+     Memory: 9.1G (peak: 9.1G)
+        CPU: 2min 34.841s
+     CGroup: /system.slice/containerd.service
+             ├─ 1481 /usr/bin/containerd
+             ├─ 2818 /usr/bin/containerd-shim-runc-v2 -namespace hivemind -id hivemind-pod-17775799001133815809 -address /run/containerd/containerd.sock
+             ├─ 5585 /usr/bin/containerd-shim-runc-v2 -namespace hivemind -id hivemind-pod-14279964170112293133 -address /run/containerd/containerd.sock
+             ├─ 6554 /usr/bin/containerd-shim-runc-v2 -namespace hivemind -id hivemind-pod-8332670729032836398 -address /run/containerd/containerd.sock
+             ├─ 9819 /usr/bin/containerd-shim-runc-v2 -namespace hivemind -id hivemind-pod-17270571163283330953 -address /run/containerd/containerd.sock
+             └─11525 /usr/bin/containerd-shim-runc-v2 -namespace hivemind -id hivemind-pod-10440568676385178531 -address /run/containerd/containerd.sock
+
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137445238Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137503505Z" level=info msg="skip loading plugin" error="lstat /var/lib/containerd/io.containerd.snapshotter.v1.zfs: no such file or directory: skip plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137530367Z" level=info msg="loading plugin" id=io.containerd.event.v1.exchange type=io.containerd.event.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137799304Z" level=info msg="loading plugin" id=io.containerd.monitor.task.v1.cgroups type=io.containerd.monitor.task.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138376227Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.nydus type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138513811Z" level=info msg="loading plugin" id=io.containerd.metadata.v1.bolt type=io.containerd.metadata.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138544869Z" level=info msg="metadata content store policy set" policy=shared
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138705342Z" level=info msg="loading plugin" id=io.containerd.gc.v1.scheduler type=io.containerd.gc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138729886Z" level=info msg="loading plugin" id=io.containerd.differ.v1.walking type=io.containerd.differ.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138741425Z" level=info msg="loading plugin" id=io.containerd.lease.v1.manager type=io.containerd.lease.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138751799Z" level=info msg="loading plugin" id=io.containerd.service.v1.containers-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138762822Z" level=info msg="loading plugin" id=io.containerd.service.v1.content-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138776938Z" level=info msg="loading plugin" id=io.containerd.service.v1.diff-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138790017Z" level=info msg="loading plugin" id=io.containerd.service.v1.images-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138799839Z" level=info msg="loading plugin" id=io.containerd.service.v1.introspection-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138808178Z" level=info msg="loading plugin" id=io.containerd.service.v1.namespaces-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138816654Z" level=info msg="loading plugin" id=io.containerd.service.v1.snapshots-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138824305Z" level=info msg="loading plugin" id=io.containerd.shim.v1.manager type=io.containerd.shim.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138839568Z" level=info msg="loading plugin" id=io.containerd.runtime.v2.task type=io.containerd.runtime.v2
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138881164Z" level=info msg="loading plugin" id=io.containerd.service.v1.tasks-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138899155Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.containers type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138910364Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.content type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138919545Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.diff type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138933533Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.events type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138942873Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.images type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138951847Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.introspection type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138961258Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.leases type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138969926Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.namespaces type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138978301Z" level=info msg="loading plugin" id=io.containerd.sandbox.store.v1.local type=io.containerd.sandbox.store.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138992685Z" level=info msg="loading plugin" id=io.containerd.cri.v1.images type=io.containerd.cri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139078894Z" level=info msg="Get image filesystem path \"/var/lib/containerd/io.containerd.snapshotter.v1.nydus\" for snapshotter \"nydus\""
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139097146Z" level=info msg="Start snapshots syncer"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139122184Z" level=info msg="loading plugin" id=io.containerd.cri.v1.runtime type=io.containerd.cri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139448214Z" level=info msg="starting cri plugin" config="{\"containerd\":{\"defaultRuntimeName\":\"runc\",\"runtimes\":{\"nvidia\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/bin/nvidia-container-runtime\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runc\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"\",\"CriuImagePath\":\"\",\"CriuWorkPath\":\"\",\"IoGid\":0,\"IoUid\":0,\"NoNewKeyring\":false,\"Root\":\"\",\"ShimCgroup\":\"\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runsc\":{\"runtimeType\":\"io.containerd.runsc.v1\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/local/bin/runsc\",\"ConfigPath\":\"/etc/containerd/runsc.toml\",\"TypeUrl\":\"io.containerd.runsc.v1.options\"},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"}},\"ignoreBlockIONotEnabledErrors\":false,\"ignoreRdtNotEnabledErrors\":false},\"cni\":{\"binDir\":\"/opt/cni/bin\",\"confDir\":\"/etc/cni/net.d\",\"maxConfNum\":1,\"setupSerially\":false,\"confTemplate\":\"\",\"ipPref\":\"\",\"useInternalLoopback\":false},\"enableSelinux\":false,\"selinuxCategoryRange\":1024,\"maxContainerLogSize\":16384,\"disableApparmor\":false,\"restrictOOMScoreAdj\":false,\"disableProcMount\":false,\"unsetSeccompProfile\":\"\",\"tolerateMissingHugetlbController\":true,\"disableHugetlbController\":true,\"device_ownership_from_security_context\":false,\"ignoreImageDefinedVolumes\":false,\"netnsMountsUnderStateDir\":false,\"enableUnprivilegedPorts\":true,\"enableUnprivilegedICMP\":true,\"enableCDI\":true,\"cdiSpecDirs\":[\"/etc/cdi\",\"/var/run/cdi\"],\"drainExecSyncIOTimeout\":\"0s\",\"ignoreDeprecationWarnings\":null,\"containerdRootDir\":\"/var/lib/containerd\",\"containerdEndpoint\":\"/run/containerd/containerd.sock\",\"rootDir\":\"/var/lib/containerd/io.containerd.grpc.v1.cri\",\"stateDir\":\"/run/containerd/io.containerd.grpc.v1.cri\"}"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139527693Z" level=info msg="loading plugin" id=io.containerd.podsandbox.controller.v1.podsandbox type=io.containerd.podsandbox.controller.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139581509Z" level=info msg="loading plugin" id=io.containerd.sandbox.controller.v1.shim type=io.containerd.sandbox.controller.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139643954Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandbox-controllers type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139668290Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandboxes type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139678529Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.snapshots type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139697219Z" level=info msg="loading plugin" id=io.containerd.streaming.v1.manager type=io.containerd.streaming.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139711890Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.streaming type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139723924Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.tasks type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139758150Z" level=info msg="loading plugin" id=io.containerd.transfer.v1.local type=io.containerd.transfer.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139786959Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.transfer type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139800821Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.version type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139826085Z" level=info msg="loading plugin" id=io.containerd.monitor.container.v1.restart type=io.containerd.monitor.container.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139874380Z" level=info msg="loading plugin" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139910976Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139923181Z" level=info msg="loading plugin" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140024608Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140037474Z" level=info msg="loading plugin" id=io.containerd.ttrpc.v1.otelttrpc type=io.containerd.ttrpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140048148Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.healthcheck type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140057502Z" level=info msg="loading plugin" id=io.containerd.nri.v1.nri type=io.containerd.nri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140073984Z" level=info msg="runtime interface created"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140078737Z" level=info msg="created NRI interface"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140087818Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.cri type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140097298Z" level=info msg="Connect containerd service"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140119705Z" level=info msg="using experimental NRI integration - disable nri plugin to prevent this"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.145578201Z" level=error msg="failed to load cni during init, please check CRI plugin status before setting up network for pods" error="cni config load failed: no network config found in /etc/cni/net.d: cni plugin not initialized: failed to load cni config"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164791409Z" level=info msg="Start subscribing containerd event"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164835776Z" level=info msg="Start recovering state"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164995614Z" level=info msg=serving... address="[::]:9113"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.165114738Z" level=info msg=serving... address=/run/containerd/containerd.sock.ttrpc
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.165161978Z" level=info msg=serving... address=/run/containerd/containerd.sock
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178587286Z" level=info msg="Start event monitor"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178624514Z" level=info msg="Start cni network conf syncer for default"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178632988Z" level=info msg="Start streaming server"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178642759Z" level=info msg="Registered namespace \"k8s.io\" with NRI"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178652140Z" level=info msg="runtime interface starting up..."
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178678298Z" level=info msg="starting plugins..."
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178689037Z" level=info msg="Synchronizing NRI (plugin) with current runtime state"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178807422Z" level=info msg="containerd successfully booted in 0.051383s"
+Apr 28 14:50:59 ip-172-31-69-17 systemd[1]: Started containerd.service - containerd container runtime.
+Apr 28 15:08:45 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:08:45.011480985Z" level=info msg="No images store for sha256:4aba5f63b2b95162e196452ef1cd2908dbdc09cf329ce391b855e155a0660e99"
+Apr 28 15:25:44 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:25:44.214079232Z" level=info msg="No images store for sha256:09fd29b97f26dc9a6c800aae59b353f98fef955469a4706ca991347a3301bf89"
+Apr 28 15:25:55 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:25:55.764961944Z" level=info msg="connecting to shim hivemind-pod-17775799001133815809" address="unix:///run/containerd/s/8b1cb1d49d3d0c4f0a42c081d14d2f3f3c23d72112354b2647f4bd6bdfad4b06" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:26:30 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:26:30.738166366Z" level=info msg="connecting to shim hivemind-pod-14279964170112293133" address="unix:///run/containerd/s/f6724cceba9517cbe1e8b015d9ea730e3846deef00c580f37ba163b6efc69a60" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:26:32 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:26:32.602364889Z" level=info msg="connecting to shim hivemind-pod-8332670729032836398" address="unix:///run/containerd/s/3818dd61b3e80f12de729f3dd5bf1051cd8df95626331e2da0a5c50dbbf40bc4" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:27:39 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:27:39.211506012Z" level=info msg="connecting to shim hivemind-pod-17270571163283330953" address="unix:///run/containerd/s/1e6d717338cb64fd4060d9746e0cf68f0b07ba02ed686969eacd5586a0fff3fc" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:27:42 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:27:42.561074858Z" level=info msg="connecting to shim hivemind-pod-10440568676385178531" address="unix:///run/containerd/s/c33684786e27f746fd6f07c21fc858fec4c974c0b7182f1ce0026da0dc3da332" namespace=hivemind protocol=ttrpc version=3
+Apr 28 14:50:52 ip-172-31-69-17 systemd[1]: Starting containerd.service - containerd container runtime...
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.751276394Z" level=info msg="starting containerd" revision=4ac6c20c7bbf8177f29e46bbdc658fec02ffb8ad version=v2.0.7
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.766225072Z" level=warning msg="Configuration migrated from version 2, use `containerd config migrate` to avoid migration" t="10.52µs"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.766262883Z" level=info msg="loading plugin" id=io.containerd.image-verifier.v1.bindir type=io.containerd.image-verifier.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.766281077Z" level=info msg="loading plugin" id=io.containerd.internal.v1.opt type=io.containerd.internal.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.767081629Z" level=info msg="loading plugin" id=io.containerd.warning.v1.deprecations type=io.containerd.warning.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.767099431Z" level=info msg="loading plugin" id=io.containerd.content.v1.content type=io.containerd.content.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.767771950Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.blockfile type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768115359Z" level=info msg="skip loading plugin" error="no scratch file generator: skip plugin" id=io.containerd.snapshotter.v1.blockfile type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768131776Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.btrfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768300817Z" level=info msg="skip loading plugin" error="path /var/lib/containerd/io.containerd.snapshotter.v1.btrfs (ext4) must be a btrfs filesystem to be used with the btrfs snapshotter: skip plugin" id=io.containerd.snapshotter.v1.btrfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768315613Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.devmapper type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768326367Z" level=info msg="skip loading plugin" error="devmapper not configured: skip plugin" id=io.containerd.snapshotter.v1.devmapper type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768335345Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.native type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.768675476Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.overlayfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.769140812Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.769173752Z" level=info msg="skip loading plugin" error="lstat /var/lib/containerd/io.containerd.snapshotter.v1.zfs: no such file or directory: skip plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.769186511Z" level=info msg="loading plugin" id=io.containerd.event.v1.exchange type=io.containerd.event.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.770537282Z" level=info msg="loading plugin" id=io.containerd.monitor.task.v1.cgroups type=io.containerd.monitor.task.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.772983213Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.nydus type=io.containerd.snapshotter.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.774926644Z" level=info msg="loading plugin" id=io.containerd.metadata.v1.bolt type=io.containerd.metadata.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.774972281Z" level=info msg="metadata content store policy set" policy=shared
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791719788Z" level=info msg="loading plugin" id=io.containerd.gc.v1.scheduler type=io.containerd.gc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791789515Z" level=info msg="loading plugin" id=io.containerd.differ.v1.walking type=io.containerd.differ.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791806988Z" level=info msg="loading plugin" id=io.containerd.lease.v1.manager type=io.containerd.lease.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791820206Z" level=info msg="loading plugin" id=io.containerd.service.v1.containers-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791832268Z" level=info msg="loading plugin" id=io.containerd.service.v1.content-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791842340Z" level=info msg="loading plugin" id=io.containerd.service.v1.diff-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791858189Z" level=info msg="loading plugin" id=io.containerd.service.v1.images-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791874522Z" level=info msg="loading plugin" id=io.containerd.service.v1.introspection-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791903822Z" level=info msg="loading plugin" id=io.containerd.service.v1.namespaces-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791920372Z" level=info msg="loading plugin" id=io.containerd.service.v1.snapshots-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791933031Z" level=info msg="loading plugin" id=io.containerd.shim.v1.manager type=io.containerd.shim.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.791946213Z" level=info msg="loading plugin" id=io.containerd.runtime.v2.task type=io.containerd.runtime.v2
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792022058Z" level=info msg="loading plugin" id=io.containerd.service.v1.tasks-service type=io.containerd.service.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792071234Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.containers type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792089265Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.content type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792107214Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.diff type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792121484Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.events type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792132955Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.images type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792149634Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.introspection type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792161783Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.leases type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792172822Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.namespaces type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792183218Z" level=info msg="loading plugin" id=io.containerd.sandbox.store.v1.local type=io.containerd.sandbox.store.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.792192909Z" level=info msg="loading plugin" id=io.containerd.cri.v1.images type=io.containerd.cri.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.793270984Z" level=info msg="Get image filesystem path \"/var/lib/containerd/io.containerd.snapshotter.v1.nydus\" for snapshotter \"nydus\""
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.793290187Z" level=info msg="Start snapshots syncer"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.793932349Z" level=info msg="loading plugin" id=io.containerd.cri.v1.runtime type=io.containerd.cri.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794281083Z" level=info msg="starting cri plugin" config="{\"containerd\":{\"defaultRuntimeName\":\"runc\",\"runtimes\":{\"nvidia\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/bin/nvidia-container-runtime\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runc\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"\",\"CriuImagePath\":\"\",\"CriuWorkPath\":\"\",\"IoGid\":0,\"IoUid\":0,\"NoNewKeyring\":false,\"Root\":\"\",\"ShimCgroup\":\"\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runsc\":{\"runtimeType\":\"io.containerd.runsc.v1\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/local/bin/runsc\",\"ConfigPath\":\"/etc/containerd/runsc.toml\",\"TypeUrl\":\"io.containerd.runsc.v1.options\"},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"}},\"ignoreBlockIONotEnabledErrors\":false,\"ignoreRdtNotEnabledErrors\":false},\"cni\":{\"binDir\":\"/opt/cni/bin\",\"confDir\":\"/etc/cni/net.d\",\"maxConfNum\":1,\"setupSerially\":false,\"confTemplate\":\"\",\"ipPref\":\"\",\"useInternalLoopback\":false},\"enableSelinux\":false,\"selinuxCategoryRange\":1024,\"maxContainerLogSize\":16384,\"disableApparmor\":false,\"restrictOOMScoreAdj\":false,\"disableProcMount\":false,\"unsetSeccompProfile\":\"\",\"tolerateMissingHugetlbController\":true,\"disableHugetlbController\":true,\"device_ownership_from_security_context\":false,\"ignoreImageDefinedVolumes\":false,\"netnsMountsUnderStateDir\":false,\"enableUnprivilegedPorts\":true,\"enableUnprivilegedICMP\":true,\"enableCDI\":true,\"cdiSpecDirs\":[\"/etc/cdi\",\"/var/run/cdi\"],\"drainExecSyncIOTimeout\":\"0s\",\"ignoreDeprecationWarnings\":null,\"containerdRootDir\":\"/var/lib/containerd\",\"containerdEndpoint\":\"/run/containerd/containerd.sock\",\"rootDir\":\"/var/lib/containerd/io.containerd.grpc.v1.cri\",\"stateDir\":\"/run/containerd/io.containerd.grpc.v1.cri\"}"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794349097Z" level=info msg="loading plugin" id=io.containerd.podsandbox.controller.v1.podsandbox type=io.containerd.podsandbox.controller.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794399319Z" level=info msg="loading plugin" id=io.containerd.sandbox.controller.v1.shim type=io.containerd.sandbox.controller.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794848987Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandbox-controllers type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794884687Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandboxes type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794897838Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.snapshots type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794910472Z" level=info msg="loading plugin" id=io.containerd.streaming.v1.manager type=io.containerd.streaming.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794923114Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.streaming type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794933972Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.tasks type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794945060Z" level=info msg="loading plugin" id=io.containerd.transfer.v1.local type=io.containerd.transfer.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794987148Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.transfer type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.794998680Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.version type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795009323Z" level=info msg="loading plugin" id=io.containerd.monitor.container.v1.restart type=io.containerd.monitor.container.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795041074Z" level=info msg="loading plugin" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795102668Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795117906Z" level=info msg="loading plugin" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795149379Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795160154Z" level=info msg="loading plugin" id=io.containerd.ttrpc.v1.otelttrpc type=io.containerd.ttrpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795175887Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.healthcheck type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795187270Z" level=info msg="loading plugin" id=io.containerd.nri.v1.nri type=io.containerd.nri.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795794627Z" level=info msg="runtime interface created"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795811050Z" level=info msg="created NRI interface"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795827358Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.cri type=io.containerd.grpc.v1
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795843004Z" level=info msg="Connect containerd service"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.795870054Z" level=info msg="using experimental NRI integration - disable nri plugin to prevent this"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.809253098Z" level=error msg="failed to load cni during init, please check CRI plugin status before setting up network for pods" error="cni config load failed: no network config found in /etc/cni/net.d: cni plugin not initialized: failed to load cni config"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.991391120Z" level=info msg="Start subscribing containerd event"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.991446977Z" level=info msg="Start recovering state"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.991641879Z" level=info msg=serving... address="[::]:9113"
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.991736040Z" level=info msg=serving... address=/run/containerd/containerd.sock.ttrpc
+Apr 28 14:50:52 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:52.991776745Z" level=info msg=serving... address=/run/containerd/containerd.sock
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009758791Z" level=info msg="Start event monitor"
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009791390Z" level=info msg="Start cni network conf syncer for default"
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009803171Z" level=info msg="Start streaming server"
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009817707Z" level=info msg="Registered namespace \"k8s.io\" with NRI"
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009825553Z" level=info msg="runtime interface starting up..."
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009831897Z" level=info msg="starting plugins..."
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.009845098Z" level=info msg="Synchronizing NRI (plugin) with current runtime state"
+Apr 28 14:50:53 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:53.011466556Z" level=info msg="containerd successfully booted in 0.264077s"
+Apr 28 14:50:53 ip-172-31-69-17 systemd[1]: Started containerd.service - containerd container runtime.
+Apr 28 14:50:54 ip-172-31-69-17 systemd[1]: Stopping containerd.service - containerd container runtime...
+Apr 28 14:50:54 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:54.385670681Z" level=info msg="Stop CRI service"
+Apr 28 14:50:54 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:54.387086168Z" level=info msg="Stop CRI service"
+Apr 28 14:50:54 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:54.387125491Z" level=info msg="Event monitor stopped"
+Apr 28 14:50:54 ip-172-31-69-17 containerd[996]: time="2026-04-28T14:50:54.387135541Z" level=info msg="Stream server stopped"
+Apr 28 14:50:54 ip-172-31-69-17 systemd[1]: containerd.service: Deactivated successfully.
+Apr 28 14:50:54 ip-172-31-69-17 systemd[1]: Stopped containerd.service - containerd container runtime.
+Apr 28 14:50:59 ip-172-31-69-17 systemd[1]: Starting containerd.service - containerd container runtime...
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.128042505Z" level=info msg="starting containerd" revision=4ac6c20c7bbf8177f29e46bbdc658fec02ffb8ad version=v2.0.7
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136757722Z" level=warning msg="Configuration migrated from version 2, use `containerd config migrate` to avoid migration" t="8.506µs"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136785746Z" level=info msg="loading plugin" id=io.containerd.image-verifier.v1.bindir type=io.containerd.image-verifier.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136801066Z" level=info msg="loading plugin" id=io.containerd.internal.v1.opt type=io.containerd.internal.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136826183Z" level=info msg="loading plugin" id=io.containerd.warning.v1.deprecations type=io.containerd.warning.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136836599Z" level=info msg="loading plugin" id=io.containerd.content.v1.content type=io.containerd.content.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.136975831Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.blockfile type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137001641Z" level=info msg="skip loading plugin" error="no scratch file generator: skip plugin" id=io.containerd.snapshotter.v1.blockfile type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137027486Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.btrfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137185451Z" level=info msg="skip loading plugin" error="path /var/lib/containerd/io.containerd.snapshotter.v1.btrfs (xfs) must be a btrfs filesystem to be used with the btrfs snapshotter: skip plugin" id=io.containerd.snapshotter.v1.btrfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137200457Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.devmapper type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137210303Z" level=info msg="skip loading plugin" error="devmapper not configured: skip plugin" id=io.containerd.snapshotter.v1.devmapper type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137217644Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.native type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137238634Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.overlayfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137445238Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137503505Z" level=info msg="skip loading plugin" error="lstat /var/lib/containerd/io.containerd.snapshotter.v1.zfs: no such file or directory: skip plugin" id=io.containerd.snapshotter.v1.zfs type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137530367Z" level=info msg="loading plugin" id=io.containerd.event.v1.exchange type=io.containerd.event.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.137799304Z" level=info msg="loading plugin" id=io.containerd.monitor.task.v1.cgroups type=io.containerd.monitor.task.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138376227Z" level=info msg="loading plugin" id=io.containerd.snapshotter.v1.nydus type=io.containerd.snapshotter.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138513811Z" level=info msg="loading plugin" id=io.containerd.metadata.v1.bolt type=io.containerd.metadata.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138544869Z" level=info msg="metadata content store policy set" policy=shared
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138705342Z" level=info msg="loading plugin" id=io.containerd.gc.v1.scheduler type=io.containerd.gc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138729886Z" level=info msg="loading plugin" id=io.containerd.differ.v1.walking type=io.containerd.differ.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138741425Z" level=info msg="loading plugin" id=io.containerd.lease.v1.manager type=io.containerd.lease.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138751799Z" level=info msg="loading plugin" id=io.containerd.service.v1.containers-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138762822Z" level=info msg="loading plugin" id=io.containerd.service.v1.content-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138776938Z" level=info msg="loading plugin" id=io.containerd.service.v1.diff-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138790017Z" level=info msg="loading plugin" id=io.containerd.service.v1.images-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138799839Z" level=info msg="loading plugin" id=io.containerd.service.v1.introspection-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138808178Z" level=info msg="loading plugin" id=io.containerd.service.v1.namespaces-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138816654Z" level=info msg="loading plugin" id=io.containerd.service.v1.snapshots-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138824305Z" level=info msg="loading plugin" id=io.containerd.shim.v1.manager type=io.containerd.shim.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138839568Z" level=info msg="loading plugin" id=io.containerd.runtime.v2.task type=io.containerd.runtime.v2
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138881164Z" level=info msg="loading plugin" id=io.containerd.service.v1.tasks-service type=io.containerd.service.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138899155Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.containers type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138910364Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.content type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138919545Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.diff type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138933533Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.events type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138942873Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.images type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138951847Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.introspection type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138961258Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.leases type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138969926Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.namespaces type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138978301Z" level=info msg="loading plugin" id=io.containerd.sandbox.store.v1.local type=io.containerd.sandbox.store.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.138992685Z" level=info msg="loading plugin" id=io.containerd.cri.v1.images type=io.containerd.cri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139078894Z" level=info msg="Get image filesystem path \"/var/lib/containerd/io.containerd.snapshotter.v1.nydus\" for snapshotter \"nydus\""
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139097146Z" level=info msg="Start snapshots syncer"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139122184Z" level=info msg="loading plugin" id=io.containerd.cri.v1.runtime type=io.containerd.cri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139448214Z" level=info msg="starting cri plugin" config="{\"containerd\":{\"defaultRuntimeName\":\"runc\",\"runtimes\":{\"nvidia\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/bin/nvidia-container-runtime\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runc\":{\"runtimeType\":\"io.containerd.runc.v2\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"\",\"CriuImagePath\":\"\",\"CriuWorkPath\":\"\",\"IoGid\":0,\"IoUid\":0,\"NoNewKeyring\":false,\"Root\":\"\",\"ShimCgroup\":\"\",\"SystemdCgroup\":true},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"},\"runsc\":{\"runtimeType\":\"io.containerd.runsc.v1\",\"runtimePath\":\"\",\"PodAnnotations\":null,\"ContainerAnnotations\":null,\"options\":{\"BinaryName\":\"/usr/local/bin/runsc\",\"ConfigPath\":\"/etc/containerd/runsc.toml\",\"TypeUrl\":\"io.containerd.runsc.v1.options\"},\"privileged_without_host_devices\":false,\"privileged_without_host_devices_all_devices_allowed\":false,\"baseRuntimeSpec\":\"\",\"cniConfDir\":\"\",\"cniMaxConfNum\":0,\"snapshotter\":\"\",\"sandboxer\":\"podsandbox\",\"io_type\":\"\"}},\"ignoreBlockIONotEnabledErrors\":false,\"ignoreRdtNotEnabledErrors\":false},\"cni\":{\"binDir\":\"/opt/cni/bin\",\"confDir\":\"/etc/cni/net.d\",\"maxConfNum\":1,\"setupSerially\":false,\"confTemplate\":\"\",\"ipPref\":\"\",\"useInternalLoopback\":false},\"enableSelinux\":false,\"selinuxCategoryRange\":1024,\"maxContainerLogSize\":16384,\"disableApparmor\":false,\"restrictOOMScoreAdj\":false,\"disableProcMount\":false,\"unsetSeccompProfile\":\"\",\"tolerateMissingHugetlbController\":true,\"disableHugetlbController\":true,\"device_ownership_from_security_context\":false,\"ignoreImageDefinedVolumes\":false,\"netnsMountsUnderStateDir\":false,\"enableUnprivilegedPorts\":true,\"enableUnprivilegedICMP\":true,\"enableCDI\":true,\"cdiSpecDirs\":[\"/etc/cdi\",\"/var/run/cdi\"],\"drainExecSyncIOTimeout\":\"0s\",\"ignoreDeprecationWarnings\":null,\"containerdRootDir\":\"/var/lib/containerd\",\"containerdEndpoint\":\"/run/containerd/containerd.sock\",\"rootDir\":\"/var/lib/containerd/io.containerd.grpc.v1.cri\",\"stateDir\":\"/run/containerd/io.containerd.grpc.v1.cri\"}"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139527693Z" level=info msg="loading plugin" id=io.containerd.podsandbox.controller.v1.podsandbox type=io.containerd.podsandbox.controller.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139581509Z" level=info msg="loading plugin" id=io.containerd.sandbox.controller.v1.shim type=io.containerd.sandbox.controller.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139643954Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandbox-controllers type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139668290Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.sandboxes type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139678529Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.snapshots type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139697219Z" level=info msg="loading plugin" id=io.containerd.streaming.v1.manager type=io.containerd.streaming.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139711890Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.streaming type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139723924Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.tasks type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139758150Z" level=info msg="loading plugin" id=io.containerd.transfer.v1.local type=io.containerd.transfer.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139786959Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.transfer type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139800821Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.version type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139826085Z" level=info msg="loading plugin" id=io.containerd.monitor.container.v1.restart type=io.containerd.monitor.container.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139874380Z" level=info msg="loading plugin" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139910976Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.tracing.processor.v1.otlp type=io.containerd.tracing.processor.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.139923181Z" level=info msg="loading plugin" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140024608Z" level=info msg="skip loading plugin" error="skip plugin: tracing endpoint not configured" id=io.containerd.internal.v1.tracing type=io.containerd.internal.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140037474Z" level=info msg="loading plugin" id=io.containerd.ttrpc.v1.otelttrpc type=io.containerd.ttrpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140048148Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.healthcheck type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140057502Z" level=info msg="loading plugin" id=io.containerd.nri.v1.nri type=io.containerd.nri.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140073984Z" level=info msg="runtime interface created"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140078737Z" level=info msg="created NRI interface"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140087818Z" level=info msg="loading plugin" id=io.containerd.grpc.v1.cri type=io.containerd.grpc.v1
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140097298Z" level=info msg="Connect containerd service"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.140119705Z" level=info msg="using experimental NRI integration - disable nri plugin to prevent this"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.145578201Z" level=error msg="failed to load cni during init, please check CRI plugin status before setting up network for pods" error="cni config load failed: no network config found in /etc/cni/net.d: cni plugin not initialized: failed to load cni config"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164791409Z" level=info msg="Start subscribing containerd event"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164835776Z" level=info msg="Start recovering state"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.164995614Z" level=info msg=serving... address="[::]:9113"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.165114738Z" level=info msg=serving... address=/run/containerd/containerd.sock.ttrpc
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.165161978Z" level=info msg=serving... address=/run/containerd/containerd.sock
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178587286Z" level=info msg="Start event monitor"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178624514Z" level=info msg="Start cni network conf syncer for default"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178632988Z" level=info msg="Start streaming server"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178642759Z" level=info msg="Registered namespace \"k8s.io\" with NRI"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178652140Z" level=info msg="runtime interface starting up..."
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178678298Z" level=info msg="starting plugins..."
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178689037Z" level=info msg="Synchronizing NRI (plugin) with current runtime state"
+Apr 28 14:50:59 ip-172-31-69-17 containerd[1481]: time="2026-04-28T14:50:59.178807422Z" level=info msg="containerd successfully booted in 0.051383s"
+Apr 28 14:50:59 ip-172-31-69-17 systemd[1]: Started containerd.service - containerd container runtime.
+Apr 28 15:08:14 ip-172-31-69-17 systemd[1]: Started hivemind-worker.service - Hivemind Worker.
+Apr 28 15:08:14 ip-172-31-69-17 hivemind-worker[2071]: worker: metrics on :8081
+Apr 28 15:08:14 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: runtime=containerd connecting to 5 replica(s) [172.31.68.176:9000,172.31.72.61:9000,172.31.66.38:9000,172.31.65.63:9000,172.31.74.48:9000] cpu=4000m mem=15788Mi gpu=T4x1
+Apr 28 15:08:14 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.68.176:9000
+Apr 28 15:08:45 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:08:45.011480985Z" level=info msg="No images store for sha256:4aba5f63b2b95162e196452ef1cd2908dbdc09cf329ce391b855e155a0660e99"
+Apr 28 15:25:44 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:25:44.214079232Z" level=info msg="No images store for sha256:09fd29b97f26dc9a6c800aae59b353f98fef955469a4706ca991347a3301bf89"
+Apr 28 15:25:52 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=17775799001133815809 deployment_id=9659130143999365733 image=docker.io/mendhak/http-https-echo:31 port=8080 gpu_count=1
+Apr 28 15:25:55 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:25:55.764961944Z" level=info msg="connecting to shim hivemind-pod-17775799001133815809" address="unix:///run/containerd/s/8b1cb1d49d3d0c4f0a42c081d14d2f3f3c23d72112354b2647f4bd6bdfad4b06" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:26:30 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=14279964170112293133 deployment_id=11693034620340510321 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019 port=8080 gpu_count=0
+Apr 28 15:26:30 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:26:30.738166366Z" level=info msg="connecting to shim hivemind-pod-14279964170112293133" address="unix:///run/containerd/s/f6724cceba9517cbe1e8b015d9ea730e3846deef00c580f37ba163b6efc69a60" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:26:32 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=8332670729032836398 deployment_id=9024654201992055039 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019 port=8080 gpu_count=1
+Apr 28 15:26:32 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:26:32.602364889Z" level=info msg="connecting to shim hivemind-pod-8332670729032836398" address="unix:///run/containerd/s/3818dd61b3e80f12de729f3dd5bf1051cd8df95626331e2da0a5c50dbbf40bc4" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:27:09 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=17270571163283330953 deployment_id=2074683623940568804 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019 port=8080 gpu_count=0
+Apr 28 15:27:39 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:27:39.211506012Z" level=info msg="connecting to shim hivemind-pod-17270571163283330953" address="unix:///run/containerd/s/1e6d717338cb64fd4060d9746e0cf68f0b07ba02ed686969eacd5586a0fff3fc" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:27:42 ip-172-31-69-17 hivemind-worker[2071]: worker: start pod pod_id=10440568676385178531 deployment_id=5632491372296299238 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019 port=8080 gpu_count=1
+Apr 28 15:27:42 ip-172-31-69-17 containerd[1481]: time="2026-04-28T15:27:42.561074858Z" level=info msg="connecting to shim hivemind-pod-10440568676385178531" address="unix:///run/containerd/s/c33684786e27f746fd6f07c21fc858fec4c974c0b7182f1ce0026da0dc3da332" namespace=hivemind protocol=ttrpc version=3
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.68.176:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:03 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:04 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.72.61:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.66.38:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.66.38:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.65.63:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.65.63:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.74.48:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: recv failed: Connection reset by peer (os error 104)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: disconnected from 172.31.74.48:9000
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 100ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connect to 172.31.68.176:9000 failed: Connection refused (os error 111)
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: reconnecting in 200ms
+Apr 28 15:29:05 ip-172-31-69-17 hivemind-worker[2071]: worker ip-172-31-69-17: connected to 172.31.72.61:9000
+REF                                                                              TYPE                                       DIGEST                                                                  SIZE     PLATFORMS                                                       LABELS 
+288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019 application/vnd.oci.image.manifest.v1+json sha256:0ef7805101e7df470e42baccddceeddf7959f214d30903c7f8aea65ce1e53cbd 41.2 MiB linux/amd64                                                     -      
+288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019 application/vnd.oci.image.manifest.v1+json sha256:a7d6d5d16403e1733cf07d130dc4b58242c8658227f07560a989a59d2039b6aa 3.0 GiB  linux/amd64                                                     -      
+docker.io/mendhak/http-https-echo:31                                             application/vnd.oci.image.index.v1+json    sha256:0fefe04350131d7bb28355e3bf037062643e45f4a8a32f23679529e1b09d8ce4 42.7 MiB linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le -      
+CONTAINER                            IMAGE                                                                               RUNTIME                  
+hivemind-pod-10440568676385178531    288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019    io.containerd.runc.v2    
+hivemind-pod-14279964170112293133    288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019    io.containerd.runc.v2    
+hivemind-pod-17270571163283330953    288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428105019    io.containerd.runc.v2    
+hivemind-pod-17775799001133815809    docker.io/mendhak/http-https-echo:31                                                io.containerd.runc.v2    
+hivemind-pod-8332670729032836398     288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428105019    io.containerd.runc.v2    
+TASK                                 PID      STATUS    
+hivemind-pod-14279964170112293133    5609     STOPPED
+hivemind-pod-8332670729032836398     6578     STOPPED
+hivemind-pod-17270571163283330953    9844     STOPPED
+hivemind-pod-10440568676385178531    11548    STOPPED
+hivemind-pod-17775799001133815809    2841     STOPPED
+State  Recv-Q Send-Q   Local Address:Port  Peer Address:PortProcess                                                  
+LISTEN 0      4096           0.0.0.0:111        0.0.0.0:*    users:(("rpcbind",pid=386,fd=4),("systemd",pid=1,fd=85))
+LISTEN 0      4096         127.0.0.1:43849      0.0.0.0:*    users:(("containerd",pid=1481,fd=13))                   
+LISTEN 0      4096     127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=390,fd=15))               
+LISTEN 0      4096        127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=390,fd=17))               
+LISTEN 0      128            0.0.0.0:8081       0.0.0.0:*    users:(("hivemind-worker",pid=2071,fd=3))               
+LISTEN 0      4096   169.254.169.253:8234       0.0.0.0:*    users:(("checkpoint-agen",pid=1055,fd=7))               
+LISTEN 0      4096                 *:9113             *:*    users:(("containerd",pid=1481,fd=9))                    
+LISTEN 0      4096                 *:9110             *:*    users:(("containerd-nydu",pid=647,fd=8))                
+LISTEN 0      4096                 *:22               *:*    users:(("sshd",pid=1818,fd=3),("systemd",pid=1,fd=184)) 
+LISTEN 0      4096              [::]:111           [::]:*    users:(("rpcbind",pid=386,fd=6),("systemd",pid=1,fd=93))
+-rwxr-xr-x 1 ubuntu ubuntu 2948344 Apr 28 15:08 /usr/local/bin/hivemind-worker
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `otlp` property of `[plugins.\"io.containerd.tracing.processor.v1\".otlp]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTLP environment variables instead: https://opentelemetry.io/docs/specs/otel/protocol/exporter/"
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `tracing` property of `[plugins.\"io.containerd.internal.v1\".tracing]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTEL environment variables instead: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/"
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `otlp` property of `[plugins.\"io.containerd.tracing.processor.v1\".otlp]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTLP environment variables instead: https://opentelemetry.io/docs/specs/otel/protocol/exporter/"
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `tracing` property of `[plugins.\"io.containerd.internal.v1\".tracing]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTEL environment variables instead: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/"
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `otlp` property of `[plugins.\"io.containerd.tracing.processor.v1\".otlp]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTLP environment variables instead: https://opentelemetry.io/docs/specs/otel/protocol/exporter/"
+time="2026-04-28T15:51:49Z" level=warning msg="DEPRECATION: The `tracing` property of `[plugins.\"io.containerd.internal.v1\".tracing]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTEL environment variables instead: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/"

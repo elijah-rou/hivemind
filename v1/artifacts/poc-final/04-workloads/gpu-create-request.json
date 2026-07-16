@@ -1,0 +1,1 @@
+{"name":"poc-gpu-1777422067","image":"288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:gpu-poc-20260428195031","replicas":1,"cpu":1000,"memory":4096,"gpu_type":"t4","gpu_count":1}

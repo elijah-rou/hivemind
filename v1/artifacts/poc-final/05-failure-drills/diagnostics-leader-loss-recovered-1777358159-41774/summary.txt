@@ -1,0 +1,6 @@
+label=leader-loss-recovered-1777358159-41774
+timestamp=2026-04-28T06:36:11Z
+api_url=http://98.92.68.87:8080
+public_api_health={"connected":false,"leader":"172.31.66.171:9001"}
+killed_leader_addr=172.31.66.171:9001
+leader_stopped_ip=98.92.68.87

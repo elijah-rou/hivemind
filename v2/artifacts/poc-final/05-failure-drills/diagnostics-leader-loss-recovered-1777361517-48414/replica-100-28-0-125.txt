@@ -1,0 +1,119 @@
+Warning: Permanently added '100.28.0.125' (ED25519) to the list of known hosts.
+== host ==
+2026-04-28T07:32:13Z
+ip-172-31-67-248.ec2.internal
+172.31.67.248 
+
+== services ==
+active
+active
+● hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-04-28 07:30:58 UTC; 1min 14s ago
+   Main PID: 2177 (hivemind)
+      Tasks: 1 (limit: 9204)
+     Memory: 15.5M
+        CPU: 1.242s
+     CGroup: /system.slice/hivemind.service
+             └─2177 /usr/local/bin/hivemind --node-id 3 --replica-count 5 --agent-port 9000 --client-port 9001 --replica-port 9102 --peers 0@172.31.71.97:9102,1@172.31.71.99:9102,2@172.31.73.170:9102,3@172.31.67.248:9102,4@172.31.77.204:9102 --data-dir /var/lib/hivemind --metrics-port 9200 --s3-backup "" --gossip-port 9300 --gossip-peers "" --region us-east-1
+
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 3 at 172.31.67.248:9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 4 at 172.31.77.204:9102
+Apr 28 07:31:10 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 4 connected
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: create_deployment name=drill-cpu-1777361517-48414 replicas=1 deployment_count=1 pod_count=1
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind replica: no worker for node_id=1082269761 pod_id=17678023832001937445
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 28 07:32:08 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 4 connected
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-04-28 07:30:58 UTC; 1min 14s ago
+   Main PID: 2178 (hivemind-api)
+      Tasks: 7 (limit: 9204)
+     Memory: 1.4M
+        CPU: 8ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2178 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.71.97:9001,172.31.71.99:9001,172.31.73.170:9001,172.31.67.248:9001,172.31.77.204:9001 --dns-targets
+
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: connecting to hivemind at [172.31.71.97:9001 172.31.71.99:9001 172.31.73.170:9001 172.31.67.248:9001 172.31.77.204:9001]
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: connected to leader at 172.31.71.97:9001
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: listening on :8080
+
+== local api health ==
+{"connected":true,"leader":"172.31.71.99:9001"}
+
+== consensus metrics ==
+# HELP hivemind_consensus_view Current VRR view number
+# TYPE hivemind_consensus_view gauge
+hivemind_consensus_view 1
+# HELP hivemind_consensus_commit Committed operation number
+# TYPE hivemind_consensus_commit gauge
+hivemind_consensus_commit 9
+# HELP hivemind_consensus_op Latest operation number
+# TYPE hivemind_consensus_op gauge
+hivemind_consensus_op 9
+# HELP hivemind_is_leader Whether this replica is the leader
+# TYPE hivemind_is_leader gauge
+hivemind_is_leader 0
+# HELP hivemind_leader_id Current leader replica ID
+# TYPE hivemind_leader_id gauge
+hivemind_leader_id 1
+# HELP hivemind_replica_status Replica status (0=normal,1=view_change,2=recovering)
+# TYPE hivemind_replica_status gauge
+hivemind_replica_status 0
+# HELP hivemind_view_change_votes Current view-change vote counters
+# TYPE hivemind_view_change_votes gauge
+hivemind_view_change_votes{type="start"} 4
+hivemind_view_change_votes{type="do"} 0
+hivemind_repair_pending 0
+# HELP hivemind_connections Connected sockets by type
+# TYPE hivemind_connections gauge
+hivemind_connections{type="agents"} 1
+hivemind_connections{type="clients"} 0
+hivemind_connections{type="peers"} 7
+hivemind_connections{type="identified_peers"} 3
+
+== sockets 9001/9102 ==
+LISTEN    0      128               0.0.0.0:9001          0.0.0.0:*           
+LISTEN    0      128               0.0.0.0:9102          0.0.0.0:*           
+ESTAB     0      0           172.31.67.248:46430    172.31.71.99:9001        
+ESTAB     0      0           172.31.67.248:40400    172.31.71.99:9102        
+TIME-WAIT 0      0           172.31.67.248:55484   172.31.77.204:9102        
+ESTAB     0      0           172.31.67.248:37366   172.31.73.170:9102        
+ESTAB     0      0           172.31.67.248:44788   172.31.77.204:9102        
+ESTAB     0      0           172.31.67.248:9102    172.31.77.204:60992       
+
+== processes ==
+   2177 Tue Apr 28 07:30:57 2026 /usr/local/bin/hivemind --node-id 3 --replica-count 5 --agent-port 9000 --client-port 9001 --replica-port 9102 --peers 0@172.31.71.97:9102,1@172.31.71.99:9102,2@172.31.73.170:9102,3@172.31.67.248:9102,4@172.31.77.204:9102 --data-dir /var/lib/hivemind --metrics-port 9200 --s3-backup  --gossip-port 9300 --gossip-peers  --region us-east-1
+   2178 Tue Apr 28 07:30:57 2026 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.71.97:9001,172.31.71.99:9001,172.31.73.170:9001,172.31.67.248:9001,172.31.77.204:9001 --dns-targets
+
+== recent hivemind logs ==
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: node=3 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: connecting to hivemind at [172.31.71.97:9001 172.31.71.99:9001 172.31.73.170:9001 172.31.67.248:9001 172.31.77.204:9001]
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: connected to leader at 172.31.71.97:9001
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:30:58 hivemind-api: listening on :8080
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: metrics on :9200
+Apr 28 07:30:58 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 0 at 172.31.71.97:9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 0 connected
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 1 at 172.31.71.99:9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 1 connected
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 2 at 172.31.73.170:9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 2 connected
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 3 at 172.31.67.248:9102
+Apr 28 07:31:00 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: connecting to peer 4 at 172.31.77.204:9102
+Apr 28 07:31:10 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 4 connected
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: create_deployment name=drill-cpu-1777361517-48414 replicas=1 deployment_count=1 pod_count=1
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind replica: no worker for node_id=1082269761 pod_id=17678023832001937445
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 28 07:31:57 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 28 07:32:08 ip-172-31-67-248.ec2.internal hivemind[2177]: hivemind core: peer 4 connected
+Apr 28 07:32:13 ip-172-31-67-248.ec2.internal hivemind-api[2178]: 2026/04/28 07:32:13 GET /v1/health

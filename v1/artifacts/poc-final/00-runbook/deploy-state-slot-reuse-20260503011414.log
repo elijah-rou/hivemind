@@ -1,0 +1,76 @@
+==> Building Zig replica (linux-x86_64)...
+==> Building Rust worker (linux-x86_64)...
+    using cargo-zigbuild (cargo-zigbuild 0.22.2, zig 0.16.0)
+warning: constant `MSG_REGISTER_ACK` is never used
+ --> src/protocol.rs:8:7
+  |
+8 | const MSG_REGISTER_ACK: u8 = 0x01;
+  |       ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hivemind-worker` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.14s
+==> Building Go API (linux-x86_64)...
+==> Reading Terraform outputs...
+    Replicas: 172.31.13.224 172.31.9.57 172.31.8.68 172.31.9.131 172.31.0.250
+    Worker CPU: 172.31.13.16
+    Worker GPU: 172.31.66.15
+    Peers: 0@172.31.13.224:9102,1@172.31.9.57:9102,2@172.31.8.68:9102,3@172.31.9.131:9102,4@172.31.0.250:9102
+    API addrs: 172.31.13.224:9001,172.31.9.57:9001,172.31.8.68:9001,172.31.9.131:9001,172.31.0.250:9001
+==> Deploying replica 0 to 98.92.227.231 (172.31.13.224)...
+Warning: Permanently added '98.92.227.231' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.227.231' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.227.231' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.227.231' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.227.231' (ED25519) to the list of known hosts.
+    replica 0 started
+==> Deploying replica 1 to 44.202.250.98 (172.31.9.57)...
+Warning: Permanently added '44.202.250.98' (ED25519) to the list of known hosts.
+Warning: Permanently added '44.202.250.98' (ED25519) to the list of known hosts.
+Warning: Permanently added '44.202.250.98' (ED25519) to the list of known hosts.
+Warning: Permanently added '44.202.250.98' (ED25519) to the list of known hosts.
+Warning: Permanently added '44.202.250.98' (ED25519) to the list of known hosts.
+    replica 1 started
+==> Deploying replica 2 to 13.223.230.237 (172.31.8.68)...
+Warning: Permanently added '13.223.230.237' (ED25519) to the list of known hosts.
+Warning: Permanently added '13.223.230.237' (ED25519) to the list of known hosts.
+Warning: Permanently added '13.223.230.237' (ED25519) to the list of known hosts.
+Warning: Permanently added '13.223.230.237' (ED25519) to the list of known hosts.
+Warning: Permanently added '13.223.230.237' (ED25519) to the list of known hosts.
+    replica 2 started
+==> Deploying replica 3 to 98.92.221.140 (172.31.9.131)...
+Warning: Permanently added '98.92.221.140' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.221.140' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.221.140' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.221.140' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.92.221.140' (ED25519) to the list of known hosts.
+    replica 3 started
+==> Deploying replica 4 to 34.236.238.62 (172.31.0.250)...
+Warning: Permanently added '34.236.238.62' (ED25519) to the list of known hosts.
+Warning: Permanently added '34.236.238.62' (ED25519) to the list of known hosts.
+Warning: Permanently added '34.236.238.62' (ED25519) to the list of known hosts.
+Warning: Permanently added '34.236.238.62' (ED25519) to the list of known hosts.
+Warning: Permanently added '34.236.238.62' (ED25519) to the list of known hosts.
+    replica 4 started
+==> Waiting 10s for leader election...
+==> Deploying worker (cpu) to 3.231.159.93...
+Warning: Permanently added '3.231.159.93' (ED25519) to the list of known hosts.
+Warning: Permanently added '3.231.159.93' (ED25519) to the list of known hosts.
+Warning: Permanently added '3.231.159.93' (ED25519) to the list of known hosts.
+Warning: Permanently added '3.231.159.93' (ED25519) to the list of known hosts.
+    worker (cpu) started
+==> Deploying worker (gpu) to 98.84.26.37...
+Warning: Permanently added '98.84.26.37' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.84.26.37' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.84.26.37' (ED25519) to the list of known hosts.
+Warning: Permanently added '98.84.26.37' (ED25519) to the list of known hosts.
+    worker (gpu) started
+
+=== POC Deployment Complete ===
+Replica IPs:  98.92.227.231 44.202.250.98 13.223.230.237 98.92.221.140 34.236.238.62
+Worker CPU:    3.231.159.93
+Worker GPU:    98.84.26.37
+API:          http://98.92.227.231:8080/v1/health
+Dashboard:    http://98.92.227.231:8080/dashboard
+Smoke:        ./smoke-test.sh http://98.92.227.231:8080 --gpu-worker 98.84.26.37 --ssh-key ~/.ssh/id_ed25519 --gpu-type t4

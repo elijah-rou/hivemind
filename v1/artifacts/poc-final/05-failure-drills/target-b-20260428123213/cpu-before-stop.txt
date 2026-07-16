@@ -1,0 +1,14 @@
+Warning: Permanently added '3.237.23.208' (ED25519) to the list of known hosts.
+TASK                                 PID     STATUS    
+hivemind-pod-17678023832001937445    4151    RUNNING
+time="2026-04-28T16:32:19Z" level=warning msg="DEPRECATION: The `otlp` property of `[plugins.\"io.containerd.tracing.processor.v1\".otlp]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTLP environment variables instead: https://opentelemetry.io/docs/specs/otel/protocol/exporter/"
+time="2026-04-28T16:32:19Z" level=warning msg="DEPRECATION: The `tracing` property of `[plugins.\"io.containerd.internal.v1\".tracing]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTEL environment variables instead: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/"
+CONTAINER                            IMAGE                                                                               RUNTIME                  
+hivemind-pod-17678023832001937445    288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428115836    io.containerd.runc.v2    
+Apr 28 16:15:37 ip-172-31-74-176 systemd[1]: Started hivemind-worker.service - Hivemind Worker.
+Apr 28 16:15:37 ip-172-31-74-176 hivemind-worker[2712]: worker: metrics on :8081
+Apr 28 16:15:37 ip-172-31-74-176 hivemind-worker[2712]: worker ip-172-31-74-176: runtime=containerd connecting to 5 replica(s) [172.31.78.59:9000,172.31.66.135:9000,172.31.72.58:9000,172.31.79.99:9000,172.31.65.208:9000] cpu=4000m mem=7736Mi gpu=Nonex0
+Apr 28 16:15:37 ip-172-31-74-176 hivemind-worker[2712]: worker ip-172-31-74-176: connected to 172.31.78.59:9000
+Apr 28 16:32:13 ip-172-31-74-176 hivemind-worker[2712]: worker: start pod pod_id=17678023832001937445 deployment_id=11177516664432764457 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428115836 port=8080 gpu_count=0
+time="2026-04-28T16:32:19Z" level=warning msg="DEPRECATION: The `otlp` property of `[plugins.\"io.containerd.tracing.processor.v1\".otlp]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTLP environment variables instead: https://opentelemetry.io/docs/specs/otel/protocol/exporter/"
+time="2026-04-28T16:32:19Z" level=warning msg="DEPRECATION: The `tracing` property of `[plugins.\"io.containerd.internal.v1\".tracing]` is deprecated since containerd v1.6 and will be removed in containerd v2.0.Use OTEL environment variables instead: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/"

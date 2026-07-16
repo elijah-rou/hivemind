@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hivemind Fuzz Report</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 24px; max-width: 1400px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin-bottom: 8px; color: #58a6ff; }
+h2 { font-size: 1.1rem; margin: 20px 0 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+.subtitle { color: #8b949e; margin-bottom: 20px; font-size: 0.85rem; }
+.stats { display: flex; gap: 32px; margin-bottom: 24px; flex-wrap: wrap; }
+.stat { text-align: center; }
+.stat-value { font-size: 2rem; font-weight: 700; color: #f0f6fc; }
+.stat-label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; }
+/* Colorblind-safe palette (deuteranopia + protanopia friendly) */
+.ok { color: #56b4e9; } .warn { color: #e69f00; } .err { color: #d55e00; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th { text-align: left; padding: 8px 12px; border-bottom: 1px solid #30363d; color: #8b949e; font-weight: 600; }
+td { padding: 6px 12px; border-bottom: 1px solid #21262d; }
+.event-log { max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; }
+.event { padding: 2px 8px; border-bottom: 1px solid #21262d; }
+.event-partition { color: #e69f00; }
+.event-heal { color: #56b4e9; }
+.event-crash { color: #d55e00; }
+.event-request { color: #009e73; }
+.event-violation { color: #d55e00; font-weight: 700; background: #3d1418; }
+.event-state { color: #8b949e; }
+.timeline { position: relative; margin: 12px 0; }
+.timeline-row { display: flex; align-items: center; margin: 4px 0; }
+.timeline-label { width: 60px; font-size: 0.75rem; color: #8b949e; flex-shrink: 0; }
+.timeline-bar { flex: 1; height: 20px; display: flex; position: relative; background: #21262d; border-radius: 3px; overflow: hidden; }
+.timeline-seg { height: 100%; }
+/* Wong palette: blue=normal, orange=view_change, vermillion=recovering */
+.seg-N { background: #0072b2; } .seg-V { background: #e69f00; } .seg-R { background: #d55e00; }
+.timeline-marker { position: absolute; top: 0; bottom: 0; width: 2px; z-index: 1; }
+.marker-crash { background: #d55e00; } .marker-partition { background: #e69f00; } .marker-heal { background: #56b4e9; }
+.filter-bar { margin-bottom: 12px; }
+.filter-bar label { margin-right: 16px; font-size: 0.8rem; color: #8b949e; cursor: pointer; }
+.filter-bar input { margin-right: 4px; }
+canvas { width: 100%; height: 200px; }
+</style>
+</head>
+<body>
+<h1>Hivemind Fuzz Report</h1>
+<div class="subtitle" id="subtitle">Loading...</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="card">
+<h2>Replica Timeline</h2>
+<div style="font-size:0.75rem;color:#8b949e;margin-bottom:8px">
+<span style="color:#0072b2">&#9632;</span> Normal
+<span style="color:#e69f00;margin-left:12px">&#9632;</span> View Change
+<span style="color:#d55e00;margin-left:12px">&#9632;</span> Recovering
+<span style="margin-left:12px">|</span> <span style="color:#e69f00">Partition</span>
+<span style="margin-left:8px">|</span> <span style="color:#d55e00">Crash</span>
+</div>
+<div id="timeline"></div>
+</div>
+
+<div class="card">
+<h2>Commit Progress</h2>
+<canvas id="commit-chart"></canvas>
+</div>
+
+<div class="card">
+<h2>Event Log</h2>
+<div class="filter-bar" id="filters"></div>
+<div class="event-log" id="event-log"></div>
+</div>
+
+<script>
+// DATA_PLACEHOLDER will be replaced by the generator
+const TRACE_DATA = /*DATA_PLACEHOLDER*/[];
+
+function render() {
+    const events = TRACE_DATA;
+    if (!events.length) { document.getElementById('subtitle').textContent = 'No trace data'; return; }
+
+    const initEvent = events.find(e => e.type === 'init');
+    const violationEvents = events.filter(e => e.type === 'violation');
+    const stateEvents = events.filter(e => e.type === 'state');
+    const lastTick = events[events.length - 1].tick || 0;
+    const replicaCount = initEvent ? initEvent.replicas : 0;
+    const seed = initEvent ? initEvent.seed : '?';
+
+    // Subtitle
+    const outcome = violationEvents.length > 0 ? 'SAFETY VIOLATION' : 'PASSED';
+    const outcomeClass = violationEvents.length > 0 ? 'err' : 'ok';
+    document.getElementById('subtitle').innerHTML =
+        `Seed: <strong>${seed}</strong> | Replicas: ${replicaCount} | Ticks: ${lastTick} | Outcome: <span class="${outcomeClass}">${outcome}</span>`;
+
+    // Stats
+    const partitions = events.filter(e => e.type === 'partition').length;
+    const heals = events.filter(e => e.type === 'heal').length;
+    const crashes = events.filter(e => e.type === 'crash').length;
+    const requests = events.filter(e => e.type === 'request').length;
+    const statsHtml = [
+        { label: 'Ticks', value: lastTick },
+        { label: 'Partitions', value: partitions },
+        { label: 'Heals', value: heals },
+        { label: 'Crashes', value: crashes },
+        { label: 'Requests', value: requests },
+        { label: 'Violations', value: violationEvents.length, cls: violationEvents.length > 0 ? 'err' : 'ok' },
+    ].map(s => `<div class="stat"><div class="stat-value ${s.cls||''}">${s.value}</div><div class="stat-label">${s.label}</div></div>`).join('');
+    document.getElementById('stats').innerHTML = statsHtml;
+
+    // Timeline: build status segments per replica
+    if (replicaCount > 0 && stateEvents.length > 0) {
+        let html = '';
+        for (let r = 0; r < replicaCount; r++) {
+            const segments = [];
+            let prevTick = 0;
+            for (const se of stateEvents) {
+                const rep = se.replicas.find(x => x.id === r);
+                if (!rep) continue;
+                const width = ((se.tick - prevTick) / lastTick * 100).toFixed(2);
+                const cls = rep.status === 'N' ? 'seg-N' : rep.status === 'V' ? 'seg-V' : 'seg-R';
+                segments.push(`<div class="timeline-seg ${cls}" style="width:${width}%" title="T=${se.tick} ${rep.status} v=${rep.view} op=${rep.op} cm=${rep.commit}"></div>`);
+                prevTick = se.tick;
+            }
+            // Fill remaining width with last known status
+            if (prevTick < lastTick) {
+                const lastState = stateEvents[stateEvents.length - 1];
+                const lastRep = lastState.replicas.find(x => x.id === r);
+                if (lastRep) {
+                    const width = ((lastTick - prevTick) / lastTick * 100).toFixed(2);
+                    const cls = lastRep.status === 'N' ? 'seg-N' : lastRep.status === 'V' ? 'seg-V' : 'seg-R';
+                    segments.push(`<div class="timeline-seg ${cls}" style="width:${width}%"></div>`);
+                }
+            }
+            // Markers for faults
+            let markers = '';
+            for (const e of events) {
+                if (e.type === 'crash' && e.replica === r) {
+                    const left = (e.tick / lastTick * 100).toFixed(2);
+                    markers += `<div class="timeline-marker marker-crash" style="left:${left}%" title="CRASH T=${e.tick}"></div>`;
+                }
+                if (e.type === 'partition' && e.replica === r) {
+                    const left = (e.tick / lastTick * 100).toFixed(2);
+                    markers += `<div class="timeline-marker marker-partition" style="left:${left}%" title="PARTITION T=${e.tick}"></div>`;
+                }
+            }
+            // Violation marker
+            for (const v of violationEvents) {
+                if (v.replica === r) {
+                    const left = (v.tick / lastTick * 100).toFixed(2);
+                    markers += `<div class="timeline-marker" style="left:${left}%;background:#d55e00;width:3px" title="VIOLATION T=${v.tick}"></div>`;
+                }
+            }
+            const leader = stateEvents.length > 0 ? stateEvents[stateEvents.length-1].replicas.find(x => x.id === r && x.leader) : null;
+            const label = `r${r}${leader ? '*' : ''}`;
+            html += `<div class="timeline-row"><div class="timeline-label">${label}</div><div class="timeline-bar">${segments.join('')}${markers}</div></div>`;
+        }
+        document.getElementById('timeline').innerHTML = html;
+    }
+
+    // Commit chart (simple canvas)
+    const canvas = document.getElementById('commit-chart');
+    const ctx = canvas.getContext('2d');
+    canvas.width = canvas.offsetWidth * 2;
+    canvas.height = 400;
+    ctx.scale(2, 2);
+    const w = canvas.offsetWidth; const h = 200;
+    ctx.fillStyle = '#161b22'; ctx.fillRect(0, 0, w, h);
+
+    if (stateEvents.length > 1 && replicaCount > 0) {
+        const maxCommit = Math.max(...stateEvents.flatMap(s => s.replicas.map(r => r.commit)), 1);
+        /* Wong colorblind-safe palette */
+        const colors = ['#0072b2', '#e69f00', '#009e73', '#d55e00', '#56b4e9', '#cc79a7', '#f0e442', '#000000'];
+        for (let r = 0; r < replicaCount; r++) {
+            ctx.strokeStyle = colors[r % colors.length];
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            let first = true;
+            for (const se of stateEvents) {
+                const rep = se.replicas.find(x => x.id === r);
+                if (!rep) continue;
+                const x = (se.tick / lastTick) * w;
+                const y = h - 20 - (rep.commit / maxCommit) * (h - 40);
+                if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+        }
+        // Legend
+        for (let r = 0; r < replicaCount; r++) {
+            ctx.fillStyle = colors[r % colors.length];
+            ctx.font = '10px monospace';
+            ctx.fillText(`r${r}`, 10 + r * 40, 12);
+        }
+        // Axis labels
+        ctx.fillStyle = '#8b949e'; ctx.font = '9px monospace';
+        ctx.fillText('0', 2, h - 8); ctx.fillText(String(lastTick), w - 30, h - 8);
+        ctx.fillText(String(maxCommit), 2, 24);
+    }
+
+    // Event log
+    const typeFilters = new Set(['partition', 'heal', 'crash', 'request', 'violation', 'state', 'init']);
+    const filterBar = document.getElementById('filters');
+    filterBar.innerHTML = Array.from(typeFilters).map(t =>
+        `<label><input type="checkbox" checked data-type="${t}"> ${t}</label>`
+    ).join('');
+
+    function renderLog() {
+        const active = new Set();
+        filterBar.querySelectorAll('input:checked').forEach(cb => active.add(cb.dataset.type));
+        const html = events.filter(e => active.has(e.type)).map(e => {
+            const cls = `event event-${e.type}`;
+            let text = `T=${String(e.tick).padStart(4)} ${e.type}`;
+            if (e.type === 'partition') text += ` replica=${e.replica}`;
+            if (e.type === 'crash') text += ` replica=${e.replica} pre:v=${e.pre.view}/op=${e.pre.op}/cm=${e.pre.commit} post:v=${e.post.view}/op=${e.post.op}/cm=${e.post.commit}`;
+            if (e.type === 'request') text += ` leader=${e.leader} #${e.num}`;
+            if (e.type === 'violation') text += ` replica=${e.replica} "${e.message}"`;
+            if (e.type === 'state') text += ' ' + e.replicas.map(r => `r${r.id}${r.leader?'*':' '}${r.status} v=${r.view} op=${r.op} cm=${r.commit}`).join(' | ');
+            return `<div class="${cls}">${text}</div>`;
+        }).join('');
+        document.getElementById('event-log').innerHTML = html;
+    }
+    filterBar.addEventListener('change', renderLog);
+    renderLog();
+}
+
+render();
+</script>
+</body>
+</html>

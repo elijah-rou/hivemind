@@ -1,0 +1,90 @@
+=== Hivemind one deployment 0 -> 50 -> 1 ===
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/1 pods_running=0 scheduled=1 total=1 op=17305 commit=17305 attempt=1/900
+ready scenario=single entity=hm-scale-single-hmctrfix-20260503015744 expected=1 attempt=2 op=17306 commit=17306 pods=1/1/1
+zero_ready scenario=single entity=hm-scale-single-hmctrfix-20260503015744 attempt=1 op=17308 commit=17308
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17363 commit=17362 attempt=1/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=2/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=3/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=4/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=5/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=6/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=7/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=8/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=9/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=10/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=11/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=12/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=13/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=14/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=15/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=16/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=17/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=18/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=19/1500
+waiting scenario=single entity=hm-scale-single-hmctrfix-20260503015744 ready=0/50 pods_running=0 scheduled=50 total=50 op=17418 commit=17418 attempt=20/1500
+ready scenario=single entity=hm-scale-single-hmctrfix-20260503015744 expected=50 attempt=21 op=17468 commit=17468 pods=50/50/50
+ready scenario=single entity=hm-scale-single-hmctrfix-20260503015744 expected=1 attempt=1 op=17469 commit=17469 pods=1/1/1
+single create submit: 293ms
+single 0->50 submit: 136ms
+single 0->50 ready: 7917ms
+single 50->1 submit: 184ms
+single 50->1 ready: 488ms
+
+=== Hivemind 50 deployments x 1 replica ===
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=25/50 pods_running=25 scheduled=47 total=50 op=17802 commit=17801 attempt=1/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=25/50 pods_running=25 scheduled=47 total=50 op=17810 commit=17809 attempt=2/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=25/50 pods_running=25 scheduled=47 total=50 op=17818 commit=17817 attempt=3/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=4/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=5/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=6/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=7/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=8/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=9/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=10/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=11/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17847 commit=17847 attempt=12/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17855 commit=17854 attempt=13/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17865 commit=17864 attempt=14/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17874 commit=17873 attempt=15/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17882 commit=17881 attempt=16/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=26/50 pods_running=26 scheduled=50 total=50 op=17890 commit=17889 attempt=17/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=18/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=19/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=20/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=21/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=22/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=23/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=24/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=25/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=26/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=27/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=28/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=29/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=30/1500
+waiting scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 ready=47/50 pods_running=47 scheduled=50 total=50 op=17919 commit=17919 attempt=31/1500
+ready scenario=multi_50x1 entity=hm-scale-many-hmctrfix-20260503015744 expected=50 attempt=32 op=17922 commit=17922 pods=50/50/50
+50x1 submit total: 10254ms
+50x1 all ready: 23559ms
+curl: (22) The requested URL returned error: 404
+# Hivemind scale benchmark matrix
+
+- run_id: hmctrfix-20260503015744
+- image: docker.io/library/nginx:1.27-alpine
+- latency_events: latency-events.csv
+- consolidated_latency_events: latency-events-consolidated.csv
+- latency_events_json: latency-events-consolidated.jsonl
+- latency_flamegraph: latency-flamegraph.folded
+- latency_summary: latency-summary.md
+- latency_deep_dive: latency-deep-dive.md
+- latency_firechart: latency-firechart.html
+
+| scenario | metric | value_ms |
+|---|---|---:|
+| one deployment 0 -> 50 -> 1 | create submit | 293 |
+| one deployment 0 -> 50 -> 1 | 0 -> 50 submit | 136 |
+| one deployment 0 -> 50 -> 1 | 0 -> 50 ready | 7917 |
+| one deployment 0 -> 50 -> 1 | 50 -> 1 submit | 184 |
+| one deployment 0 -> 50 -> 1 | 50 -> 1 ready | 488 |
+| 50 deployments x 1 replica | submit total | 10254 |
+| 50 deployments x 1 replica | all ready | 23559 |
+evidence=artifacts/poc-final/06-benchmarks/hivemind-scale-matrix-hmctrfix-20260503015744

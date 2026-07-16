@@ -1,0 +1,108 @@
+Warning: Permanently added '98.80.96.35' (ED25519) to the list of known hosts.
+== host ==
+2026-04-28T07:32:10Z
+ip-172-31-71-97.ec2.internal
+172.31.71.97 
+
+== services ==
+inactive
+active
+○ hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: inactive (dead) since Tue 2026-04-28 07:32:04 UTC; 5s ago
+   Duration: 1min 43.119s
+    Process: 2175 ExecStart=/usr/local/bin/hivemind --node-id ${HIVEMIND_NODE_ID} --replica-count ${HIVEMIND_REPLICA_COUNT} --agent-port ${HIVEMIND_AGENT_PORT} --client-port ${HIVEMIND_CLIENT_PORT} --replica-port ${HIVEMIND_PEER_PORT} --peers ${HIVEMIND_PEERS} --data-dir ${HIVEMIND_DATA_DIR} --metrics-port ${HIVEMIND_METRICS_PORT} --s3-backup ${HIVEMIND_S3_BACKUP} --gossip-port ${HIVEMIND_GOSSIP_PORT} --gossip-peers ${HIVEMIND_GOSSIP_PEERS} --region ${HIVEMIND_REGION} (code=killed, signal=TERM)
+   Main PID: 2175 (code=killed, signal=TERM)
+        CPU: 1.755s
+
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: create_deployment name=drill-cpu-1777361517-48414 replicas=1 deployment_count=1 pod_count=1
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind replica: dispatch pod_id=17678023832001937445 dep_id=11177516664432764457 node_id=1082269761 worker_idx=0
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: Stopping hivemind.service - Hivemind Replica...
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: hivemind.service: Deactivated successfully.
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: Stopped hivemind.service - Hivemind Replica.
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: hivemind.service: Consumed 1.755s CPU time.
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-04-28 07:30:21 UTC; 1min 49s ago
+   Main PID: 2176 (hivemind-api)
+      Tasks: 8 (limit: 9204)
+     Memory: 2.0M
+        CPU: 15ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2176 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.71.97:9001,172.31.71.99:9001,172.31.73.170:9001,172.31.67.248:9001,172.31.77.204:9001 --dns-targets
+
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:30:23 hivemind-api: listening on :8080
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 GET /v1/health
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 POST /v1/deployments
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 GET /dashboard/deployments
+Apr 28 07:32:02 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:02 GET /dashboard/deployments
+Apr 28 07:32:02 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:02 POST /v1/deployments/drill-cpu-1777361517-48414/run
+Apr 28 07:32:03 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:03 GET /v1/health
+Apr 28 07:32:03 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:03 GET /v1/health
+Apr 28 07:32:09 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:09 GET /v1/health
+Apr 28 07:32:09 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:09 GET /v1/health
+
+== local api health ==
+{"connected":true,"leader":"172.31.71.99:9001"}
+
+== consensus metrics ==
+
+== sockets 9001/9102 ==
+FIN-WAIT-2 0      0           172.31.71.97:9001    172.31.67.248:59154       
+FIN-WAIT-2 0      0           172.31.71.97:9001    172.31.77.204:48640       
+TIME-WAIT  0      0           172.31.71.97:51366   172.31.73.170:9102        
+TIME-WAIT  0      0           172.31.71.97:38068    172.31.71.99:9102        
+TIME-WAIT  0      0           172.31.71.97:33810   172.31.67.248:9102        
+FIN-WAIT-2 0      0           172.31.71.97:9001     172.31.71.99:34894       
+ESTAB      0      0           172.31.71.97:35234    172.31.71.99:9001        
+TIME-WAIT  0      0           172.31.71.97:60314   172.31.77.204:9102        
+FIN-WAIT-2 0      0           172.31.71.97:9001    172.31.73.170:54196       
+
+== processes ==
+   2176 Tue Apr 28 07:30:20 2026 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.71.97:9001,172.31.71.99:9001,172.31.73.170:9001,172.31.67.248:9001,172.31.77.204:9001 --dns-targets
+
+== recent hivemind logs ==
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal systemd[1]: Started hivemind.service - Hivemind Replica.
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal systemd[1]: Started hivemind-api.service - Hivemind API Gateway.
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: node=0 replicas=5 worker_port=9000 client_port=9001 peer_port=9102 data_dir=/var/lib/hivemind
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:30:21 hivemind-api: connecting to hivemind at [172.31.71.97:9001 172.31.71.99:9001 172.31.73.170:9001 172.31.67.248:9001 172.31.77.204:9001]
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: metrics on :9200
+Apr 28 07:30:21 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: listening on worker_port=9000 client_port=9001 peer_port=9102
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:30:23 hivemind-api: initial connect failed: no leader found among [172.31.71.97:9001 172.31.71.99:9001 172.31.73.170:9001 172.31.67.248:9001 172.31.77.204:9001] (will retry on first request)
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:30:23 hivemind-api: listening on :8080
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: connecting to peer 0 at 172.31.71.97:9102
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: connecting to peer 1 at 172.31.71.99:9102
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: connecting to peer 2 at 172.31.73.170:9102
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: connecting to peer 3 at 172.31.67.248:9102
+Apr 28 07:30:23 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: connecting to peer 4 at 172.31.77.204:9102
+Apr 28 07:30:34 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: peer 1 connected
+Apr 28 07:30:46 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: peer 2 connected
+Apr 28 07:30:59 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: peer 3 connected
+Apr 28 07:31:10 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind core: peer 4 connected
+Apr 28 07:31:25 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind replica: worker_idx=0 hostname=ip-172-31-74-56 assigned node_id=1082269761
+Apr 28 07:31:29 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind replica: worker_idx=1 hostname=ip-172-31-76-101 assigned node_id=1152992998833853505
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 GET /v1/health
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 POST /v1/deployments
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: create_deployment name=drill-cpu-1777361517-48414 replicas=1 deployment_count=1 pod_count=1
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind replica: dispatch pod_id=17678023832001937445 dep_id=11177516664432764457 node_id=1082269761 worker_idx=0
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:31:57 GET /dashboard/deployments
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 28 07:31:57 ip-172-31-71-97.ec2.internal hivemind[2175]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 28 07:32:02 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:02 GET /dashboard/deployments
+Apr 28 07:32:02 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:02 POST /v1/deployments/drill-cpu-1777361517-48414/run
+Apr 28 07:32:03 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:03 GET /v1/health
+Apr 28 07:32:03 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:03 GET /v1/health
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: Stopping hivemind.service - Hivemind Replica...
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: hivemind.service: Deactivated successfully.
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: Stopped hivemind.service - Hivemind Replica.
+Apr 28 07:32:04 ip-172-31-71-97.ec2.internal systemd[1]: hivemind.service: Consumed 1.755s CPU time.
+Apr 28 07:32:09 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:09 GET /v1/health
+Apr 28 07:32:09 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:09 GET /v1/health
+Apr 28 07:32:10 ip-172-31-71-97.ec2.internal hivemind-api[2176]: 2026/04/28 07:32:10 GET /v1/health

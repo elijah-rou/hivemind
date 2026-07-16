@@ -1,0 +1,37 @@
+section5_tag=section5-20260428015455
+api_url=http://18.207.4.79:8080
+replica_public_ips=18.207.4.79,3.238.202.101,13.217.168.119,18.207.237.139,3.239.84.9
+worker_cpu_public_ip=100.52.216.97
+worker_gpu_public_ip=44.213.58.222
+cpu_image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-section5-20260428015211
+timeout_seconds=900
+out_dir=/Users/elijahrou/Projects/hivemind/artifacts/poc-final/05-failure-drills
+log=/Users/elijahrou/Projects/hivemind/artifacts/poc-final/00-runbook/section5-section5-20260428015455.log
+=== Drill A: Leader loss during traffic ===
+
+[A1] Create deployment for drill traffic...
+{"id":11177516664432764457,"name":"drill-cpu-1777355696-35458"}
+
+[A2] Wait for deployment ready...
+  ready at attempt 2
+[A3] Verify /run works before kill...
+  PASS: pre-kill run succeeds (attempt 1)
+[A4] Current leader: 172.31.74.114:9001 public_ip=18.207.4.79
+     Killing hivemind on leader...
+     Leader stopped.
+[A5] Wait for new leader election + API reconnect...
+  PASS: api reconnects after leader loss (attempt 1)
+[Diagnostics] Capturing replica state: leader-loss-recovered-1777355696-35458 -> /Users/elijahrou/Projects/hivemind/artifacts/poc-final/05-failure-drills/diagnostics-leader-loss-recovered-1777355696-35458
+  capture 18.207.4.79
+  capture 3.238.202.101
+  capture 13.217.168.119
+  capture 18.207.237.139
+  capture 3.239.84.9
+     New leader: 172.31.65.128:9001
+  PASS: new leader different from killed
+[A6] Verify /run works after failover...
+  FAIL: post-kill run succeeds (expected field 'model', got '')
+[Cleanup] Restarting stopped leader replica 18.207.4.79...
+[Cleanup] Deleting drill deployment 11177516664432764457...
+TIMEOUT: command exceeded 900s; sending TERM to pid 35458
+/Users/elijahrou/Projects/hivemind/scripts/poc-section5-drill.sh: line 70: 35458 Terminated: 15          "$@"

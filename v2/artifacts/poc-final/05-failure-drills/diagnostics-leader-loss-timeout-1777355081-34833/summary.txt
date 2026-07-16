@@ -1,0 +1,6 @@
+label=leader-loss-timeout-1777355081-34833
+timestamp=2026-04-28T05:46:27Z
+api_url=http://100.49.44.172:8080
+public_api_health=unavailable
+killed_leader_addr=172.31.64.132:9001
+leader_stopped_ip=100.49.44.172

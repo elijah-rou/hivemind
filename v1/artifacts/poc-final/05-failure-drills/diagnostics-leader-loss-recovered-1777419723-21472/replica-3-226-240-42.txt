@@ -1,0 +1,210 @@
+Warning: Permanently added '3.226.240.42' (ED25519) to the list of known hosts.
+== host ==
+2026-04-28T23:42:42Z
+ip-172-31-10-192.ec2.internal
+172.31.10.192 
+
+== services ==
+inactive
+active
+○ hivemind.service - Hivemind Replica
+     Loaded: loaded (/etc/systemd/system/hivemind.service; enabled; preset: disabled)
+     Active: inactive (dead) since Tue 2026-04-28 23:42:36 UTC; 5s ago
+   Duration: 21min 1.531s
+    Process: 2523 ExecStart=/usr/local/bin/hivemind --node-id ${HIVEMIND_NODE_ID} --replica-count ${HIVEMIND_REPLICA_COUNT} --agent-port ${HIVEMIND_AGENT_PORT} --client-port ${HIVEMIND_CLIENT_PORT} --replica-port ${HIVEMIND_PEER_PORT} --peers ${HIVEMIND_PEERS} --data-dir ${HIVEMIND_DATA_DIR} --metrics-port ${HIVEMIND_METRICS_PORT} --s3-backup ${HIVEMIND_S3_BACKUP} --gossip-port ${HIVEMIND_GOSSIP_PORT} --gossip-peers ${HIVEMIND_GOSSIP_PEERS} --region ${HIVEMIND_REGION} (code=killed, signal=TERM)
+   Main PID: 2523 (code=killed, signal=TERM)
+        CPU: 24.779s
+
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=12186465589309304625 dep_id=1956468987595729445 node_id=1152992998833853505 worker_idx=1
+Apr 28 23:42:32 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14960181732260564859 old=terminating new=succeeded active=false
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=10440568676385178531 old=terminating new=succeeded active=false
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=scheduled new=pending active=true
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=pending new=scheduled active=true
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=scheduled new=running active=true
+Apr 28 23:42:36 ip-172-31-10-192.ec2.internal systemd[1]: Stopping hivemind.service - Hivemind Replica...
+Apr 28 23:42:36 ip-172-31-10-192.ec2.internal systemd[1]: hivemind.service: Deactivated successfully.
+Apr 28 23:42:37 ip-172-31-10-192.ec2.internal systemd[1]: Stopped hivemind.service - Hivemind Replica.
+Apr 28 23:42:37 ip-172-31-10-192.ec2.internal systemd[1]: hivemind.service: Consumed 24.779s CPU time.
+
+● hivemind-api.service - Hivemind API Gateway
+     Loaded: loaded (/etc/systemd/system/hivemind-api.service; enabled; preset: disabled)
+     Active: active (running) since Tue 2026-04-28 23:21:35 UTC; 21min ago
+   Main PID: 2524 (hivemind-api)
+      Tasks: 9 (limit: 9204)
+     Memory: 5.7M
+        CPU: 55ms
+     CGroup: /system.slice/hivemind-api.service
+             └─2524 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.10.192:9001,172.31.12.75:9001,172.31.6.158:9001,172.31.0.59:9001,172.31.6.253:9001 --dns-targets
+
+Apr 28 23:42:14 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:14 GET /dashboard/deployments
+Apr 28 23:42:19 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:19 GET /dashboard/deployments
+Apr 28 23:42:24 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:24 GET /dashboard/deployments
+Apr 28 23:42:29 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:29 GET /dashboard/deployments
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /dashboard/deployments
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 POST /v1/deployments/drill-cpu-1777419723-21472/run
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /v1/health
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /v1/health
+Apr 28 23:42:42 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:42 GET /v1/health
+Apr 28 23:42:42 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:42 GET /v1/health
+
+== local api health ==
+{"connected":true,"leader":"172.31.12.75:9001"}
+
+== consensus metrics ==
+
+== sockets 9001/9102 ==
+ESTAB      0      0           172.31.10.192:37054    172.31.12.75:9001        
+FIN-WAIT-2 0      0           172.31.10.192:9001     172.31.12.75:50526       
+FIN-WAIT-2 0      0           172.31.10.192:9001     172.31.6.158:56572       
+FIN-WAIT-2 0      0           172.31.10.192:9001     172.31.6.253:43938       
+TIME-WAIT  0      0           172.31.10.192:40884    172.31.6.158:9102        
+FIN-WAIT-2 0      0           172.31.10.192:9001      172.31.0.59:45430       
+TIME-WAIT  0      0           172.31.10.192:37658    172.31.6.253:9102        
+TIME-WAIT  0      0           172.31.10.192:41590     172.31.0.59:9102        
+TIME-WAIT  0      0           172.31.10.192:59406    172.31.12.75:9102        
+
+== processes ==
+   2524 Tue Apr 28 23:21:35 2026 /usr/local/bin/hivemind-api --listen :8080 --addrs 172.31.10.192:9001,172.31.12.75:9001,172.31.6.158:9001,172.31.0.59:9001,172.31.6.253:9001 --dns-targets
+
+== recent hivemind logs ==
+Apr 28 23:39:20 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:20 GET /v1/health
+Apr 28 23:39:20 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:20 GET /dashboard
+Apr 28 23:39:20 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:20 GET /dashboard/cluster
+Apr 28 23:39:20 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:20 GET /dashboard/nodes
+Apr 28 23:39:20 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:20 GET /dashboard/workers
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:22 POST /v1/deployments
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=smoke-cpu-1777419560-21058 replicas=1 deployment_count=1 pod_count=1
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=17678023832001937445 node_id=1082269761 phase=scheduled
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=17678023832001937445 dep_id=11177516664432764457 node_id=1082269761 worker_idx=0
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=pending active=true
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:22 GET /dashboard/deployments
+Apr 28 23:39:22 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:22 GET /dashboard/deployments
+Apr 28 23:39:25 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=pending new=scheduled active=true
+Apr 28 23:39:25 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=scheduled new=running active=true
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:27 GET /dashboard/deployments
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:27 POST /v1/deployments/smoke-cpu-1777419560-21058/run
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:27 POST /v1/deployments
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=smoke-gpu-1777419560-21058 replicas=1 deployment_count=2 pod_count=2
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=17775799001133815809 node_id=1152992998833853505 phase=scheduled
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=17775799001133815809 dep_id=9659130143999365733 node_id=1152992998833853505 worker_idx=1
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=pending active=true
+Apr 28 23:39:27 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:27 GET /dashboard/deployments
+Apr 28 23:39:28 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:28 GET /dashboard/deployments
+Apr 28 23:39:30 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=pending new=scheduled active=true
+Apr 28 23:39:30 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=scheduled new=running active=true
+Apr 28 23:39:33 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:33 GET /dashboard/deployments
+Apr 28 23:39:33 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:33 POST /v1/deployments/smoke-gpu-1777419560-21058/run
+Apr 28 23:39:34 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:34 GET /dashboard/deployments
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:35 GET /dashboard/pods
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:35 DELETE /v1/deployments/11177516664432764457
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:35 DELETE /v1/deployments/9659130143999365733
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:35 POST /v1/deployments
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=poc-cpu-1777419575 replicas=1 deployment_count=3 pod_count=3
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=14279964170112293133 node_id=1082269761 phase=scheduled
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=14279964170112293133 dep_id=11693034620340510321 node_id=1082269761 worker_idx=0
+Apr 28 23:39:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:35 GET /dashboard/deployments
+Apr 28 23:39:40 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:40 GET /dashboard/deployments
+Apr 28 23:39:46 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:46 GET /dashboard/deployments
+Apr 28 23:39:51 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:51 GET /dashboard/deployments
+Apr 28 23:39:56 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:39:56 GET /dashboard/deployments
+Apr 28 23:40:01 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:01 GET /dashboard/deployments
+Apr 28 23:40:05 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17678023832001937445 old=terminating new=succeeded active=false
+Apr 28 23:40:05 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=pending active=true
+Apr 28 23:40:05 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=pending new=scheduled active=true
+Apr 28 23:40:05 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=scheduled new=running active=true
+Apr 28 23:40:05 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17775799001133815809 old=terminating new=succeeded active=false
+Apr 28 23:40:06 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:06 GET /dashboard/deployments
+Apr 28 23:40:06 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:06 POST /v1/deployments/poc-cpu-1777419575/run
+Apr 28 23:40:06 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:06 POST /v1/deployments/poc-cpu-1777419575/run
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:07 POST /v1/deployments
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=poc-gpu-1777419575 replicas=1 deployment_count=4 pod_count=4
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=8332670729032836398 node_id=1152992998833853505 phase=scheduled
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=8332670729032836398 dep_id=9024654201992055039 node_id=1152992998833853505 worker_idx=1
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=8332670729032836398 old=scheduled new=pending active=true
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=8332670729032836398 old=pending new=scheduled active=true
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:07 GET /dashboard/deployments
+Apr 28 23:40:07 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=8332670729032836398 old=scheduled new=running active=true
+Apr 28 23:40:12 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:12 GET /dashboard/deployments
+Apr 28 23:40:12 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:12 POST /v1/deployments/poc-gpu-1777419575/run
+Apr 28 23:40:13 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:13 POST /v1/deployments/poc-gpu-1777419575/run
+Apr 28 23:40:13 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:13 GET /dashboard/deployments
+Apr 28 23:40:13 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:13 GET /dashboard/pods
+Apr 28 23:40:13 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:13 DELETE /v1/deployments/9024654201992055039
+Apr 28 23:40:13 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:13 DELETE /v1/deployments/11693034620340510321
+Apr 28 23:40:14 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:14 POST /v1/deployments
+Apr 28 23:40:14 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=op-cpu-1777419613 replicas=1 deployment_count=5 pod_count=5
+Apr 28 23:40:14 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=17270571163283330953 node_id=1082269761 phase=scheduled
+Apr 28 23:40:14 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=17270571163283330953 dep_id=2074683623940568804 node_id=1082269761 worker_idx=0
+Apr 28 23:40:14 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:14 GET /dashboard/deployments
+Apr 28 23:40:19 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:19 GET /dashboard/deployments
+Apr 28 23:40:24 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:24 GET /dashboard/deployments
+Apr 28 23:40:29 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:29 GET /dashboard/deployments
+Apr 28 23:40:34 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:34 GET /dashboard/deployments
+Apr 28 23:40:40 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:40 GET /dashboard/deployments
+Apr 28 23:40:43 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=8332670729032836398 old=terminating new=succeeded active=false
+Apr 28 23:40:43 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14279964170112293133 old=terminating new=succeeded active=false
+Apr 28 23:40:43 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17270571163283330953 old=scheduled new=pending active=true
+Apr 28 23:40:43 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17270571163283330953 old=pending new=scheduled active=true
+Apr 28 23:40:44 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17270571163283330953 old=scheduled new=running active=true
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:45 GET /dashboard/deployments
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:45 POST /v1/deployments
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=op-gpu-1777419613 replicas=1 deployment_count=6 pod_count=6
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=10440568676385178531 node_id=1152992998833853505 phase=scheduled
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=10440568676385178531 dep_id=5632491372296299238 node_id=1152992998833853505 worker_idx=1
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=10440568676385178531 old=scheduled new=pending active=true
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=10440568676385178531 old=pending new=scheduled active=true
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:45 GET /dashboard/deployments
+Apr 28 23:40:45 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=10440568676385178531 old=scheduled new=running active=true
+Apr 28 23:40:50 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:50 GET /dashboard/deployments
+Apr 28 23:40:50 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:50 PUT /v1/deployments/2074683623940568804
+Apr 28 23:40:50 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:50 PUT /v1/deployments/2074683623940568804/rollback
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:51 PUT /v1/deployments/2074683623940568804/scale
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=9909853072257765348 node_id=1082269761 phase=scheduled
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=9909853072257765348 dep_id=2074683623940568804 node_id=1082269761 worker_idx=0
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=9909853072257765348 old=scheduled new=pending active=true
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=9909853072257765348 old=pending new=scheduled active=true
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:51 GET /dashboard/deployments
+Apr 28 23:40:51 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=9909853072257765348 old=scheduled new=running active=true
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:56 GET /dashboard/deployments
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:56 PUT /v1/deployments/2074683623940568804/scale
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:56 GET /dashboard/deployments
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:40:56 POST /v1/deployments/op-cpu-1777419613/run
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=14960181732260564859 node_id=1082269761 phase=scheduled
+Apr 28 23:40:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=14960181732260564859 dep_id=2074683623940568804 node_id=1082269761 worker_idx=0
+Apr 28 23:41:26 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=17270571163283330953 old=terminating new=succeeded active=false
+Apr 28 23:41:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=9909853072257765348 old=terminating new=succeeded active=false
+Apr 28 23:41:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14960181732260564859 old=scheduled new=pending active=true
+Apr 28 23:41:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14960181732260564859 old=pending new=scheduled active=true
+Apr 28 23:41:56 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14960181732260564859 old=scheduled new=running active=true
+Apr 28 23:42:02 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:02 POST /v1/deployments/op-cpu-1777419613/run
+Apr 28 23:42:02 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:02 GET /dashboard/deployments
+Apr 28 23:42:02 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:02 DELETE /v1/deployments/2074683623940568804
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:03 DELETE /v1/deployments/5632491372296299238
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:03 GET /dashboard/deployments
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:03 GET /dashboard/pods
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:03 POST /v1/deployments
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: create_deployment name=drill-cpu-1777419723-21472 replicas=1 deployment_count=7 pod_count=9
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: bind_pod pod_id=12186465589309304625 node_id=1152992998833853505 phase=scheduled
+Apr 28 23:42:03 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind replica: dispatch pod_id=12186465589309304625 dep_id=1956468987595729445 node_id=1152992998833853505 worker_idx=1
+Apr 28 23:42:04 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:04 GET /dashboard/deployments
+Apr 28 23:42:09 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:09 GET /dashboard/deployments
+Apr 28 23:42:14 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:14 GET /dashboard/deployments
+Apr 28 23:42:19 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:19 GET /dashboard/deployments
+Apr 28 23:42:24 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:24 GET /dashboard/deployments
+Apr 28 23:42:29 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:29 GET /dashboard/deployments
+Apr 28 23:42:32 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=14960181732260564859 old=terminating new=succeeded active=false
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=10440568676385178531 old=terminating new=succeeded active=false
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=scheduled new=pending active=true
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=pending new=scheduled active=true
+Apr 28 23:42:33 ip-172-31-10-192.ec2.internal hivemind[2523]: hivemind sm: update_pod_status pod_id=12186465589309304625 old=scheduled new=running active=true
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /dashboard/deployments
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 POST /v1/deployments/drill-cpu-1777419723-21472/run
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /v1/health
+Apr 28 23:42:35 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:35 GET /v1/health
+Apr 28 23:42:36 ip-172-31-10-192.ec2.internal systemd[1]: Stopping hivemind.service - Hivemind Replica...
+Apr 28 23:42:36 ip-172-31-10-192.ec2.internal systemd[1]: hivemind.service: Deactivated successfully.
+Apr 28 23:42:37 ip-172-31-10-192.ec2.internal systemd[1]: Stopped hivemind.service - Hivemind Replica.
+Apr 28 23:42:37 ip-172-31-10-192.ec2.internal systemd[1]: hivemind.service: Consumed 24.779s CPU time.
+Apr 28 23:42:42 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:42 GET /v1/health
+Apr 28 23:42:42 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:42 GET /v1/health
+Apr 28 23:42:42 ip-172-31-10-192.ec2.internal hivemind-api[2524]: 2026/04/28 23:42:42 GET /v1/health

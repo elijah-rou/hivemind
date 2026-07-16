@@ -1,0 +1,24 @@
+api_url = "http://98.92.92.143:8080"
+dashboard_url = "http://98.92.92.143:8080/dashboard"
+ecr_repository_name = "hivemind-poc"
+ecr_repository_url = "288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc"
+replica_ami = "ami-098e39bafa7e7303d"
+replica_ips = [
+  "172.31.66.163",
+  "172.31.78.252",
+  "172.31.64.145",
+  "172.31.70.110",
+  "172.31.71.214",
+]
+replica_public_ips = [
+  "98.92.92.143",
+  "18.232.184.23",
+  "44.200.25.212",
+  "3.238.171.17",
+  "32.195.200.97",
+]
+worker_ami = "ami-0714f823ff4e72d73"
+worker_cpu_ip = "172.31.68.241"
+worker_cpu_public_ip = "44.211.239.120"
+worker_gpu_ip = "172.31.65.54"
+worker_gpu_public_ip = "3.236.20.222"

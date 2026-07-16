@@ -1,0 +1,16 @@
+{
+  "prefer_us_east_with_spillover": {
+    "app_id": "proj-app",
+    "preferred_locality": "us-east",
+    "allowed_localities": ["us-east", "us-central", "europe"],
+    "residency_mode": "prefer",
+    "fallback_order": ["us-east", "us-central", "europe"]
+  },
+  "strict_europe": {
+    "app_id": "proj-app",
+    "preferred_locality": "europe",
+    "allowed_localities": ["europe"],
+    "residency_mode": "strict",
+    "fallback_order": ["europe"]
+  }
+}
