@@ -1216,3 +1216,125 @@ test "journal retention: log_full before overwrite and restart reconstructs stat
     tc.advance(5);
     try std.testing.expectEqual(dep_count_before, tc.state_machines[0].deployment_count);
 }
+
+test "durable storage: duplicate reply waits for commit barrier" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xD0D0);
+    defer tc.deinit();
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    const client_id: u128 = 0xBEEF;
+    const request_id: msg.RequestId = 7;
+    const slot = replica_mod.journalSlot(1);
+
+    // Synthesize the unpublished-commit window: client table already updated
+    // (pre-fix behavior) while pending_reply still awaits the barrier.
+    tc.replicas[0].client_table[0] = .{
+        .client_id = client_id,
+        .request_id = request_id,
+        .result = .{ .ok = .{ .entity_id = 0 } },
+        .active = true,
+    };
+    tc.replicas[0].client_count = 1;
+    tc.replicas[0].pending_reply[slot] = true;
+    tc.replicas[0].pending_reply_client_id[slot] = client_id;
+    tc.replicas[0].pending_reply_request_id[slot] = request_id;
+    tc.replicas[0].pending_reply_result[slot] = .{ .ok = .{ .entity_id = 0 } };
+    tc.replicas[0].journal_occupied[slot] = true;
+    tc.replicas[0].journal[slot] = .{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = client_id,
+        .request_id = request_id,
+        .parent_checksum = 0,
+        .checksum = 0,
+    };
+    tc.replicas[0].journal[slot].checksum = tc.replicas[0].journal[slot].computeChecksum();
+    tc.replicas[0].commit_min = 1;
+    tc.replicas[0].commit_max = 1;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].metadata_dirty = true;
+
+    capture.count = 0;
+    tc.requestWithIdentity(0, client_id, request_id, .{ .noop = {} });
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+
+    // Barrier publishes the pending reply; a later duplicate may replay.
+    tc.tick();
+    try std.testing.expect(capture.count >= 1);
+    try std.testing.expect(capture.last_ok);
+
+    capture.count = 0;
+    tc.requestWithIdentity(0, client_id, request_id, .{ .noop = {} });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expect(capture.last_ok);
+}
+
+test "durable storage: StartView PrepareOk waits for barrier" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x57A1);
+    defer tc.deinit();
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var entry = msg.LogEntry{
+        .view_number = tc.replicas[0].view_number,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+
+    var sv = msg.StartViewMsg{
+        .view_number = tc.replicas[0].view_number,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+
+    // Install via StartView without ticking (no durability barrier yet).
+    tc.deliver(1, 0, .{ .start_view = sv });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(tc.replicas[1].journalHas(1));
+    try std.testing.expect(tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
+
+    // PrepareOk must not reach the leader until the follower flushes.
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
+
+    tc.tick();
+    tc.deliverAll();
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(!tc.replicas[1].journal_dirty[slot]);
+}
+
+test "recovery rejects metadata commit_max above op_number" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA17A);
+    defer tc.deinit();
+
+    try tc.disks[0].writeMetadata(.{
+        .view_number = 1,
+        .last_normal_view = 1,
+        .op_number = 2,
+        .commit_min = 2,
+        .commit_max = 5,
+    });
+    try tc.disks[0].sync();
+
+    tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
+    tc.replicas[0].initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+    try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
+}

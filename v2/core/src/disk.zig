@@ -71,7 +71,8 @@ pub const DiskInterface = struct {
 // ---------------------------------------------------------------------------
 
 pub const SimulatedDisk = struct {
-    const MAX_PENDING_WRITES: usize = 64;
+    /// Must cover a full retained-log flush (one dirty bit per slot).
+    const MAX_PENDING_WRITES: usize = replica_mod.LOG_SIZE_MAX;
 
     const PendingWrite = struct {
         slot: usize,
@@ -758,4 +759,22 @@ test "durable storage: fail-next-sync returns error and keeps pending" {
     try std.testing.expect(sim.readSlot(0) == null);
     try sim.sync();
     try std.testing.expect(sim.readSlot(0).?.op_number == 1);
+}
+
+test "durable storage: SimulatedDisk pending capacity covers LOG_SIZE_MAX" {
+    var sim = SimulatedDisk.init();
+    var slot: usize = 0;
+    while (slot < replica_mod.LOG_SIZE_MAX) : (slot += 1) {
+        var entry = msg.LogEntry{
+            .op_number = @intCast(slot + 1),
+            .view_number = 0,
+            .command = .{ .noop = {} },
+        };
+        entry.checksum = entry.computeChecksum();
+        try sim.writeSlot(slot, &entry);
+    }
+    try std.testing.expectEqual(replica_mod.LOG_SIZE_MAX, sim.pending_write_count);
+    try sim.sync();
+    try std.testing.expectEqual(@as(usize, 0), sim.pending_write_count);
+    try std.testing.expect(sim.readSlot(replica_mod.LOG_SIZE_MAX - 1) != null);
 }

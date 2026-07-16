@@ -88,6 +88,11 @@ pub fn main(init: std.process.Init) !void {
         node_id, replica_count, worker_port, client_port, peer_port, data_dir,
     });
 
+    if (data_dir.len == 0) {
+        std.debug.print("hivemind core: --data-dir is required (durable-before-ack storage)\n", .{});
+        std.process.exit(2);
+    }
+
     const sm = try allocator.create(StateMachine);
     sm.initInPlace(0);
 

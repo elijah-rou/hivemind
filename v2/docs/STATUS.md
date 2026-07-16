@@ -171,7 +171,7 @@ FRAME_HEADER = 7 bytes
 ## VRR Consensus
 
 - 5-node clusters, regionally scoped
-- LOG_SIZE_MAX=256 circular slots, CLIENT_TABLE_MAX=64
+- LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=64
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
 - Full view change protocol: StartViewChange → DoViewChange → StartView
@@ -323,7 +323,7 @@ Legacy deploy-mode benchmark, retained for historical context only:
 2. **Authentication** - No auth on API or agent connections. Need API keys + agent tokens.
 3. **Provider adapter** - No auto-provisioning of nodes. Manual VM setup required.
 4. **App spec model** - Current CreateDeployment is basic. Need full app spec (probes, scaling policy, env config, storage).
-5. **Log compaction** - 256-slot circular log works but needs compaction for long-running clusters.
+5. **Log compaction / snapshots** - Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; need snapshots before removing the cap.
 
 ### Important (blocks Knative parity)
 

@@ -364,6 +364,11 @@ pub const Replica = struct {
         var disk = self.disk orelse return false;
 
         const meta = disk.readMetadata() orelse return false;
+        if (meta.commit_min > meta.commit_max) return error.CorruptMetadata;
+        if (meta.commit_max > meta.op_number) return error.CorruptMetadata;
+        if (meta.op_number > LOG_SIZE_MAX) return error.CorruptMetadata;
+        if (meta.last_normal_view > meta.view_number) return error.CorruptMetadata;
+
         self.view_number = meta.view_number;
         self.last_normal_view = meta.last_normal_view;
         self.op_number = meta.op_number;
@@ -608,7 +613,10 @@ pub const Replica = struct {
         if (self.repair_pending) return;
         if (self.storage_failed) return;
 
-        // Client table dedup
+        // Client table dedup — only replay results that have already passed
+        // the commit durability barrier. Unpublished pending replies must not
+        // be acknowledged from the in-memory client table.
+        if (self.hasPendingClientReply(request.client_id, request.request_id)) return;
         if (self.findClient(request.client_id)) |entry| {
             if (entry.request_id >= request.request_id) {
                 // Replay committed result without mutating the journal.
@@ -1709,19 +1717,13 @@ pub const Replica = struct {
 
             self.journalPut(entry);
             const slot = journalSlot(entry.op_number);
-            const self_bit = @as(u16, 1) << @intCast(self.replica_id);
             const from_bit = @as(u16, 1) << @intCast(from);
-            self.prepare_ok_from[slot] = self_bit | from_bit;
-            self.prepare_ok_counts[slot] = if (from == self.replica_id) 1 else 2;
-
-            self.sendToAllOthers(.{ .prepare = .{
-                .view_number = self.view_number,
-                .op_number = entry.op_number,
-                .commit_min = self.commit_min,
-                .retention_floor = self.retention_floor,
-                .entry = entry,
-            } });
-            self.advanceCommit();
+            // Remote repair source already holds the entry; self-vote and Prepare
+            // broadcast wait for the local durability barrier.
+            self.prepare_ok_from[slot] = if (from == self.replica_id) 0 else from_bit;
+            self.prepare_ok_counts[slot] = if (from == self.replica_id) 0 else 1;
+            self.pending_prepare_broadcast[slot] = true;
+            self.metadata_dirty = true;
 
             if (!self.hasLogGaps()) {
                 self.repair_pending = false;
@@ -1732,25 +1734,19 @@ pub const Replica = struct {
             if (entry.op_number <= self.op_number) {
                 if (self.journalHas(entry.op_number)) return;
                 self.journalPut(entry);
-                // Send prepare_ok for gap fill to accelerate commit progress
+                // PrepareOk for gap fill waits for the durability barrier.
                 if (entry.op_number > self.commit_min) {
-                    self.sendTo(self.leader(), .{ .prepare_ok = .{
-                        .view_number = self.view_number,
-                        .op_number = entry.op_number,
-                        .replica_id = self.replica_id,
-                        .commit_min = self.commit_min,
-                    } });
+                    const slot = journalSlot(entry.op_number);
+                    self.pending_prepare_ok[slot] = true;
+                    self.pending_prepare_ok_to[slot] = self.leader();
                 }
             } else if (entry.op_number == self.op_number + 1) {
                 self.op_number = entry.op_number;
                 self.journalPut(entry);
 
-                self.sendTo(self.leader(), .{ .prepare_ok = .{
-                    .view_number = self.view_number,
-                    .op_number = entry.op_number,
-                    .replica_id = self.replica_id,
-                    .commit_min = self.commit_min,
-                } });
+                const slot = journalSlot(entry.op_number);
+                self.pending_prepare_ok[slot] = true;
+                self.pending_prepare_ok_to[slot] = self.leader();
             } else {
                 return;
             }
@@ -1822,13 +1818,11 @@ pub const Replica = struct {
         while (ack_op <= self.op_number) : (ack_op += 1) {
             const e = self.journalGet(ack_op) orelse break;
             if (!e.valid()) break;
-            self.sendTo(new_leader, .{ .prepare_ok = .{
-                .view_number = self.view_number,
-                .op_number = ack_op,
-                .replica_id = self.replica_id,
-                .commit_min = self.commit_min,
-            } });
+            const slot = journalSlot(ack_op);
+            self.pending_prepare_ok[slot] = true;
+            self.pending_prepare_ok_to[slot] = new_leader;
         }
+        self.metadata_dirty = true;
 
         if (self.hasLogGaps()) {
             self.transfer_pending = true;
@@ -1954,7 +1948,7 @@ pub const Replica = struct {
         const apply_end = io_mod.nowTick(self.io);
         const applied_deployment_id = if (entry.command == .create_deployment and result == .ok) result.ok.entity_id else latency.deploymentId(entry.command);
         latency.record(.{ .phase = "commit_apply", .op = latency.commandName(entry.command), .deployment_id = applied_deployment_id, .pod_id = latency.podId(entry.command), .name = latency.commandNameField(entry.command), .start_ms = apply_start, .end_ms = apply_end, .source = "core/src/replica.zig" });
-        self.updateClientTable(entry.client_id, entry.request_id, result);
+        // Client-table publication waits for the commit durability barrier.
         self.commit_min = op;
         self.replica_commit_min[self.replica_id] = self.commit_min;
         if (self.isLeader()) self.recomputeRetentionFloor();
@@ -2040,6 +2034,11 @@ pub const Replica = struct {
         }
 
         if (self.pending_reply[slot]) {
+            self.updateClientTable(
+                self.pending_reply_client_id[slot],
+                self.pending_reply_request_id[slot],
+                self.pending_reply_result[slot],
+            );
             if (self.client_reply_fn) |cb| {
                 cb(
                     self.client_reply_ctx.?,
@@ -2172,8 +2171,11 @@ pub const Replica = struct {
                     .retention_floor = self.retention_floor,
                     .entry = entry,
                 } });
-                self.prepare_ok_counts[slot] = 1;
-                self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+                const self_bit = @as(u16, 1) << @intCast(self.replica_id);
+                if (self.prepare_ok_from[slot] & self_bit == 0) {
+                    self.prepare_ok_from[slot] |= self_bit;
+                    self.prepare_ok_counts[slot] += 1;
+                }
                 self.pending_prepare_broadcast[slot] = false;
             }
 
@@ -2336,6 +2338,18 @@ pub const Replica = struct {
         return null;
     }
 
+    fn hasPendingClientReply(self: *const Replica, client_id: u128, request_id: msg.RequestId) bool {
+        for (0..LOG_SIZE_MAX) |i| {
+            if (!self.pending_reply[i]) continue;
+            if (self.pending_reply_client_id[i] == client_id and
+                self.pending_reply_request_id[i] == request_id)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn hasPendingRequest(self: *const Replica, client_id: u128, request_id: msg.RequestId) bool {
         var op = self.commit_max + 1;
         while (op <= self.op_number) : (op += 1) {
@@ -2374,6 +2388,8 @@ pub const Replica = struct {
     fn resendUncommittedPrepares(self: *Replica) void {
         var resend_op = self.commit_min + 1;
         while (resend_op <= self.op_number) : (resend_op += 1) {
+            // Never re-broadcast a Prepare before its local durability barrier.
+            if (resend_op > self.durable_prepare_through) continue;
             if (self.journalGet(resend_op)) |entry| {
                 const slot = journalSlot(resend_op);
                 if (self.prepare_ok_counts[slot] < self.quorum_size) {

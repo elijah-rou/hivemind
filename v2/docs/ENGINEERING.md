@@ -64,10 +64,11 @@ Design rule: Hivemind should not clone broad Kubernetes APIs by default. Build p
 
 VRR acknowledgements are durable-before-promise:
 
-1. Journal slot writes and protocol metadata are staged on the replica control loop.
-2. A single synchronous durability barrier (`fdatasync`, with `fsync` fallback) covers the flush batch for that tick.
-3. Prepare / PrepareOk / client replies / worker side effects are published only after the barrier that covers their state succeeds.
-4. Any write/metadata/sync error sets `storage_failed`, stops consensus/client/worker traffic, and causes the production process to exit nonzero.
+1. Production requires `--data-dir` (file-backed journal); starting without it exits nonzero.
+2. Journal slot writes and protocol metadata are staged on the replica control loop.
+3. A single synchronous durability barrier (`fdatasync`, with `fsync` fallback) covers the flush batch for that tick.
+4. Prepare / PrepareOk / client replies / worker side effects are published only after the barrier that covers their state succeeds.
+5. Any write/metadata/sync error sets `storage_failed`, stops consensus/client/worker traffic, and causes the production process to exit nonzero.
 
 Group commit keeps sync count O(1) per tick batch (typically one prepare barrier and one commit-metadata barrier), not one sync per operation. Persistence remains on the single core loop; slow disks can still stall unrelated work. Snapshots are required before removing the 1024-operation retained-log cap.
 
