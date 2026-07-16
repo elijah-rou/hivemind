@@ -68,6 +68,12 @@ pub const DiskInterface = struct {
 //
 // Writes update pending state only. Durable state is published on successful
 // sync(). crash() discards pending state (process loss before barrier).
+//
+// Fault model (intentional scope):
+//   - whole write() failures (fail-next / write_fault_rate)
+//   - whole sync() failures (fail-next / fail_at_sync_count)
+//   - loss of unsynced pending writes via crash()
+// Torn/partial sector writes and power-loss bit corruption are NOT modeled.
 // ---------------------------------------------------------------------------
 
 pub const SimulatedDisk = struct {
@@ -325,7 +331,7 @@ pub const SimulatedDisk = struct {
 };
 
 // ---------------------------------------------------------------------------
-// FileDisk -- file-backed persistence with TigerBeetle-inspired layout.
+// FileDisk -- experimental single-copy file-backed journal (layout v1).
 //
 // File layout (fixed zones):
 //   Offset 0:     Header   (64 bytes): magic, version, log_size_max
@@ -335,6 +341,11 @@ pub const SimulatedDisk = struct {
 //
 // All reads served from an in-memory copy. Writes go through to file via
 // pwrite + explicit fsync. No mmap for macOS compatibility.
+//
+// Contract: successful whole write + sync before publication, checksummed
+// entries, fail-closed open on wrong size/version, I/O errors fail-stop.
+// Torn writes and power-loss partial updates are NOT validated as
+// production-safe; this is an experimental POC journal, not a durability claim.
 // ---------------------------------------------------------------------------
 
 pub const FileDisk = struct {

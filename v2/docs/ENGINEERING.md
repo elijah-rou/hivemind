@@ -62,14 +62,14 @@ Design rule: Hivemind should not clone broad Kubernetes APIs by default. Build p
 
 ## Stable storage and group commit
 
-VRR acknowledgements are durable-before-promise:
+VRR acknowledgements use a write/sync-before-publication barrier when a journal is configured. This is an experimental POC contract, not a production torn-write / power-loss durability claim.
 
-1. Production requires `--data-dir` (file-backed journal); starting without it exits nonzero. The data directory is created/chmod'd to `0700`; `journal.bin` is created mode `0600` (commands may contain registry passwords or secret names; S3 journal backup propagates raw contents — treat at-rest access as sensitive).
+1. `--data-dir` is optional. Absent: explicit logged volatile POC mode (in-memory only). Present: experimental single-copy file journal with an explicit warning that torn writes and power loss are not validated. When present, the data directory is created/chmod'd to `0700`; `journal.bin` is created mode `0600` (commands may contain registry passwords or secret names; S3 journal backup propagates raw contents — treat at-rest access as sensitive).
 2. Journal slot writes and protocol metadata are staged on the replica control loop.
 3. A single synchronous durability barrier (`fdatasync`, with `fsync` fallback) covers the flush batch for that tick.
 4. Prepare / PrepareOk / client replies / worker side effects are published only after the barrier that covers their current entry identity `(op, checksum)` succeeds. A monotonic op watermark alone is not sufficient after same-op replacement (view change / StartView).
-5. Any write/metadata/sync error sets `storage_failed`, stops consensus/client/worker traffic, and causes the production process to exit nonzero.
-6. Opening an existing `journal.bin` that is not exactly the expected layout size fails closed (no silent empty re-init of truncated/partial journals). New journals are created exclusively (`O_EXCL`) and the parent directory is fsynced.
+5. Any whole write/metadata/sync error sets `storage_failed`, stops consensus/client/worker traffic, and causes the production process to exit nonzero. Simulation models whole write/sync failures and unsynced-write loss only — not torn/partial sector writes.
+6. Opening an existing `journal.bin` that is not exactly the expected layout size fails closed (no silent empty re-init of truncated/partial journals). New journals are created exclusively (`O_EXCL`) and the parent directory is fsynced. FileDisk layout remains version 1 with a fail-closed 1024-op retained-log lifetime cap.
 
 Group commit keeps sync count O(1) per tick batch (typically one prepare barrier and one commit-metadata barrier), not one sync per operation. Persistence remains on the single core loop; slow disks can still stall unrelated work. Snapshots are required before removing the 1024-operation retained-log cap.
 

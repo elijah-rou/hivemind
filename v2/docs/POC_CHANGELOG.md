@@ -44,6 +44,27 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Narrow experimental journal runtime contract
+
+What changed:
+- `--data-dir` is optional again: absent logs explicit volatile POC mode; present logs an experimental single-copy journal warning that torn writes and power loss are not validated
+- disk/simulation comments narrowed to whole write/sync failures and unsynced-write loss only (no torn-write claim)
+- deterministic real-binary `tests/storage_mode_smoke_test.sh` covers both modes and is wired into `tests/run-all.sh`
+- FileDisk remains layout version 1 with fail-closed 1024-op lifetime cap, checksums, sync-before-publication, and I/O fail-stop
+
+Why it matters:
+- avoids overclaiming production torn-write / power-loss durability while keeping the experimental journal path usable for POC
+- makes storage mode operator-visible at startup without requiring live infrastructure to verify
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; POC v2 still the presentation gate)
+
+Next steps:
+1. keep HM-BLK-01 torn-write-safe production durability out of scope until a real design lands
+2. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; this change is contract/docs + local smoke only)
+
 ### 2026-07-16 — Durable VRR storage, fail-closed retained log, stronger VOPR checker
 - Re-review hardenings: per-slot durable prepare identity, fail-closed truncated journals, launcher `--data-dir`, journal/data-dir modes, sim write faults on metadata/clear.
 

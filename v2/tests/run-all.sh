@@ -52,6 +52,10 @@ run_phase "Go build" \
 run_phase "Infra POC script tests" \
     bash -c "'$REPO_ROOT/infra/poc/test-worker-env.sh'"
 
+# --- Phase 4b: Storage-mode smoke (real binary, no live infra) ---
+run_phase "Storage-mode smoke (volatile + experimental)" \
+    bash -c "'$SCRIPT_DIR/storage_mode_smoke_test.sh'"
+
 # --- Phase 5: Containerd integration (Docker/OrbStack) ---
 if [ "$SKIP_CONTAINERD" = false ]; then
     if command -v docker &>/dev/null; then

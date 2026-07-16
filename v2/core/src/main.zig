@@ -88,9 +88,14 @@ pub fn main(init: std.process.Init) !void {
         node_id, replica_count, worker_port, client_port, peer_port, data_dir,
     });
 
+    // Storage-mode contract (POC, not production durability):
+    // - absent --data-dir: volatile in-memory journal (explicit POC mode)
+    // - present --data-dir: experimental single-copy file journal; torn writes /
+    //   power loss are not validated as production-safe
     if (data_dir.len == 0) {
-        std.debug.print("hivemind core: --data-dir is required (durable-before-ack storage)\n", .{});
-        std.process.exit(2);
+        std.debug.print("hivemind core: storage mode: volatile POC (no --data-dir; in-memory only, not durable across restart)\n", .{});
+    } else {
+        std.debug.print("hivemind core: storage mode: experimental single-copy journal (--data-dir); torn writes and power loss are not validated\n", .{});
     }
 
     const sm = try allocator.create(StateMachine);

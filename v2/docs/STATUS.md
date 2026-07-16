@@ -177,7 +177,7 @@ FRAME_HEADER = 7 bytes
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
 - Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence: journal.bin (`0600`) under `--data-dir` (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after durable `(op, checksum)` identity matches
+- Disk persistence (experimental): optional `--data-dir` → `journal.bin` (`0600`) under data dir (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after durable `(op, checksum)` identity matches. Absent `--data-dir` is explicit volatile POC mode. Torn writes / power loss are not validated as production-safe.
 - Crash recovery: validate committed prefix checksum chain; corrupt/missing/truncated journal or wrong-sized file fail-stop (nonzero exit); otherwise enter view_change to rejoin
 - Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries
 
@@ -275,7 +275,7 @@ Legacy deploy-mode benchmark, retained for historical context only:
 
 **VOPR simulation coverage:**
 - VRR consensus under faults (partitions, crashes, restarts)
-- Durable-before-ack storage barriers, group commit, and fail-stop on disk errors
+- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes not modeled)
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
 - Checker compares full entry checksums; commit regression and history capacity are violations
 - Cross-region gossip propagation
