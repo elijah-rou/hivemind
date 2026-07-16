@@ -1,6 +1,6 @@
 # Hivemind Status Report
 
-*Last updated: 2026-05-05*
+*Last updated: 2026-07-16*
 
 
 ## Current Presentation Gate (2026-05-05)
@@ -137,8 +137,8 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
          │  │ State Machine       │   │  nodes, deployments, pods
          │  │ Scheduler           │   │  bin-packing on GPU/CPU/mem
          │  │ Request Queue       │   │  run requests (no consensus)
-         │  │ Disk Journal        │   │  mmap'd, crash recovery
-         │  │ S3 Backup           │   │  forked aws s3 cp, 60s interval
+         │  │ Disk Journal        │   │  experimental v1 single-copy; not torn-write safe
+         │  │ S3 Backup           │   │  forked aws s3 cp (not atomic restore)
          │  │ Gossip              │   │  UDP, 5s broadcast, 30s stale
          │  └─────────────────────┘   │
          └──────────────┬──────────────┘
@@ -177,9 +177,10 @@ FRAME_HEADER = 7 bytes
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
 - Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence (experimental): optional `--data-dir` → `journal.bin` (`0600`) under data dir (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after durable `(op, checksum)` identity matches. Absent `--data-dir` is explicit volatile POC mode. Torn writes / power loss are not validated as production-safe.
-- Crash recovery: validate committed prefix checksum chain; corrupt/missing/truncated journal or wrong-sized file fail-stop (nonzero exit); otherwise enter view_change to rejoin
+- Disk persistence (experimental): optional `--data-dir` → `journal.bin` (`0600`) under data dir (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after successful write/sync for the current `(op, checksum)` identity. Absent `--data-dir` is explicit volatile POC mode. No torn-write / power-loss guarantee or simulation; no production crash-durability claim.
+- Restart recovery (experimental best-effort): validate committed-prefix checksum chain; VOPR enforces canonical recovered-prefix and immutable committed-prefix contracts; corrupt/missing/truncated/wrong-sized journal fail-stop (nonzero exit); otherwise enter view_change to rejoin. Not validated under torn writes or power loss.
 - Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries
+- S3 journal backup: periodic `aws s3 cp` of mutable v1 `journal.bin` — not an atomic crash-consistent restore artifact
 
 ## State Machine Operations
 
@@ -265,18 +266,20 @@ Legacy deploy-mode benchmark, retained for historical context only:
 
 ## Test Coverage
 
-**Current local verification:**
-- 132 Zig tests passing in Debug (`zig test src/unit_tests.zig`)
-- 132 Zig tests passing in ReleaseFast (`zig test src/unit_tests.zig -OReleaseFast`)
-- `zig build test` passing
-- 94 Rust tests passing (`cargo test`)
-- 10000 mutated core fuzz seeds passing
-- 10000 mutated worker fuzz seeds passing
+**Current local verification (branch evidence; no new live durability run):**
+- 176 Zig unit tests passing (`zig test src/unit_tests.zig -lc`)
+- `zig build test` / ReleaseFast suites used on prior branch commits
+- local smoke: `16 passed, 0 failed` (`tests/local-smoke.sh`)
+- local failover smoke: PASS (`tests/local-failover-smoke.sh`)
+- storage-mode smoke: volatile + experimental-journal startup contract (`tests/storage_mode_smoke_test.sh`)
+- launcher contract: stale smoke wrappers + bench/infra paths (`tests/launcher_contract_test.sh`)
+- Acceptance counts unchanged: `6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack; live infra status remains `up` from prior entries (no new live evidence in this docs pass)
 
 **VOPR simulation coverage:**
 - VRR consensus under faults (partitions, crashes, restarts)
-- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes not modeled)
+- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled)
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
+- Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection)
 - Checker compares full entry checksums; commit regression and history capacity are violations
 - Cross-region gossip propagation
 - Gossip under network partitions
@@ -297,14 +300,14 @@ Legacy deploy-mode benchmark, retained for historical context only:
 ## What's Working
 
 - [x] VRR 5-node consensus with view change, log repair, leader election
-- [x] Disk persistence + crash recovery
+- [x] Experimental v1 journal: write/sync-before-publication, I/O fail-stop, fail-closed 1024-op retention, best-effort restart recovery (not torn-write / power-loss safe)
 - [x] Agent registration, heartbeat, pod dispatch
 - [x] Full pod lifecycle: pull → create → start → monitor → stop with bounded worker-side lifecycle concurrency
 - [x] Run requests (stateless, no consensus overhead)
 - [x] Abandoned run request cleanup on client disconnect/timeout
 - [x] Scale-to-zero with queue-triggered wake
 - [x] Cross-region gossip (UDP, leader-only broadcast)
-- [x] S3 journal backup (forked, non-blocking, 60s interval)
+- [x] S3 journal backup (forked, non-blocking, 60s interval; not an atomic restore artifact)
 - [x] HTTP REST API (Go gateway)
 - [x] Secret resolution (Doppler, 5min cache)
 - [x] JuiceFS volume mounts
@@ -323,23 +326,24 @@ Legacy deploy-mode benchmark, retained for historical context only:
 2. **Authentication** - No auth on API or agent connections. Need API keys + agent tokens.
 3. **Provider adapter** - No auto-provisioning of nodes. Manual VM setup required.
 4. **App spec model** - Current CreateDeployment is basic. Need full app spec (probes, scaling policy, env config, storage).
-5. **Log compaction / snapshots** - Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; need snapshots before removing the cap.
+5. **Crash-consistent versioned storage + torn-write simulation** - v1 single-copy journal has no torn-write/power-loss model; required before any production durability claim (separate from snapshots).
+6. **Log compaction / snapshots** - Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; need snapshots before removing the cap.
 
 ### Important (blocks Knative parity)
 
-6. **Thalamus integration** - POC branch now has locality/residency resolver tests and localhost smoke evidence against Hivemind federation JSON; production integration remains future work.
-7. **Axon integration** - CLI/SDK needs to target Hivemind API instead of Knative.
-8. **Image pull secrets** - No registry auth for private images.
-9. **Readiness probes** - Liveness works, readiness not wired to traffic routing.
-10. **Graceful agent shutdown** - SIGTERM handler, pod draining.
-11. **Blue-green/canary traffic** - TrafficSplit command exists but not wired to request routing.
+7. **Thalamus integration** - POC branch now has locality/residency resolver tests and localhost smoke evidence against Hivemind federation JSON; production integration remains future work.
+8. **Axon integration** - CLI/SDK needs to target Hivemind API instead of Knative.
+9. **Image pull secrets** - No registry auth for private images.
+10. **Readiness probes** - Liveness works, readiness not wired to traffic routing.
+11. **Graceful agent shutdown** - SIGTERM handler, pod draining.
+12. **Blue-green/canary traffic** - TrafficSplit command exists but not wired to request routing.
 
 ### Nice-to-have (polish)
 
-12. **Rate limiting** - No request rate limits.
-13. **Advanced scheduling** - Basic bin-packing; no affinity, spread, cost optimization.
-14. **Observability** - Metrics exist but no tracing, no structured logging.
-15. **Multi-cluster state transfer** - No mechanism to migrate state between clusters.
+13. **Rate limiting** - No request rate limits.
+14. **Advanced scheduling** - Basic bin-packing; no affinity, spread, cost optimization.
+15. **Observability** - Metrics exist but no tracing, no structured logging.
+16. **Multi-cluster state transfer** - No mechanism to migrate state between clusters.
 
 ## Recommended Roadmap (Next Sessions)
 
@@ -403,7 +407,7 @@ Recently trimmed/frozen:
 | `core/src/message.zig` | VRR message types, field-by-field serialization |
 | `core/src/gossip.zig` | Cross-region UDP gossip |
 | `core/src/s3_backup.zig` | Forked S3 journal upload |
-| `core/src/disk.zig` | mmap'd journal persistence |
+| `core/src/disk.zig` | Experimental v1 single-copy journal (not torn-write safe) |
 | `core/src/metrics.zig` | Prometheus metrics export |
 | `core/src/request_queue.zig` | Leader-local run request queue |
 | `core/src/vopr/vopr.zig` | VOPR simulation scenarios |

@@ -21,7 +21,8 @@
 | C2 | Authentication | API and agent connections previously had no auth |
 | C3 | Provider adapter | Nodes are manual / out-of-band |
 | C4 | App spec model | CreateDeployment is minimal vs probes, scaling policy, env, storage |
-| C5 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; `log_full` / HTTP 507 until snapshots exist |
+| C5 | Crash-consistent versioned storage + torn-write simulation | v1 single-copy journal: write/sync-before-publication and I/O fail-stop only; no torn-write/power-loss model or simulation; blocks any production durability claim |
+| C6 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; `log_full` / HTTP 507 until snapshots exist |
 
 ### Important — Knative / platform parity
 
@@ -172,7 +173,8 @@ Use `docs/POC_V2_ACCEPTANCE.md` as the acceptance gate before team-facing replac
 5. **Security/isolation baseline** — auth, encrypted/authenticated component links, resource/device restrictions, explicit limitations.
 6. **Queue-aware serving/autoscaling** — queue-proxy/forwarder metrics, concurrency policy, scale-to-zero activation.
 7. **GitOps/integration** — declarative apply/status path and Thalamus routing integration.
-8. **Compaction / snapshots** — bounded replay time at restarts.
+8. **Compaction / snapshots** — bounded replay time at restarts (after crash-consistent storage).
+9. **Crash-consistent journal** — versioned dual-copy or append-safe publication plus torn-write simulation before production durability claims.
 
 ---
 

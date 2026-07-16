@@ -44,6 +44,55 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Withdraw unvalidated crash-durability claims
+
+What changed:
+- active docs now state the validated contract only: write/sync success before publication, fail-stop on complete I/O errors, fail-closed 1024-op retention, experimental v1 single-copy best-effort restart recovery
+- recorded canonical recovered-prefix (`observeRecovery`) and immutable committed-prefix validation; recorded HM-BLK-04/05 launcher repairs against maintained smoke/failover/bench paths
+- explicit non-claims: no torn-write/power-loss guarantee or simulation; S3 `journal.bin` copy is not an atomic restore artifact; no production crash-durability wording
+- FINDINGS adds crash-consistent versioned storage + torn-write simulation as a production blocker separate from snapshots
+
+Why it matters:
+- keeps POC safety hardenings reviewable without overclaiming production crash durability
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack; POC v2 still the presentation gate)
+
+Next steps:
+1. option-A crash-consistent journal + torn-write simulation before any production durability claim
+2. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; docs-only — no new live durability evidence)
+
+### 2026-07-16 — Repair active smoke and benchmark launchers
+
+What changed:
+- stale `tests/smoke_test.sh` / `tests/multi_node_smoke_test.sh` are `exec` wrappers to `local-smoke.sh --build` / `local-failover-smoke.sh --build`
+- `bench/compare.sh`, `infra/bench/{deploy.sh,main.tf}`, `infra/poc/hivemind.service`, `infra/gpu-test/run-tests.sh` use current `core/`/`worker/` roots and `--worker-port`
+- bench client speaks flags-byte framing; `HIVEMIND_ONLY=1` runs offline without kind
+- `tests/launcher_contract_test.sh` wired into `tests/run-all.sh`
+
+Why it matters:
+- active ops surfaces exercise current binaries instead of removed `agent/` / `--agent-port` / positional `cluster` paths
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; local launcher/bench verification only — no new live durability evidence)
+
+### 2026-07-16 — Preserve canonical committed prefixes across recovery
+
+What changed:
+- VOPR `StateChecker.observeRecovery` rejects recovered commit regression and divergent recovered canonical prefixes
+- `journalPut` / `onStartView` / `maybeStartView` reject same-op different-checksum replacement of locally committed slots; conflicting committed DVC values stay in view_change
+- deterministic regressions: `checker rejects: recovered commit regression`, `checker rejects: divergent recovered canonical prefix`, `StartView rejects conflicting committed prefix`, `view change rejects conflicting committed DVC values`
+
+Why it matters:
+- recovery and view installation no longer silently mutate or escape the canonical committed prefix under adversarial deterministic tests
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; deterministic safety only — no new live durability evidence)
+
 ### 2026-07-16 — Narrow experimental journal runtime contract
 
 What changed:
@@ -65,19 +114,20 @@ Next steps:
 
 Live infra status: unchanged (`up` from prior entries; this change is contract/docs + local smoke only)
 
-### 2026-07-16 — Durable VRR storage, fail-closed retained log, stronger VOPR checker
-- Re-review hardenings: per-slot durable prepare identity, fail-closed truncated journals, launcher `--data-dir`, journal/data-dir modes, sim write faults on metadata/clear.
+### 2026-07-16 — Write/sync-before-publication VRR storage, fail-closed retained log, stronger VOPR checker
+- Re-review hardenings: per-slot prepare identity after sync, fail-closed truncated journals, launcher `--data-dir`, journal/data-dir modes, sim write faults on metadata/clear.
 
 What changed:
-- PrepareOk, client replies, and worker effects wait for a successful journal/metadata durability barrier (synchronous group commit on the core loop)
-- storage write/sync failures fail-stop the replica (`storage_failed`) and exit nonzero in production
+- PrepareOk, client replies, and worker effects wait for a successful journal/metadata write/sync barrier (synchronous group commit on the core loop)
+- complete write/sync I/O failures fail-stop the replica (`storage_failed`) and exit nonzero in production
 - recovery validates the metadata-declared committed prefix (checksum chain); corrupt/missing slots refuse to continue as a fresh replica
 - retained log is fail-closed at `LOG_SIZE_MAX` (1024) with Zig `log_full`, API `ErrCodeLogFull`, and HTTP 507; no circular overwrite without snapshots
 - VOPR checker compares full entry checksums, treats commit regression as a violation, and fails loudly on history capacity exhaustion
 - deterministic filters: `durable storage`, `journal retention`, `group commit`, `checker rejects`
+- explicit non-claims in this entry: no torn-write/power-loss model; S3 journal copy is not an atomic restore; experimental v1 single-copy restart recovery only
 
 Why it matters:
-- closes acknowledged volatile prepares/replies and wrap-around state-loss classes that would invalidate POC durability claims
+- closes previously acknowledged in-memory prepares/replies and wrap-around committed-overwrite classes under the validated write/sync and retention contract
 - makes the finite-log blocker explicit to operators via metrics and HTTP 507 instead of silent overwrite
 
 Acceptance progress: unchanged (`6 / 8` POC v1 sections; POC v2 still the presentation gate)
