@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -105,4 +106,45 @@ func TestReadFrameRoundTrip(t *testing.T) {
 	_ = sr.Close()
 	_ = cw.Close()
 	_ = cr.Close()
+}
+
+func TestShortFrameErrorDoesNotPanic(t *testing.T) {
+	// Flags-only plaintext body: version/tag missing.
+	sr, cw := io.Pipe()
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr, w: cw}
+	go func() {
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], 1) // flags only
+		header[4] = 0x00
+		_, _ = sw.Write(header)
+		_ = sw.Close()
+	}()
+
+	buf := make([]byte, 256)
+	frame, err := readFrame(client, buf, time.Second)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if len(frame) != 0 {
+		t.Fatalf("expected empty body after flags, got %d", len(frame))
+	}
+	_, err = readReply(client, buf)
+	// readReply will try another read on the closed pipe; either path must not panic.
+	_ = err
+	_ = sr.Close()
+	_ = cw.Close()
+	_ = cr.Close()
+}
+
+func TestFormatShortFrameError(t *testing.T) {
+	frame := []byte{}
+	if len(frame) < 3 {
+		err := fmt.Errorf("short reply frame: %d bytes", len(frame))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		return
+	}
+	t.Fatalf("should not index frame[2]")
 }

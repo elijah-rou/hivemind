@@ -53,9 +53,11 @@ if [[ ! -x "$BENCH_BIN" ]]; then
 fi
 
 BENCH_DATA="$(mktemp -d "${TMPDIR:-/tmp}/hivemind-bench.XXXXXX")"
-BASE_REPLICA_PORT=55000
-BASE_CLIENT_PORT=55060
-BASE_WORKER_PORT=55120
+# Unique high ports per PID to avoid collision across parallel benchmark jobs.
+BASE=$((20000 + ($$ % 20000)))
+BASE_REPLICA_PORT=$((BASE + 0))
+BASE_CLIENT_PORT=$((BASE + 10))
+BASE_WORKER_PORT=$((BASE + 20))
 
 for i in 0 1 2; do
     rport=$((BASE_REPLICA_PORT + i))

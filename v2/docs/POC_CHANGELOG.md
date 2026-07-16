@@ -44,6 +44,30 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Peer-input safety and launcher fail-closed hardening
+
+What changed:
+- checked VRR deserialize (invalid tag / short payload / oversized DVC count) and peer identity/bound validation before vote and journal mutation
+- secret-bearing env files and journal paths fail-closed on permissions; GPU and bench launchers no longer fail-open on test status, broad `pkill`, or caller CWD
+- VOPR liveness retries recovery after clearing transient faults without wiping durable state; checker `committed_by` widened to `u16` for 11-replica topologies
+
+Why it matters:
+- malformed peer traffic can no longer panic/UB-crash replicas or forge view-change votes by spoofed identity
+- launchers and smoke paths stop reporting false success or leaking paid infra / journal directories
+
+Progress after change:
+- Acceptance sections complete: `6 / 8` (unchanged)
+- Execution checklist complete: `16 / 16` for warm-cache evidence pack (unchanged)
+- Infra status: `up` (unchanged)
+
+Next steps:
+1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
+2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
+3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+
+Blockers / unknowns:
+- nested `Command` union tags still lack a stable wire-byte layout for deserialize-time validation; handlers continue to rely on `LogEntry.valid()` and apply-time checks
+
 ### 2026-07-16 — Withdraw unvalidated crash-durability claims
 
 What changed:

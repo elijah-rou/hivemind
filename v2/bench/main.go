@@ -37,6 +37,19 @@ func main() {
 	payloadSize := flag.Int("payload", 64, "workload request payload size in bytes")
 	flag.Parse()
 
+	if *count <= 0 {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -n must be > 0\n")
+		os.Exit(2)
+	}
+	if *payloadSize < 0 {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -payload must be >= 0\n")
+		os.Exit(2)
+	}
+	if *replicas < 0 || *gpuCount < 0 {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -replicas and -gpus must be >= 0\n")
+		os.Exit(2)
+	}
+
 	addrList := strings.Split(*addrs, ",")
 
 	switch *mode {
@@ -162,6 +175,9 @@ func readRunResponse(conn net.Conn, buf []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagRunResponse {
+		if len(frame) < 3 {
+			return nil, fmt.Errorf("short run response frame: %d bytes", len(frame))
+		}
 		return nil, fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
 	return frame[3:], nil
@@ -291,6 +307,9 @@ func readLeaderProbe(conn net.Conn, buf []byte) (bool, error) {
 		return false, err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagClusterStateResp {
+		if len(frame) < 3 {
+			return false, fmt.Errorf("short probe frame: %d bytes", len(frame))
+		}
 		return false, fmt.Errorf("unexpected probe tag: 0x%02x", frame[2])
 	}
 	payload := frame[3:]
@@ -307,6 +326,9 @@ func readReply(conn net.Conn, buf []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagReply {
+		if len(frame) < 3 {
+			return nil, fmt.Errorf("short reply frame: %d bytes", len(frame))
+		}
 		return nil, fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
 	return frame[3:], nil
@@ -325,6 +347,12 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 }
 
 func printResults(label string, count int, totalDuration time.Duration, latencies []time.Duration) {
+	if len(latencies) == 0 {
+		fmt.Printf("\n=== Hivemind %s Benchmark Results ===\n", label)
+		fmt.Printf("Requests:     %d\n", count)
+		fmt.Printf("No completed samples\n")
+		return
+	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
 	n := len(latencies)
