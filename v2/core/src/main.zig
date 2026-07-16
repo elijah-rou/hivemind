@@ -123,7 +123,17 @@ pub fn main(init: std.process.Init) !void {
         const path = std.fmt.bufPrint(&path_buf, "{s}/journal.bin", .{data_dir}) catch @panic("data-dir path too long");
         const fd_ptr = try allocator.create(disk_mod.FileDisk);
         fd_ptr.openInPlace(path) catch |err| {
-            std.debug.print("failed to open journal: {}\n", .{err});
+            switch (err) {
+                error.LegacyJournalVersion => std.debug.print(
+                    "failed to open journal: legacy layout v1 is unsupported after the command codec change; delete journal.bin or use a fresh --data-dir (no migration)\n",
+                    .{},
+                ),
+                error.UnsupportedJournalVersion => std.debug.print(
+                    "failed to open journal: unsupported journal layout version (want v{d})\n",
+                    .{disk_mod.FileDisk.VERSION},
+                ),
+                else => std.debug.print("failed to open journal: {}\n", .{err}),
+            }
             return err;
         };
         file_disk = fd_ptr;

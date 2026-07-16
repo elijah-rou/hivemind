@@ -44,6 +44,22 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — FileDisk journal layout v2 with explicit LogEntry codec
+
+What changed:
+- FileDisk journal format bumped to layout version 2
+- on-disk LogEntry uses an explicit little-endian codec with checked tag-first Command decoding (never native `@sizeOf(LogEntry)` / `asBytes`)
+- legacy layout v1 journals are rejected at open with a useful startup error; no migration
+- corrupt Command tags fail during open/decode without materializing invalid unions
+- 1024-slot lifetime cap and complete-write/sync-before-publication semantics unchanged
+
+Why it matters:
+- after the nested Command wire codec change, persisting native tagged-union bytes under version 1 was an unsafe layout mismatch; v2 makes the durable format explicit and fail-closed
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; deterministic journal codec only — no new live durability evidence)
+
 ### 2026-07-16 — Fixed nested wire codec and fail-closed bench/deploy gates
 
 What changed:
