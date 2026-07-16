@@ -17,7 +17,8 @@ KEEP_INFRA="${KEEP_INFRA:-0}"
 BUCKET=""
 INSTANCE_ID=""
 CLEANUP_INSTALLED=0
-TERRAFORM_OWNED_BY_RUN=0
+RUN_WORKSPACE="hivemind-gpu-$(date +%s)-$$-$RANDOM"
+TF_DATA_DIR=""
 
 if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
   echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
@@ -27,6 +28,9 @@ if [[ ! -d "$WORKER_DIR" ]]; then
   echo "FAIL: worker source not found at $WORKER_DIR" >&2
   exit 1
 fi
+TF_DATA_DIR="$(mktemp -d)"
+export TF_DATA_DIR
+export TF_WORKSPACE="$RUN_WORKSPACE"
 
 cleanup() {
   local status=$?
@@ -34,19 +38,20 @@ cleanup() {
   set +e
   if [[ "$KEEP_INFRA" == "1" ]]; then
     echo "KEEP_INFRA=1: leaving resources for debugging"
+    echo "terraform workspace: $RUN_WORKSPACE"
     [[ -n "$INSTANCE_ID" ]] && echo "instance: $INSTANCE_ID"
     [[ -n "$BUCKET" ]] && echo "s3: s3://$BUCKET"
+    rm -rf "$TF_DATA_DIR"
     exit "$status"
   fi
   if [[ -n "$BUCKET" ]]; then
     aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null || true
   fi
-  if [[ "$TERRAFORM_OWNED_BY_RUN" == "1" ]]; then
-    cd "$SCRIPT_DIR"
-    terraform destroy -auto-approve 2>/dev/null || true
-  else
-    echo "preserving Terraform resources not owned by this invocation"
-  fi
+  cd "$SCRIPT_DIR"
+  terraform destroy -auto-approve 2>/dev/null || true
+  env -u TF_WORKSPACE terraform workspace select default >/dev/null 2>&1 || true
+  env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null 2>&1 || true
+  rm -rf "$TF_DATA_DIR"
   exit "$status"
 }
 
@@ -61,13 +66,9 @@ echo ""
 echo "=== Step 2: Terraform apply ==="
 cd "$SCRIPT_DIR"
 terraform init -input=false 2>/dev/null
-INITIAL_TERRAFORM_STATE="$(terraform state list)"
-if [[ -z "$INITIAL_TERRAFORM_STATE" ]]; then
-  TERRAFORM_OWNED_BY_RUN=1
-else
-  echo "Terraform state is nonempty; this invocation will not auto-destroy it"
-fi
-# Install cleanup after ownership inspection and before Terraform mutation.
+# Each invocation owns a unique Terraform workspace and local metadata directory.
+# Concurrent runs therefore cannot observe, mutate, or destroy each other's state.
+env -u TF_WORKSPACE terraform workspace new "$RUN_WORKSPACE" >/dev/null
 if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
   trap cleanup EXIT
   trap 'exit 130' INT
@@ -101,7 +102,7 @@ fi
 echo ""
 echo "=== Step 4: Setup instance ==="
 # Upload worker source and build on-instance (avoids cross-compilation issues)
-BUCKET_CANDIDATE="hivemind-gpu-test-$(date +%s)"
+BUCKET_CANDIDATE="hivemind-gpu-test-${RUN_WORKSPACE#hivemind-gpu-}"
 aws s3 mb "s3://$BUCKET_CANDIDATE" --region "$REGION"
 BUCKET="$BUCKET_CANDIDATE"
 

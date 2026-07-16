@@ -44,25 +44,26 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
-### 2026-07-16 — GPU cleanup ownership and explicit journal upgrade disposition
+### 2026-07-16 — Adversarial safety gate follow-up
 
 What changed:
-- GPU test launcher records whether Terraform state was empty before apply and auto-destroys only resources created from an initially empty state by this invocation
-- pre-existing nonempty Terraform state survives apply failures; `KEEP_INFRA=1` still explicitly retains invocation-owned resources; the current-run S3 bucket is cleaned independently after successful creation
-- active storage docs now require a full-cluster stop and fresh or explicitly archived/replaced data for the layout-v2 POC change
-- mixed-version peer clusters, legacy-v1 journal upgrades, rolling migration, and an incarnation protocol are explicitly unsupported and unclaimed
+- run requests now use gateway-unique worker correlation IDs and restore the original client/request identity on reply; a full 1024-entry table backpressures before dequeue instead of evicting unrelated work
+- duplicate peer sockets cannot replace an established replica binding based on an application frame; invalid Prepare, Commit, and StartView frames leave the healthy binding intact
+- worker response bodies have one 16 KiB-minus-metadata bound across Rust, Zig, and Go; overflow becomes explicit status 4 instead of successful truncation; frame writers reject oversize before allocation/write
+- GPU tests use per-run Terraform workspaces and local metadata directories; a concurrent barrier fixture proves overlapping runs destroy only their own workspaces
+- layout-v2 header, metadata, Command, LogEntry, and checksum inputs now use fixed-size little-endian codecs with static golden bytes
+- active storage docs retain the full-cluster-stop/fresh-data boundary and no rolling migration/incarnation claim
 
 Why it matters:
-- failure cleanup no longer risks destroying infrastructure owned before the GPU test invocation
-- the POC storage-format change has an explicit operational boundary without implying a rolling upgrade protocol
+- closes cross-client response disclosure/loss, duplicate-peer eviction, concurrent infra destruction, successful response corruption, and ABI/endian-dependent journal risks found by the adversarial gate
 
 Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
 
 Next steps:
-1. keep GPU integration runs isolated or explicitly retain resources with `KEEP_INFRA=1`
-2. design a version/incarnation protocol before any rolling-upgrade claim
+1. rerun the independent publish/adversarial gates
+2. retain the torn-write, dual-copy, migration, and snapshot work as separate production-hardening scope
 
-Live infra status: unchanged (`up` from prior entries; offline stubs and docs only)
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
 
 ### 2026-07-16 — Exact /run request-response length contract
 
