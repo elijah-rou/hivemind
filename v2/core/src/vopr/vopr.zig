@@ -78,6 +78,20 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
     for (0..config.replica_count) |i| {
         tc.disks[i].read_fault_rate = Ratio.zero();
         tc.disks[i].write_fault_rate = Ratio.zero();
+        tc.disks[i].fail_next_write = false;
+        tc.disks[i].fail_next_sync = false;
+        // Restart storage-failed / offline replicas. If local durable state is
+        // corrupt, wipe once and rejoin empty under a healed network.
+        if (!tc.replica_running[i] or tc.replicas[i].storage_failed) {
+            if (!tc.replica_running[i] and tc.replicas[i].storage_failed) {
+                tc.disks[i].wipe();
+            }
+            tc.crashReplica(@intCast(i));
+            if (!tc.replica_running[i]) {
+                tc.disks[i].wipe();
+                tc.crashReplica(@intCast(i));
+            }
+        }
     }
 }
 
@@ -199,6 +213,7 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
         }
 
         tc.tick();
+        tc.restartStorageFailed();
         tc.tickWorkers();
 
         phase1_ticks = tick_count + 1;
@@ -225,6 +240,7 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
     tick_count = 0;
     while (tick_count < config.liveness_ticks) : (tick_count += 1) {
         tc.tick();
+        tc.restartStorageFailed();
         tc.tickWorkers();
         phase2_ticks = tick_count + 1;
 
@@ -431,6 +447,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         }
 
         tc.tick();
+        tc.restartStorageFailed();
         tc.tickWorkers();
 
         phase1_ticks = tick_count + 1;
@@ -475,6 +492,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
 
     while (tick_count < config.liveness_ticks) : (tick_count += 1) {
         tc.tick();
+        tc.restartStorageFailed();
         tc.tickWorkers();
         phase2_ticks = tick_count + 1;
 

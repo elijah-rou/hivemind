@@ -15,34 +15,39 @@ pub const Metadata = struct {
     commit_max: msg.OpNumber = 0,
 };
 
+pub const DiskError = error{
+    WriteFailed,
+    SyncFailed,
+};
+
 // ---------------------------------------------------------------------------
 // DiskInterface -- vtable for disk persistence backends.
 // ---------------------------------------------------------------------------
 
 pub const DiskInterface = struct {
     ctx: *anyopaque,
-    write_slot_fn: *const fn (*anyopaque, usize, *const msg.LogEntry) void,
-    clear_slot_fn: *const fn (*anyopaque, usize) void,
+    write_slot_fn: *const fn (*anyopaque, usize, *const msg.LogEntry) DiskError!void,
+    clear_slot_fn: *const fn (*anyopaque, usize) DiskError!void,
     read_slot_fn: *const fn (*anyopaque, usize) ?msg.LogEntry,
-    write_metadata_fn: *const fn (*anyopaque, Metadata) void,
+    write_metadata_fn: *const fn (*anyopaque, Metadata) DiskError!void,
     read_metadata_fn: *const fn (*anyopaque) ?Metadata,
     metadata_equals_fn: *const fn (*anyopaque, Metadata) bool,
-    sync_fn: *const fn (*anyopaque) void,
+    sync_fn: *const fn (*anyopaque) DiskError!void,
 
-    pub fn writeSlot(self: DiskInterface, slot: usize, entry: *const msg.LogEntry) void {
-        self.write_slot_fn(self.ctx, slot, entry);
+    pub fn writeSlot(self: DiskInterface, slot: usize, entry: *const msg.LogEntry) DiskError!void {
+        return self.write_slot_fn(self.ctx, slot, entry);
     }
 
-    pub fn clearSlot(self: DiskInterface, slot: usize) void {
-        self.clear_slot_fn(self.ctx, slot);
+    pub fn clearSlot(self: DiskInterface, slot: usize) DiskError!void {
+        return self.clear_slot_fn(self.ctx, slot);
     }
 
     pub fn readSlot(self: DiskInterface, slot: usize) ?msg.LogEntry {
         return self.read_slot_fn(self.ctx, slot);
     }
 
-    pub fn writeMetadata(self: DiskInterface, meta: Metadata) void {
-        self.write_metadata_fn(self.ctx, meta);
+    pub fn writeMetadata(self: DiskInterface, meta: Metadata) DiskError!void {
+        return self.write_metadata_fn(self.ctx, meta);
     }
 
     pub fn readMetadata(self: DiskInterface) ?Metadata {
@@ -53,29 +58,49 @@ pub const DiskInterface = struct {
         return self.metadata_equals_fn(self.ctx, meta);
     }
 
-    pub fn sync(self: DiskInterface) void {
-        self.sync_fn(self.ctx);
+    pub fn sync(self: DiskInterface) DiskError!void {
+        return self.sync_fn(self.ctx);
     }
 };
 
 // ---------------------------------------------------------------------------
-// SimulatedDisk -- in-memory disk for deterministic simulation testing.
+// SimulatedDisk -- staged in-memory disk for deterministic simulation.
 //
-// Provides fixed-slot journal storage and metadata persistence.
-// Each slot holds one LogEntry. Metadata is a small fixed record.
+// Writes update pending state only. Durable state is published on successful
+// sync(). crash() discards pending state (process loss before barrier).
 // ---------------------------------------------------------------------------
 
 pub const SimulatedDisk = struct {
+    const MAX_PENDING_WRITES: usize = 64;
+
+    const PendingWrite = struct {
+        slot: usize,
+        entry: msg.LogEntry,
+    };
+
+    // Durable (post-sync) state
     slots: [replica_mod.LOG_SIZE_MAX]msg.LogEntry,
     slot_occupied: [replica_mod.LOG_SIZE_MAX]bool,
     metadata: Metadata,
     metadata_written: bool,
 
+    // Pending (pre-sync) state
+    pending_writes: [MAX_PENDING_WRITES]PendingWrite,
+    pending_write_count: usize,
+    pending_clear: [replica_mod.LOG_SIZE_MAX]bool,
+    pending_metadata: Metadata,
+    pending_metadata_dirty: bool,
+
     // Stats
     writes: u64,
     metadata_writes: u64,
+    syncs: u64,
     read_faults: u64,
     write_faults: u64,
+
+    // Deterministic fail-next controls
+    fail_next_write: bool,
+    fail_next_sync: bool,
 
     // Fault injection (set by VOPR)
     read_fault_rate: prng_mod.Ratio,
@@ -88,38 +113,99 @@ pub const SimulatedDisk = struct {
             .slot_occupied = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool),
             .metadata = .{},
             .metadata_written = false,
+            .pending_writes = undefined,
+            .pending_write_count = 0,
+            .pending_clear = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool),
+            .pending_metadata = .{},
+            .pending_metadata_dirty = false,
             .writes = 0,
             .metadata_writes = 0,
+            .syncs = 0,
             .read_faults = 0,
             .write_faults = 0,
+            .fail_next_write = false,
+            .fail_next_sync = false,
             .read_fault_rate = prng_mod.Ratio.zero(),
             .write_fault_rate = prng_mod.Ratio.zero(),
             .fault_prng = prng_mod.Prng.init(0xD15C),
         };
     }
 
-    pub fn writeSlot(self: *SimulatedDisk, slot: usize, entry: *const msg.LogEntry) void {
-        // Torn write fault: write happens but data is corrupted (slot marked occupied
-        // with garbage). Simulates power loss mid-write.
+    /// Reset durable and pending state in place (avoids huge stack temporaries).
+    pub fn wipe(self: *SimulatedDisk) void {
+        self.crash();
+        self.slot_occupied = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool);
+        self.metadata = .{};
+        self.metadata_written = false;
+        self.writes = 0;
+        self.metadata_writes = 0;
+        self.syncs = 0;
+        self.read_faults = 0;
+        self.write_faults = 0;
+    }
+
+    /// Discard unsynced writes (process crash before durability barrier).
+    pub fn crash(self: *SimulatedDisk) void {
+        self.pending_write_count = 0;
+        self.pending_clear = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool);
+        self.pending_metadata_dirty = false;
+        self.fail_next_write = false;
+        self.fail_next_sync = false;
+    }
+
+    fn removePendingWrite(self: *SimulatedDisk, slot: usize) void {
+        var i: usize = 0;
+        while (i < self.pending_write_count) {
+            if (self.pending_writes[i].slot == slot) {
+                self.pending_write_count -= 1;
+                self.pending_writes[i] = self.pending_writes[self.pending_write_count];
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn writeSlot(self: *SimulatedDisk, slot: usize, entry: *const msg.LogEntry) DiskError!void {
+        std.debug.assert(slot < replica_mod.LOG_SIZE_MAX);
+        if (self.fail_next_write) {
+            self.fail_next_write = false;
+            self.write_faults += 1;
+            return error.WriteFailed;
+        }
         if (self.fault_prng.chance(self.write_fault_rate)) {
-            self.slot_occupied[slot] = false; // torn: slot appears empty after "crash"
             self.write_faults += 1;
             self.writes += 1;
-            return;
+            return error.WriteFailed;
         }
-        self.slots[slot] = entry.*;
-        self.slot_occupied[slot] = true;
+        self.pending_clear[slot] = false;
+        for (self.pending_writes[0..self.pending_write_count]) |*pw| {
+            if (pw.slot == slot) {
+                pw.entry = entry.*;
+                self.writes += 1;
+                return;
+            }
+        }
+        if (self.pending_write_count >= MAX_PENDING_WRITES) return error.WriteFailed;
+        self.pending_writes[self.pending_write_count] = .{ .slot = slot, .entry = entry.* };
+        self.pending_write_count += 1;
         self.writes += 1;
     }
 
-    pub fn clearSlot(self: *SimulatedDisk, slot: usize) void {
-        self.slot_occupied[slot] = false;
+    pub fn clearSlot(self: *SimulatedDisk, slot: usize) DiskError!void {
+        std.debug.assert(slot < replica_mod.LOG_SIZE_MAX);
+        if (self.fail_next_write) {
+            self.fail_next_write = false;
+            self.write_faults += 1;
+            return error.WriteFailed;
+        }
+        self.removePendingWrite(slot);
+        self.pending_clear[slot] = true;
         self.writes += 1;
     }
 
     pub fn readSlot(self: *SimulatedDisk, slot: usize) ?msg.LogEntry {
+        std.debug.assert(slot < replica_mod.LOG_SIZE_MAX);
         if (!self.slot_occupied[slot]) return null;
-        // Read fault: data on disk but read fails (EIO, bit rot)
         if (self.fault_prng.chance(self.read_fault_rate)) {
             self.read_faults += 1;
             return null;
@@ -127,9 +213,14 @@ pub const SimulatedDisk = struct {
         return self.slots[slot];
     }
 
-    pub fn writeMetadata(self: *SimulatedDisk, meta: Metadata) void {
-        self.metadata = meta;
-        self.metadata_written = true;
+    pub fn writeMetadata(self: *SimulatedDisk, meta: Metadata) DiskError!void {
+        if (self.fail_next_write) {
+            self.fail_next_write = false;
+            self.write_faults += 1;
+            return error.WriteFailed;
+        }
+        self.pending_metadata = meta;
+        self.pending_metadata_dirty = true;
         self.metadata_writes += 1;
     }
 
@@ -147,6 +238,30 @@ pub const SimulatedDisk = struct {
             self.metadata.commit_max == meta.commit_max;
     }
 
+    pub fn sync(self: *SimulatedDisk) DiskError!void {
+        if (self.fail_next_sync) {
+            self.fail_next_sync = false;
+            return error.SyncFailed;
+        }
+        for (0..replica_mod.LOG_SIZE_MAX) |slot| {
+            if (self.pending_clear[slot]) {
+                self.slot_occupied[slot] = false;
+                self.pending_clear[slot] = false;
+            }
+        }
+        for (self.pending_writes[0..self.pending_write_count]) |pw| {
+            self.slots[pw.slot] = pw.entry;
+            self.slot_occupied[pw.slot] = true;
+        }
+        self.pending_write_count = 0;
+        if (self.pending_metadata_dirty) {
+            self.metadata = self.pending_metadata;
+            self.metadata_written = true;
+            self.pending_metadata_dirty = false;
+        }
+        self.syncs += 1;
+    }
+
     pub fn diskInterface(self: *SimulatedDisk) DiskInterface {
         return .{
             .ctx = @ptrCast(self),
@@ -160,20 +275,20 @@ pub const SimulatedDisk = struct {
         };
     }
 
-    fn writeSlotVtable(self: *SimulatedDisk, slot: usize, entry: *const msg.LogEntry) void {
-        self.writeSlot(slot, entry);
+    fn writeSlotVtable(self: *SimulatedDisk, slot: usize, entry: *const msg.LogEntry) DiskError!void {
+        return self.writeSlot(slot, entry);
     }
 
-    fn clearSlotVtable(self: *SimulatedDisk, slot: usize) void {
-        self.clearSlot(slot);
+    fn clearSlotVtable(self: *SimulatedDisk, slot: usize) DiskError!void {
+        return self.clearSlot(slot);
     }
 
     fn readSlotVtable(self: *SimulatedDisk, slot: usize) ?msg.LogEntry {
         return self.readSlot(slot);
     }
 
-    fn writeMetadataVtable(self: *SimulatedDisk, meta: Metadata) void {
-        self.writeMetadata(meta);
+    fn writeMetadataVtable(self: *SimulatedDisk, meta: Metadata) DiskError!void {
+        return self.writeMetadata(meta);
     }
 
     fn readMetadataVtable(self: *SimulatedDisk) ?Metadata {
@@ -184,8 +299,8 @@ pub const SimulatedDisk = struct {
         return self.metadataEquals(meta);
     }
 
-    fn syncVtable(_: *SimulatedDisk) void {
-        // No-op for simulation
+    fn syncVtable(self: *SimulatedDisk) DiskError!void {
+        return self.sync();
     }
 };
 
@@ -241,13 +356,12 @@ pub const FileDisk = struct {
         std.debug.assert(@sizeOf(MetadataOnDisk) == METADATA_SIZE);
     }
 
-    // In-memory copies
+    // In-memory copies (mirror of durable file content after successful writes)
     slots: [replica_mod.LOG_SIZE_MAX]msg.LogEntry,
     slot_occupied: [replica_mod.LOG_SIZE_MAX]bool,
     metadata: Metadata,
     metadata_written: bool,
     fd: std.posix.fd_t,
-    write_error: bool,
 
     /// Open or create a journal file. Initializes `self` in-place to avoid
     /// stack overflow (the slots array is ~115KB).
@@ -268,7 +382,6 @@ pub const FileDisk = struct {
                 if (std.c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
                 break :blk @intCast(stat_buf.size);
             } else {
-                // Linux: use lseek to get file size
                 const end = std.c.lseek(fd, 0, std.c.SEEK.END);
                 if (end < 0) return error.StatFailed;
                 _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
@@ -280,7 +393,6 @@ pub const FileDisk = struct {
         self.metadata = .{};
         self.metadata_written = false;
         self.fd = fd;
-        self.write_error = false;
 
         if (file_size < TOTAL_SIZE) {
             try self.initNewFile();
@@ -290,18 +402,14 @@ pub const FileDisk = struct {
     }
 
     fn initNewFile(self: *FileDisk) !void {
-        // Extend file to full size
         if (std.c.ftruncate(self.fd, @intCast(TOTAL_SIZE)) != 0) return error.TruncateFailed;
 
-        // Write header
         const header = Header{};
         try pwriteAll(self.fd, std.mem.asBytes(&header), HEADER_OFFSET);
 
-        // Write zeroed metadata
         const meta_disk = MetadataOnDisk{};
         try pwriteAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET);
 
-        // Write zeroed bitmap
         const zero_bitmap = std.mem.zeroes([BITMAP_SIZE]u8);
         try pwriteAll(self.fd, &zero_bitmap, BITMAP_OFFSET);
 
@@ -309,13 +417,11 @@ pub const FileDisk = struct {
     }
 
     fn loadExisting(self: *FileDisk) !void {
-        // Read and verify header
         var header: Header = undefined;
         try preadAll(self.fd, std.mem.asBytes(&header), HEADER_OFFSET);
         if (header.magic != MAGIC) return error.BadMagic;
         if (header.version != VERSION) return error.BadVersion;
 
-        // Read metadata
         var meta_disk: MetadataOnDisk = undefined;
         try preadAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET);
         self.metadata_written = meta_disk.written != 0;
@@ -327,11 +433,9 @@ pub const FileDisk = struct {
             .commit_max = meta_disk.commit_max,
         };
 
-        // Read bitmap
         var bitmap: [BITMAP_SIZE]u8 = undefined;
         try preadAll(self.fd, &bitmap, BITMAP_OFFSET);
 
-        // Read journal slots
         for (0..replica_mod.LOG_SIZE_MAX) |i| {
             const byte_idx = i / 8;
             const bit_idx: u3 = @intCast(i % 8);
@@ -349,24 +453,19 @@ pub const FileDisk = struct {
         self.fd = -1;
     }
 
-    pub fn writeSlot(self: *FileDisk, slot: usize, entry: *const msg.LogEntry) void {
+    pub fn writeSlot(self: *FileDisk, slot: usize, entry: *const msg.LogEntry) DiskError!void {
+        std.debug.assert(slot < replica_mod.LOG_SIZE_MAX);
+        const offset = JOURNAL_OFFSET + slot * ENTRY_SIZE;
+        pwriteAll(self.fd, std.mem.asBytes(entry), offset) catch return error.WriteFailed;
+        self.writeBitmapBit(slot, true) catch return error.WriteFailed;
         self.slots[slot] = entry.*;
         self.slot_occupied[slot] = true;
-
-        // Write entry to journal zone
-        const offset = JOURNAL_OFFSET + slot * ENTRY_SIZE;
-        pwriteAll(self.fd, std.mem.asBytes(entry), offset) catch |err| {
-            std.debug.print("disk write error (writeSlot slot={d}): {}\n", .{ slot, err });
-            self.write_error = true;
-        };
-
-        // Update bitmap
-        self.writeBitmapBit(slot, true);
     }
 
-    pub fn clearSlot(self: *FileDisk, slot: usize) void {
+    pub fn clearSlot(self: *FileDisk, slot: usize) DiskError!void {
+        std.debug.assert(slot < replica_mod.LOG_SIZE_MAX);
+        self.writeBitmapBit(slot, false) catch return error.WriteFailed;
         self.slot_occupied[slot] = false;
-        self.writeBitmapBit(slot, false);
     }
 
     pub fn readSlot(self: *const FileDisk, slot: usize) ?msg.LogEntry {
@@ -374,10 +473,7 @@ pub const FileDisk = struct {
         return self.slots[slot];
     }
 
-    pub fn writeMetadata(self: *FileDisk, meta: Metadata) void {
-        self.metadata = meta;
-        self.metadata_written = true;
-
+    pub fn writeMetadata(self: *FileDisk, meta: Metadata) DiskError!void {
         const meta_disk = MetadataOnDisk{
             .view_number = meta.view_number,
             .last_normal_view = meta.last_normal_view,
@@ -386,10 +482,9 @@ pub const FileDisk = struct {
             .commit_max = meta.commit_max,
             .written = 1,
         };
-        pwriteAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET) catch |err| {
-            std.debug.print("disk write error (writeMetadata): {}\n", .{err});
-            self.write_error = true;
-        };
+        pwriteAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET) catch return error.WriteFailed;
+        self.metadata = meta;
+        self.metadata_written = true;
     }
 
     pub fn readMetadata(self: *const FileDisk) ?Metadata {
@@ -406,21 +501,16 @@ pub const FileDisk = struct {
             self.metadata.commit_max == meta.commit_max;
     }
 
-    pub fn sync(self: *FileDisk) void {
-        fsyncFd(self.fd) catch |err| {
-            std.debug.print("disk sync error: {}\n", .{err});
-        };
+    pub fn sync(self: *FileDisk) DiskError!void {
+        fsyncFd(self.fd) catch return error.SyncFailed;
     }
 
-    fn writeBitmapBit(self: *FileDisk, slot: usize, occupied: bool) void {
-        // Read current bitmap byte, modify bit, write back
+    fn writeBitmapBit(self: *FileDisk, slot: usize, occupied: bool) DiskError!void {
         const byte_idx = slot / 8;
         const bit_idx: u3 = @intCast(slot % 8);
 
         var bitmap_byte: [1]u8 = undefined;
-        preadAll(self.fd, &bitmap_byte, BITMAP_OFFSET + byte_idx) catch {
-            bitmap_byte[0] = 0;
-        };
+        preadAll(self.fd, &bitmap_byte, BITMAP_OFFSET + byte_idx) catch return error.WriteFailed;
 
         if (occupied) {
             bitmap_byte[0] |= @as(u8, 1) << bit_idx;
@@ -428,10 +518,7 @@ pub const FileDisk = struct {
             bitmap_byte[0] &= ~(@as(u8, 1) << bit_idx);
         }
 
-        pwriteAll(self.fd, &bitmap_byte, BITMAP_OFFSET + byte_idx) catch |err| {
-            std.debug.print("disk write error (writeBitmapBit slot={d}): {}\n", .{ slot, err });
-            self.write_error = true;
-        };
+        pwriteAll(self.fd, &bitmap_byte, BITMAP_OFFSET + byte_idx) catch return error.WriteFailed;
     }
 
     pub fn diskInterface(self: *FileDisk) DiskInterface {
@@ -447,20 +534,20 @@ pub const FileDisk = struct {
         };
     }
 
-    fn writeSlotVtable(self: *FileDisk, slot: usize, entry: *const msg.LogEntry) void {
-        self.writeSlot(slot, entry);
+    fn writeSlotVtable(self: *FileDisk, slot: usize, entry: *const msg.LogEntry) DiskError!void {
+        return self.writeSlot(slot, entry);
     }
 
-    fn clearSlotVtable(self: *FileDisk, slot: usize) void {
-        self.clearSlot(slot);
+    fn clearSlotVtable(self: *FileDisk, slot: usize) DiskError!void {
+        return self.clearSlot(slot);
     }
 
     fn readSlotVtable(self: *FileDisk, slot: usize) ?msg.LogEntry {
         return self.readSlot(slot);
     }
 
-    fn writeMetadataVtable(self: *FileDisk, meta: Metadata) void {
-        self.writeMetadata(meta);
+    fn writeMetadataVtable(self: *FileDisk, meta: Metadata) DiskError!void {
+        return self.writeMetadata(meta);
     }
 
     fn readMetadataVtable(self: *FileDisk) ?Metadata {
@@ -471,13 +558,9 @@ pub const FileDisk = struct {
         return self.metadataEquals(meta);
     }
 
-    fn syncVtable(self: *FileDisk) void {
-        self.sync();
+    fn syncVtable(self: *FileDisk) DiskError!void {
+        return self.sync();
     }
-
-    // -----------------------------------------------------------------------
-    // POSIX helpers: pwrite/pread/fsync wrappers
-    // -----------------------------------------------------------------------
 
     fn pwriteAll(fd: std.posix.fd_t, buf: []const u8, offset: usize) !void {
         var written: usize = 0;
@@ -498,7 +581,12 @@ pub const FileDisk = struct {
     }
 
     fn fsyncFd(fd: std.posix.fd_t) !void {
-        if (std.c.fsync(fd) != 0) return error.FsyncFailed;
+        // Prefer fdatasync when available; fall back to fsync.
+        if (comptime @import("builtin").os.tag == .linux) {
+            if (std.c.fdatasync(fd) != 0) return error.FsyncFailed;
+        } else {
+            if (std.c.fsync(fd) != 0) return error.FsyncFailed;
+        }
     }
 };
 
@@ -523,31 +611,29 @@ test "SimulatedDisk through DiskInterface" {
     var sim = SimulatedDisk.init();
     var iface = sim.diskInterface();
 
-    // No metadata yet
     try std.testing.expect(iface.readMetadata() == null);
     try std.testing.expect(!iface.metadataEquals(.{}));
 
-    // Write metadata
     const meta = Metadata{ .view_number = 3, .op_number = 10, .commit_min = 5, .commit_max = 8 };
-    iface.writeMetadata(meta);
+    try iface.writeMetadata(meta);
+    try iface.sync();
     const read_meta = iface.readMetadata().?;
     try std.testing.expectEqual(read_meta.view_number, 3);
     try std.testing.expectEqual(read_meta.op_number, 10);
     try std.testing.expect(iface.metadataEquals(meta));
 
-    // Write and read slot
     var entry = msg.LogEntry{ .op_number = 42, .view_number = 3, .command = .{ .noop = {} } };
     entry.checksum = entry.computeChecksum();
-    iface.writeSlot(1, &entry);
+    try iface.writeSlot(1, &entry);
+    try iface.sync();
     const read_entry = iface.readSlot(1).?;
     try std.testing.expectEqual(read_entry.op_number, 42);
 
-    // Clear slot
-    iface.clearSlot(1);
+    try iface.clearSlot(1);
+    try iface.sync();
     try std.testing.expect(iface.readSlot(1) == null);
 
-    // Sync is a no-op but should not crash
-    iface.sync();
+    try iface.sync();
 }
 
 test "FileDisk: write and read slot" {
@@ -562,15 +648,14 @@ test "FileDisk: write and read slot" {
     var entry = msg.LogEntry{ .op_number = 7, .view_number = 1, .command = .{ .noop = {} } };
     entry.checksum = entry.computeChecksum();
 
-    fd.writeSlot(3, &entry);
-    fd.sync();
+    try fd.writeSlot(3, &entry);
+    try fd.sync();
 
     const read = fd.readSlot(3).?;
     try std.testing.expectEqual(read.op_number, 7);
     try std.testing.expectEqual(read.view_number, 1);
     try std.testing.expect(read.valid());
 
-    // Unoccupied slot returns null
     try std.testing.expect(fd.readSlot(4) == null);
 }
 
@@ -586,8 +671,8 @@ test "FileDisk: metadata persistence" {
     try std.testing.expect(fd.readMetadata() == null);
 
     const meta = Metadata{ .view_number = 5, .last_normal_view = 3, .op_number = 20, .commit_min = 15, .commit_max = 18 };
-    fd.writeMetadata(meta);
-    fd.sync();
+    try fd.writeMetadata(meta);
+    try fd.sync();
 
     const read = fd.readMetadata().?;
     try std.testing.expectEqual(read.view_number, 5);
@@ -605,18 +690,16 @@ test "FileDisk: reopen preserves data" {
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
 
-    // Write data and close
     try fd.openInPlace(path);
     var entry = msg.LogEntry{ .op_number = 99, .view_number = 2, .command = .{ .noop = {} } };
     entry.checksum = entry.computeChecksum();
-    fd.writeSlot(10, &entry);
+    try fd.writeSlot(10, &entry);
 
     const meta = Metadata{ .view_number = 2, .op_number = 99, .commit_min = 50, .commit_max = 60 };
-    fd.writeMetadata(meta);
-    fd.sync();
+    try fd.writeMetadata(meta);
+    try fd.sync();
     fd.close();
 
-    // Reopen and verify
     try fd.openInPlace(path);
     defer fd.close();
 
@@ -631,6 +714,48 @@ test "FileDisk: reopen preserves data" {
     try std.testing.expectEqual(read_meta.commit_min, 50);
     try std.testing.expectEqual(read_meta.commit_max, 60);
 
-    // Slot 0 should be empty
     try std.testing.expect(fd.readSlot(0) == null);
+}
+
+test "durable storage: SimulatedDisk stages until sync" {
+    var sim = SimulatedDisk.init();
+    var entry = msg.LogEntry{ .op_number = 1, .view_number = 0, .command = .{ .noop = {} } };
+    entry.checksum = entry.computeChecksum();
+
+    try sim.writeSlot(1, &entry);
+    try std.testing.expect(sim.readSlot(1) == null);
+    try sim.sync();
+    try std.testing.expect(sim.readSlot(1).?.op_number == 1);
+    try std.testing.expectEqual(@as(u64, 1), sim.syncs);
+}
+
+test "durable storage: SimulatedDisk crash discards pending" {
+    var sim = SimulatedDisk.init();
+    var entry = msg.LogEntry{ .op_number = 1, .view_number = 0, .command = .{ .noop = {} } };
+    entry.checksum = entry.computeChecksum();
+
+    try sim.writeSlot(1, &entry);
+    sim.crash();
+    try sim.sync();
+    try std.testing.expect(sim.readSlot(1) == null);
+}
+
+test "durable storage: fail-next-write returns error" {
+    var sim = SimulatedDisk.init();
+    sim.fail_next_write = true;
+    var entry = msg.LogEntry{ .op_number = 1, .command = .{ .noop = {} } };
+    entry.checksum = entry.computeChecksum();
+    try std.testing.expectError(error.WriteFailed, sim.writeSlot(0, &entry));
+}
+
+test "durable storage: fail-next-sync returns error and keeps pending" {
+    var sim = SimulatedDisk.init();
+    var entry = msg.LogEntry{ .op_number = 1, .command = .{ .noop = {} } };
+    entry.checksum = entry.computeChecksum();
+    try sim.writeSlot(0, &entry);
+    sim.fail_next_sync = true;
+    try std.testing.expectError(error.SyncFailed, sim.sync());
+    try std.testing.expect(sim.readSlot(0) == null);
+    try sim.sync();
+    try std.testing.expect(sim.readSlot(0).?.op_number == 1);
 }

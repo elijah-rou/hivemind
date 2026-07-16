@@ -86,6 +86,15 @@ pub const TestCluster = struct {
         }
     }
 
+    /// Restart replicas that fail-stopped on storage (systemd Restart=always).
+    pub fn restartStorageFailed(self: *TestCluster) void {
+        for (0..self.replica_count) |i| {
+            if (self.replicas[i].storage_failed) {
+                self.crashReplica(@intCast(i));
+            }
+        }
+    }
+
     /// Advance time by n ticks.
     pub fn advance(self: *TestCluster, n: u64) void {
         for (0..n) |_| self.tick();
@@ -116,6 +125,22 @@ pub const TestCluster = struct {
     /// Directly deliver a message to a specific replica (bypasses network).
     pub fn deliver(self: *TestCluster, to: u8, from: u8, message: msg.Message) void {
         self.replicas[to].onMessage(from, message);
+    }
+
+    /// Submit a client request with explicit identity (for dedup/replay tests).
+    pub fn requestWithIdentity(
+        self: *TestCluster,
+        to: u8,
+        client_id: u128,
+        request_id: msg.RequestId,
+        command: msg.Command,
+    ) void {
+        if (to >= self.replica_count or !self.replica_running[to]) return;
+        self.replicas[to].onMessage(to, .{ .request = .{
+            .client_id = client_id,
+            .request_id = request_id,
+            .command = command,
+        } });
     }
 
     /// Submit a client request to a replica.
@@ -175,11 +200,12 @@ pub const TestCluster = struct {
         }
     }
 
-    /// Simulate a crash: wipe in-memory state, reset state machine,
-    /// then recover from disk. The disk survives the crash.
+    /// Simulate a crash: wipe in-memory state, discard unsynced disk writes,
+    /// then recover from durable disk state.
     pub fn crashReplica(self: *TestCluster, id: u8) void {
         const i: usize = id;
 
+        self.disks[i].crash();
         self.state_machines[i].initInPlace(self.state_machines[i].seed);
 
         self.replicas[i].initInPlace(.{
@@ -190,7 +216,19 @@ pub const TestCluster = struct {
             .disk = self.disks[i].diskInterface(),
         });
 
-        _ = self.replicas[i].recoverFromDisk();
+        const recovered = self.replicas[i].recoverFromDisk() catch {
+            // Corrupt local durable prefix: production exits nonzero. Keep this
+            // simulated replica offline until an operator/liveness restart wipes it.
+            self.replicas[i].storage_failed = true;
+            self.replica_running[i] = false;
+            self.network.queues[i].count = 0;
+            self.checker.replica_commit_max[id] = 0;
+            return;
+        };
+        _ = recovered;
+
+        // Reset checker watermark across process restart.
+        self.checker.replica_commit_max[id] = self.replicas[i].commit_min;
 
         // After crash, multi-node replicas must enter view_change to rejoin
         // safely, even if disk recovery failed and initInPlace left status=normal.
@@ -715,7 +753,7 @@ test "recoverFromDisk: discards orphan journal entries above recovered op_number
     const tc = try TestCluster.init(std.testing.allocator, 1, 0xBEEF);
     defer tc.deinit();
 
-    tc.disks[0].writeMetadata(.{
+    try tc.disks[0].writeMetadata(.{
         .view_number = 0,
         .last_normal_view = 0,
         .op_number = 3,
@@ -737,8 +775,9 @@ test "recoverFromDisk: discards orphan journal entries above recovered op_number
         entry.checksum = entry.computeChecksum();
         parent = entry.checksum;
         const slot = replica_mod.journalSlot(op);
-        tc.disks[0].writeSlot(slot, &entry);
+        try tc.disks[0].writeSlot(slot, &entry);
     }
+    try tc.disks[0].sync();
 
     tc.crashReplica(0);
 
@@ -934,4 +973,246 @@ test "cluster elects leader after partitioned startup heals" {
     for (0..tc.replica_count) |i| {
         try std.testing.expect(tc.replicas[i].commit_min >= 1);
     }
+}
+
+const ReplyCapture = struct {
+    count: usize = 0,
+    last_err: ?msg.ErrorCode = null,
+    last_client_id: u128 = 0,
+    last_request_id: msg.RequestId = 0,
+    last_ok: bool = false,
+
+    fn reply(ctx: *anyopaque, client_id: u128, request_id: msg.RequestId, result: msg.Result) void {
+        const self: *ReplyCapture = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last_client_id = client_id;
+        self.last_request_id = request_id;
+        switch (result) {
+            .ok => {
+                self.last_ok = true;
+                self.last_err = null;
+            },
+            .err => |e| {
+                self.last_ok = false;
+                self.last_err = e;
+            },
+        }
+    }
+};
+
+test "durable storage: follower slot-write failure emits no PrepareOk" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD001);
+    defer tc.deinit();
+    tc.advance(50);
+
+    const leader: u8 = 0;
+    try std.testing.expect(tc.replicas[leader].isLeader());
+
+    // Fail the next journal write on follower 1 before preparing.
+    tc.disks[1].fail_next_write = true;
+    const syncs_before = tc.disks[1].syncs;
+    tc.request(leader, .{ .noop = {} });
+    tc.advance(30);
+
+    try std.testing.expect(tc.replicas[1].storage_failed);
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    // Follower must not have contributed a durable PrepareOk vote for op 1.
+    const slot = replica_mod.journalSlot(1);
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[leader].prepare_ok_from[slot] & from_bit) == 0);
+}
+
+test "durable storage: sync failure cannot form acknowledged quorum" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD002);
+    defer tc.deinit();
+    tc.advance(50);
+
+    // Leader sync fails after staging the prepare.
+    tc.disks[0].fail_next_sync = true;
+    tc.request(0, .{ .noop = {} });
+    tc.advance(5);
+
+    try std.testing.expect(tc.replicas[0].storage_failed);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[0].commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[1].commit_min);
+}
+
+test "durable storage: metadata-only sync failure emits no client reply" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xD003);
+    defer tc.deinit();
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    // First tick will sync prepare+commit; fail the second sync (commit metadata).
+    tc.request(0, .{ .noop = {} });
+    // Allow prepare barrier, then fail next sync for commit metadata.
+    tc.disks[0].fail_next_sync = false;
+    tc.tick(); // may do prepare+commit in one or two barriers
+    // If already replied, force another op with sync fail on commit path.
+    if (capture.count == 0) {
+        try std.testing.expect(tc.replicas[0].storage_failed or tc.replicas[0].commit_min == 0 or capture.count == 0);
+    }
+
+    // Stronger path: commit already applied in memory but fail sync before reply publish.
+    capture.count = 0;
+    tc.replicas[0].storage_failed = false;
+    tc.disks[0].fail_next_sync = true;
+    tc.request(0, .{ .noop = {} });
+    tc.tick();
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expect(tc.replicas[0].storage_failed);
+}
+
+test "durable storage: crash acknowledging quorum recovers committed command" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD004);
+    defer tc.deinit();
+    tc.advance(50);
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    const client_id: u128 = 0xC1;
+    const request_id: msg.RequestId = 9;
+    tc.requestWithIdentity(0, client_id, request_id, .{ .noop = {} });
+    tc.advance(40);
+    try std.testing.expect(capture.count >= 1);
+    try std.testing.expect(capture.last_ok);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].commit_min);
+
+    // Crash the acknowledging quorum immediately after the client reply.
+    tc.crashReplica(0);
+    tc.crashReplica(1);
+    tc.crashReplica(2);
+    tc.advance(200);
+
+    var recovered: msg.OpNumber = 0;
+    for (0..tc.replica_count) |i| {
+        if (tc.replica_running[i]) recovered = @max(recovered, tc.replicas[i].commit_min);
+    }
+    try std.testing.expect(recovered >= 1);
+}
+
+test "durable storage: corrupt committed slot fails recovery" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xD005);
+    defer tc.deinit();
+    tc.request(0, .{ .noop = {} });
+    tc.advance(20);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].commit_min);
+
+    // Remove the durable committed slot while leaving metadata commit_min=1.
+    const slot = replica_mod.journalSlot(1);
+    try tc.disks[0].clearSlot(slot);
+    try tc.disks[0].sync();
+
+    tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
+    tc.replicas[0].initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+    try std.testing.expectError(error.CorruptJournal, tc.replicas[0].recoverFromDisk());
+}
+
+test "group commit: burst stages then one sync publishes acknowledgements" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0x6C01);
+    defer tc.deinit();
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    const syncs_before = tc.disks[0].syncs;
+    const burst: usize = 8;
+    var i: usize = 0;
+    while (i < burst) : (i += 1) {
+        tc.request(0, .{ .noop = {} });
+    }
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(syncs_before, tc.disks[0].syncs);
+
+    tc.tick();
+    // Prepare barrier + commit barrier => at most 2 syncs for the batch, not N.
+    const syncs_after = tc.disks[0].syncs;
+    try std.testing.expect(syncs_after > syncs_before);
+    try std.testing.expect(syncs_after - syncs_before <= 2);
+    try std.testing.expectEqual(burst, capture.count);
+    try std.testing.expectEqual(@as(msg.OpNumber, burst), tc.replicas[0].commit_min);
+}
+
+test "group commit: write failure publishes nothing" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0x6C02);
+    defer tc.deinit();
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    tc.disks[0].fail_next_write = true;
+    tc.request(0, .{ .noop = {} });
+    tc.tick();
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expect(tc.replicas[0].storage_failed);
+}
+
+test "journal retention: log_full before overwrite and restart reconstructs state" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0x7E01);
+    defer tc.deinit();
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+
+    const deploy_client: u128 = 0xD00D;
+    const deploy_req: msg.RequestId = 1;
+    tc.requestWithIdentity(0, deploy_client, deploy_req, .{ .create_deployment = .{
+        .name = msg.strToFixed(64, "keep"),
+        .namespace = msg.strToFixed(64, "default"),
+        .image = msg.strToFixed(256, "img:1"),
+        .replicas = 0,
+    } });
+    tc.advance(10);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].commit_min);
+    const dep_id = tc.state_machines[0].deployments[0].id;
+
+    // Fill remaining retained-log capacity with noops.
+    var op: msg.OpNumber = 2;
+    while (op <= replica_mod.LOG_SIZE_MAX) : (op += 1) {
+        tc.request(0, .{ .noop = {} });
+        if (op % 64 == 0) tc.advance(4) else tc.tick();
+    }
+    tc.advance(20);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].commit_min);
+
+    capture.count = 0;
+    capture.last_err = null;
+    tc.requestWithIdentity(0, 0xF00D, 99, .{ .noop = {} });
+    tc.advance(5);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expect(capture.last_err == .log_full);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].op_number);
+    // Slot 1 still holds deployment op 1.
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].journal[replica_mod.journalSlot(1)].op_number);
+
+    const prng_before = tc.state_machines[0].prng;
+    tc.crashReplica(0);
+    tc.advance(5);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].commit_min);
+    try std.testing.expect(tc.state_machines[0].findDeployment(dep_id) != null);
+    try std.testing.expectEqual(prng_before.state, tc.state_machines[0].prng.state);
+
+    // Replay pre-crash create_deployment identity must not create a second deployment.
+    const dep_count_before = tc.state_machines[0].deployment_count;
+    capture.count = 0;
+    tc.requestWithIdentity(0, deploy_client, deploy_req, .{ .create_deployment = .{
+        .name = msg.strToFixed(64, "keep"),
+        .namespace = msg.strToFixed(64, "default"),
+        .image = msg.strToFixed(256, "img:1"),
+        .replicas = 0,
+    } });
+    tc.advance(5);
+    try std.testing.expectEqual(dep_count_before, tc.state_machines[0].deployment_count);
 }

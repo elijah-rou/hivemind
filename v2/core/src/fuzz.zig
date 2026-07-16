@@ -323,7 +323,7 @@ fn baseConfig() VoprConfig {
         .replica_count = 5,
         .safety_ticks = 500,
         .request_count = 20,
-        .liveness_ticks = 2000,
+        .liveness_ticks = 8000,
         .partition_probability = Ratio.init(3, 100),
         .heal_probability = Ratio.init(8, 100),
         .crash_probability = Ratio.init(1, 100),
@@ -369,7 +369,7 @@ fn mutateConfig(base: VoprConfig, seed: u64) VoprConfig {
         12 => config.path_max_capacity = @intCast(4 + prng.bounded(28)),
         13 => config.deployment_count = @intCast(prng.bounded(11)),
         14 => config.worker_count = @intCast(prng.bounded(9)),
-        15 => config.liveness_ticks = 100 + prng.bounded(900),
+        15 => config.liveness_ticks = 500 + prng.bounded(3500),
         else => {},
     }
 

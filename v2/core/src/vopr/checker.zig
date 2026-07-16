@@ -5,17 +5,21 @@ const replica_mod = @import("../replica.zig");
 /// Observes commits across all replicas and verifies consensus safety.
 ///
 /// Invariant: if two replicas both commit operation N, they must have
-/// applied the same command. We track a canonical commit history --
-/// first replica to commit op N establishes truth, all others must match.
+/// applied the same complete log entry (checksum + client/request identity).
 ///
 /// Modeled after TigerBeetle's StateChecker.
 pub const StateChecker = struct {
-    pub const MAX_HISTORY: usize = 4096;
+    /// Bound checker history to the retained-log lifetime (no snapshots yet).
+    pub const MAX_HISTORY: usize = replica_mod.LOG_SIZE_MAX;
 
-    /// Canonical commit record: the command that was committed at each op.
+    comptime {
+        std.debug.assert(MAX_HISTORY == replica_mod.LOG_SIZE_MAX);
+    }
+
+    /// Canonical commit record: the complete entry identity at each op.
     const CommitRecord = struct {
         op: msg.OpNumber,
-        command_tag: u8,
+        checksum: u64,
         client_id: u128,
         request_id: msg.RequestId,
         /// Which replicas have committed this op (bitset).
@@ -77,7 +81,23 @@ pub const StateChecker = struct {
         const prev_commit = self.replica_commit_max[replica_id];
         const curr_commit = r.commit_min;
 
-        if (curr_commit <= prev_commit) return;
+        if (curr_commit < prev_commit) {
+            // After crash recovery the in-memory commit point may be behind the
+            // last observed value until catch-up. Reset tracking; do not treat
+            // process restart as a durability regression.
+            if (r.recovered_from_disk) {
+                self.replica_commit_max[replica_id] = curr_commit;
+                return;
+            }
+            self.recordViolation(
+                "replica {d}: durable commit point regressed from {d} to {d}",
+                .{ replica_id, prev_commit, curr_commit },
+            );
+            self.replica_commit_max[replica_id] = curr_commit;
+            return;
+        }
+
+        if (curr_commit == prev_commit) return;
 
         // Replica committed new operations. Validate each one.
         var op = prev_commit + 1;
@@ -96,27 +116,23 @@ pub const StateChecker = struct {
     ) void {
         self.commits_checked += 1;
 
-        // Get the journal entry for this op
         const entry = r.journalGet(op) orelse {
             self.recordViolation("replica {d} committed op {d} but entry not in journal", .{
                 replica_id, op,
             });
             return;
         };
-        const command_tag: u8 = @intFromEnum(std.meta.activeTag(entry.command));
 
-        // Check against canonical history
         if (self.findRecord(op)) |record| {
-            // Another replica already committed this op. Must match.
-            if (record.command_tag != command_tag or
+            if (record.checksum != entry.checksum or
                 record.client_id != entry.client_id or
                 record.request_id != entry.request_id)
             {
                 self.recordViolation(
-                    "CONSENSUS VIOLATION: replica {d} committed op {d} with different command (tag {d} vs {d}, client {d} vs {d}, req {d} vs {d}, view {d}, committed_by 0b{b:0>3})",
+                    "CONSENSUS VIOLATION: replica {d} committed op {d} with different entry (checksum {d} vs {d}, client {d} vs {d}, req {d} vs {d}, view {d}, committed_by 0b{b:0>3})",
                     .{
-                        replica_id, op,
-                        command_tag,         record.command_tag,
+                        replica_id,          op,
+                        entry.checksum,      record.checksum,
                         entry.client_id,     record.client_id,
                         entry.request_id,    record.request_id,
                         entry.view_number,
@@ -125,16 +141,18 @@ pub const StateChecker = struct {
                 );
                 return;
             }
-            // Mark this replica as having committed
             record.committed_by |= @as(u8, 1) << @intCast(replica_id);
         } else {
-            // First replica to commit this op. Establish canonical record.
             if (self.history_len >= MAX_HISTORY) {
+                self.recordViolation(
+                    "checker history capacity exhausted at {d} (MAX_HISTORY={d}) while recording op {d}",
+                    .{ self.history_len, MAX_HISTORY, op },
+                );
                 return;
             }
             self.history[self.history_len] = .{
                 .op = op,
-                .command_tag = command_tag,
+                .checksum = entry.checksum,
                 .client_id = entry.client_id,
                 .request_id = entry.request_id,
                 .committed_by = @as(u8, 1) << @intCast(replica_id),
@@ -143,17 +161,13 @@ pub const StateChecker = struct {
         }
     }
 
-    /// Check per-replica protocol invariants.
     fn checkReplicaInvariants(self: *StateChecker, replica_id: u8, r: *const replica_mod.Replica) void {
-        // commit_min must never exceed op_number
         if (r.commit_min > r.op_number) {
             self.recordViolation("replica {d}: commit_min ({d}) > op_number ({d})", .{
                 replica_id, r.commit_min, r.op_number,
             });
         }
 
-        // Pipeline window must fit in circular journal.
-        // Bound is over own commit_min -- retention_floor is informational only.
         if (r.op_number > r.commit_min and
             r.op_number - r.commit_min > @as(msg.OpNumber, replica_mod.LOG_SIZE_MAX))
         {
@@ -164,7 +178,6 @@ pub const StateChecker = struct {
             });
         }
 
-        // Journal's highest op must not exceed op_number.
         const high_op = r.logHighOp();
         if (high_op > r.op_number) {
             self.recordViolation("replica {d}: highest journal op ({d}) > op_number ({d})", .{
@@ -172,7 +185,6 @@ pub const StateChecker = struct {
             });
         }
 
-        // GPU capacity accounting: allocated must never exceed total
         for (r.state_machine.nodes[0..r.state_machine.node_count]) |node| {
             if (!node.active) continue;
             if (node.allocatable_gpu > node.gpu_count) {
@@ -182,7 +194,6 @@ pub const StateChecker = struct {
             }
         }
 
-        // Leader in normal status must have view_number % replica_count == replica_id
         if (r.status == .normal and r.isLeader()) {
             if (r.view_number % r.replica_count != r.replica_id) {
                 self.recordViolation("replica {d}: claims leader but view {d} mod {d} != {d}", .{
@@ -206,12 +217,6 @@ pub const StateChecker = struct {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Liveness evaluation
-    // -----------------------------------------------------------------------
-
-    /// Check whether all (non-partitioned) replicas have converged to the
-    /// same commit point. Returns null if converged, or a reason string.
     pub fn checkConvergence(
         _: *const StateChecker,
         replicas: []*const replica_mod.Replica,
@@ -239,12 +244,8 @@ pub const StateChecker = struct {
             }
         }
 
-        return null; // converged
+        return null;
     }
-
-    // -----------------------------------------------------------------------
-    // Summary
-    // -----------------------------------------------------------------------
 
     pub fn summary(self: *const StateChecker) Summary {
         var max_commit: msg.OpNumber = 0;
@@ -268,3 +269,102 @@ pub const StateChecker = struct {
         view_changes_observed: u64,
     };
 };
+
+test "checker rejects: divergent bodies with same tag/client/request" {
+    var checker = StateChecker.init(2);
+    checker.silent = true;
+
+    var entry_a = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 7,
+        .request_id = 3,
+    };
+    entry_a.checksum = entry_a.computeChecksum();
+
+    var entry_b = entry_a;
+    entry_b.command = .{ .create_deployment = .{
+        .name = msg.strToFixed(64, "x"),
+        .namespace = msg.strToFixed(64, "default"),
+        .image = msg.strToFixed(256, "img"),
+        .replicas = 1,
+    } };
+    // Keep same client/request but different body/checksum.
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    // Manually seed history as if replica 0 committed entry_a.
+    checker.history[0] = .{
+        .op = 1,
+        .checksum = entry_a.checksum,
+        .client_id = entry_a.client_id,
+        .request_id = entry_a.request_id,
+        .committed_by = 0b01,
+    };
+    checker.history_len = 1;
+    checker.replica_commit_max[0] = 1;
+
+    // Build a minimal fake replica view for validateCommit via check().
+    // Use a TestCluster path instead for realism.
+    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0xC0DE);
+    defer tc.deinit();
+    tc.advance(5);
+    tc.request(0, .{ .noop = {} });
+    tc.advance(20);
+
+    // Inject divergent commit observation for op 1 on a second logical replica id.
+    var diverged = tc.replicas[0].*;
+    const slot = replica_mod.journalSlot(1);
+    diverged.journal[slot] = entry_b;
+    diverged.journal_occupied[slot] = true;
+    diverged.commit_min = 1;
+
+    var checker2 = StateChecker.init(2);
+    checker2.silent = true;
+    checker2.history[0] = .{
+        .op = 1,
+        .checksum = entry_a.checksum,
+        .client_id = entry_a.client_id,
+        .request_id = entry_a.request_id,
+        .committed_by = 0b01,
+    };
+    checker2.history_len = 1;
+    checker2.replica_commit_max[0] = 1;
+    checker2.replica_commit_max[1] = 0;
+    checker2.check(1, &diverged);
+    try std.testing.expectEqual(@as(u64, 1), checker2.safety_violations);
+}
+
+test "checker rejects: commit regression after recovery" {
+    var checker = StateChecker.init(1);
+    checker.silent = true;
+    checker.replica_commit_max[0] = 5;
+
+    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0x2E60);
+    defer tc.deinit();
+    // Force observed regression without recovery flag (live process regression).
+    tc.replicas[0].commit_min = 2;
+    tc.replicas[0].op_number = 2;
+    tc.replicas[0].recovered_from_disk = false;
+    const before = checker.safety_violations;
+    checker.check(0, tc.replicas[0]);
+    try std.testing.expectEqual(@as(u64, 1), checker.safety_violations - before);
+}
+
+test "checker rejects: history capacity exhaustion" {
+    var checker = StateChecker.init(1);
+    checker.silent = true;
+    checker.history_len = StateChecker.MAX_HISTORY;
+
+    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0xCA12);
+    defer tc.deinit();
+    tc.advance(5);
+    tc.request(0, .{ .noop = {} });
+    tc.advance(20);
+
+    // Reset checker tracking so check tries to record op 1 into a full history.
+    checker.replica_commit_max[0] = 0;
+    checker.check(0, tc.replicas[0]);
+    try std.testing.expect(checker.safety_violations >= 1);
+}

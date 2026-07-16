@@ -115,7 +115,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Recover from disk if we have one
     if (file_disk != null) {
-        if (replica.recoverFromDisk()) {
+        const recovered = replica.recoverFromDisk() catch |err| {
+            std.debug.print("hivemind core: fatal storage recovery error: {}\n", .{err});
+            std.process.exit(1);
+        };
+        if (recovered) {
             std.debug.print("hivemind core: recovered from disk (view={d} op={d} commit={d})\n", .{
                 replica.view_number, replica.op_number, replica.commit_min,
             });
@@ -227,6 +231,10 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         conn_mgr.poll();
         replica.tick();
+        if (replica.storage_failed) {
+            std.debug.print("hivemind core: fatal storage failure; exiting nonzero\n", .{});
+            std.process.exit(1);
+        }
         conn_mgr.dispatchRun();
         if (metrics) |*m| m.poll();
         if (s3_backup) |*b| b.maybeTrigger(io_mod.nowTick(init.io));

@@ -144,6 +144,14 @@ pub const MetricsServer = struct {
         pos += write(buf, pos, "# TYPE hivemind_consensus_pipeline_guard_drops_total counter\n");
         pos += writeFmt(buf, pos, "hivemind_consensus_pipeline_guard_drops_total {d}\n", .{self.replica.pipeline_guard_drops});
 
+        pos += write(buf, pos, "# HELP hivemind_consensus_log_full_rejections_total Requests rejected because the retained log is full\n");
+        pos += write(buf, pos, "# TYPE hivemind_consensus_log_full_rejections_total counter\n");
+        pos += writeFmt(buf, pos, "hivemind_consensus_log_full_rejections_total {d}\n", .{self.replica.log_full_rejections});
+
+        pos += write(buf, pos, "# HELP hivemind_consensus_storage_failures_total Storage write/sync failures that fail-stopped this replica\n");
+        pos += write(buf, pos, "# TYPE hivemind_consensus_storage_failures_total counter\n");
+        pos += writeFmt(buf, pos, "hivemind_consensus_storage_failures_total {d}\n", .{self.replica.storage_failures});
+
         const is_leader: u8 = if (self.replica.isLeader() and self.replica.status == .normal) 1 else 0;
         pos += write(buf, pos, "# HELP hivemind_is_leader Whether this replica is the leader\n");
         pos += write(buf, pos, "# TYPE hivemind_is_leader gauge\n");
@@ -539,6 +547,8 @@ test "metrics include origin-aware gossip labels and cpu summaries" {
     try std.testing.expect(std.mem.indexOf(u8, out, "locality=\"us-east\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "continent=\"na\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_pipeline_guard_drops_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_log_full_rejections_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_storage_failures_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_queue_depth") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_available_millicores") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_total_millicores") != null);

@@ -231,6 +231,8 @@ pub const ErrorCode = enum(u8) {
     capacity_exceeded,
     invalid_transition,
     not_leader,
+    /// Retained log is full; no snapshot floor exists to truncate committed ops.
+    log_full,
 };
 
 pub const ResultData = struct {
