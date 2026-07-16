@@ -21,7 +21,7 @@
 | C2 | Authentication | API and agent connections previously had no auth |
 | C3 | Provider adapter | Nodes are manual / out-of-band |
 | C4 | App spec model | CreateDeployment is minimal vs probes, scaling policy, env, storage |
-| C5 | Crash-consistent versioned storage + torn-write simulation | v1 single-copy journal: write/sync-before-publication and I/O fail-stop only; no torn-write/power-loss model or simulation; blocks any production durability claim |
+| C5 | Crash-consistent versioned storage + torn-write simulation | Layout v2 single-copy journal: write/sync-before-publication and I/O fail-stop only; no torn-write/power-loss model or simulation; blocks any production durability claim |
 | C6 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; `log_full` / HTTP 507 until snapshots exist |
 
 ### Important — Knative / platform parity

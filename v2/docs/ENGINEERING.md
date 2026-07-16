@@ -1122,4 +1122,3 @@ fn test_scheduler_under_network_partition() {
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
 Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid.
-
