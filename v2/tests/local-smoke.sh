@@ -22,6 +22,9 @@ cleanup() {
     done
     wait 2>/dev/null || true
     rm -f /tmp/hivemind-smoke-*.log
+    if [[ -n "${DATA_DIR:-}" && -d "$DATA_DIR" ]]; then
+        rm -rf "$DATA_DIR"
+    fi
 }
 trap cleanup EXIT
 

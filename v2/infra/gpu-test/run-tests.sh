@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Spin up a g4dn.xlarge, run containerd integration tests, tear down.
 # Usage: ./run-tests.sh
+# Set KEEP_INFRA=1 to skip destroy after success/failure (debug retention).
 #
 # Prerequisites:
 #   - Rust worker built for Linux: cd worker && cross build --release --target x86_64-unknown-linux-gnu --features containerd-integration
@@ -12,11 +13,32 @@ set -euo pipefail
 REGION="us-east-1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKER_DIR="$SCRIPT_DIR/../../worker"
+KEEP_INFRA="${KEEP_INFRA:-0}"
+BUCKET=""
+INSTANCE_ID=""
+CLEANUP_INSTALLED=0
 
 if [[ ! -d "$WORKER_DIR" ]]; then
   echo "FAIL: worker source not found at $WORKER_DIR" >&2
   exit 1
 fi
+
+cleanup() {
+  local status=$?
+  set +e
+  if [[ "$KEEP_INFRA" == "1" ]]; then
+    echo "KEEP_INFRA=1: leaving instance/bucket for debugging"
+    [[ -n "$INSTANCE_ID" ]] && echo "instance: $INSTANCE_ID"
+    [[ -n "$BUCKET" ]] && echo "s3: s3://$BUCKET"
+    return
+  fi
+  if [[ -n "$BUCKET" ]]; then
+    aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null || true
+  fi
+  cd "$SCRIPT_DIR"
+  terraform destroy -auto-approve 2>/dev/null || true
+  exit "$status"
+}
 
 echo "=== Step 1: Build worker + test binary for Linux ==="
 cd "$WORKER_DIR"
@@ -34,18 +56,30 @@ terraform apply -auto-approve
 INSTANCE_ID=$(terraform output -raw instance_id)
 echo "instance: $INSTANCE_ID"
 
+# Install cleanup as soon as paid resources exist.
+if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
+  trap cleanup EXIT
+  CLEANUP_INSTALLED=1
+fi
+
 echo ""
 echo "=== Step 3: Wait for SSM ==="
+SSM_READY=0
 for i in $(seq 1 60); do
   status=$(aws ssm describe-instance-information --region "$REGION" \
     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
     --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
   if [[ "$status" == "Online" ]]; then
     echo "SSM online"
+    SSM_READY=1
     break
   fi
   sleep 5
 done
+if [[ "$SSM_READY" -ne 1 ]]; then
+  echo "FAIL: SSM never came online for $INSTANCE_ID" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== Step 4: Setup instance ==="
@@ -69,7 +103,7 @@ CMD_ID=$(aws ssm send-command --region "$REGION" \
     \"source /root/.cargo/env\",
     \"aws s3 cp s3://$BUCKET/worker-src.tar.gz /tmp/worker-src.tar.gz --region $REGION\",
     \"cd /tmp && tar xzf worker-src.tar.gz\",
-    \"cd /tmp/worker && cargo test --test containerd_integration --features containerd-integration -- --test-threads=1 2>&1 || true\",
+    \"cd /tmp/worker && cargo test --test containerd_integration --features containerd-integration -- --test-threads=1\",
     \"echo TESTS_COMPLETE\"
   ]" \
   --query 'Command.CommandId' --output text)
@@ -79,11 +113,13 @@ echo ""
 echo "=== Step 5: Wait for tests ==="
 echo "(this may take 5-10 minutes for first build)"
 
+FINAL_STATUS="Pending"
 for i in $(seq 1 120); do
   status=$(aws ssm list-command-invocations --region "$REGION" \
     --command-id "$CMD_ID" \
     --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
-  if [[ "$status" == "Success" || "$status" == "Failed" ]]; then
+  if [[ "$status" == "Success" || "$status" == "Failed" || "$status" == "Cancelled" || "$status" == "TimedOut" ]]; then
+    FINAL_STATUS="$status"
     echo "status: $status"
     break
   fi
@@ -96,17 +132,11 @@ aws ssm list-command-invocations --region "$REGION" \
   --command-id "$CMD_ID" --details \
   --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text
 
+if [[ "$FINAL_STATUS" != "Success" ]]; then
+  echo "FAIL: remote tests ended with status=$FINAL_STATUS" >&2
+  exit 1
+fi
+
 echo ""
 echo "=== Step 6: Cleanup ==="
-read -p "Destroy instance? [y/N] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  aws s3 rb "s3://$BUCKET" --force --region "$REGION"
-  terraform destroy -auto-approve
-  echo "cleaned up"
-else
-  echo "instance still running: $INSTANCE_ID"
-  echo "connect: aws ssm start-session --target $INSTANCE_ID --region $REGION"
-  echo "destroy: cd $SCRIPT_DIR && terraform destroy -auto-approve"
-  echo "s3 cleanup: aws s3 rb s3://$BUCKET --force --region $REGION"
-fi
+# cleanup trap handles destroy unless KEEP_INFRA=1

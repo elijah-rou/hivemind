@@ -98,6 +98,17 @@ assert_contains "$DEPLOY" 'SCRIPT_DIR/.*/core/zig-out/bin/hivemind|\$\{SCRIPT_DI
 # Word-splitting START_COMMANDS=($(...)) breaks commands with spaces.
 assert_lacks "$DEPLOY" 'START_COMMANDS=\(\$\('
 assert_contains "$DEPLOY" 'mapfile[[:space:]]+-t[[:space:]]+START_COMMANDS'
+# Terraform must be caller-CWD independent.
+assert_contains "$DEPLOY" '-chdir="\$SCRIPT_DIR"|-chdir=\$SCRIPT_DIR'
+# Broad pkill must not appear in this launcher.
+assert_lacks "$DEPLOY" 'pkill[[:space:]]+-f[[:space:]]+hivemind'
+
+echo "==> infra/poc/replica-init.sh secret file modes"
+INIT="$REPO_ROOT/infra/poc/replica-init.sh"
+assert_file "$INIT"
+assert_contains "$INIT" 'umask[[:space:]]+077'
+assert_contains "$INIT" 'chmod[[:space:]]+600.*/etc/hivemind/replica.env|install[[:space:]]+-m[[:space:]]+600'
+assert_contains "$INIT" 'chmod[[:space:]]+600.*/etc/hivemind/api.env|install[[:space:]]+-m[[:space:]]+600'
 
 echo "==> --worker-port on active core launch surfaces"
 assert_file "$SERVICE"
@@ -112,6 +123,12 @@ assert_file "$GPU_TEST"
 assert_contains "$GPU_TEST" '/worker'
 assert_lacks "$GPU_TEST" '/agent'
 assert_lacks "$GPU_TEST" '[[:space:]]agent/'
+# Failures must propagate; never mask cargo test with || true.
+if grep -E 'cargo[[:space:]]+test' "$GPU_TEST" | grep -qF '||'; then
+    echo "FAIL: $GPU_TEST cargo test must not use || true" >&2
+    FAIL=$((FAIL + 1))
+fi
+assert_contains "$GPU_TEST" 'trap[[:space:]]+cleanup[[:space:]]+EXIT'
 
 if [[ "$FAIL" -ne 0 ]]; then
     echo "FAIL: launcher contract ($FAIL assertion(s))"

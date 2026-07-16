@@ -428,7 +428,7 @@ pub const FileDisk = struct {
         if (fd < 0) return error.OpenFailed;
         errdefer _ = std.c.close(fd);
         self.fd = fd;
-        _ = std.c.fchmod(fd, 0o600);
+        if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
 
         const file_size = try fileSizeFd(fd);
         if (file_size != TOTAL_SIZE) return error.WrongSize;

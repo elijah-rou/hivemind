@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="${1:-$SCRIPT_DIR/../../core/zig-out/bin/hivemind}"
 BENCH="${2:-$SCRIPT_DIR/../../bench/hivemind-bench}"
 REGION="us-east-1"
+TF=(terraform -chdir="$SCRIPT_DIR")
 
 if [[ ! -f "$BINARY" ]]; then
   echo "binary not found: $BINARY"
@@ -17,10 +18,10 @@ if [[ ! -f "$BINARY" ]]; then
   exit 1
 fi
 
-# Get terraform outputs
-mapfile -t INSTANCE_IDS < <(terraform output -json instance_ids | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
-mapfile -t PRIVATE_IPS < <(terraform output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
-BENCH_ADDRS=$(terraform output -raw bench_addrs)
+# Get terraform outputs (always scoped to SCRIPT_DIR, independent of caller CWD)
+mapfile -t INSTANCE_IDS < <("${TF[@]}" output -json instance_ids | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+mapfile -t PRIVATE_IPS < <("${TF[@]}" output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+BENCH_ADDRS=$("${TF[@]}" output -raw bench_addrs)
 
 NODE_COUNT=${#INSTANCE_IDS[@]}
 echo "deploying to $NODE_COUNT nodes: ${INSTANCE_IDS[*]}"
@@ -51,7 +52,7 @@ fi
 echo "uploaded binary to s3://$BUCKET"
 
 # Preserve each start command as a single line (commands contain spaces).
-mapfile -t START_COMMANDS < <(terraform output -json start_commands | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+mapfile -t START_COMMANDS < <("${TF[@]}" output -json start_commands | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 
 if [[ ${#START_COMMANDS[@]} -ne $NODE_COUNT ]]; then
   echo "FAIL: start_commands count (${#START_COMMANDS[@]}) != node count ($NODE_COUNT)" >&2
@@ -76,10 +77,10 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
       \"chmod +x /tmp/hivemind\",
       \"aws s3 cp s3://$BUCKET/bench /tmp/bench --region $REGION 2>/dev/null || true\",
       \"chmod +x /tmp/bench 2>/dev/null || true\",
-      \"pkill -f hivemind || true\",
-      \"cd /tmp && nohup $cmd_json > /tmp/hivemind.log 2>&1 &\",
+      \"if [[ -f /tmp/hivemind.pid ]]; then kill \\\$(cat /tmp/hivemind.pid) 2>/dev/null || true; fi\",
+      \"cd /tmp && nohup $cmd_json > /tmp/hivemind.log 2>&1 & echo \\\$! > /tmp/hivemind.pid\",
       \"sleep 3\",
-      \"pgrep -f hivemind && echo 'hivemind running' || echo 'FAILED TO START'\"
+      \"kill -0 \\\$(cat /tmp/hivemind.pid) 2>/dev/null && echo 'hivemind running' || echo 'FAILED TO START'\"
     ]" \
     --output text --query 'Command.CommandId' &
 done
@@ -97,4 +98,4 @@ echo "  /tmp/bench -addrs $BENCH_ADDRS -n 100"
 echo ""
 echo "cleanup:"
 echo "  aws s3 rb s3://$BUCKET --force --region $REGION"
-echo "  terraform destroy -auto-approve"
+echo "  terraform -chdir=\"$SCRIPT_DIR\" destroy -auto-approve"

@@ -114,7 +114,10 @@ pub fn main(init: std.process.Init) !void {
         if (data_dir.len >= dir_z_buf.len) return error.PathTooLong;
         @memcpy(dir_z_buf[0..data_dir.len], data_dir);
         dir_z_buf[data_dir.len] = 0;
-        _ = std.c.chmod(@ptrCast(&dir_z_buf), @as(std.c.mode_t, 0o700));
+        if (std.c.chmod(@ptrCast(&dir_z_buf), @as(std.c.mode_t, 0o700)) != 0) {
+            std.debug.print("failed to chmod data-dir 0700\n", .{});
+            return error.PermissionDenied;
+        }
 
         var path_buf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/journal.bin", .{data_dir}) catch @panic("data-dir path too long");

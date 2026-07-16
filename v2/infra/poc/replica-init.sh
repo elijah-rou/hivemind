@@ -3,10 +3,13 @@ set -euo pipefail
 
 # Hivemind replica cloud-init script
 # Binaries must be uploaded separately (deploy.sh handles this)
+# Secret-bearing env files and the data dir must be owner-only.
+umask 077
 
 mkdir -m 700 -p /var/lib/hivemind
-mkdir -p /etc/hivemind
+mkdir -m 700 -p /etc/hivemind
 
+install -m 600 /dev/null /etc/hivemind/replica.env
 cat > /etc/hivemind/replica.env <<'ENVEOF'
 HIVEMIND_NODE_ID=${node_id}
 HIVEMIND_REPLICA_COUNT=${replica_count}
@@ -22,7 +25,9 @@ HIVEMIND_GOSSIP_PEERS=
 HIVEMIND_REGION=${region}
 HIVEMIND_ENCRYPTION_KEY=${encryption_key}
 ENVEOF
+chmod 600 /etc/hivemind/replica.env
 
+install -m 600 /dev/null /etc/hivemind/api.env
 cat > /etc/hivemind/api.env <<'APIEOF'
 HIVEMIND_API_LISTEN=:8080
 HIVEMIND_API_ADDRS=127.0.0.1:9001
@@ -30,5 +35,6 @@ HIVEMIND_API_DNS_TARGETS=
 HIVEMIND_ENCRYPTION_KEY=${encryption_key}
 HIVEMIND_API_TOKEN=
 APIEOF
+chmod 600 /etc/hivemind/api.env
 
 echo "hivemind: replica ${node_id} cloud-init complete"
