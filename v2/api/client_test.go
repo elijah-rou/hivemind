@@ -61,6 +61,104 @@ func TestReadFrameGenericClearsReadDeadlineOnError(t *testing.T) {
 	}
 }
 
+func buildTestFrame(t *testing.T, flags byte, version uint16, tag byte, payload []byte, crypto *CryptoState) []byte {
+	t.Helper()
+	inner := make([]byte, 3+len(payload))
+	binary.LittleEndian.PutUint16(inner[:2], version)
+	inner[2] = tag
+	copy(inner[3:], payload)
+
+	if flags == 0x01 {
+		if crypto == nil || !crypto.Enabled {
+			t.Fatal("encrypted test frame requires configured crypto")
+		}
+		frameLen := 1 + CryptoNonceLen + len(inner) + CryptoTagLen
+		frame := make([]byte, 5, 4+frameLen)
+		binary.LittleEndian.PutUint32(frame[:4], uint32(frameLen))
+		frame[4] = flags
+		encrypted, err := EncryptFrame(&crypto.ClientKey, inner, frame)
+		if err != nil {
+			t.Fatalf("encrypt test frame: %v", err)
+		}
+		return append(frame, encrypted...)
+	}
+
+	frame := make([]byte, 5+len(inner))
+	binary.LittleEndian.PutUint32(frame[:4], uint32(1+len(inner)))
+	frame[4] = flags
+	copy(frame[5:], inner)
+	return frame
+}
+
+func TestReadFrameGenericContract(t *testing.T) {
+	crypto, err := NewCryptoState("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oversize := make([]byte, 4)
+	binary.LittleEndian.PutUint32(oversize, 16)
+	plaintextBoundary := buildTestFrame(t, 0x00, ProtocolVersion, TagReply, bytes.Repeat([]byte{0x5a}, 56), nil)
+	encryptedBoundary := buildTestFrame(t, 0x01, ProtocolVersion, TagReply, bytes.Repeat([]byte{0x5a}, 16), crypto)
+	if len(plaintextBoundary) != 64 || len(encryptedBoundary) != 64 {
+		t.Fatal("test boundary frames must exactly fill their receive buffers")
+	}
+	cases := []struct {
+		name      string
+		frame     []byte
+		readBuf   int
+		crypto    *CryptoState
+		wantError bool
+	}{
+		{name: "unknown flags", frame: buildTestFrame(t, 0x02, ProtocolVersion, TagReply, nil, nil), readBuf: 64, wantError: true},
+		{name: "bad plaintext version", frame: buildTestFrame(t, 0x00, ProtocolVersion+1, TagReply, nil, nil), readBuf: 64, wantError: true},
+		{name: "bad encrypted version", frame: buildTestFrame(t, 0x01, ProtocolVersion+1, TagReply, nil, crypto), readBuf: 128, crypto: crypto, wantError: true},
+		{name: "plaintext while key configured", frame: buildTestFrame(t, 0x00, ProtocolVersion, TagReply, nil, nil), readBuf: 64, crypto: crypto, wantError: true},
+		{name: "encrypted without key", frame: buildTestFrame(t, 0x01, ProtocolVersion, TagReply, nil, crypto), readBuf: 128, wantError: true},
+		{name: "short plaintext", frame: []byte{1, 0, 0, 0, 0x00}, readBuf: 64, wantError: true},
+		{name: "short encrypted", frame: []byte{1, 0, 0, 0, 0x01}, readBuf: 64, crypto: crypto, wantError: true},
+		{name: "oversize declaration", frame: oversize, readBuf: 16, wantError: true},
+		{name: "valid plaintext minimum", frame: buildTestFrame(t, 0x00, ProtocolVersion, TagReply, nil, nil), readBuf: 8},
+		{name: "valid encrypted minimum", frame: buildTestFrame(t, 0x01, ProtocolVersion, TagReply, nil, crypto), readBuf: 64, crypto: crypto},
+		{name: "valid plaintext receive-buffer boundary", frame: plaintextBoundary, readBuf: 64},
+		{name: "valid encrypted receive-buffer boundary", frame: encryptedBoundary, readBuf: 64, crypto: crypto},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &deadlineTrackingConn{readBuf: bytes.NewReader(tc.frame)}
+			frame, err := readFrameGeneric(conn, make([]byte, tc.readBuf), time.Second, tc.crypto)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected rejection, got frame %x", frame)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected rejection: %v", err)
+			}
+			if len(frame) < 3 || frame[2] != TagReply {
+				t.Fatalf("decoded frame = %x", frame)
+			}
+		})
+	}
+}
+
+func TestReadFrameGenericLeavesTrailingFrameForNextRead(t *testing.T) {
+	first := buildTestFrame(t, 0x00, ProtocolVersion, TagReply, []byte{0xaa}, nil)
+	second := buildTestFrame(t, 0x00, ProtocolVersion, TagRunResponse, []byte{0xbb}, nil)
+	conn := &deadlineTrackingConn{readBuf: bytes.NewReader(append(first, second...))}
+
+	frame, err := readFrameGeneric(conn, make([]byte, 64), time.Second, nil)
+	if err != nil || frame[2] != TagReply || frame[3] != 0xaa {
+		t.Fatalf("first frame = %x, err = %v", frame, err)
+	}
+	frame, err = readFrameGeneric(conn, make([]byte, 64), time.Second, nil)
+	if err != nil || frame[2] != TagRunResponse || frame[3] != 0xbb {
+		t.Fatalf("second frame = %x, err = %v", frame, err)
+	}
+}
+
 func buildCommandReplyFrame(requestID uint64, entityID uint64) []byte {
 	payload := make([]byte, 17)
 	binary.LittleEndian.PutUint64(payload[0:8], requestID)

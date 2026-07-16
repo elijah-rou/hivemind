@@ -462,42 +462,66 @@ func probeIsLeader(conn net.Conn, crypto *CryptoState) (bool, error) {
 	return payload[26] == 1, nil
 }
 
-// readFrameGeneric reads a frame, decrypts if needed, returns [version(2)][tag(1)][payload...].
+// readFrameGeneric reads exactly one frame and returns [version(2)][tag(1)][payload...].
 func readFrameGeneric(conn net.Conn, buf []byte, timeout time.Duration, crypto *CryptoState) ([]byte, error) {
 	conn.SetReadDeadline(time.Now().Add(timeout))
 	defer conn.SetReadDeadline(time.Time{})
 
-	// Read 4-byte length
+	if len(buf) < 4 {
+		return nil, fmt.Errorf("frame buffer too small: %d", len(buf))
+	}
 	if _, err := readFull(conn, buf[:4]); err != nil {
 		return nil, err
 	}
 	frameLen := binary.LittleEndian.Uint32(buf[:4])
-	if frameLen > uint32(len(buf)) || frameLen < 1 {
+	if frameLen < 1 || uint64(frameLen) > uint64(len(buf)-4) {
 		return nil, fmt.Errorf("bad frame len: %d", frameLen)
 	}
 
-	// Read rest of frame
-	if _, err := readFull(conn, buf[4:4+frameLen]); err != nil {
+	if _, err := readFull(conn, buf[4:4+int(frameLen)]); err != nil {
 		return nil, err
 	}
 
 	flags := buf[4]
-	if flags&0x01 != 0 {
-		// Encrypted
-		if crypto == nil || !crypto.Enabled {
+	if flags != 0x00 && flags != 0x01 {
+		return nil, fmt.Errorf("unknown frame flags: 0x%02x", flags)
+	}
+	keyConfigured := crypto != nil && crypto.Enabled
+	if (flags == 0x01) != keyConfigured {
+		if flags == 0x01 {
 			return nil, fmt.Errorf("encrypted frame but no key")
 		}
-		encData := buf[5 : 4+frameLen]
-		aad := buf[0:5] // len + flags
-		plaintext, err := DecryptFrame(&crypto.ClientKey, encData, aad)
+		return nil, fmt.Errorf("plaintext frame while key configured")
+	}
+
+	var plaintext []byte
+	if flags == 0x01 {
+		const encryptedMinimum = CryptoNonceLen + 3 + CryptoTagLen
+		if frameLen < 1+encryptedMinimum {
+			return nil, fmt.Errorf("encrypted frame too short: %d", frameLen)
+		}
+		encData := buf[5 : 4+int(frameLen)]
+		aad := buf[0:5]
+		var err error
+		plaintext, err = DecryptFrame(&crypto.ClientKey, encData, aad)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt failed: %w", err)
 		}
-		return plaintext, nil
+	} else {
+		if frameLen < 1+3 {
+			return nil, fmt.Errorf("plaintext frame too short: %d", frameLen)
+		}
+		plaintext = buf[5 : 4+int(frameLen)]
 	}
 
-	// Plaintext: buf[5..4+frameLen] = [version(2)][tag(1)][payload...]
-	return buf[5 : 4+frameLen], nil
+	if len(plaintext) < 3 {
+		return nil, fmt.Errorf("frame payload too short: %d", len(plaintext))
+	}
+	version := binary.LittleEndian.Uint16(plaintext[:2])
+	if version != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported protocol version: %d", version)
+	}
+	return plaintext, nil
 }
 
 func readReply(conn net.Conn, buf []byte) ([]byte, error) {

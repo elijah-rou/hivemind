@@ -252,7 +252,7 @@ pub const ConnectionManager = struct {
 
         while (consumed + 5 <= data.len) {
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(worker_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(worker_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break;
                 consumed += frame_consumed;
                 continue;
@@ -543,7 +543,7 @@ pub const ConnectionManager = struct {
 
         while (consumed + 5 <= data.len) { // min: len(4) + flags(1)
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(client_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(client_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break; // incomplete
                 consumed += frame_consumed; // skip bad frame
                 continue;
@@ -821,36 +821,55 @@ pub const ConnectionManager = struct {
         }
     }
 
-    /// Decode a frame from buffer, decrypting if flags indicate encryption.
-    /// Returns the plaintext payload slice within the provided decrypt_buf,
-    /// or the original payload slice from data if plaintext.
-    /// Returns null if frame is incomplete or decryption fails.
-    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8) ?[]const u8 {
-        if (data.len < 5) return null; // need at least len(4) + flags(1)
+    /// Decode one bounded frame. Client/worker payloads are versioned; peer payloads are not.
+    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
+        if (data.len < 5) return null;
 
         const frame_len = std.mem.readInt(u32, data[0..4], .little);
-        const total = 4 + @as(usize, frame_len);
-        if (data.len < total) return null; // incomplete frame
-
-        if (frame_len < 1) {
-            consumed.* = total;
+        if (frame_len > MAX_FRAME_BYTES - 4) {
+            consumed.* = data.len;
             return null;
-        } // too short
+        }
 
         const flags = data[4];
+        if (flags != 0x00 and flags != 0x01) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+        const key_configured = self.encryption != null and self.encryption.?.enabled;
+        if ((flags == 0x01) != key_configured) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+        if (flags == 0x01 and key == null) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+
+        const inner_min: usize = if (versioned) 3 else 1;
+        const payload_min = if (flags == 0x01) enc.NONCE_LEN + enc.TAG_LEN + inner_min else inner_min;
+        if (frame_len < 1 + payload_min) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+
+        const total = 4 + @as(usize, frame_len);
+        if (data.len < total) return null;
         consumed.* = total;
 
-        if (flags & 0x01 != 0) {
-            // Encrypted
-            if (key == null or self.encryption == null or !self.encryption.?.enabled) return null;
+        const plaintext = if (flags == 0x01) blk: {
             const encrypted_data = data[5..total];
-            const aad = data[0..5]; // len + flags
-            const pt_len = enc.decryptFrame(key.?, encrypted_data, aad, decrypt_buf) catch return null;
-            return decrypt_buf[0..pt_len];
-        } else {
-            // Plaintext: payload starts after flags byte
-            return data[5..total];
+            const pt_len = enc.decryptFrame(key.?, encrypted_data, data[0..5], decrypt_buf) catch return null;
+            if (pt_len < inner_min) return null;
+            break :blk decrypt_buf[0..pt_len];
+        } else data[5..total];
+
+        if (versioned) {
+            if (plaintext.len < 3) return null;
+            const version = std.mem.readInt(u16, plaintext[0..2], .little);
+            if (version != PROTOCOL_VERSION) return null;
         }
+        return plaintext;
     }
 
     fn disconnectClient(self: *ConnectionManager, client: *Conn) void {
@@ -908,7 +927,7 @@ pub const ConnectionManager = struct {
         // Frame format (encrypted): [4B len][1B flags=0x01][24B nonce][encrypted(from_id + VRR)][16B tag]
         while (consumed + 5 <= data.len) {
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf, false) orelse {
                 if (frame_consumed == 0) break;
                 consumed += frame_consumed;
                 continue;
@@ -1587,6 +1606,126 @@ test "connectToPeer ignores self target" {
 
     try std.testing.expectEqual(@as(usize, 0), cm.peer_target_count);
     try std.testing.expectEqual(@as(usize, 0), cm.peer_count);
+}
+
+fn buildTestProtocolFrame(flags: u8, version: u16, state: ?*const enc.EncryptionState) ![]u8 {
+    var inner = [_]u8{ 0, 0, 0x42 };
+    std.mem.writeInt(u16, inner[0..2], version, .little);
+
+    if (flags == 0x01) {
+        const encryption = state orelse return error.MissingTestKey;
+        const frame_len = 1 + enc.NONCE_LEN + inner.len + enc.TAG_LEN;
+        const frame = try std.testing.allocator.alloc(u8, 4 + frame_len);
+        std.mem.writeInt(u32, frame[0..4], @intCast(frame_len), .little);
+        frame[4] = flags;
+        const encrypted_len = enc.encryptFrame(&encryption.client_key, &inner, frame[0..5], frame[5..]);
+        std.debug.assert(encrypted_len == frame_len - 1);
+        return frame;
+    }
+
+    const frame = try std.testing.allocator.alloc(u8, 5 + inner.len);
+    std.mem.writeInt(u32, frame[0..4], @intCast(1 + inner.len), .little);
+    frame[4] = flags;
+    @memcpy(frame[5..], &inner);
+    return frame;
+}
+
+test "client and worker frame contract table" {
+    var state = try enc.EncryptionState.init("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const Case = struct {
+        name: []const u8,
+        flags: u8,
+        version: u16,
+        encrypted_frame: bool,
+        key_configured: bool,
+        valid: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "unknown flags", .flags = 0x02, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = false, .valid = false },
+        .{ .name = "bad plaintext version", .flags = 0x00, .version = PROTOCOL_VERSION + 1, .encrypted_frame = false, .key_configured = false, .valid = false },
+        .{ .name = "bad encrypted version", .flags = 0x01, .version = PROTOCOL_VERSION + 1, .encrypted_frame = true, .key_configured = true, .valid = false },
+        .{ .name = "plaintext while key configured", .flags = 0x00, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = true, .valid = false },
+        .{ .name = "encrypted without key", .flags = 0x01, .version = PROTOCOL_VERSION, .encrypted_frame = true, .key_configured = false, .valid = false },
+        .{ .name = "valid plaintext minimum", .flags = 0x00, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = false, .valid = true },
+        .{ .name = "valid encrypted minimum", .flags = 0x01, .version = PROTOCOL_VERSION, .encrypted_frame = true, .key_configured = true, .valid = true },
+    };
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    for (cases) |tc| {
+        const frame = try buildTestProtocolFrame(tc.flags, tc.version, if (tc.encrypted_frame) &state else null);
+        defer std.testing.allocator.free(frame);
+        cm.encryption = if (tc.key_configured) &state else null;
+        const key = if (tc.key_configured) &state.client_key else null;
+        var consumed: usize = 0;
+        const decoded = cm.decodeFrame(key, frame, &consumed, &decrypt_buf, true);
+        try std.testing.expectEqual(tc.valid, decoded != null);
+        try std.testing.expectEqual(frame.len, consumed);
+        if (decoded) |payload| {
+            try std.testing.expectEqual(PROTOCOL_VERSION, std.mem.readInt(u16, payload[0..2], .little));
+            try std.testing.expectEqual(@as(u8, 0x42), payload[2]);
+        } else {
+            _ = tc.name;
+        }
+    }
+}
+
+test "frame contract rejects short and oversize declarations before slicing" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+
+    const cases = [_][]const u8{
+        &[_]u8{ 1, 0, 0, 0, 0x00 },
+        &[_]u8{ 1, 0, 0, 0, 0x01 },
+        &[_]u8{ 0x00, 0x00, 0x01, 0x00, 0x00 },
+    };
+    for (cases) |frame| {
+        var consumed: usize = 0;
+        try std.testing.expect(cm.decodeFrame(null, frame, &consumed, &decrypt_buf, true) == null);
+        try std.testing.expectEqual(frame.len, consumed);
+    }
+}
+
+test "frame decoder accepts exact receive-buffer boundary" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    const frame = try std.testing.allocator.alloc(u8, MAX_FRAME_BYTES);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0x5a);
+    std.mem.writeInt(u32, frame[0..4], MAX_FRAME_BYTES - 4, .little);
+    frame[4] = 0x00;
+    std.mem.writeInt(u16, frame[5..7], PROTOCOL_VERSION, .little);
+    frame[7] = 0x42;
+
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    var consumed: usize = 0;
+    const decoded = cm.decodeFrame(null, frame, &consumed, &decrypt_buf, true) orelse
+        return error.ExpectedBoundaryFrame;
+    try std.testing.expectEqual(MAX_FRAME_BYTES, consumed);
+    try std.testing.expectEqual(MAX_FRAME_BYTES - 8, decoded[3..].len);
+}
+
+test "frame decoder leaves trailing frame bytes unconsumed" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    const first = try buildTestProtocolFrame(0x00, PROTOCOL_VERSION, null);
+    defer std.testing.allocator.free(first);
+    const second = try buildTestProtocolFrame(0x00, PROTOCOL_VERSION, null);
+    defer std.testing.allocator.free(second);
+    const stream = try std.testing.allocator.alloc(u8, first.len + second.len);
+    defer std.testing.allocator.free(stream);
+    @memcpy(stream[0..first.len], first);
+    @memcpy(stream[first.len..], second);
+
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    var consumed: usize = 0;
+    try std.testing.expect(cm.decodeFrame(null, stream, &consumed, &decrypt_buf, true) != null);
+    try std.testing.expectEqual(first.len, consumed);
 }
 
 fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Replica) void {

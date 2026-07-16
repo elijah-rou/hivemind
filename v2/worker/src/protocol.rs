@@ -76,6 +76,71 @@ struct WirePodStatusEvent {
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 pub const PROTOCOL_VERSION: u16 = 1;
+const FRAME_FLAGS_LEN: usize = 1;
+const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
+const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;
+
+fn validate_frame_declaration(
+    total_len: usize,
+    flags: u8,
+    key_configured: bool,
+) -> io::Result<usize> {
+    if flags != 0x00 && flags != 0x01 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown frame flags: 0x{flags:02x}"),
+        ));
+    }
+    if (flags == 0x01) != key_configured {
+        let message = if flags == 0x01 {
+            "encrypted frame but no key"
+        } else {
+            "plaintext frame while key configured"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+
+    let remaining = total_len
+        .checked_sub(FRAME_FLAGS_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame too short"))?;
+    let overhead = if flags == 0x01 {
+        ENCRYPTED_FRAME_OVERHEAD
+    } else {
+        0
+    };
+    let minimum = overhead + FRAME_INNER_MIN;
+    let maximum = overhead + FRAME_INNER_MIN + MAX_FRAME_PAYLOAD;
+    if remaining < minimum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+    if remaining > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: declared={remaining} max={maximum}"),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn validate_protocol_version(inner: &[u8]) -> io::Result<()> {
+    if inner.len() < FRAME_INNER_MIN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame payload too short",
+        ));
+    }
+    let version = u16::from_le_bytes(inner[..2].try_into().unwrap());
+    if version != PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported protocol version: {version}"),
+        ));
+    }
+    Ok(())
+}
 
 pub fn write_frame(w: &mut impl Write, msg_type: u8, payload: &[u8]) -> io::Result<()> {
     write_frame_encrypted(w, msg_type, payload, None)
@@ -128,58 +193,28 @@ pub fn try_decode_frame(
     }
 
     let total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    if total_len < 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-
-    let frame_len = 4 + total_len;
+    let flags = data[4];
+    let remaining = validate_frame_declaration(total_len, flags, key.is_some())?;
+    let frame_len = 4usize
+        .checked_add(total_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"))?;
     if data.len() < frame_len {
         return Ok(None);
     }
+    let frame_payload = &data[5..frame_len];
 
-    let flags = data[4];
-    let remaining = total_len - 1;
-    let payload = &data[5..frame_len];
-
-    if flags & 0x01 != 0 {
-        let k = key.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
-        })?;
-
-        let plaintext = crate::crypto::decrypt_frame(k, payload, &data[0..5])
+    let decrypted;
+    let plaintext = if flags == 0x01 {
+        decrypted = crate::crypto::decrypt_frame(key.unwrap(), frame_payload, &data[0..5])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if plaintext.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decrypted frame too short",
-            ));
-        }
-        let msg_type = plaintext[2];
-        let payload_len = plaintext.len() - 3;
-        if payload_len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "frame too large: payload={payload_len} buffer={}",
-                    buf.len()
-                ),
-            ));
-        }
-        buf[..payload_len].copy_from_slice(&plaintext[3..]);
-        return Ok(Some((msg_type, payload_len, frame_len)));
-    }
+        decrypted.as_slice()
+    } else {
+        frame_payload
+    };
+    validate_protocol_version(plaintext)?;
 
-    if remaining < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-    let msg_type = payload[2];
-    let payload_len = remaining - 3;
+    let msg_type = plaintext[2];
+    let payload_len = plaintext.len() - FRAME_INNER_MIN;
     if payload_len > buf.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -190,8 +225,9 @@ pub fn try_decode_frame(
         ));
     }
     if payload_len > 0 {
-        buf[..payload_len].copy_from_slice(&payload[3..]);
+        buf[..payload_len].copy_from_slice(&plaintext[FRAME_INNER_MIN..]);
     }
+    debug_assert_eq!(remaining, frame_payload.len());
     Ok(Some((msg_type, payload_len, frame_len)))
 }
 
@@ -204,43 +240,24 @@ pub fn read_frame_encrypted(
     r.read_exact(&mut len_bytes)?;
     let total_len = u32::from_le_bytes(len_bytes) as usize;
 
-    if total_len < 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-
-    // Read flags byte
     let mut flags = [0u8; 1];
     r.read_exact(&mut flags)?;
-    let remaining = total_len - 1;
+    let remaining = validate_frame_declaration(total_len, flags[0], key.is_some())?;
 
-    if flags[0] & 0x01 != 0 {
-        // Encrypted frame
-        let k = key.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
-        })?;
+    if flags[0] == 0x01 {
+        // The declaration is bounded before this allocation.
         let mut enc_buf = vec![0u8; remaining];
         r.read_exact(&mut enc_buf)?;
 
-        // AAD = len_bytes + flags
         let mut aad = [0u8; 5];
         aad[0..4].copy_from_slice(&len_bytes);
         aad[4] = flags[0];
-
-        let plaintext = crate::crypto::decrypt_frame(k, &enc_buf, &aad)
+        let plaintext = crate::crypto::decrypt_frame(key.unwrap(), &enc_buf, &aad)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        validate_protocol_version(&plaintext)?;
 
-        // plaintext = [version(2)][tag(1)][payload...]
-        if plaintext.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decrypted frame too short",
-            ));
-        }
         let msg_type = plaintext[2];
-        let payload_len = plaintext.len() - 3;
+        let payload_len = plaintext.len() - FRAME_INNER_MIN;
         if payload_len > buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -250,35 +267,27 @@ pub fn read_frame_encrypted(
                 ),
             ));
         }
-        buf[..payload_len].copy_from_slice(&plaintext[3..]);
-        Ok((msg_type, payload_len))
-    } else {
-        // Plaintext frame: remaining = [version(2)][tag(1)][payload...]
-        if remaining < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame too short",
-            ));
-        }
-        let mut ver_bytes = [0u8; 2];
-        r.read_exact(&mut ver_bytes)?;
-        let mut type_byte = [0u8; 1];
-        r.read_exact(&mut type_byte)?;
-        let payload_len = remaining - 3;
-        if payload_len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "frame too large: payload={payload_len} buffer={}",
-                    buf.len()
-                ),
-            ));
-        }
-        if payload_len > 0 {
-            r.read_exact(&mut buf[..payload_len])?;
-        }
-        Ok((type_byte[0], payload_len))
+        buf[..payload_len].copy_from_slice(&plaintext[FRAME_INNER_MIN..]);
+        return Ok((msg_type, payload_len));
     }
+
+    let mut inner_header = [0u8; FRAME_INNER_MIN];
+    r.read_exact(&mut inner_header)?;
+    validate_protocol_version(&inner_header)?;
+    let payload_len = remaining - FRAME_INNER_MIN;
+    if payload_len > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame too large: payload={payload_len} buffer={}",
+                buf.len()
+            ),
+        ));
+    }
+    if payload_len > 0 {
+        r.read_exact(&mut buf[..payload_len])?;
+    }
+    Ok((inner_header[2], payload_len))
 }
 
 // -- Encode agent messages to wire bytes --
@@ -586,6 +595,157 @@ mod tests {
 
         assert_eq!(msg_type, MSG_REGISTER_ACK);
         assert_eq!(len, 0);
+    }
+
+    fn test_frame(
+        flags: u8,
+        version: u16,
+        msg_type: u8,
+        key: Option<&[u8; crate::crypto::KEY_LEN]>,
+    ) -> Vec<u8> {
+        let mut inner = Vec::from(version.to_le_bytes());
+        inner.push(msg_type);
+        if flags == 0x01 {
+            let key = key.expect("encrypted test frame requires key");
+            let total_len = 1 + crate::crypto::NONCE_LEN + inner.len() + crate::crypto::TAG_LEN;
+            let mut header = [0u8; 5];
+            header[..4].copy_from_slice(&(total_len as u32).to_le_bytes());
+            header[4] = flags;
+            let encrypted = crate::crypto::encrypt_frame(key, &inner, &header);
+            return header.into_iter().chain(encrypted).collect();
+        }
+
+        let mut frame = Vec::with_capacity(5 + inner.len());
+        frame.extend_from_slice(&(1u32 + inner.len() as u32).to_le_bytes());
+        frame.push(flags);
+        frame.extend_from_slice(&inner);
+        frame
+    }
+
+    #[test]
+    fn streaming_frame_contract_table() {
+        let state = crate::crypto::EncryptionState::from_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
+        let mut oversize = Vec::from(((MAX_FRAME_PAYLOAD + 45) as u32).to_le_bytes());
+        oversize.push(0x01);
+
+        let cases = [
+            (
+                "unknown flags",
+                test_frame(0x02, PROTOCOL_VERSION, 0x42, None),
+                None,
+                false,
+            ),
+            (
+                "bad plaintext version",
+                test_frame(0x00, PROTOCOL_VERSION + 1, 0x42, None),
+                None,
+                false,
+            ),
+            (
+                "bad encrypted version",
+                test_frame(0x01, PROTOCOL_VERSION + 1, 0x42, Some(&state.worker_key)),
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "plaintext while key configured",
+                test_frame(0x00, PROTOCOL_VERSION, 0x42, None),
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "encrypted without key",
+                test_frame(0x01, PROTOCOL_VERSION, 0x42, Some(&state.worker_key)),
+                None,
+                false,
+            ),
+            ("short plaintext", vec![1, 0, 0, 0, 0x00], None, false),
+            (
+                "short encrypted",
+                vec![1, 0, 0, 0, 0x01],
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "oversize declaration",
+                oversize,
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "valid plaintext minimum",
+                test_frame(0x00, PROTOCOL_VERSION, 0x42, None),
+                None,
+                true,
+            ),
+            (
+                "valid encrypted minimum",
+                test_frame(0x01, PROTOCOL_VERSION, 0x42, Some(&state.worker_key)),
+                Some(&state.worker_key),
+                true,
+            ),
+        ];
+
+        for (name, frame, key, valid) in cases {
+            let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+            let streaming =
+                read_frame_encrypted(&mut std::io::Cursor::new(&frame), &mut payload, key);
+            assert_eq!(streaming.is_ok(), valid, "streaming {name}: {streaming:?}");
+
+            let buffered = try_decode_frame(&frame, &mut payload, key);
+            assert_eq!(
+                matches!(buffered, Ok(Some(_))),
+                valid,
+                "buffered {name}: {buffered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_frame_accepts_exact_payload_boundary() {
+        let payload = vec![0x5a; MAX_FRAME_PAYLOAD];
+        let mut frame = Vec::new();
+        write_frame(&mut frame, 0x42, &payload).unwrap();
+        let mut decoded = [0u8; MAX_FRAME_PAYLOAD];
+        let (msg_type, payload_len) =
+            read_frame(&mut std::io::Cursor::new(frame), &mut decoded).unwrap();
+        assert_eq!(msg_type, 0x42);
+        assert_eq!(payload_len, MAX_FRAME_PAYLOAD);
+        assert_eq!(decoded, payload.as_slice());
+    }
+
+    #[test]
+    fn buffered_frame_contract_rejects_oversize_before_full_frame_arrives() {
+        let mut declaration = [0u8; 5];
+        declaration[..4].copy_from_slice(&((MAX_FRAME_PAYLOAD + 5) as u32).to_le_bytes());
+        declaration[4] = 0x00;
+        let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+        let result = try_decode_frame(&declaration, &mut payload, None);
+        assert!(
+            result.is_err(),
+            "oversize declaration must fail immediately"
+        );
+    }
+
+    #[test]
+    fn buffered_frame_leaves_trailing_frame_for_next_decode() {
+        let first = test_frame(0x00, PROTOCOL_VERSION, 0x41, None);
+        let second = test_frame(0x00, PROTOCOL_VERSION, 0x42, None);
+        let stream: Vec<u8> = first.iter().chain(&second).copied().collect();
+        let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+        let (_, _, consumed) = try_decode_frame(&stream, &mut payload, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, first.len());
+        let (msg_type, _, second_consumed) =
+            try_decode_frame(&stream[consumed..], &mut payload, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(msg_type, 0x42);
+        assert_eq!(second_consumed, second.len());
     }
 
     #[test]
