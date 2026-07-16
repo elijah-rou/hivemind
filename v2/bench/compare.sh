@@ -22,6 +22,10 @@ zig build 2>/dev/null
 
 pkill -f "hivemind cluster" 2>/dev/null; sleep 1
 
+BENCH_DATA="${TMPDIR:-/tmp}/hivemind-bench-$$"
+mkdir -p "$BENCH_DATA"
+trap 'pkill -f "hivemind cluster" 2>/dev/null || true; rm -rf "$BENCH_DATA"' EXIT
+
 for i in 0 1 2; do
     RPORT=$((55000 + $i))
     CPORT=$((55060 + $i))
@@ -31,7 +35,9 @@ for i in 0 1 2; do
         [ -n "$PEERS" ] && PEERS="$PEERS,"
         PEERS="${PEERS}${j}@127.0.0.1:$((55000 + $j))"
     done
-    ./zig-out/bin/hivemind cluster --node-id $i --replica-count 3 --replica-port $RPORT --client-port $CPORT --peers "$PEERS" 2>/dev/null &
+    DD="$BENCH_DATA/replica-$i"
+    mkdir -m 700 -p "$DD"
+    ./zig-out/bin/hivemind cluster --node-id $i --replica-count 3 --replica-port $RPORT --client-port $CPORT --peers "$PEERS" --data-dir "$DD" 2>/dev/null &
 done
 
 sleep 10

@@ -177,8 +177,8 @@ FRAME_HEADER = 7 bytes
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
 - Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence: journal.bin with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after successful barrier
-- Crash recovery: validate committed prefix checksum chain; corrupt/missing slots fail-stop (nonzero exit); otherwise enter view_change to rejoin
+- Disk persistence: journal.bin (`0600`) under `--data-dir` (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after durable `(op, checksum)` identity matches
+- Crash recovery: validate committed prefix checksum chain; corrupt/missing/truncated journal or wrong-sized file fail-stop (nonzero exit); otherwise enter view_change to rejoin
 - Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries
 
 ## State Machine Operations

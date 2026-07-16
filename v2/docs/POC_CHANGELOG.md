@@ -45,6 +45,7 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 ## Entries
 
 ### 2026-07-16 — Durable VRR storage, fail-closed retained log, stronger VOPR checker
+- Re-review hardenings: per-slot durable prepare identity, fail-closed truncated journals, launcher `--data-dir`, journal/data-dir modes, sim write faults on metadata/clear.
 
 What changed:
 - PrepareOk, client replies, and worker effects wait for a successful journal/metadata durability barrier (synchronous group commit on the core loop)

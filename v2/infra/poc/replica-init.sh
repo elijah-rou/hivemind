@@ -4,7 +4,8 @@ set -euo pipefail
 # Hivemind replica cloud-init script
 # Binaries must be uploaded separately (deploy.sh handles this)
 
-mkdir -p /var/lib/hivemind /etc/hivemind
+mkdir -m 700 -p /var/lib/hivemind
+mkdir -p /etc/hivemind
 
 cat > /etc/hivemind/replica.env <<'ENVEOF'
 HIVEMIND_NODE_ID=${node_id}

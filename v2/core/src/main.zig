@@ -99,6 +99,18 @@ pub fn main(init: std.process.Init) !void {
     // Open file-backed disk if --data-dir is set
     var file_disk: ?*disk_mod.FileDisk = null;
     if (data_dir.len > 0) {
+        // Restrict data-dir permissions; journal contents may include secrets.
+        const dir_perms: std.Io.Dir.Permissions = @enumFromInt(@as(std.posix.mode_t, 0o700));
+        _ = std.Io.Dir.cwd().createDirPathStatus(init.io, data_dir, dir_perms) catch |err| {
+            std.debug.print("failed to create data-dir: {}\n", .{err});
+            return err;
+        };
+        var dir_z_buf: [4096]u8 = undefined;
+        if (data_dir.len >= dir_z_buf.len) return error.PathTooLong;
+        @memcpy(dir_z_buf[0..data_dir.len], data_dir);
+        dir_z_buf[data_dir.len] = 0;
+        _ = std.c.chmod(@ptrCast(&dir_z_buf), @as(std.c.mode_t, 0o700));
+
         var path_buf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/journal.bin", .{data_dir}) catch @panic("data-dir path too long");
         const fd_ptr = try allocator.create(disk_mod.FileDisk);

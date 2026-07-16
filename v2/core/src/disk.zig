@@ -102,6 +102,8 @@ pub const SimulatedDisk = struct {
     // Deterministic fail-next controls
     fail_next_write: bool,
     fail_next_sync: bool,
+    /// Fail when `syncs` (successful count so far) reaches this value.
+    fail_at_sync_count: ?u64,
 
     // Fault injection (set by VOPR)
     read_fault_rate: prng_mod.Ratio,
@@ -126,6 +128,7 @@ pub const SimulatedDisk = struct {
             .write_faults = 0,
             .fail_next_write = false,
             .fail_next_sync = false,
+            .fail_at_sync_count = null,
             .read_fault_rate = prng_mod.Ratio.zero(),
             .write_fault_rate = prng_mod.Ratio.zero(),
             .fault_prng = prng_mod.Prng.init(0xD15C),
@@ -199,6 +202,11 @@ pub const SimulatedDisk = struct {
             self.write_faults += 1;
             return error.WriteFailed;
         }
+        if (self.fault_prng.chance(self.write_fault_rate)) {
+            self.write_faults += 1;
+            self.writes += 1;
+            return error.WriteFailed;
+        }
         self.removePendingWrite(slot);
         self.pending_clear[slot] = true;
         self.writes += 1;
@@ -218,6 +226,11 @@ pub const SimulatedDisk = struct {
         if (self.fail_next_write) {
             self.fail_next_write = false;
             self.write_faults += 1;
+            return error.WriteFailed;
+        }
+        if (self.fault_prng.chance(self.write_fault_rate)) {
+            self.write_faults += 1;
+            self.metadata_writes += 1;
             return error.WriteFailed;
         }
         self.pending_metadata = meta;
@@ -243,6 +256,12 @@ pub const SimulatedDisk = struct {
         if (self.fail_next_sync) {
             self.fail_next_sync = false;
             return error.SyncFailed;
+        }
+        if (self.fail_at_sync_count) |target| {
+            if (self.syncs == target) {
+                self.fail_at_sync_count = null;
+                return error.SyncFailed;
+            }
         }
         for (0..replica_mod.LOG_SIZE_MAX) |slot| {
             if (self.pending_clear[slot]) {
@@ -366,6 +385,10 @@ pub const FileDisk = struct {
 
     /// Open or create a journal file. Initializes `self` in-place to avoid
     /// stack overflow (the slots array is ~115KB).
+    ///
+    /// New journals are created exclusively (O_CREAT|O_EXCL) with mode 0600.
+    /// Pre-existing files must already be exactly TOTAL_SIZE; truncated or
+    /// partial journals fail closed instead of being silently re-initialized.
     pub fn openInPlace(self: *FileDisk, path: []const u8) !void {
         var path_buf: [4096]u8 = undefined;
         if (path.len >= path_buf.len) return error.PathTooLong;
@@ -373,33 +396,32 @@ pub const FileDisk = struct {
         path_buf[path.len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        const fd = std.c.open(path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return error.OpenFailed;
-        errdefer _ = std.c.close(fd);
-
-        const file_size: usize = blk: {
-            if (comptime @import("builtin").os.tag == .macos) {
-                var stat_buf: std.c.Stat = undefined;
-                if (std.c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
-                break :blk @intCast(stat_buf.size);
-            } else {
-                const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-                if (end < 0) return error.StatFailed;
-                _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
-                break :blk @intCast(end);
-            }
-        };
-
         self.slot_occupied = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool);
         self.metadata = .{};
         self.metadata_written = false;
-        self.fd = fd;
 
-        if (file_size < TOTAL_SIZE) {
+        const excl_fd = std.c.open(path_z, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+        if (excl_fd >= 0) {
+            self.fd = excl_fd;
+            errdefer {
+                _ = std.c.close(self.fd);
+                _ = std.c.unlink(path_z);
+                self.fd = -1;
+            }
             try self.initNewFile();
-        } else {
-            try self.loadExisting();
+            try fsyncParentDir(path);
+            return;
         }
+
+        const fd = std.c.open(path_z, .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.OpenFailed;
+        errdefer _ = std.c.close(fd);
+        self.fd = fd;
+        _ = std.c.fchmod(fd, 0o600);
+
+        const file_size = try fileSizeFd(fd);
+        if (file_size != TOTAL_SIZE) return error.WrongSize;
+        try self.loadExisting();
     }
 
     fn initNewFile(self: *FileDisk) !void {
@@ -422,6 +444,7 @@ pub const FileDisk = struct {
         try preadAll(self.fd, std.mem.asBytes(&header), HEADER_OFFSET);
         if (header.magic != MAGIC) return error.BadMagic;
         if (header.version != VERSION) return error.BadVersion;
+        if (header.log_size_max != replica_mod.LOG_SIZE_MAX) return error.BadLogSize;
 
         var meta_disk: MetadataOnDisk = undefined;
         try preadAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET);
@@ -594,6 +617,41 @@ pub const FileDisk = struct {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn fileSizeFd(fd: std.posix.fd_t) !usize {
+    if (comptime @import("builtin").os.tag == .macos) {
+        var stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
+        return @intCast(stat_buf.size);
+    } else {
+        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (end < 0) return error.StatFailed;
+        if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.StatFailed;
+        return @intCast(end);
+    }
+}
+
+fn fsyncParentDir(path: []const u8) !void {
+    const sync_dir = struct {
+        fn call(dir_z: [*:0]const u8) !void {
+            const dfd = std.c.open(dir_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+            if (dfd < 0) return error.OpenFailed;
+            defer _ = std.c.close(dfd);
+            if (std.c.fsync(dfd) != 0) return error.FsyncFailed;
+        }
+    }.call;
+
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse {
+        try sync_dir(".");
+        return;
+    };
+    var dir_buf: [4096]u8 = undefined;
+    const dir_path = if (slash == 0) "/" else path[0..slash];
+    if (dir_path.len >= dir_buf.len) return error.PathTooLong;
+    @memcpy(dir_buf[0..dir_path.len], dir_path);
+    dir_buf[dir_path.len] = 0;
+    try sync_dir(@ptrCast(&dir_buf));
+}
 
 fn unlinkFile(path: []const u8) void {
     var path_buf: [4096]u8 = undefined;
@@ -777,4 +835,57 @@ test "durable storage: SimulatedDisk pending capacity covers LOG_SIZE_MAX" {
     try sim.sync();
     try std.testing.expectEqual(@as(usize, 0), sim.pending_write_count);
     try std.testing.expect(sim.readSlot(replica_mod.LOG_SIZE_MAX - 1) != null);
+}
+
+test "FileDisk: truncated journal fails closed" {
+    const path = "/tmp/hivemind_test_truncated.bin";
+    defer unlinkFile(path);
+
+    const fd = try std.testing.allocator.create(FileDisk);
+    defer std.testing.allocator.destroy(fd);
+    try fd.openInPlace(path);
+    var entry = msg.LogEntry{ .op_number = 1, .view_number = 0, .command = .{ .noop = {} } };
+    entry.checksum = entry.computeChecksum();
+    try fd.writeSlot(0, &entry);
+    try fd.writeMetadata(.{ .view_number = 1, .op_number = 1, .commit_min = 1, .commit_max = 1 });
+    try fd.sync();
+    fd.close();
+
+    // Truncate below TOTAL_SIZE (non-empty corrupt/partial journal).
+    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    try std.testing.expect(raw >= 0);
+    defer _ = std.c.close(raw);
+    try std.testing.expect(std.c.ftruncate(raw, 64) == 0);
+
+    try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
+}
+
+test "FileDisk: creation-crash partial journal fails closed" {
+    const path = "/tmp/hivemind_test_partial.bin";
+    defer unlinkFile(path);
+
+    // Simulate exclusive create that crashed after writing a few bytes.
+    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(raw >= 0);
+    const junk = [_]u8{ 0x48, 0x49, 0x56, 0x45 };
+    try std.testing.expect(std.c.pwrite(raw, &junk, junk.len, 0) == junk.len);
+    _ = std.c.close(raw);
+
+    const fd = try std.testing.allocator.create(FileDisk);
+    defer std.testing.allocator.destroy(fd);
+    try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
+}
+
+test "durable storage: write_fault_rate applies to metadata writes" {
+    var sim = SimulatedDisk.init();
+    sim.write_fault_rate = prng_mod.Ratio.init(1, 1);
+    try std.testing.expectError(error.WriteFailed, sim.writeMetadata(.{ .op_number = 1 }));
+    try std.testing.expect(sim.write_faults >= 1);
+}
+
+test "durable storage: write_fault_rate applies to clearSlot" {
+    var sim = SimulatedDisk.init();
+    sim.write_fault_rate = prng_mod.Ratio.init(1, 1);
+    try std.testing.expectError(error.WriteFailed, sim.clearSlot(0));
+    try std.testing.expect(sim.write_faults >= 1);
 }

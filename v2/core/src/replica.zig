@@ -182,7 +182,11 @@ pub const Replica = struct {
     pending_stop_ops: [MAX_PENDING_STOPS]msg.OpNumber,
     pending_stop_count: usize,
     /// Highest op whose Prepare was acknowledged locally after a barrier.
+    /// Not sufficient alone: same-op replacements require identity checks.
     durable_prepare_through: msg.OpNumber,
+    /// Per-slot durable prepare identity after a successful barrier.
+    durable_prepare_op: [LOG_SIZE_MAX]msg.OpNumber,
+    durable_prepare_checksum: [LOG_SIZE_MAX]u64,
 
     // Tick-based timers
     last_heartbeat: i64,
@@ -267,6 +271,8 @@ pub const Replica = struct {
             .pending_stop_ops = undefined,
             .pending_stop_count = 0,
             .durable_prepare_through = 0,
+            .durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber),
+            .durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64),
             .io = config.io,
             .state_machine = config.state_machine,
             .scheduler = sched.Scheduler.init(@as(u64, config.replica_id) +% 0x5C4ED),
@@ -334,6 +340,8 @@ pub const Replica = struct {
         self.pending_effect = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_stop_count = 0;
         self.durable_prepare_through = 0;
+        self.durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
+        self.durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
         self.io = config.io;
         self.state_machine = config.state_machine;
         self.scheduler = sched.Scheduler.init(@as(u64, config.replica_id) +% 0x5C4ED);
@@ -378,6 +386,8 @@ pub const Replica = struct {
         self.replica_commit_min = std.mem.zeroes([msg.REPLICA_COUNT_MAX]msg.OpNumber);
         self.replica_commit_min[self.replica_id] = self.commit_min;
         self.durable_prepare_through = self.op_number;
+        self.durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
+        self.durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
 
         // Restore journal entries from disk
         self.journal_occupied = std.mem.zeroes([LOG_SIZE_MAX]bool);
@@ -386,6 +396,10 @@ pub const Replica = struct {
                 if (entry.op_number > 0 and entry.valid()) {
                     self.journal[i] = entry;
                     self.journal_occupied[i] = true;
+                    if (entry.op_number <= self.op_number) {
+                        self.durable_prepare_op[i] = entry.op_number;
+                        self.durable_prepare_checksum[i] = entry.checksum;
+                    }
                 }
             }
         }
@@ -735,8 +749,8 @@ pub const Replica = struct {
             if (self.journalGet(prepare.op_number)) |existing| {
                 if (existing.checksum == prepare.entry.checksum) {
                     const slot = journalSlot(prepare.op_number);
-                    // Re-ack only after the entry is known durable locally.
-                    if (prepare.op_number <= self.durable_prepare_through) {
+                    // Re-ack only when the current entry identity is durable.
+                    if (self.isDurablePrepare(prepare.op_number)) {
                         self.sendTo(from, .{ .prepare_ok = .{
                             .view_number = self.view_number,
                             .op_number = prepare.op_number,
@@ -1093,10 +1107,13 @@ pub const Replica = struct {
         if (highest_kept > max_commit) {
             var ack_op = max_commit + 1;
             while (ack_op <= highest_kept) : (ack_op += 1) {
-                if (self.journalHas(ack_op)) {
-                    const slot = journalSlot(ack_op);
+                if (!self.journalHas(ack_op)) continue;
+                const slot = journalSlot(ack_op);
+                if (self.isDurablePrepare(ack_op)) {
                     self.prepare_ok_counts[slot] = 1;
                     self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+                } else {
+                    self.pending_prepare_broadcast[slot] = true;
                 }
             }
         }
@@ -1130,13 +1147,16 @@ pub const Replica = struct {
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
 
-        // Count self as having acked all locally-present uncommitted entries.
+        // Self-ack only durable matching identities; otherwise queue Prepare publish.
         var ack_op = self.commit_min + 1;
         while (ack_op <= self.op_number) : (ack_op += 1) {
-            if (self.journalHas(ack_op)) {
-                const slot = journalSlot(ack_op);
+            if (!self.journalHas(ack_op)) continue;
+            const slot = journalSlot(ack_op);
+            if (self.isDurablePrepare(ack_op)) {
                 self.prepare_ok_counts[slot] = 1;
                 self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+            } else {
+                self.pending_prepare_broadcast[slot] = true;
             }
         }
 
@@ -2189,6 +2209,11 @@ pub const Replica = struct {
                 } });
                 self.pending_prepare_ok[slot] = false;
             }
+
+            if (self.journalHas(op)) {
+                self.durable_prepare_op[slot] = op;
+                self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
+            }
         }
         self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
 
@@ -2262,9 +2287,21 @@ pub const Replica = struct {
                 self.journal_occupied[i] = false;
                 self.prepare_ok_counts[i] = 0;
                 self.prepare_ok_from[i] = 0;
+                self.durable_prepare_op[i] = 0;
+                self.durable_prepare_checksum[i] = 0;
                 self.journal_dirty[i] = true;
             }
         }
+    }
+
+    /// True when op is present and its current checksum was covered by a barrier.
+    pub fn isDurablePrepare(self: *const Replica, op: msg.OpNumber) bool {
+        if (op == 0) return false;
+        const slot = journalSlot(op);
+        if (!self.journal_occupied[slot]) return false;
+        if (self.journal[slot].op_number != op) return false;
+        return self.durable_prepare_op[slot] == op and
+            self.durable_prepare_checksum[slot] == self.journal[slot].checksum;
     }
 
     pub fn logHighOp(self: *const Replica) msg.OpNumber {
@@ -2388,8 +2425,8 @@ pub const Replica = struct {
     fn resendUncommittedPrepares(self: *Replica) void {
         var resend_op = self.commit_min + 1;
         while (resend_op <= self.op_number) : (resend_op += 1) {
-            // Never re-broadcast a Prepare before its local durability barrier.
-            if (resend_op > self.durable_prepare_through) continue;
+            // Never re-broadcast until the current entry identity is durable.
+            if (!self.isDurablePrepare(resend_op)) continue;
             if (self.journalGet(resend_op)) |entry| {
                 const slot = journalSlot(resend_op);
                 if (self.prepare_ok_counts[slot] < self.quorum_size) {

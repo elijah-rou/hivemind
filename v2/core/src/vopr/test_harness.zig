@@ -1038,6 +1038,8 @@ test "durable storage: sync failure cannot form acknowledged quorum" {
 }
 
 test "durable storage: metadata-only sync failure emits no client reply" {
+    // First barrier durably prepares; the second (commit-metadata) sync fails.
+    // No client reply may escape after the metadata barrier fails.
     const tc = try TestCluster.init(std.testing.allocator, 1, 0xD003);
     defer tc.deinit();
 
@@ -1045,24 +1047,18 @@ test "durable storage: metadata-only sync failure emits no client reply" {
     tc.replicas[0].client_reply_ctx = &capture;
     tc.replicas[0].client_reply_fn = ReplyCapture.reply;
 
-    // First tick will sync prepare+commit; fail the second sync (commit metadata).
-    tc.request(0, .{ .noop = {} });
-    // Allow prepare barrier, then fail next sync for commit metadata.
-    tc.disks[0].fail_next_sync = false;
-    tc.tick(); // may do prepare+commit in one or two barriers
-    // If already replied, force another op with sync fail on commit path.
-    if (capture.count == 0) {
-        try std.testing.expect(tc.replicas[0].storage_failed or tc.replicas[0].commit_min == 0 or capture.count == 0);
-    }
-
-    // Stronger path: commit already applied in memory but fail sync before reply publish.
-    capture.count = 0;
-    tc.replicas[0].storage_failed = false;
-    tc.disks[0].fail_next_sync = true;
+    // Allow exactly one successful sync (prepare barrier), fail the next (commit meta).
+    tc.disks[0].fail_at_sync_count = 1;
     tc.request(0, .{ .noop = {} });
     tc.tick();
-    try std.testing.expectEqual(@as(usize, 0), capture.count);
+
     try std.testing.expect(tc.replicas[0].storage_failed);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expect(tc.replicas[0].op_number >= 1);
+    // Durable commit metadata must not have advanced.
+    if (tc.disks[0].readMetadata()) |meta| {
+        try std.testing.expectEqual(@as(msg.OpNumber, 0), meta.commit_min);
+    }
 }
 
 test "durable storage: crash acknowledging quorum recovers committed command" {
@@ -1313,6 +1309,91 @@ test "durable storage: StartView PrepareOk waits for barrier" {
     tc.deliverAll();
     try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
     try std.testing.expect(!tc.replicas[1].journal_dirty[slot]);
+}
+
+test "durable storage: replaced op cannot re-ack on stale durable watermark" {
+    // Follower durably holds uncommitted op 1 (checksum A). StartView replaces
+    // that op with checksum B. A duplicate Prepare must not PrepareOk before the
+    // replacement syncs — a monotonic op watermark is not enough.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD10A);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var original = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    original.checksum = original.computeChecksum();
+
+    // Install a durable-but-uncommitted prepare on follower 1.
+    tc.replicas[1].journalPut(original);
+    tc.replicas[1].op_number = 1;
+    tc.replicas[1].commit_min = 0;
+    tc.replicas[1].commit_max = 0;
+    tc.tick(); // durability barrier for the staged journal write
+    try std.testing.expect(!tc.replicas[1].journal_dirty[replica_mod.journalSlot(1)]);
+    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
+    try std.testing.expect(tc.disks[1].readSlot(replica_mod.journalSlot(1)) != null);
+
+    var replacement = msg.LogEntry{
+        .view_number = 3, // view % 3 == 0 keeps replica 0 as leader
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 99,
+        .request_id = 99,
+        .parent_checksum = 0,
+    };
+    replacement.checksum = replacement.computeChecksum();
+    try std.testing.expect(replacement.checksum != original.checksum);
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = replacement;
+
+    // Leader must be able to accept a PrepareOk for op 1 if one is wrongly sent.
+    tc.replicas[0].view_number = 3;
+    tc.replicas[0].last_normal_view = 3;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].commit_min = 0;
+    tc.replicas[0].commit_max = 0;
+    tc.replicas[0].journalPut(replacement);
+    tc.replicas[0].journal_dirty[replica_mod.journalSlot(1)] = false;
+    const slot = replica_mod.journalSlot(1);
+    tc.replicas[0].prepare_ok_from[slot] = 0;
+    tc.replicas[0].prepare_ok_counts[slot] = 0;
+
+    tc.deliver(1, 0, .{ .start_view = sv });
+    try std.testing.expectEqual(replacement.checksum, tc.replicas[1].journalGet(1).?.checksum);
+    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
+    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
+
+    // Fail sync for the replacement, then inject a duplicate Prepare.
+    tc.disks[1].fail_next_sync = true;
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = replacement,
+    } });
+    tc.tick(); // deliverAll then flush (sync fails)
+
+    try std.testing.expect(tc.replicas[1].storage_failed);
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
+    try std.testing.expectEqual(@as(u8, 0), tc.replicas[0].prepare_ok_counts[slot]);
 }
 
 test "recovery rejects metadata commit_max above op_number" {

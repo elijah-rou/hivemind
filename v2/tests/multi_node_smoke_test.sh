@@ -32,26 +32,33 @@ R2_PORT=20002
 AGENT_PORT=20010
 
 echo "=== Starting 3 replicas ==="
+SMOKE_DATA="${TMPDIR:-/tmp}/hivemind-smoke-$$"
+mkdir -m 700 -p "$SMOKE_DATA/r0" "$SMOKE_DATA/r1" "$SMOKE_DATA/r2"
+cleanup_data() { rm -rf "$SMOKE_DATA"; }
+trap 'cleanup; cleanup_data' EXIT
 
 # Replica 0 (leader at view 0) -- also listens for agents
 ./zig-out/bin/hivemind cluster \
     --node-id 0 --replica-count 3 \
     --replica-port $R0_PORT --agent-port $AGENT_PORT \
-    --peers "1@127.0.0.1:$R1_PORT,2@127.0.0.1:$R2_PORT" &
+    --peers "1@127.0.0.1:$R1_PORT,2@127.0.0.1:$R2_PORT" \
+    --data-dir "$SMOKE_DATA/r0" &
 PIDS+=($!)
 
 # Replica 1
 ./zig-out/bin/hivemind cluster \
     --node-id 1 --replica-count 3 \
     --replica-port $R1_PORT \
-    --peers "0@127.0.0.1:$R0_PORT,2@127.0.0.1:$R2_PORT" &
+    --peers "0@127.0.0.1:$R0_PORT,2@127.0.0.1:$R2_PORT" \
+    --data-dir "$SMOKE_DATA/r1" &
 PIDS+=($!)
 
 # Replica 2
 ./zig-out/bin/hivemind cluster \
     --node-id 2 --replica-count 3 \
     --replica-port $R2_PORT \
-    --peers "0@127.0.0.1:$R0_PORT,1@127.0.0.1:$R1_PORT" &
+    --peers "0@127.0.0.1:$R0_PORT,1@127.0.0.1:$R1_PORT" \
+    --data-dir "$SMOKE_DATA/r2" &
 PIDS+=($!)
 
 # Let replicas start and connect to each other
