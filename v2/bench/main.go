@@ -21,6 +21,7 @@ const (
 	ClientTagClusterStateResp    byte   = 0x25
 	CmdCreateDeploy              byte   = 3
 	ProtocolVersion              uint16 = 1
+	MaxRunPayload                       = 512
 
 	ResultOk     byte = 0
 	ResultErr    byte = 1
@@ -41,8 +42,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hivemind-bench: -n must be > 0\n")
 		os.Exit(2)
 	}
-	if *payloadSize < 0 {
-		fmt.Fprintf(os.Stderr, "hivemind-bench: -payload must be >= 0\n")
+	if *payloadSize < 0 || *payloadSize > MaxRunPayload {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -payload must be between 0 and %d\n", MaxRunPayload)
 		os.Exit(2)
 	}
 	if *replicas < 0 || *gpuCount < 0 {
@@ -117,6 +118,9 @@ func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error 
 // =================================================================
 
 func runWorkloadBenchmark(addrList []string, count int, depName string, payloadSize int) error {
+	if payloadSize < 0 || payloadSize > MaxRunPayload {
+		return fmt.Errorf("payload size must be between 0 and %d", MaxRunPayload)
+	}
 	addr := strings.TrimSpace(addrList[0])
 	fmt.Printf("hivemind-bench: connecting to %s for workload\n", addr)
 
@@ -160,6 +164,9 @@ func runWorkloadBenchmark(addrList []string, count int, depName string, payloadS
 }
 
 func sendRunRequest(conn net.Conn, requestID uint64, depName string, payload []byte) error {
+	if len(payload) > MaxRunPayload {
+		return fmt.Errorf("run payload exceeds max %d bytes", MaxRunPayload)
+	}
 	// Payload: request_id(u64) + deployment_name(64 bytes) + payload_len(u32) + payload
 	data := make([]byte, 8+64+4+len(payload))
 	binary.LittleEndian.PutUint64(data[0:8], requestID)

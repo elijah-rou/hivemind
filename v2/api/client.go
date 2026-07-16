@@ -269,14 +269,18 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 
 // Run-request error codes (match v2/src/connection.zig handleRunRequest + sendRunError).
 const (
-	RunStatusOK             byte = 0
-	RunStatusNotFound       byte = 1 // deployment not found
-	RunStatusQueueFull      byte = 2
-	RunStatusInvalidPayload byte = 3 // declared length mismatch / over MAX_PAYLOAD
+	RunStatusOK               byte = 0
+	RunStatusNotFound         byte = 1 // deployment not found
+	RunStatusQueueFull        byte = 2
+	RunStatusInvalidPayload   byte = 3 // declared length mismatch / over MAX_PAYLOAD
+	RunStatusResponseTooLarge byte = 4
 )
 
 // MaxRunPayload is the shared run-request body bound (matches core request_queue.MAX_PAYLOAD).
 const MaxRunPayload = 512
+
+// MaxRunResponseBody matches the Rust worker and Zig gateway response bound.
+const MaxRunResponseBody = 16*1024 - 9
 
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
@@ -365,6 +369,9 @@ func parseRunResponse(raw []byte) (*RunResponse, error) {
 	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
 	// Overflow-safe exact equality: compare body slice length to declared length.
 	body := raw[13:]
+	if bodyLen > MaxRunResponseBody {
+		return nil, fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
+	}
 	if uint64(len(body)) != uint64(bodyLen) {
 		return nil, fmt.Errorf("run response length mismatch: declared %d have %d", bodyLen, len(body))
 	}

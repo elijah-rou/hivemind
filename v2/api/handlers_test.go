@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func TestRunStatusResponseTooLargeMapsExplicitly(t *testing.T) {
+	status, reason := runStatusToHTTP(RunStatusResponseTooLarge)
+	if status != http.StatusBadGateway || reason != "response_too_large" {
+		t.Fatalf("mapping = (%d, %q), want (%d, %q)", status, reason, http.StatusBadGateway, "response_too_large")
+	}
+}
+
 func TestWriteResultLogFullMapsTo507(t *testing.T) {
 	rr := httptest.NewRecorder()
 	writeResult(rr, CommandResult{OK: false, ErrCode: ErrCodeLogFull}, nil)

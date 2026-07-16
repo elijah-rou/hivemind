@@ -31,6 +31,16 @@ type pipeAddr string
 func (a pipeAddr) Network() string { return "pipe" }
 func (a pipeAddr) String() string  { return string(a) }
 
+func TestSendRunRequestRejectsOversizeBeforeWriting(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	if err := sendRunRequest(client, 1, "dep", make([]byte, MaxRunPayload+1)); err == nil {
+		t.Fatal("expected oversized payload rejection")
+	}
+}
+
 func TestWriteFrameIncludesFlagsByte(t *testing.T) {
 	pr, pw := io.Pipe()
 	client := &pipeConn{w: pw}

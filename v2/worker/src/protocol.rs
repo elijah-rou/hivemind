@@ -12,6 +12,9 @@ const MSG_PROBE_POD: u8 = 0x05;
 const MSG_RUN_REQUEST: u8 = 0x04;
 /// Must match v2/core/src/request_queue.zig MAX_PAYLOAD.
 pub const MAX_RUN_PAYLOAD: usize = 512;
+/// Shared worker response-body bound. RunResponse metadata consumes 9 frame-payload bytes.
+pub const MAX_RUN_RESPONSE_BODY: usize = MAX_FRAME_PAYLOAD - 9;
+pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = 4;
 
 const MSG_NODE_REGISTER: u8 = 0x10;
 const MSG_NODE_HEARTBEAT: u8 = 0x11;
@@ -152,8 +155,19 @@ pub fn write_frame_encrypted(
     payload: &[u8],
     key: Option<&[u8; crate::crypto::KEY_LEN]>,
 ) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "frame payload too large: {} > {MAX_FRAME_PAYLOAD}",
+                payload.len()
+            ),
+        ));
+    }
     // Build inner: [version(2)][tag(1)][payload...]
-    let inner_len = 2 + 1 + payload.len();
+    let inner_len = FRAME_INNER_MIN
+        .checked_add(payload.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
     let mut inner = vec![0u8; inner_len];
     inner[0..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     inner[2] = msg_type;
@@ -161,8 +175,14 @@ pub fn write_frame_encrypted(
 
     if let Some(k) = key {
         // Build header first for AAD (must match Zig decodeFrame)
-        let enc_payload_len = crate::crypto::NONCE_LEN + inner.len() + crate::crypto::TAG_LEN;
-        let frame_len = (1 + enc_payload_len) as u32; // flags + encrypted
+        let enc_payload_len = crate::crypto::NONCE_LEN
+            .checked_add(inner.len())
+            .and_then(|len| len.checked_add(crate::crypto::TAG_LEN))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
+        let frame_len = FRAME_FLAGS_LEN
+            .checked_add(enc_payload_len)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
         let mut header = [0u8; 5];
         header[0..4].copy_from_slice(&frame_len.to_le_bytes());
         header[4] = 0x01; // encrypted
@@ -171,7 +191,10 @@ pub fn write_frame_encrypted(
         w.write_all(&header)?;
         w.write_all(&encrypted)?;
     } else {
-        let frame_len = (1 + inner_len) as u32; // flags + inner
+        let frame_len = FRAME_FLAGS_LEN
+            .checked_add(inner_len)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
         w.write_all(&frame_len.to_le_bytes())?;
         w.write_all(&[0x00])?; // flags: plaintext
         w.write_all(&inner)?;
@@ -345,16 +368,29 @@ pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(
         }
 
         WorkerMessage::RunResponse(m) => {
-            // Payload: request_id(u64) + status(u8) + response_data
-            let mut pos = 0;
-            buf[pos..pos + 8].copy_from_slice(&m.request_id.to_le_bytes());
-            pos += 8;
-            buf[pos] = m.status;
-            pos += 1;
-            let copy_len = m.payload.len().min(buf.len() - pos);
-            buf[pos..pos + copy_len].copy_from_slice(&m.payload[..copy_len]);
-            pos += copy_len;
-            Ok((MSG_RUN_RESPONSE, pos))
+            // Payload: request_id(u64) + status(u8) + response_data.
+            // Oversize output is an explicit error response, never successful truncation.
+            const HEADER: usize = 9;
+            if buf.len() < HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RunResponse buffer too small",
+                ));
+            }
+            buf[0..8].copy_from_slice(&m.request_id.to_le_bytes());
+            if m.payload.len() > MAX_RUN_RESPONSE_BODY {
+                buf[8] = RUN_STATUS_RESPONSE_TOO_LARGE;
+                return Ok((MSG_RUN_RESPONSE, HEADER));
+            }
+            if m.payload.len() > buf.len() - HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RunResponse buffer too small",
+                ));
+            }
+            buf[8] = m.status;
+            buf[HEADER..HEADER + m.payload.len()].copy_from_slice(&m.payload);
+            Ok((MSG_RUN_RESPONSE, HEADER + m.payload.len()))
         }
     }
 }
@@ -595,6 +631,40 @@ mod tests {
 
         assert_eq!(msg_type, MSG_REGISTER_ACK);
         assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn frame_writer_rejects_oversize_before_writing() {
+        let mut output = Vec::new();
+        let payload = vec![0x5a; MAX_FRAME_PAYLOAD + 1];
+        let error = write_frame(&mut output, 0x42, &payload).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn run_response_exact_bound_and_overflow_status() {
+        let exact = WorkerMessage::RunResponse(RunResponseMsg {
+            request_id: 7,
+            status: 0,
+            payload: vec![0x5a; MAX_RUN_RESPONSE_BODY],
+        });
+        let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+        let (tag, len) = encode_agent_message(&exact, &mut buf).unwrap();
+        assert_eq!(tag, MSG_RUN_RESPONSE);
+        assert_eq!(len, MAX_FRAME_PAYLOAD);
+        assert_eq!(buf[8], 0);
+        assert_eq!(&buf[9..], vec![0x5a; MAX_RUN_RESPONSE_BODY]);
+
+        let overflow = WorkerMessage::RunResponse(RunResponseMsg {
+            request_id: 8,
+            status: 0,
+            payload: vec![0x6b; MAX_RUN_RESPONSE_BODY + 1],
+        });
+        let (_, len) = encode_agent_message(&overflow, &mut buf).unwrap();
+        assert_eq!(len, 9);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 8);
+        assert_eq!(buf[8], RUN_STATUS_RESPONSE_TOO_LARGE);
     }
 
     fn test_frame(

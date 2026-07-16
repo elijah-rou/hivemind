@@ -214,6 +214,8 @@ func runStatusToHTTP(status byte) (int, string) {
 		return http.StatusServiceUnavailable, "queue_full"
 	case RunStatusInvalidPayload:
 		return http.StatusBadRequest, "invalid_payload"
+	case RunStatusResponseTooLarge:
+		return http.StatusBadGateway, "response_too_large"
 	default:
 		return http.StatusBadGateway, "worker_error"
 	}

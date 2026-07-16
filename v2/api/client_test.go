@@ -315,8 +315,13 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 		},
 		{
 			name:    "ok max body",
-			raw:     buildRunResponseRaw(7, RunStatusOK, bytes.Repeat([]byte{1}, MaxRunPayload), false),
-			wantLen: MaxRunPayload,
+			raw:     buildRunResponseRaw(7, RunStatusOK, bytes.Repeat([]byte{1}, MaxRunResponseBody), false),
+			wantLen: MaxRunResponseBody,
+		},
+		{
+			name:    "body over max",
+			raw:     buildRunResponseRaw(7, RunStatusOK, bytes.Repeat([]byte{1}, MaxRunResponseBody+1), false),
+			wantErr: "exceeds max",
 		},
 		{
 			name: "gateway error without length",
