@@ -1,0 +1,308 @@
+package main
+
+import (
+	"encoding/binary"
+	"io"
+	"strings"
+	"testing"
+	"time"
+)
+
+func encodeOkReply(requestID, entityID uint64) []byte {
+	buf := make([]byte, 17)
+	binary.LittleEndian.PutUint64(buf[0:8], requestID)
+	buf[8] = ResultOk
+	binary.LittleEndian.PutUint64(buf[9:17], entityID)
+	return buf
+}
+
+func encodeErrReply(requestID uint64, code byte) []byte {
+	buf := make([]byte, 10)
+	binary.LittleEndian.PutUint64(buf[0:8], requestID)
+	buf[8] = ResultErr
+	buf[9] = code
+	return buf
+}
+
+func writeReplyFrame(w *io.PipeWriter, payload []byte) error {
+	inner := make([]byte, 2+1+len(payload))
+	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+	inner[2] = ClientTagReply
+	copy(inner[3:], payload)
+	header := make([]byte, 5)
+	binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+	header[4] = 0x00
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
+	_, err := w.Write(inner)
+	return err
+}
+
+func TestParseResultTable(t *testing.T) {
+	tests := []struct {
+		name    string
+		reply   []byte
+		wantID  uint64
+		wantOK  bool
+		wantErr string
+	}{
+		{
+			name:   "valid success",
+			reply:  encodeOkReply(7, 99),
+			wantID: 7,
+			wantOK: true,
+		},
+		{
+			name:    "mismatched request id",
+			reply:   encodeOkReply(41, 1),
+			wantID:  42,
+			wantErr: "request_id mismatch",
+		},
+		{
+			name:    "truncated frame missing result tag",
+			reply:   encodeOkReply(1, 0)[:8],
+			wantID:  1,
+			wantErr: "too short",
+		},
+		{
+			name:    "malformed empty",
+			reply:   nil,
+			wantID:  1,
+			wantErr: "too short",
+		},
+		{
+			name:    "unexpected result tag",
+			reply:   append(encodeOkReply(3, 0)[:8], 0xFF),
+			wantID:  3,
+			wantErr: "unknown result type",
+		},
+		{
+			name:   "error result",
+			reply:  encodeErrReply(5, ErrNotLeader),
+			wantID: 5,
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseResult(tc.reply, tc.wantID)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil (result=%+v)", tc.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.OK != tc.wantOK {
+				t.Fatalf("OK=%v want %v", got.OK, tc.wantOK)
+			}
+			if tc.wantOK {
+				if err := expectSuccessResult(tc.reply, tc.wantID); err != nil {
+					t.Fatalf("expectSuccessResult: %v", err)
+				}
+			} else {
+				if err := expectSuccessResult(tc.reply, tc.wantID); err == nil {
+					t.Fatal("expected error result to fail expectSuccessResult")
+				}
+			}
+		})
+	}
+}
+
+func TestReadReplyValidatesRequestIDAndSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		wantID  uint64
+		wantErr string
+	}{
+		{
+			name:    "valid success",
+			payload: encodeOkReply(11, 100),
+			wantID:  11,
+		},
+		{
+			name:    "mismatched request id",
+			payload: encodeOkReply(10, 1),
+			wantID:  11,
+			wantErr: "request_id mismatch",
+		},
+		{
+			name:    "error result not counted as success",
+			payload: encodeErrReply(11, ErrNotLeader),
+			wantID:  11,
+			wantErr: "error code",
+		},
+		{
+			name:    "unexpected result tag",
+			payload: append(encodeOkReply(11, 0)[:8], 0xAB),
+			wantID:  11,
+			wantErr: "unknown result type",
+		},
+		{
+			name:    "truncated payload",
+			payload: encodeOkReply(11, 0)[:8],
+			wantID:  11,
+			wantErr: "too short",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cr, sw := io.Pipe()
+			client := &pipeConn{r: cr}
+			go func() {
+				_ = writeReplyFrame(sw, tc.payload)
+				_ = sw.Close()
+			}()
+
+			buf := make([]byte, 256)
+			err := readReply(client, buf, tc.wantID)
+			_ = cr.Close()
+
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestReadReplyConnectionReuseMatchesEachRequestID(t *testing.T) {
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr}
+
+	go func() {
+		_ = writeReplyFrame(sw, encodeOkReply(1, 10))
+		_ = writeReplyFrame(sw, encodeOkReply(2, 20))
+		_ = writeReplyFrame(sw, encodeErrReply(3, ErrNotLeader))
+		_ = sw.Close()
+	}()
+
+	buf := make([]byte, 256)
+	if err := readReply(client, buf, 1); err != nil {
+		t.Fatalf("first reply: %v", err)
+	}
+	if err := readReply(client, buf, 2); err != nil {
+		t.Fatalf("second reply: %v", err)
+	}
+	err := readReply(client, buf, 3)
+	_ = cr.Close()
+	if err == nil {
+		t.Fatal("expected third reply (error result) to fail")
+	}
+	if !strings.Contains(err.Error(), "error code") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReadReplyRejectsWrongTag(t *testing.T) {
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr}
+	go func() {
+		inner := make([]byte, 2+1+9)
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+		inner[2] = ClientTagRunResponse
+		copy(inner[3:], encodeOkReply(1, 0))
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+		header[4] = 0x00
+		_, _ = sw.Write(header)
+		_, _ = sw.Write(inner)
+		_ = sw.Close()
+	}()
+
+	buf := make([]byte, 256)
+	err := readReply(client, buf, 1)
+	_ = cr.Close()
+	if err == nil || !strings.Contains(err.Error(), "unexpected tag") {
+		t.Fatalf("expected unexpected tag error, got %v", err)
+	}
+}
+
+func TestReadRunResponseValidatesRequestID(t *testing.T) {
+	encodeRun := func(requestID uint64, status byte) []byte {
+		buf := make([]byte, 9)
+		binary.LittleEndian.PutUint64(buf[0:8], requestID)
+		buf[8] = status
+		return buf
+	}
+	writeRun := func(w *io.PipeWriter, payload []byte) {
+		inner := make([]byte, 2+1+len(payload))
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+		inner[2] = ClientTagRunResponse
+		copy(inner[3:], payload)
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+		header[4] = 0x00
+		_, _ = w.Write(header)
+		_, _ = w.Write(inner)
+	}
+
+	tests := []struct {
+		name    string
+		payload []byte
+		wantID  uint64
+		wantErr string
+	}{
+		{name: "valid success", payload: encodeRun(9, 0), wantID: 9},
+		{name: "mismatched request id", payload: encodeRun(8, 0), wantID: 9, wantErr: "request_id mismatch"},
+		{name: "error status", payload: encodeRun(9, 1), wantID: 9, wantErr: "run status"},
+		{name: "truncated", payload: encodeRun(9, 0)[:8], wantID: 9, wantErr: "too short"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cr, sw := io.Pipe()
+			client := &pipeConn{r: cr}
+			go func() {
+				writeRun(sw, tc.payload)
+				_ = sw.Close()
+			}()
+			buf := make([]byte, 256)
+			err := readRunResponse(client, buf, tc.wantID)
+			_ = cr.Close()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestReadReplyDeadlineHonored(t *testing.T) {
+	// Ensure read path still sets a deadline (smoke: closed pipe errors promptly).
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr}
+	_ = sw.Close()
+	buf := make([]byte, 256)
+	start := time.Now()
+	err := readReply(client, buf, 1)
+	_ = cr.Close()
+	if err == nil {
+		t.Fatal("expected error on closed pipe")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("read took too long: %v", time.Since(start))
+	}
+}

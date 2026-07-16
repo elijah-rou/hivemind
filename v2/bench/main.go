@@ -101,7 +101,7 @@ func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error 
 			return fmt.Errorf("send failed at %d: %w", i, err)
 		}
 
-		if _, err := readReply(conn, recvBuf); err != nil {
+		if err := readReply(conn, recvBuf, requestID); err != nil {
 			return fmt.Errorf("recv failed at %d: %w", i, err)
 		}
 
@@ -148,7 +148,7 @@ func runWorkloadBenchmark(addrList []string, count int, depName string, payloadS
 			return fmt.Errorf("send failed at %d: %w", i, err)
 		}
 
-		if _, err := readRunResponse(conn, recvBuf); err != nil {
+		if err := readRunResponse(conn, recvBuf, requestID); err != nil {
 			return fmt.Errorf("recv failed at %d: %w", i, err)
 		}
 
@@ -169,18 +169,18 @@ func sendRunRequest(conn net.Conn, requestID uint64, depName string, payload []b
 	return writeFrame(conn, ClientTagRunRequest, data)
 }
 
-func readRunResponse(conn net.Conn, buf []byte) ([]byte, error) {
+func readRunResponse(conn net.Conn, buf []byte, expectedRequestID uint64) error {
 	frame, err := readFrame(conn, buf, 5*time.Second)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagRunResponse {
 		if len(frame) < 3 {
-			return nil, fmt.Errorf("short run response frame: %d bytes", len(frame))
+			return fmt.Errorf("short run response frame: %d bytes", len(frame))
 		}
-		return nil, fmt.Errorf("unexpected tag: 0x%02x", frame[2])
+		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
-	return frame[3:], nil
+	return expectSuccessRunResponse(frame[3:], expectedRequestID)
 }
 
 // =================================================================
@@ -320,18 +320,80 @@ func readLeaderProbe(conn net.Conn, buf []byte) (bool, error) {
 	return payload[26] == 1, nil
 }
 
-func readReply(conn net.Conn, buf []byte) ([]byte, error) {
+// CommandResult mirrors the client API wire result for deploy replies.
+// Wire: [request_id(8)][result_type(1)][ok:entity_id(8) | err:code(1)].
+type CommandResult struct {
+	OK       bool
+	EntityID uint64
+	ErrCode  byte
+}
+
+// parseResult matches v2/api/client.go decode contract (bench is a separate module).
+func parseResult(reply []byte, expectedRequestID uint64) (CommandResult, error) {
+	if len(reply) < 9 {
+		return CommandResult{}, fmt.Errorf("reply too short: %d bytes", len(reply))
+	}
+	replyRequestID := binary.LittleEndian.Uint64(reply[0:8])
+	if replyRequestID != expectedRequestID {
+		return CommandResult{}, fmt.Errorf("reply request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
+	}
+
+	switch reply[8] {
+	case ResultOk:
+		var entityID uint64
+		if len(reply) >= 17 {
+			entityID = binary.LittleEndian.Uint64(reply[9:17])
+		}
+		return CommandResult{OK: true, EntityID: entityID}, nil
+	case ResultErr:
+		var errCode byte
+		if len(reply) >= 10 {
+			errCode = reply[9]
+		}
+		return CommandResult{OK: false, ErrCode: errCode}, nil
+	default:
+		return CommandResult{}, fmt.Errorf("unknown result type: %d", reply[8])
+	}
+}
+
+func expectSuccessResult(reply []byte, expectedRequestID uint64) error {
+	result, err := parseResult(reply, expectedRequestID)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("reply error code %d", result.ErrCode)
+	}
+	return nil
+}
+
+func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
+	if len(raw) < 9 {
+		return fmt.Errorf("run response too short: %d bytes", len(raw))
+	}
+	replyRequestID := binary.LittleEndian.Uint64(raw[0:8])
+	if replyRequestID != expectedRequestID {
+		return fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
+	}
+	status := raw[8]
+	if status != 0 {
+		return fmt.Errorf("run status %d", status)
+	}
+	return nil
+}
+
+func readReply(conn net.Conn, buf []byte, expectedRequestID uint64) error {
 	frame, err := readFrame(conn, buf, 5*time.Second)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagReply {
 		if len(frame) < 3 {
-			return nil, fmt.Errorf("short reply frame: %d bytes", len(frame))
+			return fmt.Errorf("short reply frame: %d bytes", len(frame))
 		}
-		return nil, fmt.Errorf("unexpected tag: 0x%02x", frame[2])
+		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
-	return frame[3:], nil
+	return expectSuccessResult(frame[3:], expectedRequestID)
 }
 
 func readFull(conn net.Conn, buf []byte) (int, error) {

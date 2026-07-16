@@ -129,7 +129,7 @@ func TestShortFrameErrorDoesNotPanic(t *testing.T) {
 	if len(frame) != 0 {
 		t.Fatalf("expected empty body after flags, got %d", len(frame))
 	}
-	_, err = readReply(client, buf)
+	err = readReply(client, buf, 1)
 	// readReply will try another read on the closed pipe; either path must not panic.
 	_ = err
 	_ = sr.Close()
