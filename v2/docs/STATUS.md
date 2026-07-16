@@ -177,8 +177,9 @@ FRAME_HEADER = 7 bytes
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
 - Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence: journal.bin (mmap'd), metadata write-through
-- Crash recovery: read journal + metadata, enter view_change to rejoin
+- Disk persistence: journal.bin with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after successful barrier
+- Crash recovery: validate committed prefix checksum chain; corrupt/missing slots fail-stop (nonzero exit); otherwise enter view_change to rejoin
+- Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries
 
 ## State Machine Operations
 
@@ -274,6 +275,9 @@ Legacy deploy-mode benchmark, retained for historical context only:
 
 **VOPR simulation coverage:**
 - VRR consensus under faults (partitions, crashes, restarts)
+- Durable-before-ack storage barriers, group commit, and fail-stop on disk errors
+- Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
+- Checker compares full entry checksums; commit regression and history capacity are violations
 - Cross-region gossip propagation
 - Gossip under network partitions
 - Deterministic federated locality selector proof inputs (`same-locality-best`, `same-locality-failover`, `cross-locality-fallback`, `residency-restricted`)

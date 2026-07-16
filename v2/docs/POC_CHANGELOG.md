@@ -44,6 +44,29 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Durable VRR storage, fail-closed retained log, stronger VOPR checker
+
+What changed:
+- PrepareOk, client replies, and worker effects wait for a successful journal/metadata durability barrier (synchronous group commit on the core loop)
+- storage write/sync failures fail-stop the replica (`storage_failed`) and exit nonzero in production
+- recovery validates the metadata-declared committed prefix (checksum chain); corrupt/missing slots refuse to continue as a fresh replica
+- retained log is fail-closed at `LOG_SIZE_MAX` (1024) with Zig `log_full`, API `ErrCodeLogFull`, and HTTP 507; no circular overwrite without snapshots
+- VOPR checker compares full entry checksums, treats commit regression as a violation, and fails loudly on history capacity exhaustion
+- deterministic filters: `durable storage`, `journal retention`, `group commit`, `checker rejects`
+
+Why it matters:
+- closes acknowledged volatile prepares/replies and wrap-around state-loss classes that would invalidate POC durability claims
+- makes the finite-log blocker explicit to operators via metrics and HTTP 507 instead of silent overwrite
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; POC v2 still the presentation gate)
+
+Next steps:
+1. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+2. keep codec/padding-free journal serialization as a separate coordinated PR
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; this change is deterministic storage-safety only — no new live failure evidence)
+
 ### 2026-07-16 — Remove former platform association branding
 
 What changed:
