@@ -1121,4 +1121,10 @@ fn test_scheduler_under_network_partition() {
 
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
-Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid.
+Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid. Status `4` means the selected worker became unavailable during dispatch; the request is not automatically requeued because a partial write cannot prove non-execution.
+
+## Peer identity limitation
+
+Peer sockets bind an initially unbound slot to a configured replica ID only after a valid frame. Once bound, application frames cannot replace that identity. For each configured pair, only the lower replica ID initiates TCP and the higher ID accepts inbound, preventing reciprocal startup deadlock.
+
+This initial binding is unauthenticated unless the shared encryption key is configured, and a shared key still does not provide unique per-peer identity. Authenticated per-peer TLS/mTLS handshakes remain required. Mixed-version rolling upgrades are unsupported; stop and upgrade the full cluster together.

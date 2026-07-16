@@ -27,6 +27,80 @@ func buildClusterStateProbeFrame(isLeader bool) []byte {
 	return frame
 }
 
+func TestParseResultRequiresExactVariantLengths(t *testing.T) {
+	ok := make([]byte, 17)
+	binary.LittleEndian.PutUint64(ok[:8], 7)
+	ok[8] = 0
+	errReply := make([]byte, 10)
+	binary.LittleEndian.PutUint64(errReply[:8], 7)
+	errReply[8] = 1
+
+	cases := []struct {
+		name  string
+		reply []byte
+	}{
+		{name: "ok truncated", reply: ok[:16]},
+		{name: "ok trailing", reply: append(ok, 0)},
+		{name: "error truncated", reply: errReply[:9]},
+		{name: "error trailing", reply: append(errReply, 0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseResult(tc.reply, 7); err == nil {
+				t.Fatalf("parseResult accepted malformed %d-byte reply", len(tc.reply))
+			}
+		})
+	}
+}
+
+func TestParseClusterStateRejectsTruncationAndExcessCountsWithoutPanic(t *testing.T) {
+	validEmpty := make([]byte, 27+2+2+2+2+40)
+	validEmpty[0] = 1
+	if _, err := parseClusterState(validEmpty); err != nil {
+		t.Fatalf("valid empty state rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{name: "header truncation", data: validEmpty[:26]},
+		{name: "node record truncation", data: func() []byte {
+			b := append([]byte(nil), validEmpty[:29]...)
+			binary.LittleEndian.PutUint16(b[27:29], 1)
+			return b
+		}()},
+		{name: "node count over bound", data: func() []byte {
+			b := append([]byte(nil), validEmpty...)
+			binary.LittleEndian.PutUint16(b[27:29], 129)
+			return b
+		}()},
+		{name: "deployment count over bound", data: func() []byte {
+			b := append([]byte(nil), validEmpty...)
+			binary.LittleEndian.PutUint16(b[29:31], 65)
+			return b
+		}()},
+		{name: "pod count over bound", data: func() []byte {
+			b := append([]byte(nil), validEmpty...)
+			binary.LittleEndian.PutUint16(b[31:33], 513)
+			return b
+		}()},
+		{name: "agent count over bound", data: func() []byte {
+			b := append([]byte(nil), validEmpty...)
+			binary.LittleEndian.PutUint16(b[33:35], 129)
+			return b
+		}()},
+		{name: "queue stats truncation", data: validEmpty[:len(validEmpty)-1]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseClusterState(tc.data); err == nil {
+				t.Fatalf("parseClusterState accepted malformed %d-byte state", len(tc.data))
+			}
+		})
+	}
+}
+
 func TestProbeIsLeaderClearsDeadlines(t *testing.T) {
 	conn := &deadlineTrackingConn{
 		readBuf: bytes.NewReader(buildClusterStateProbeFrame(true)),

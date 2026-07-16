@@ -19,6 +19,7 @@ INSTANCE_ID=""
 CLEANUP_INSTALLED=0
 RUN_WORKSPACE="hivemind-gpu-$(date +%s)-$$-$RANDOM"
 TF_DATA_DIR=""
+WORKER_ARCHIVE=""
 
 if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
   echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
@@ -29,6 +30,7 @@ if [[ ! -d "$WORKER_DIR" ]]; then
   exit 1
 fi
 TF_DATA_DIR="$(mktemp -d)"
+WORKER_ARCHIVE="$(mktemp "$TF_DATA_DIR/worker-src.XXXXXX.tar.gz")"
 export TF_DATA_DIR
 export TF_WORKSPACE="$RUN_WORKSPACE"
 
@@ -122,8 +124,8 @@ BUCKET="$BUCKET_CANDIDATE"
 
 # Package the worker source
 cd "$WORKER_DIR"
-tar czf /tmp/worker-src.tar.gz --exclude target --exclude .git -C .. worker/
-aws s3 cp /tmp/worker-src.tar.gz "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
+tar czf "$WORKER_ARCHIVE" --exclude target --exclude .git -C .. worker/
+aws s3 cp "$WORKER_ARCHIVE" "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
 
 CMD_ID=$(aws ssm send-command --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \

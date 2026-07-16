@@ -120,17 +120,16 @@ func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error 
 // =================================================================
 
 func runWorkloadBenchmark(addrList []string, count int, depName string, payloadSize int) error {
+	return runWorkloadBenchmarkWithFinder(addrList, count, depName, payloadSize, findLeader)
+}
+
+func runWorkloadBenchmarkWithFinder(addrList []string, count int, depName string, payloadSize int, find func([]string) net.Conn) error {
 	if payloadSize < 0 || payloadSize > MaxRunPayload {
 		return fmt.Errorf("payload size must be between 0 and %d", MaxRunPayload)
 	}
-	addr := strings.TrimSpace(addrList[0])
-	fmt.Printf("hivemind-bench: connecting to %s for workload\n", addr)
-
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("connect failed: %w", err)
+	if len(addrList) == 0 {
+		return fmt.Errorf("no replica addresses configured")
 	}
-	defer conn.Close()
 
 	payload := make([]byte, payloadSize)
 	for i := range payload {
@@ -146,18 +145,25 @@ func runWorkloadBenchmark(addrList []string, count int, depName string, payloadS
 	totalStart := time.Now()
 
 	for i := 0; i < count; i++ {
+		// Reprobe the configured list before each sample so a changed leader is
+		// discovered without retrying an accepted request and risking duplicates.
+		conn := find(addrList)
+		if conn == nil {
+			return fmt.Errorf("no leader found at workload request %d", i)
+		}
 		requestID := uint64(i + 1)
-
 		start := time.Now()
-
 		if err := sendRunRequest(conn, requestID, depName, payload); err != nil {
+			_ = conn.Close()
 			return fmt.Errorf("send failed at %d: %w", i, err)
 		}
-
 		if err := readRunResponse(conn, recvBuf, requestID); err != nil {
+			_ = conn.Close()
 			return fmt.Errorf("recv failed at %d: %w", i, err)
 		}
-
+		if err := conn.Close(); err != nil {
+			return fmt.Errorf("close failed at %d: %w", i, err)
+		}
 		latencies = append(latencies, time.Since(start))
 	}
 

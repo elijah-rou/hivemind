@@ -586,17 +586,15 @@ func parseResult(reply []byte, expectedRequestID uint64) (CommandResult, error) 
 	resultType := reply[8]
 	switch resultType {
 	case 0: // ok
-		var entityID uint64
-		if len(reply) >= 17 {
-			entityID = binary.LittleEndian.Uint64(reply[9:17])
+		if len(reply) != 17 {
+			return CommandResult{}, fmt.Errorf("ok reply length %d, want 17", len(reply))
 		}
-		return CommandResult{OK: true, EntityID: entityID}, nil
+		return CommandResult{OK: true, EntityID: binary.LittleEndian.Uint64(reply[9:17])}, nil
 	case 1: // error
-		var errCode byte
-		if len(reply) >= 10 {
-			errCode = reply[9]
+		if len(reply) != 10 {
+			return CommandResult{}, fmt.Errorf("err reply length %d, want 10", len(reply))
 		}
-		return CommandResult{OK: false, ErrCode: errCode}, nil
+		return CommandResult{OK: false, ErrCode: reply[9]}, nil
 	default:
 		return CommandResult{}, fmt.Errorf("unknown result type: %d", resultType)
 	}
@@ -707,12 +705,24 @@ func (c *HivemindClient) SendClusterStateRequest() (*ClusterState, error) {
 }
 
 func parseClusterState(data []byte) (*ClusterState, error) {
-	if len(data) < 29 {
+	const (
+		headerSize     = 29
+		nodeSize       = 148
+		deploymentSize = 215
+		podSize        = 25
+		agentSize      = 83
+		queueStatsSize = 40
+		maxNodes       = 128
+		maxDeployments = 64
+		maxPods        = 512
+		maxAgents      = 128
+	)
+	if len(data) < headerSize {
 		return nil, fmt.Errorf("cluster state too short: %d", len(data))
 	}
 
 	cs := &ClusterState{}
-	pos := 1 // skip query_type byte
+	pos := 1
 	cs.ViewNumber = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 	cs.CommitMin = binary.LittleEndian.Uint64(data[pos:])
@@ -724,14 +734,27 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 	cs.IsLeader = data[pos] == 1
 	pos++
 
-	// Nodes
-	nodeCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
+	readCount := func(kind string, max int, recordSize int) (int, error) {
+		if pos+2 > len(data) {
+			return 0, fmt.Errorf("cluster state truncated before %s count", kind)
+		}
+		count := int(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		if count > max {
+			return 0, fmt.Errorf("cluster state %s count %d exceeds max %d", kind, count, max)
+		}
+		if count > (len(data)-pos)/recordSize {
+			return 0, fmt.Errorf("cluster state truncated %s records: count=%d remaining=%d", kind, count, len(data)-pos)
+		}
+		return count, nil
+	}
+
+	nodeCount, err := readCount("node", maxNodes, nodeSize)
+	if err != nil {
+		return nil, err
+	}
 	cs.Nodes = make([]NodeInfo, nodeCount)
 	for i := range cs.Nodes {
-		if pos+140 > len(data) {
-			break
-		}
 		n := &cs.Nodes[i]
 		n.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -755,17 +778,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos += 32
 	}
 
-	// Deployments
-	if pos+2 > len(data) {
-		return cs, nil
+	deploymentCount, err := readCount("deployment", maxDeployments, deploymentSize)
+	if err != nil {
+		return nil, err
 	}
-	depCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
-	cs.Deployments = make([]DeploymentInfo, depCount)
+	cs.Deployments = make([]DeploymentInfo, deploymentCount)
 	for i := range cs.Deployments {
-		if pos+211 > len(data) {
-			break
-		} // 8+64+128+4+4+1+4+1+1 = 215, round to 211
 		d := &cs.Deployments[i]
 		d.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -787,17 +805,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Pods
-	if pos+2 > len(data) {
-		return cs, nil
+	podCount, err := readCount("pod", maxPods, podSize)
+	if err != nil {
+		return nil, err
 	}
-	podCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
 	cs.Pods = make([]PodInfo, podCount)
 	for i := range cs.Pods {
-		if pos+25 > len(data) {
-			break
-		}
 		p := &cs.Pods[i]
 		p.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -809,17 +822,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Agents
-	if pos+2 > len(data) {
-		return cs, nil
+	agentCount, err := readCount("agent", maxAgents, agentSize)
+	if err != nil {
+		return nil, err
 	}
-	agentCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
 	cs.Agents = make([]WorkerInfo, agentCount)
 	for i := range cs.Agents {
-		if pos+83 > len(data) {
-			break
-		}
 		a := &cs.Agents[i]
 		a.Hostname = trimNull(data[pos : pos+64])
 		pos += 64
@@ -835,9 +843,8 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Queue stats
-	if pos+40 > len(data) {
-		return cs, nil
+	if len(data)-pos != queueStatsSize {
+		return nil, fmt.Errorf("cluster state queue stats length %d, want %d", len(data)-pos, queueStatsSize)
 	}
 	cs.QueueDepth = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
@@ -848,7 +855,10 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 	cs.DispatchTotal = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 	cs.ResolveTotal = binary.LittleEndian.Uint64(data[pos:])
-
+	pos += 8
+	if pos != len(data) {
+		panic("cluster state parser length invariant")
+	}
 	return cs, nil
 }
 

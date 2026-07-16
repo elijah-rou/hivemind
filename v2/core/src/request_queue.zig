@@ -74,6 +74,7 @@ const InFlightEntry = struct {
     worker_request_id: u64 = 0,
     client_request_id: u64 = 0,
     client_id: u128 = 0,
+    worker_idx: usize = 0,
     active: bool = false,
 };
 
@@ -133,6 +134,10 @@ pub const RequestQueue = struct {
 
     /// Resolve a worker correlation ID to the original client request.
     pub fn resolveResponse(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
+        return self.releaseInFlight(worker_request_id);
+    }
+
+    pub fn releaseInFlight(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
         for (&self.in_flight) |*entry| {
             if (entry.active and entry.worker_request_id == worker_request_id) {
                 entry.active = false;
@@ -144,6 +149,23 @@ pub const RequestQueue = struct {
             }
         }
         return null;
+    }
+
+    /// Atomically release every correlation owned by one worker connection.
+    pub fn releaseWorker(self: *RequestQueue, worker_idx: usize, released: *[MAX_IN_FLIGHT]ResolvedRequest) usize {
+        var released_count: usize = 0;
+        for (&self.in_flight) |*entry| {
+            if (!entry.active or entry.worker_idx != worker_idx) continue;
+            std.debug.assert(released_count < released.len);
+            released[released_count] = .{
+                .client_id = entry.client_id,
+                .client_request_id = entry.client_request_id,
+            };
+            released_count += 1;
+            entry.active = false;
+            self.resolve_total += 1;
+        }
+        return released_count;
     }
 
     /// Drop all queued and in-flight requests owned by a disconnected client.
@@ -218,6 +240,10 @@ pub const RequestQueue = struct {
 
     /// Reserve a unique worker correlation ID. Returns null without mutation when full.
     pub fn trackInFlight(self: *RequestQueue, client_request_id: u64, client_id: u128) ?u64 {
+        return self.trackInFlightForWorker(client_request_id, client_id, 0);
+    }
+
+    pub fn trackInFlightForWorker(self: *RequestQueue, client_request_id: u64, client_id: u128, worker_idx: usize) ?u64 {
         if (self.activeInFlightCount() >= MAX_IN_FLIGHT) return null;
 
         for (&self.in_flight) |*entry| {
@@ -228,6 +254,7 @@ pub const RequestQueue = struct {
                 .worker_request_id = worker_request_id,
                 .client_request_id = client_request_id,
                 .client_id = client_id,
+                .worker_idx = worker_idx,
                 .active = true,
             };
             self.dispatch_total += 1;
@@ -359,6 +386,32 @@ test "request queue: cancel client clears queued and in-flight requests only for
     const remaining = rq.queues[0].dequeue().?;
     try std.testing.expectEqual(@as(u64, 11), remaining.request_id);
     try std.testing.expectEqual(@as(u128, 200), remaining.client_id);
+}
+
+test "request queue: worker failure releases owned correlations and reuses slots" {
+    var rq = RequestQueue.init();
+    const failed = rq.trackInFlightForWorker(10, 100, 3).?;
+    const kept = rq.trackInFlightForWorker(11, 200, 4).?;
+
+    var released: [MAX_IN_FLIGHT]ResolvedRequest = undefined;
+    const released_count = rq.releaseWorker(3, &released);
+    try std.testing.expectEqual(@as(usize, 1), released_count);
+    try std.testing.expectEqual(@as(u128, 100), released[0].client_id);
+    try std.testing.expect(rq.resolveResponse(failed) == null);
+    try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
+
+    const reused = rq.trackInFlightForWorker(12, 300, 3).?;
+    try std.testing.expect(reused != kept);
+    try std.testing.expectEqual(@as(usize, 2), rq.activeInFlightCount());
+}
+
+test "request queue: explicit release returns original request once" {
+    var rq = RequestQueue.init();
+    const worker_request_id = rq.trackInFlightForWorker(42, 123, 7).?;
+    const released = rq.releaseInFlight(worker_request_id).?;
+    try std.testing.expectEqual(@as(u64, 42), released.client_request_id);
+    try std.testing.expectEqual(@as(u128, 123), released.client_id);
+    try std.testing.expect(rq.releaseInFlight(worker_request_id) == null);
 }
 
 test "request queue: rejects oversized payload instead of clamping" {

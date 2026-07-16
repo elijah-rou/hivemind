@@ -31,6 +31,51 @@ type pipeAddr string
 func (a pipeAddr) Network() string { return "pipe" }
 func (a pipeAddr) String() string  { return string(a) }
 
+func TestWorkloadBenchmarkReprobesLeaderAcrossAddressList(t *testing.T) {
+	firstClient, firstServer := net.Pipe()
+	secondClient, secondServer := net.Pipe()
+	defer firstServer.Close()
+	defer secondServer.Close()
+
+	writeRunResponse := func(conn net.Conn, requestID uint64, status byte) {
+		payload := make([]byte, 9)
+		binary.LittleEndian.PutUint64(payload[:8], requestID)
+		payload[8] = status
+		if status == 0 {
+			payload = append(payload, 0, 0, 0, 0)
+		}
+		_ = writeFrame(conn, ClientTagRunResponse, payload)
+	}
+	serve := func(conn net.Conn, status byte) {
+		buf := make([]byte, MaxFrameBytes)
+		frame, err := readFrame(conn, buf, time.Second)
+		if err != nil || len(frame) < 11 || frame[2] != ClientTagRunRequest {
+			return
+		}
+		writeRunResponse(conn, binary.LittleEndian.Uint64(frame[3:11]), status)
+	}
+	go serve(firstServer, 0)
+	go serve(secondServer, 0)
+
+	finderCalls := 0
+	finder := func(addrs []string) net.Conn {
+		if len(addrs) != 2 || addrs[0] != "replica-a" || addrs[1] != "replica-b" {
+			t.Fatalf("finder received addresses %v", addrs)
+		}
+		finderCalls++
+		if finderCalls == 1 {
+			return firstClient
+		}
+		return secondClient
+	}
+	if err := runWorkloadBenchmarkWithFinder([]string{"replica-a", "replica-b"}, 2, "echo", 0, finder); err != nil {
+		t.Fatalf("workload benchmark did not recover: %v", err)
+	}
+	if finderCalls != 2 {
+		t.Fatalf("finder calls=%d want 2", finderCalls)
+	}
+}
+
 func TestSendRunRequestRejectsOversizeBeforeWriting(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

@@ -90,6 +90,8 @@ chmod +x "$STUB_BIN/aws"
 cat > "$STUB_BIN/tar" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+: "${STUB_STATE:?}"
+printf '%s\n' "$*" >> "$STUB_STATE/tar.log"
 exit 0
 EOF
 chmod +x "$STUB_BIN/tar"
@@ -193,10 +195,16 @@ wait "$pid_b"; rc_b=$?
 set -e
 mapfile -t applied < <(sed -n 's/^terraform:apply -auto-approve:workspace=//p' "$STUB_STATE/terraform.log" | sort -u)
 mapfile -t destroyed < <(sort -u "$STUB_STATE/destroyed.log")
+mapfile -t archives < <(sed -n 's/^czf \([^ ]*\).*/\1/p' "$STUB_STATE/tar.log" | sort -u)
 if [[ "$rc_a" -eq 0 && "$rc_b" -eq 0 && "${#applied[@]}" -eq 2 && "${#destroyed[@]}" -eq 2 && "${applied[*]}" == "${destroyed[*]}" ]]; then
   pass "concurrent barrier runs apply and destroy two isolated workspaces"
 else
   fail "concurrent workspace isolation failed (rc_a=$rc_a rc_b=$rc_b applied=${applied[*]-} destroyed=${destroyed[*]-})"
+fi
+if [[ "${#archives[@]}" -eq 2 && "${archives[0]}" != "${archives[1]}" && "${archives[*]}" != *"/tmp/worker-src.tar.gz"* ]]; then
+  pass "concurrent runs use distinct workspace-owned worker archives"
+else
+  fail "concurrent archive isolation failed (archives=${archives[*]-})"
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

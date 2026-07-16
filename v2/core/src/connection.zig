@@ -422,8 +422,10 @@ pub const ConnectionManager = struct {
 
             var batch: usize = 0;
             while (batch < 16) : (batch += 1) {
-                // Never dequeue work that cannot be tracked without eviction.
+                // Never dequeue work unless a connected worker can accept it and
+                // the correlation table can track the accepted dispatch.
                 if (self.request_queue.activeInFlightCount() >= rq.MAX_IN_FLIGHT) break;
+                const worker_idx = self.selectConnectedWorker(qi, backends_buf[0..backend_count]) orelse break;
                 const req_opt = self.request_queue.queues[qi].dequeue();
                 const req = req_opt orelse break;
 
@@ -434,14 +436,8 @@ pub const ConnectionManager = struct {
                     dep_mut.last_request_tick = now;
                 }
 
-                // Round-robin backend
-                const idx = self.request_queue.dispatch_idx[qi] % backend_count;
-                self.request_queue.dispatch_idx[qi] += 1;
-
-                const worker_idx = self.replica.findWorkerForNode(backends_buf[idx].node_id) orelse continue;
-
                 // Translate the client-supplied ID to a gateway-unique worker correlation.
-                const worker_request_id = self.request_queue.trackInFlight(req.request_id, req.client_id) orelse unreachable;
+                const worker_request_id = self.request_queue.trackInFlightForWorker(req.request_id, req.client_id, worker_idx) orelse unreachable;
 
                 const dispatch_now = @import("vopr/simulated_io.zig").nowTick(self.replica.io);
                 latency.record(.{ .phase = "dispatch_send", .op = "run_request", .deployment_id = req.deployment_id, .start_ms = dispatch_now, .end_ms = dispatch_now, .source = "core/src/connection.zig" });
@@ -459,16 +455,35 @@ pub const ConnectionManager = struct {
                 @memcpy(agent_payload[pos..][0..req.payload_len], req.payload[0..req.payload_len]);
                 pos += req.payload_len;
 
-                self.sendToWorker(worker_idx, .run_request, agent_payload[0..pos]);
+                self.sendToWorker(worker_idx, .run_request, agent_payload[0..pos]) catch {
+                    // The write outcome is known failed. Do not requeue because a
+                    // partial write could have been accepted by the worker.
+                    self.disconnectWorker(&self.workers[worker_idx]);
+                };
             }
         }
     }
 
-    /// Send a framed message to a connected worker.
-    pub fn sendToWorker(self: *ConnectionManager, worker_idx: usize, tag: msg.WorkerTag, payload: []const u8) void {
-        if (worker_idx >= self.worker_count) return;
+    fn selectConnectedWorker(self: *ConnectionManager, queue_idx: usize, backends: []const sm_mod.Backend) ?usize {
+        std.debug.assert(queue_idx < self.request_queue.queue_count);
+        if (backends.len == 0) return null;
+        const start = self.request_queue.dispatch_idx[queue_idx] % backends.len;
+        for (0..backends.len) |offset| {
+            const backend_idx = (start + offset) % backends.len;
+            const worker_idx = self.replica.findWorkerForNode(backends[backend_idx].node_id) orelse continue;
+            if (worker_idx >= self.worker_count) continue;
+            if (!self.workers[worker_idx].connected) continue;
+            self.request_queue.dispatch_idx[queue_idx] = backend_idx + 1;
+            return worker_idx;
+        }
+        return null;
+    }
+
+    /// Send a framed message to a connected worker with explicit outcome.
+    pub fn sendToWorker(self: *ConnectionManager, worker_idx: usize, tag: msg.WorkerTag, payload: []const u8) !void {
+        if (worker_idx >= self.worker_count) return error.WorkerUnavailable;
         const worker = &self.workers[worker_idx];
-        if (!worker.connected) return;
+        if (!worker.connected) return error.WorkerUnavailable;
 
         // Build inner payload: [version(2)][tag(1)][payload...]
         var inner: [8192]u8 = undefined;
@@ -478,21 +493,30 @@ pub const ConnectionManager = struct {
         const inner_len = 3 + payload.len;
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.worker_key else null;
-        self.sendFrame(worker.fd, key, inner[0..inner_len]) catch {
-            std.debug.print(
-                "hivemind conn: sendToWorker failed worker_idx={d} tag={s}\n",
-                .{ worker_idx, @tagName(tag) },
-            );
-            self.disconnectWorker(worker);
-        };
+        try self.sendFrame(worker.fd, key, inner[0..inner_len]);
     }
 
     fn disconnectWorker(self: *ConnectionManager, worker: *Conn) void {
+        const worker_idx = worker.worker_idx;
         _ = libc.close(worker.fd);
         worker.fd = -1;
         worker.connected = false;
         worker.frame_pos = 0;
-        self.replica.onWorkerDisconnect(worker.worker_idx);
+        self.replica.onWorkerDisconnect(worker_idx);
+
+        var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
+        const released_count = self.request_queue.releaseWorker(worker_idx, &released);
+        for (released[0..released_count]) |request| {
+            self.sendRunErrorToClientId(request.client_id, request.client_request_id, 4);
+        }
+    }
+
+    fn sendRunErrorToClientId(self: *ConnectionManager, client_id: u128, request_id: u64, status: u8) void {
+        for (self.clients[0..self.client_count]) |*client| {
+            if (!client.connected or client.client_id != client_id) continue;
+            self.sendRunError(client, request_id, status);
+            return;
+        }
     }
 
     // -- Client connections --
@@ -998,10 +1022,16 @@ pub const ConnectionManager = struct {
     pub fn connectToPeer(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
         if (peer_id == self.replica_id) return;
 
-        // Record target for retry
+        // Retain configured membership for observability/validation, but only
+        // the lower replica ID initiates. The higher side accepts inbound.
         self.recordPeerTarget(peer_id, host, port);
+        if (!self.shouldInitiatePeerConnection(peer_id)) return;
 
         self.connectToPeerInner(peer_id, host, port);
+    }
+
+    fn shouldInitiatePeerConnection(self: *const ConnectionManager, peer_id: u8) bool {
+        return self.replica_id < peer_id;
     }
 
     fn recordPeerTarget(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
@@ -1077,6 +1107,7 @@ pub const ConnectionManager = struct {
         self.last_retry_tick = now_tick;
 
         for (self.peer_targets[0..self.peer_target_count]) |target| {
+            if (!self.shouldInitiatePeerConnection(target.peer_id)) continue;
             if (!self.hasPeerConnection(target.peer_id)) {
                 self.connectToPeerInner(target.peer_id, target.host, target.port);
             }
@@ -1617,6 +1648,22 @@ test "hasPeerConnection recognizes identified inbound peers" {
     try std.testing.expect(!cm.hasPeerConnection(3));
 }
 
+test "only lower replica records and initiates configured peer target" {
+    const higher = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(higher);
+    higher.replica_id = 4;
+    higher.peer_targets = [_]PeerTarget{.{}} ** msg.REPLICA_COUNT_MAX;
+    higher.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    higher.peer_target_count = 0;
+    higher.peer_count = 0;
+
+    higher.connectToPeer(2, 0, 9102);
+
+    try std.testing.expectEqual(@as(usize, 1), higher.peer_target_count);
+    try std.testing.expect(!higher.shouldInitiatePeerConnection(2));
+    try std.testing.expectEqual(@as(usize, 0), higher.peer_count);
+}
+
 test "connectToPeer ignores self target" {
     const cm = try std.testing.allocator.create(ConnectionManager);
     defer std.testing.allocator.destroy(cm);
@@ -1890,6 +1937,104 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     try std.testing.expectEqual(@as(u8, 0), buf[16]);
     try std.testing.expectEqual(@as(u32, 4), std.mem.littleToNative(u32, std.mem.bytesToValue(u32, buf[17..21])));
     try std.testing.expect(std.mem.eql(u8, buf[21..25], "pong"));
+}
+
+test "dispatchRun preserves queued work without worker and fails accepted work on send or disconnect" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(9876);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(9876, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(9876);
+    _ = sm.apply(.{ .create_deployment = .{
+        .name = msg.strToFixed(64, "echo"),
+        .image = msg.strToFixed(256, "img:v1"),
+        .replicas = 1,
+        .cpu_millicores = 100,
+        .memory_megabytes = 128,
+    } });
+    const dep_id = sm.deployments[0].id;
+    sm.pods[0].node_id = 99;
+    sm.pods[0].phase = .running;
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    replica.workers[0].node_id = 99;
+    replica.workers[0].connected = true;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+    cm.client_count = 1;
+
+    var client_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds));
+    defer _ = libc.close(client_fds[1]);
+    cm.clients[0] = .{ .fd = client_fds[0], .connected = true, .client_id = 55 };
+
+    // No connected worker: request remains queued and no correlation is allocated.
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 1, 55, "one"));
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    // Immediate write failure after dequeue: correlation is released and client gets unavailable.
+    cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    var client_buf: [128]u8 = undefined;
+    var n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 17);
+    try std.testing.expectEqual(@as(u8, 4), client_buf[16]);
+
+    // Accepted dispatch followed by disconnect releases its owned correlation.
+    var worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_fds));
+    defer _ = libc.close(worker_fds[1]);
+    replica.workers[0].connected = true;
+    cm.workers[0] = .{ .fd = worker_fds[0], .connected = true, .worker_idx = 0 };
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 2, 55, "two"));
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    cm.disconnectWorker(&cm.workers[0]);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 17);
+    try std.testing.expectEqual(@as(u8, 4), client_buf[16]);
+
+    // A replacement connection reuses the released slot and completes normally.
+    var success_worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &success_worker_fds));
+    defer _ = libc.close(success_worker_fds[0]);
+    defer _ = libc.close(success_worker_fds[1]);
+    replica.workers[0].connected = true;
+    cm.workers[0] = .{ .fd = success_worker_fds[0], .connected = true, .worker_idx = 0 };
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 3, 55, "three"));
+    cm.dispatchRun();
+    var worker_buf: [128]u8 = undefined;
+    const worker_n = try std.posix.read(success_worker_fds[1], &worker_buf);
+    try std.testing.expect(worker_n >= 28);
+    const worker_request_id = std.mem.readInt(u64, worker_buf[8..16], .little);
+    var response: [11]u8 = undefined;
+    std.mem.writeInt(u64, response[0..8], worker_request_id, .little);
+    response[8] = 0;
+    @memcpy(response[9..11], "ok");
+    cm.handleRunResponse(&response);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 23);
+    try std.testing.expectEqual(@as(u8, 0), client_buf[16]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, client_buf[17..21], .little));
+    try std.testing.expect(std.mem.eql(u8, client_buf[21..23], "ok"));
 }
 
 test "disconnectClient clears abandoned queued and in-flight run requests" {

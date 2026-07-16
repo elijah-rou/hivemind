@@ -47,6 +47,9 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 ### 2026-07-16 — Adversarial safety gate follow-up
 
 What changed:
+- run requests select a connected worker before dequeue; explicit send failure and post-dispatch worker disconnect atomically release all worker-owned correlations and return unavailable without unsafe automatic requeue; the 1024-entry bound and slot reuse remain deterministic
+- peer startup uses one connection direction per configured pair (lower ID outbound, higher ID inbound); established bindings are immutable, and the unauthenticated initial-bind/TLS-auth limitation plus no mixed-version rolling support are explicit
+- Go cluster-state parsing validates exact record sizes and bounded counts before allocation; workload benchmarks reprobe the configured replica list; GPU source archives are per-run and workspace-owned
 - run requests now use gateway-unique worker correlation IDs and restore the original client/request identity on reply; a full 1024-entry table backpressures before dequeue instead of evicting unrelated work
 - reciprocal peer sockets converge deterministically by replica ID and direction (lower ID outbound, higher ID inbound) only after a fully validated frame; invalid Prepare, Commit, and StartView frames leave the healthy binding intact
 - worker response bodies have one 16 KiB-minus-metadata bound across Rust, Zig, and Go; overflow becomes explicit status 4 instead of successful truncation; frame writers reject oversize before allocation/write
