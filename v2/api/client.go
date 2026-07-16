@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -282,6 +283,11 @@ const MaxRunPayload = 512
 // MaxRunResponseBody matches the Rust worker and Zig gateway response bound.
 const MaxRunResponseBody = 16*1024 - 9
 
+// ErrRunOutcomeAmbiguous means the gateway attempted to write a run request but
+// could not prove whether the worker executed it. Callers must not retry unless
+// the workload operation is independently idempotent.
+var ErrRunOutcomeAmbiguous = errors.New("run outcome ambiguous")
+
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
 	RequestID uint64
@@ -310,40 +316,40 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 	binary.LittleEndian.PutUint32(data[72:76], uint32(len(payload)))
 	copy(data[76:], payload)
 
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if c.conn == nil {
-			if err := c.reconnect(nil); err != nil {
-				lastErr = err
-				continue
-			}
+	var connectErr error
+	for attempt := 0; attempt < 2 && c.conn == nil; attempt++ {
+		if err := c.reconnect(nil); err != nil {
+			connectErr = err
 		}
-
-		if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
-			lastErr = fmt.Errorf("send failed: %w", err)
-			c.closeLocked()
-			continue
-		}
-
-		buf := make([]byte, 65536)
-		raw, err := readRunResponseEncrypted(c.conn, buf, c.crypto)
-		if err != nil {
-			lastErr = fmt.Errorf("recv failed: %w", err)
-			c.closeLocked()
-			continue
-		}
-
-		resp, err := parseRunResponse(raw)
-		if err != nil {
-			return nil, err
-		}
-		if resp.RequestID != reqID {
-			return nil, fmt.Errorf("run response request_id mismatch: got %d want %d", resp.RequestID, reqID)
-		}
-		return resp, nil
+	}
+	if c.conn == nil {
+		return nil, connectErr
 	}
 
-	return nil, lastErr
+	// Calling writeFrameEncrypted may partially write before returning an error.
+	// From this boundary onward, resending could execute the request twice.
+	if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
+		c.closeLocked()
+		return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+	}
+
+	buf := make([]byte, 65536)
+	raw, err := readRunResponseEncrypted(c.conn, buf, c.crypto)
+	if err != nil {
+		c.closeLocked()
+		return nil, fmt.Errorf("%w: recv failed: %w", ErrRunOutcomeAmbiguous, err)
+	}
+
+	resp, err := parseRunResponse(raw)
+	if err != nil {
+		c.closeLocked()
+		return nil, fmt.Errorf("%w: invalid response: %w", ErrRunOutcomeAmbiguous, err)
+	}
+	if resp.RequestID != reqID {
+		c.closeLocked()
+		return nil, fmt.Errorf("%w: run response request_id mismatch: got %d want %d", ErrRunOutcomeAmbiguous, resp.RequestID, reqID)
+	}
+	return resp, nil
 }
 
 // parseRunResponse decodes a run_response payload: [request_id(8)][status(1)][len(4)?][data?].

@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — `/run` ambiguous outcomes and worker response ownership hardened
+
+What changed:
+- the Go gateway never resends a `/run` request after any write attempt; read, parse, request-ID, and write failures after that boundary return `ErrRunOutcomeAmbiguous`
+- worker responses resolve only when both the opaque correlation ID and sender worker index match one active entry
+- malformed, oversized, foreign, and unknown worker responses disconnect only the sender through centralized worker cleanup, releasing all sender-owned correlations with deterministic client errors
+- deterministic saturation coverage proves malformed-response cleanup, 1024-slot reuse, ownership isolation, unknown-ID isolation, and valid response boundaries
+
+Why it matters:
+- prevents duplicate workload execution after an accepted request loses its response and prevents one worker from resolving or leaking another worker's client correlation
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. rerun independent `/run` safety review
+2. retain application-level idempotency keys as future protocol scope; ambiguous requests are not automatically replayed
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
 ### 2026-07-16 — Adversarial safety gate follow-up
 
 What changed:

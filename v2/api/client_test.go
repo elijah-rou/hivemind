@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -445,6 +446,88 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 	}
 }
 
+type failingWriteConn struct {
+	writeCalls int
+	closed     bool
+}
+
+func (c *failingWriteConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
+func (c *failingWriteConn) Write([]byte) (int, error)        { c.writeCalls++; return 0, net.ErrClosed }
+func (c *failingWriteConn) Close() error                     { c.closed = true; return nil }
+func (c *failingWriteConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *failingWriteConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *failingWriteConn) SetDeadline(time.Time) error      { return nil }
+func (c *failingWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *failingWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSendRunRequestDoesNotResendAfterWriteFailure(t *testing.T) {
+	conn := &failingWriteConn{}
+	client := NewClient([]string{"127.0.0.1:1"}, nil)
+	client.conn = conn
+
+	_, err := client.SendRunRequest("dep", []byte("attempted"))
+	if !errors.Is(err, ErrRunOutcomeAmbiguous) {
+		t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("write calls = %d, want exactly 1", conn.writeCalls)
+	}
+	if !conn.closed || client.conn != nil {
+		t.Fatalf("failed connection was not closed and cleared")
+	}
+}
+
+func TestSendRunRequestDoesNotResendAfterServerAcceptsRequest(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	requests := make(chan struct{}, 2)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for accepted := 0; accepted < 2; accepted++ {
+			if tcpListener, ok := listener.(*net.TCPListener); ok {
+				_ = tcpListener.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			}
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 1024)
+			frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+			if err != nil || len(frame) < 3 || frame[2] != TagClusterStateRequest {
+				conn.Close()
+				return
+			}
+			if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
+				conn.Close()
+				return
+			}
+			frame, err = readFrameGeneric(conn, buf, time.Second, nil)
+			if err != nil || len(frame) < 3 || frame[2] != TagRunRequest {
+				conn.Close()
+				return
+			}
+			requests <- struct{}{}
+			conn.Close()
+		}
+	}()
+
+	client := NewClient([]string{listener.Addr().String()}, nil)
+	_, err = client.SendRunRequest("dep", []byte("accepted"))
+	if !errors.Is(err, ErrRunOutcomeAmbiguous) {
+		t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
+	}
+	<-serverDone
+	close(requests)
+	if got := len(requests); got != 1 {
+		t.Fatalf("server received %d run requests, want exactly 1", got)
+	}
+}
+
 func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T) {
 	t.Parallel()
 
@@ -493,6 +576,8 @@ func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T)
 	client = NewClient([]string{listener.Addr().String()}, nil)
 	if _, err := client.SendRunRequest("dep", []byte("ok")); err == nil {
 		t.Fatalf("expected request_id mismatch error")
+	} else if !errors.Is(err, ErrRunOutcomeAmbiguous) {
+		t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
 	} else if !bytes.Contains([]byte(err.Error()), []byte("request_id mismatch")) {
 		t.Fatalf("error = %v, want request_id mismatch", err)
 	}

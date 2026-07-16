@@ -132,21 +132,33 @@ pub const RequestQueue = struct {
         return ok;
     }
 
-    /// Resolve a worker correlation ID to the original client request.
-    pub fn resolveResponse(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
-        return self.releaseInFlight(worker_request_id);
+    /// Resolve only when one active entry atomically matches both the opaque
+    /// correlation and the worker connection that owns it.
+    pub fn resolveResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ?ResolvedRequest {
+        for (&self.in_flight) |*entry| {
+            if (!entry.active) continue;
+            if (entry.worker_request_id != worker_request_id) continue;
+            if (entry.worker_idx != worker_idx) return null;
+
+            entry.active = false;
+            self.resolve_total += 1;
+            return .{
+                .client_id = entry.client_id,
+                .client_request_id = entry.client_request_id,
+            };
+        }
+        return null;
     }
 
-    pub fn releaseInFlight(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
+    fn releaseInFlight(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
         for (&self.in_flight) |*entry| {
-            if (entry.active and entry.worker_request_id == worker_request_id) {
-                entry.active = false;
-                self.resolve_total += 1;
-                return .{
-                    .client_id = entry.client_id,
-                    .client_request_id = entry.client_request_id,
-                };
-            }
+            if (!entry.active or entry.worker_request_id != worker_request_id) continue;
+            entry.active = false;
+            self.resolve_total += 1;
+            return .{
+                .client_id = entry.client_id,
+                .client_request_id = entry.client_request_id,
+            };
         }
         return null;
     }
@@ -307,13 +319,25 @@ test "request queue: resolve response restores original client identity" {
     var rq = RequestQueue.init();
     const worker_request_id = rq.trackInFlight(42, 0xABCD).?;
     try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
-    const resolved = rq.resolveResponse(worker_request_id).?;
+    const resolved = rq.resolveResponseForWorker(worker_request_id, 0).?;
     try std.testing.expectEqual(@as(u128, 0xABCD), resolved.client_id);
     try std.testing.expectEqual(@as(u64, 42), resolved.client_request_id);
     try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
     try std.testing.expectEqual(@as(u64, 1), rq.dispatch_total);
     try std.testing.expectEqual(@as(u64, 1), rq.resolve_total);
-    try std.testing.expect(rq.resolveResponse(worker_request_id) == null);
+    try std.testing.expect(rq.resolveResponseForWorker(worker_request_id, 0) == null);
+}
+
+test "request queue: response ownership requires correlation and worker match atomically" {
+    var rq = RequestQueue.init();
+    const worker_request_id = rq.trackInFlightForWorker(42, 0xABCD, 3).?;
+
+    try std.testing.expect(rq.resolveResponseForWorker(worker_request_id, 4) == null);
+    try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
+    const resolved = rq.resolveResponseForWorker(worker_request_id, 3).?;
+    try std.testing.expectEqual(@as(u128, 0xABCD), resolved.client_id);
+    try std.testing.expectEqual(@as(u64, 42), resolved.client_request_id);
+    try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
 }
 
 test "request queue: same client request id receives unique worker correlations" {
@@ -322,8 +346,8 @@ test "request queue: same client request id receives unique worker correlations"
     const second = rq.trackInFlight(1, 200).?;
     try std.testing.expect(first != second);
 
-    const second_resolved = rq.resolveResponse(second).?;
-    const first_resolved = rq.resolveResponse(first).?;
+    const second_resolved = rq.resolveResponseForWorker(second, 0).?;
+    const first_resolved = rq.resolveResponseForWorker(first, 0).?;
     try std.testing.expectEqual(@as(u128, 200), second_resolved.client_id);
     try std.testing.expectEqual(@as(u64, 1), second_resolved.client_request_id);
     try std.testing.expectEqual(@as(u128, 100), first_resolved.client_id);
@@ -349,7 +373,7 @@ test "request queue: full in-flight table rejects without eviction" {
     try std.testing.expectEqual(@as(u64, MAX_IN_FLIGHT), rq.dispatch_total);
 
     for (0..MAX_IN_FLIGHT) |i| {
-        const resolved = rq.resolveResponse(@intCast(i + 1)).?;
+        const resolved = rq.resolveResponseForWorker(@intCast(i + 1), 0).?;
         try std.testing.expectEqual(@as(u64, @intCast(i)), resolved.client_request_id);
     }
 }
@@ -379,8 +403,8 @@ test "request queue: cancel client clears queued and in-flight requests only for
     try std.testing.expectEqual(@as(usize, 0), rq.depthFor(2));
     try std.testing.expectEqual(@as(usize, 1), rq.totalDepth());
     try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
-    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponse(second_worker_id).?.client_id);
-    try std.testing.expect(rq.resolveResponse(first_worker_id) == null);
+    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponseForWorker(second_worker_id, 0).?.client_id);
+    try std.testing.expect(rq.resolveResponseForWorker(first_worker_id, 0) == null);
     try std.testing.expectEqual(@as(u64, 2), rq.resolve_total);
 
     const remaining = rq.queues[0].dequeue().?;
@@ -397,7 +421,7 @@ test "request queue: worker failure releases owned correlations and reuses slots
     const released_count = rq.releaseWorker(3, &released);
     try std.testing.expectEqual(@as(usize, 1), released_count);
     try std.testing.expectEqual(@as(u128, 100), released[0].client_id);
-    try std.testing.expect(rq.resolveResponse(failed) == null);
+    try std.testing.expect(rq.resolveResponseForWorker(failed, 3) == null);
     try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
 
     const reused = rq.trackInFlightForWorker(12, 300, 3).?;
