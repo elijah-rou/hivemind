@@ -82,6 +82,42 @@ fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
     return true;
 }
 
+/// Prospective StartView parent-chain gate against the local committed prefix and
+/// all incoming parent_checksum links. Gaps above commit_min remain allowed for
+/// transfer repair; unknown committed predecessors fail closed.
+fn startViewProspectiveChainValid(self: *const Replica, sv: msg.StartViewMsg) bool {
+    var i: usize = 0;
+    while (i < sv.log_entry_count) : (i += 1) {
+        const entry = sv.log_entries[i];
+        if (entry.op_number == 1) {
+            if (entry.parent_checksum != 0) return false;
+            continue;
+        }
+
+        const parent_op = entry.op_number - 1;
+        var found_sv_parent = false;
+        var sv_parent_checksum: u64 = 0;
+        var j: usize = 0;
+        while (j < sv.log_entry_count) : (j += 1) {
+            if (sv.log_entries[j].op_number == parent_op) {
+                found_sv_parent = true;
+                sv_parent_checksum = sv.log_entries[j].checksum;
+                break;
+            }
+        }
+        if (found_sv_parent) {
+            if (entry.parent_checksum != sv_parent_checksum) return false;
+            continue;
+        }
+
+        if (parent_op <= self.commit_min) {
+            const prev = self.journalGet(parent_op) orelse return false;
+            if (entry.parent_checksum != prev.checksum) return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Client table entry for request deduplication
 // ---------------------------------------------------------------------------
@@ -880,13 +916,31 @@ pub const Replica = struct {
         // Reject malformed commits before any view/status/log mutation.
         if (!commitSemanticsValid(commit_msg)) return;
 
+        const target = @max(commit_msg.commit_min, commit_msg.commit_max);
+        const advancing = target > self.commit_min;
+        var preserved_target: ?msg.LogEntry = null;
+        if (advancing) {
+            // Advancing Commit must carry a nonzero checksum that exactly matches
+            // the local target when present. Invalid messages leave state unchanged.
+            if (commit_msg.commit_checksum == 0) return;
+            if (self.journalGet(target)) |target_entry| {
+                if (target_entry.checksum != commit_msg.commit_checksum) return;
+                preserved_target = target_entry.*;
+            }
+        }
+
         if (commit_msg.view_number > self.view_number) {
             // A higher-view leader may only safely reuse our committed prefix.
-            // Any locally-held uncommitted suffix could be divergent.
+            // Any locally-held uncommitted suffix could be divergent — except a
+            // verified advancing commit target, which must survive to be applied.
             self.truncateAbove(self.commit_min);
             self.view_number = commit_msg.view_number;
             self.op_number = self.commit_min;
             self.commit_max = self.commit_min;
+            if (preserved_target) |entry| {
+                self.journalPut(entry);
+                self.op_number = @max(self.op_number, entry.op_number);
+            }
         }
 
         if (commit_msg.view_number != self.view_number) return;
@@ -898,6 +952,10 @@ pub const Replica = struct {
             self.truncateAbove(self.commit_min);
             self.op_number = self.commit_min;
             self.commit_max = self.commit_min;
+            if (preserved_target) |entry| {
+                self.journalPut(entry);
+                self.op_number = @max(self.op_number, entry.op_number);
+            }
             self.status = .normal;
             self.last_normal_view = self.view_number;
             self.recovered_from_disk = false;
@@ -907,24 +965,15 @@ pub const Replica = struct {
         self.noteReplicaCommitMin(from, commit_msg.commit_min);
         self.retention_floor = commit_msg.retention_floor;
 
-        const target = @max(commit_msg.commit_min, commit_msg.commit_max);
         if (target > self.commit_min) {
-            if (commit_msg.commit_checksum != 0) {
-                const target_entry = self.journalGet(target) orelse {
-                    self.transfer_pending = true;
-                    self.transfer_target_op = @max(self.transfer_target_op, target);
-                    return;
-                };
-                if (target_entry.checksum != commit_msg.commit_checksum) {
-                    self.truncateAbove(target - 1);
-                    self.op_number = @max(self.logHighOp(), self.commit_min);
-                    self.commit_max = @min(self.commit_max, self.op_number);
-                    self.transfer_pending = true;
-                    self.transfer_target_op = @max(self.transfer_target_op, target);
-                    return;
-                }
+            if (self.journalGet(target) != null) {
+                std.debug.assert(commit_msg.commit_checksum != 0);
+                self.commitUpTo(target);
+            } else {
+                // Valid advancing Commit for an op we lack locally: repair, do not commit.
+                self.transfer_pending = true;
+                self.transfer_target_op = @max(self.transfer_target_op, target);
             }
-            self.commitUpTo(target);
         }
 
         if (commit_msg.op_number > self.op_number) {
@@ -1065,6 +1114,7 @@ pub const Replica = struct {
         // higher-view but uncommitted suffix entry could overwrite a value that
         // another replica proved committed via commit_min.
         // Conflicting committed identities fail closed: remain in view_change.
+        // Preflight the full candidate set before any journalPut.
         var committed_source_lnv = std.mem.zeroes([LOG_SIZE_MAX]msg.ViewNumber);
         var committed_source_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
         var committed_source_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
@@ -1096,11 +1146,26 @@ pub const Replica = struct {
                     dvc.last_normal_view >= committed_source_lnv[slot];
                 if (!should_install) continue;
 
-                self.journalPut(entry);
                 committed_source_set[slot] = true;
                 committed_source_op[slot] = entry.op_number;
                 committed_source_checksum[slot] = entry.checksum;
                 committed_source_lnv[slot] = dvc.last_normal_view;
+            }
+        }
+        for (0..self.replica_count) |i| {
+            if (!self.do_vc_received[i]) continue;
+            const dvc = &self.do_vc_msgs[i];
+            for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+                if (!entry.valid()) continue;
+                if (entry.op_number > max_commit) continue;
+                if (entry.op_number > dvc.commit_min) continue;
+                const slot = journalSlot(entry.op_number);
+                if (!committed_source_set[slot]) continue;
+                if (committed_source_op[slot] != entry.op_number) continue;
+                if (committed_source_checksum[slot] != entry.checksum) continue;
+                self.journalPut(entry);
+                // Clear so each winning identity is installed once.
+                committed_source_set[slot] = false;
             }
         }
 
@@ -1903,6 +1968,9 @@ pub const Replica = struct {
                 if (existing.checksum != entry.checksum) return;
             }
         }
+        // Preflight: prospective parent chain (local committed predecessor +
+        // all incoming parent_checksum relationships) before mutation/ack.
+        if (!startViewProspectiveChainValid(self, sv)) return;
 
         self.view_number = sv.view_number;
         self.retention_floor = sv.retention_floor;
@@ -2560,10 +2628,13 @@ pub const Replica = struct {
 
     fn sendCommitHeartbeat(self: *Replica) void {
         const target = @max(self.commit_min, self.commit_max);
-        const commit_checksum = if (target > 0) blk: {
-            const entry = self.journalGet(target) orelse break :blk 0;
+        // Never emit checksum 0 for a nonzero advancing/current commit target.
+        const commit_checksum: u64 = if (target > 0) blk: {
+            const entry = self.journalGet(target) orelse return;
+            if (entry.checksum == 0) return;
             break :blk entry.checksum;
         } else 0;
+        std.debug.assert(target == 0 or commit_checksum != 0);
         self.sendToAllOthers(.{ .commit = .{
             .view_number = self.view_number,
             .commit_min = self.commit_min,
@@ -3639,4 +3710,267 @@ test "onStartView accepts valid bounded message" {
     try std.testing.expectEqual(@as(msg.ViewNumber, 3), replica.view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
     try std.testing.expectEqual(entry1.checksum, replica.journalGet(1).?.checksum);
+}
+
+test "onStartView rejects broken prospective parent chain before mutation" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7020);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7020, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7020);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+
+    var committed = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+    replica.journalPut(committed);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+
+    var bad_child = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 2,
+        .request_id = 2,
+        .parent_checksum = 0xDEADBEEF, // does not match local committed predecessor
+    };
+    bad_child.checksum = bad_child.computeChecksum();
+
+    // Leader for view 3 with replica_count=3 is replica 0.
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 2,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = bad_child;
+    replica.onMessage(0, .{ .start_view = sv });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expect(!replica.journalHas(2));
+    try std.testing.expectEqual(committed.checksum, replica.journalGet(1).?.checksum);
+
+    // Incoming adjacent entries with a broken parent link must also be rejected.
+    var e1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 3,
+        .request_id = 3,
+        .parent_checksum = committed.checksum,
+    };
+    e1.checksum = e1.computeChecksum();
+    var e2 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 3,
+        .command = .{ .noop = {} },
+        .client_id = 4,
+        .request_id = 4,
+        .parent_checksum = 0xBAD0BAD0,
+    };
+    e2.checksum = e2.computeChecksum();
+    var sv_chain = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 3,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_chain.log_entries[0] = e1;
+    sv_chain.log_entries[1] = e2;
+    replica.onMessage(0, .{ .start_view = sv_chain });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(2));
+    try std.testing.expect(!replica.journalHas(3));
+}
+
+test "onCommit advancing requires nonzero checksum and exact local match" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7021);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7021, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7021);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var e1 = msg.LogEntry{
+        .view_number = 1,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    e1.checksum = e1.computeChecksum();
+    replica.journalPut(e1);
+    replica.op_number = 1;
+
+    const journal_checksum_before = e1.checksum;
+    const sm_seed_before = sm.seed;
+
+    // Advancing with zero commit_checksum must not mutate view/status/log.
+    // Leader for view 2 with replica_count=3 is replica 2.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.retention_floor);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+
+    // Advancing with nonzero but mismatched checksum must leave all state unchanged.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = journal_checksum_before ^ 1,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expect(replica.journalHas(1));
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+    try std.testing.expect(!replica.transfer_pending);
+
+    // Matching nonzero checksum advances and may rejoin from view_change,
+    // preserving the verified target across higher-view truncate.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = journal_checksum_before,
+    } });
+    try std.testing.expectEqual(msg.Status.normal, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+}
+
+test "sendCommitHeartbeat never emits zero checksum for advancing target" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7022);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7022, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7022);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    var e1 = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    e1.checksum = e1.computeChecksum();
+    replica.journalPut(e1);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+
+    const Capture = struct {
+        checksum: u64 = 0,
+        seen: bool = false,
+
+        fn send(ctx: *anyopaque, to: u8, data: []const u8) void {
+            _ = to;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (data.len < 5) return;
+            const message = msg.deserialize(data[5..]) catch return;
+            switch (message) {
+                .commit => |c| {
+                    self.checksum = c.commit_checksum;
+                    self.seen = true;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{};
+    replica.peer_send_ctx = &capture;
+    replica.peer_send_fn = Capture.send;
+
+    replica.sendCommitHeartbeat();
+    try std.testing.expect(capture.seen);
+    try std.testing.expect(capture.checksum != 0);
+    try std.testing.expectEqual(e1.checksum, capture.checksum);
 }

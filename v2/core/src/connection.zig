@@ -912,14 +912,27 @@ pub const ConnectionManager = struct {
             const from_id = frame_payload[0];
             if (from_id >= self.replica.replica_count) continue;
             const vrr_data = frame_payload[1..];
+
+            // Deserialize and identity-check before any peer bind/replace so a
+            // malformed spoof frame cannot evict a healthy bound socket.
+            const message = msg.deserialize(vrr_data) catch continue;
+            if (!peerFrameIdentityValid(from_id, message)) continue;
             if (!self.identifyPeerConnection(peer_idx, from_id)) continue;
 
-            if (msg.deserialize(vrr_data)) |message| {
-                self.replica.onMessage(from_id, message);
-            } else |_| {}
+            self.replica.onMessage(from_id, message);
         }
 
         shiftBuffer(&peer.frame_buf, &peer.frame_pos, consumed);
+    }
+
+    /// Messages that carry replica_id must agree with the frame from_id before bind.
+    fn peerFrameIdentityValid(from_id: u8, message: msg.Message) bool {
+        return switch (message) {
+            .prepare_ok => |m| m.replica_id == from_id,
+            .start_view_change => |m| m.replica_id == from_id,
+            .do_view_change => |m| m.replica_id == from_id,
+            else => true,
+        };
     }
 
     /// Send a framed VRR message to a peer. `data` is pre-framed:
@@ -1948,4 +1961,71 @@ test "processPeerFrames drops out-of-range from_id" {
     cm.processPeerFrames(0);
     try std.testing.expect(!cm.peers[0].peer_id_known);
     try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
+}
+
+test "processPeerFrames malformed spoof cannot evict healthy peer socket" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4245);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4245, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4245);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    var healthy_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &healthy_fds));
+    defer _ = libc.close(healthy_fds[1]);
+
+    var spoof_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &spoof_fds));
+    defer _ = libc.close(spoof_fds[1]);
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 2;
+    cm.peers[0] = .{
+        .fd = healthy_fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+    cm.peers[1] = .{
+        .fd = spoof_fds[0],
+        .connected = true,
+        .frame_pos = 0,
+    };
+
+    // Malformed VRR on unbound socket claiming replica 1 must not disconnect
+    // the healthy bound peer-1 socket or bind the spoof socket.
+    const inner_len: u32 = 1 + 1; // from_id + bad tag
+    std.mem.writeInt(u32, cm.peers[1].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[1].frame_buf[4] = 0x00;
+    cm.peers[1].frame_buf[5] = 1;
+    cm.peers[1].frame_buf[6] = 0xFF;
+    cm.peers[1].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(1);
+    try std.testing.expect(cm.peers[0].connected);
+    try std.testing.expect(cm.peers[0].peer_id_known);
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expectEqual(healthy_fds[0], cm.peers[0].fd);
+    try std.testing.expect(cm.peers[1].connected);
+    try std.testing.expect(!cm.peers[1].peer_id_known);
+    try std.testing.expectEqual(@as(usize, 0), cm.peers[1].frame_pos);
 }
