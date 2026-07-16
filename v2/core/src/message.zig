@@ -479,7 +479,7 @@ pub fn serialize(msg: Message, buf: []u8) usize {
     return 1 + payload_len;
 }
 
-fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) !E {
+pub fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) !E {
     inline for (@typeInfo(E).@"enum".fields) |field| {
         if (value == field.value) return @enumFromInt(value);
     }
@@ -663,7 +663,7 @@ fn readLogEntry(src: []const u8) !LogEntry {
     return try readStructFields(LogEntry, src);
 }
 
-fn validateCommand(command: Command) !void {
+pub fn validateCommand(command: Command) !void {
     switch (command) {
         .register_node => |c| try validateEnumValue(GpuType, c.gpu_type),
         .update_node_status => |c| try validateEnumValue(NodeStatus, c.new_status),

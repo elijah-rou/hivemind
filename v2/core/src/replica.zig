@@ -51,6 +51,37 @@ fn prepareSemanticsValid(prepare: msg.PrepareMsg) bool {
     return true;
 }
 
+/// Commit wire/semantics gate used before onCommit mutates view/status/log.
+fn commitSemanticsValid(commit: msg.CommitMsg) bool {
+    if (commit.op_number > LOG_SIZE_MAX) return false;
+    if (commit.commit_min > LOG_SIZE_MAX) return false;
+    if (commit.commit_max > LOG_SIZE_MAX) return false;
+    if (commit.retention_floor > LOG_SIZE_MAX) return false;
+    if (commit.commit_min > commit.op_number) return false;
+    if (commit.commit_max > commit.op_number) return false;
+    if (commit.retention_floor > commit.commit_min) return false;
+    return true;
+}
+
+/// StartView entry-set gate: bounds, no op above sv.op_number, no duplicate/conflict identities.
+fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
+    if (sv.commit_min > sv.op_number or sv.op_number > LOG_SIZE_MAX) return false;
+    if (sv.retention_floor > sv.commit_min) return false;
+    if (sv.log_entry_count > msg.SV_LOG_MAX) return false;
+    var i: usize = 0;
+    while (i < sv.log_entry_count) : (i += 1) {
+        const entry = sv.log_entries[i];
+        if (entry.op_number < 1 or entry.op_number > LOG_SIZE_MAX) return false;
+        if (!entry.valid()) return false;
+        if (entry.op_number > sv.op_number) return false;
+        var j: usize = i + 1;
+        while (j < sv.log_entry_count) : (j += 1) {
+            if (sv.log_entries[j].op_number == entry.op_number) return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Client table entry for request deduplication
 // ---------------------------------------------------------------------------
@@ -845,6 +876,9 @@ pub const Replica = struct {
     fn onCommit(self: *Replica, from: u8, commit_msg: msg.CommitMsg) void {
         if (self.status == .recovering) return;
         if (from != self.leaderForView(commit_msg.view_number)) return;
+
+        // Reject malformed commits before any view/status/log mutation.
+        if (!commitSemanticsValid(commit_msg)) return;
 
         if (commit_msg.view_number > self.view_number) {
             // A higher-view leader may only safely reuse our committed prefix.
@@ -1859,9 +1893,7 @@ pub const Replica = struct {
     fn onStartView(self: *Replica, from: u8, sv: msg.StartViewMsg) void {
         if (from != self.leaderForView(sv.view_number)) return;
         if (sv.view_number < self.view_number) return;
-        if (!peerLogBoundsOk(sv.commit_min, sv.op_number)) return;
-        if (sv.retention_floor > sv.commit_min) return;
-        if (!peerLogEntriesOk(&sv.log_entries, sv.log_entry_count, msg.SV_LOG_MAX)) return;
+        if (!startViewEntriesValid(sv)) return;
 
         // Preflight: StartView must not conflict with the locally committed
         // prefix. Reject the message without mutating local state.
@@ -3363,4 +3395,248 @@ test "onPrepare rejects bad retention before mutating view_change status" {
     } });
     try std.testing.expectEqual(msg.Status.view_change, replica.status);
     try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+}
+
+test "onCommit rejects bad semantics before mutating view_change status" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7012);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7012, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7012);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var committed = msg.LogEntry{
+        .view_number = 1,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 7,
+        .request_id = 7,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+    replica.journalPut(committed);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+    const journal_checksum_before = replica.journalGet(1).?.checksum;
+    const sm_seed_before = sm.seed;
+
+    // Leader for view 2 with replica_count=3 is replica 2.
+    // retention_floor > commit_min must not promote or truncate.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 5,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_max);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.retention_floor);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+
+    // commit_min > op_number must also be ignored pre-mutation.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 5,
+        .commit_max = 5,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+
+    // op_number beyond retained log must be ignored pre-mutation.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = LOG_SIZE_MAX + 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+}
+
+test "onStartView rejects out-of-range duplicate and conflicting entries before mutation" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7013);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7013, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7013);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var entry1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry1.checksum = entry1.computeChecksum();
+
+    var entry2 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 2,
+        .request_id = 2,
+        .parent_checksum = entry1.checksum,
+    };
+    entry2.checksum = entry2.computeChecksum();
+
+    // Leader for view 3 with replica_count=3 is replica 0.
+    // Entry above sv.op_number must not mutate view/status/log.
+    var sv_oor = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv_oor.log_entries[0] = entry2;
+    replica.onMessage(0, .{ .start_view = sv_oor });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.op_number);
+    try std.testing.expect(!replica.journalHas(2));
+
+    // Exact duplicate same-op identity must be rejected pre-mutation.
+    var sv_dup = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_dup.log_entries[0] = entry1;
+    sv_dup.log_entries[1] = entry1;
+    replica.onMessage(0, .{ .start_view = sv_dup });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(1));
+
+    // Conflicting same-op identities must be rejected pre-mutation.
+    var conflict = entry1;
+    conflict.client_id = 99;
+    conflict.request_id = 99;
+    conflict.checksum = conflict.computeChecksum();
+    try std.testing.expect(conflict.checksum != entry1.checksum);
+    var sv_conflict = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_conflict.log_entries[0] = entry1;
+    sv_conflict.log_entries[1] = conflict;
+    replica.onMessage(0, .{ .start_view = sv_conflict });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(1));
+}
+
+test "onStartView accepts valid bounded message" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7014);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7014, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7014);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+
+    var entry1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry1.checksum = entry1.computeChecksum();
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry1;
+    replica.onMessage(0, .{ .start_view = sv });
+    try std.testing.expectEqual(msg.Status.normal, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(entry1.checksum, replica.journalGet(1).?.checksum);
 }

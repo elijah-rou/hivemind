@@ -271,16 +271,7 @@ pub const ConnectionManager = struct {
     fn dispatchWorkerMessage(self: *ConnectionManager, worker: *Conn, tag_byte: u8, payload: []const u8) void {
         switch (tag_byte) {
             @intFromEnum(msg.WorkerTag.register) => {
-                // Wire size is 138 (packed), not @sizeOf which includes alignment padding
-                if (payload.len < 138) return;
-                var register = msg.WorkerRegisterMsg{};
-                register.hostname = payload[0..64].*;
-                register.cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[64..68]));
-                register.memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[68..72]));
-                register.gpu_type = @enumFromInt(payload[72]);
-                register.gpu_count = payload[73];
-                register.provider = payload[74..106].*;
-                register.region = payload[106..138].*;
+                const register = parseWorkerRegister(payload) orelse return;
                 self.replica.onWorkerRegister(worker.worker_idx, register);
             },
             @intFromEnum(msg.WorkerTag.heartbeat) => {
@@ -294,14 +285,7 @@ pub const ConnectionManager = struct {
                 self.replica.onWorkerHeartbeat(worker.worker_idx, heartbeat);
             },
             @intFromEnum(msg.WorkerTag.pod_status) => {
-                if (payload.len < 150) return;
-                var status = msg.WorkerPodStatusMsg{};
-                status.pod_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-                status.old_phase = @enumFromInt(payload[8]);
-                status.new_phase = @enumFromInt(payload[9]);
-                status.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[10..18]));
-                status.exit_code = std.mem.littleToNative(i32, std.mem.bytesToValue(i32, payload[18..22]));
-                status.message = payload[22..150].*;
+                const status = parseWorkerPodStatus(payload) orelse return;
                 self.replica.onWorkerPodStatus(worker.worker_idx, status);
             },
             @intFromEnum(msg.WorkerTag.run_response) => {
@@ -1160,22 +1144,52 @@ pub const ConnectionManager = struct {
         }
     }
 
+    fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
+        // Wire size is 138 (packed), not @sizeOf which includes alignment padding
+        if (payload.len < 138) return null;
+        const gpu_type = msg.enumFromIntChecked(msg.GpuType, payload[72]) catch return null;
+        var register = msg.WorkerRegisterMsg{};
+        register.hostname = payload[0..64].*;
+        register.cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[64..68]));
+        register.memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[68..72]));
+        register.gpu_type = gpu_type;
+        register.gpu_count = payload[73];
+        register.provider = payload[74..106].*;
+        register.region = payload[106..138].*;
+        return register;
+    }
+
+    fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
+        if (payload.len < 150) return null;
+        const old_phase = msg.enumFromIntChecked(msg.PodPhase, payload[8]) catch return null;
+        const new_phase = msg.enumFromIntChecked(msg.PodPhase, payload[9]) catch return null;
+        var status = msg.WorkerPodStatusMsg{};
+        status.pod_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        status.old_phase = old_phase;
+        status.new_phase = new_phase;
+        status.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[10..18]));
+        status.exit_code = std.mem.littleToNative(i32, std.mem.bytesToValue(i32, payload[18..22]));
+        status.message = payload[22..150].*;
+        return status;
+    }
+
     fn parseClientCommand(tag: u8, fields: []const u8) ?msg.Command {
-        return switch (tag) {
+        const command: msg.Command = switch (tag) {
             0 => blk: { // register_node
-                if (fields.len < 138) break :blk null;
+                if (fields.len < 138) return null;
+                const gpu_type = msg.enumFromIntChecked(msg.GpuType, fields[72]) catch return null;
                 break :blk .{ .register_node = .{
                     .node_name = fields[0..64].*,
                     .cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[64..68])),
                     .memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[68..72])),
-                    .gpu_type = @enumFromInt(fields[72]),
+                    .gpu_type = gpu_type,
                     .gpu_count = fields[73],
                     .provider = fields[74..106].*,
                     .region = fields[106..138].*,
                 } };
             },
             3 => blk: { // create_deployment
-                if (fields.len < 398) break :blk null;
+                if (fields.len < 398) return null;
                 var p: usize = 0;
                 var cmd: msg.CreateDeploymentCmd = .{
                     .name = fields[p..][0..64].*,
@@ -1201,7 +1215,7 @@ pub const ConnectionManager = struct {
                     },
                     .gpu_type = blk7: {
                         p += 4;
-                        break :blk7 @enumFromInt(fields[p]);
+                        break :blk7 msg.enumFromIntChecked(msg.GpuType, fields[p]) catch return null;
                     },
                     .gpu_count = blk8: {
                         p += 1;
@@ -1223,14 +1237,14 @@ pub const ConnectionManager = struct {
                 break :blk .{ .create_deployment = cmd };
             },
             6 => blk: { // scale_deployment
-                if (fields.len < 12) break :blk null;
+                if (fields.len < 12) return null;
                 break :blk .{ .scale_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                     .desired_replicas = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[8..12])),
                 } };
             },
             10 => blk: { // update_deployment
-                if (fields.len < 532) break :blk null;
+                if (fields.len < 532) return null;
                 var p: usize = 0;
                 const deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[p..][0..8]));
                 p += 8;
@@ -1244,7 +1258,7 @@ pub const ConnectionManager = struct {
                 p += 4;
                 const memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[p..][0..4]));
                 p += 4;
-                const gpu_type: msg.GpuType = @enumFromInt(fields[p]);
+                const gpu_type = msg.enumFromIntChecked(msg.GpuType, fields[p]) catch return null;
                 p += 1;
                 const gpu_count = fields[p];
                 break :blk .{ .update_deployment = .{
@@ -1259,7 +1273,7 @@ pub const ConnectionManager = struct {
                 } };
             },
             11 => blk: { // set_traffic_split
-                if (fields.len < 29) break :blk null;
+                if (fields.len < 29) return null;
                 var rules: [4]msg.TrafficRule = [_]msg.TrafficRule{.{}} ** 4;
                 var off: usize = 8;
                 for (0..4) |i| {
@@ -1276,31 +1290,33 @@ pub const ConnectionManager = struct {
                 } };
             },
             12 => blk: { // rollback_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .rollback_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             13 => blk: { // delete_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .delete_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             14 => blk: { // pause_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .pause_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             15 => blk: { // resume_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .resume_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
-            else => null,
+            else => return null,
         };
+        msg.validateCommand(command) catch return null;
+        return command;
     }
 };
 
@@ -1372,6 +1388,67 @@ test "parse update deployment client command" {
         },
         else => return error.WrongCommand,
     }
+}
+
+test "parseClientCommand rejects invalid GpuType on register_node" {
+    var fields: [138]u8 = std.mem.zeroes([138]u8);
+    fields[72] = 0xFF; // invalid GpuType
+    try std.testing.expect(ConnectionManager.parseClientCommand(0, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid GpuType on create_deployment" {
+    var fields: [398]u8 = std.mem.zeroes([398]u8);
+    // gpu_type is at offset 64+64+256+4+4+4 = 396
+    fields[396] = 0xFE;
+    try std.testing.expect(ConnectionManager.parseClientCommand(3, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid GpuType on update_deployment" {
+    var fields: [532]u8 = std.mem.zeroes([532]u8);
+    // gpu_type is at offset 8+256+256+2+4+4 = 530
+    fields[530] = 0xFD;
+    try std.testing.expect(ConnectionManager.parseClientCommand(10, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid traffic rule_count" {
+    var fields: [29]u8 = std.mem.zeroes([29]u8);
+    fields[28] = 5; // > rules.len (4)
+    try std.testing.expect(ConnectionManager.parseClientCommand(11, &fields) == null);
+}
+
+test "parseWorkerRegister rejects invalid GpuType" {
+    var payload: [138]u8 = std.mem.zeroes([138]u8);
+    payload[72] = 0xFF;
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&payload) == null);
+}
+
+test "parseWorkerRegister accepts valid GpuType" {
+    var payload: [138]u8 = std.mem.zeroes([138]u8);
+    payload[72] = @intFromEnum(msg.GpuType.t4);
+    payload[73] = 2;
+    const register = ConnectionManager.parseWorkerRegister(&payload) orelse return error.ExpectedRegister;
+    try std.testing.expectEqual(msg.GpuType.t4, register.gpu_type);
+    try std.testing.expectEqual(@as(u8, 2), register.gpu_count);
+}
+
+test "parseWorkerPodStatus rejects invalid PodPhase" {
+    var payload: [150]u8 = std.mem.zeroes([150]u8);
+    payload[8] = 0xFF; // old_phase
+    payload[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&payload) == null);
+
+    payload[8] = @intFromEnum(msg.PodPhase.pending);
+    payload[9] = 0xFE; // new_phase
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&payload) == null);
+}
+
+test "parseWorkerPodStatus accepts valid PodPhase" {
+    var payload: [150]u8 = std.mem.zeroes([150]u8);
+    payload[8] = @intFromEnum(msg.PodPhase.pending);
+    payload[9] = @intFromEnum(msg.PodPhase.running);
+    const status = ConnectionManager.parseWorkerPodStatus(&payload) orelse return error.ExpectedStatus;
+    try std.testing.expectEqual(msg.PodPhase.pending, status.old_phase);
+    try std.testing.expectEqual(msg.PodPhase.running, status.new_phase);
 }
 
 test "writeAll retries when nonblocking peer writes hit EAGAIN" {
