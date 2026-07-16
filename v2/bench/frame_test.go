@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,10 +110,9 @@ func TestReadFrameRoundTrip(t *testing.T) {
 }
 
 func TestShortFrameErrorDoesNotPanic(t *testing.T) {
-	// Flags-only plaintext body: version/tag missing.
-	sr, cw := io.Pipe()
+	// Flags-only plaintext body: version/tag missing — must fail closed.
 	cr, sw := io.Pipe()
-	client := &pipeConn{r: cr, w: cw}
+	client := &pipeConn{r: cr}
 	go func() {
 		header := make([]byte, 5)
 		binary.LittleEndian.PutUint32(header[0:4], 1) // flags only
@@ -122,19 +122,11 @@ func TestShortFrameErrorDoesNotPanic(t *testing.T) {
 	}()
 
 	buf := make([]byte, 256)
-	frame, err := readFrame(client, buf, time.Second)
-	if err != nil {
-		t.Fatalf("readFrame: %v", err)
-	}
-	if len(frame) != 0 {
-		t.Fatalf("expected empty body after flags, got %d", len(frame))
-	}
-	err = readReply(client, buf, 1)
-	// readReply will try another read on the closed pipe; either path must not panic.
-	_ = err
-	_ = sr.Close()
-	_ = cw.Close()
+	_, err := readFrame(client, buf, time.Second)
 	_ = cr.Close()
+	if err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected too-short frame error, got %v", err)
+	}
 }
 
 func TestFormatShortFrameError(t *testing.T) {
@@ -147,4 +139,50 @@ func TestFormatShortFrameError(t *testing.T) {
 		return
 	}
 	t.Fatalf("should not index frame[2]")
+}
+
+func TestReadFrameRejectsUnknownFlags(t *testing.T) {
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr}
+	go func() {
+		inner := make([]byte, 2+1+1)
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+		inner[2] = ClientTagReply
+		inner[3] = 0
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+		header[4] = 0x02 // unknown plaintext flag bit
+		_, _ = sw.Write(header)
+		_, _ = sw.Write(inner)
+		_ = sw.Close()
+	}()
+	buf := make([]byte, 256)
+	_, err := readFrame(client, buf, time.Second)
+	_ = cr.Close()
+	if err == nil || !strings.Contains(err.Error(), "flags") {
+		t.Fatalf("expected flags error, got %v", err)
+	}
+}
+
+func TestReadFrameRejectsBadVersion(t *testing.T) {
+	cr, sw := io.Pipe()
+	client := &pipeConn{r: cr}
+	go func() {
+		inner := make([]byte, 2+1+1)
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion+1)
+		inner[2] = ClientTagReply
+		inner[3] = 0
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+		header[4] = 0x00
+		_, _ = sw.Write(header)
+		_, _ = sw.Write(inner)
+		_ = sw.Close()
+	}()
+	buf := make([]byte, 256)
+	_, err := readFrame(client, buf, time.Second)
+	_ = cr.Close()
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected version error, got %v", err)
+	}
 }

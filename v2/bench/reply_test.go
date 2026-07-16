@@ -66,6 +66,18 @@ func TestParseResultTable(t *testing.T) {
 			wantErr: "too short",
 		},
 		{
+			name:    "truncated ok missing entity id",
+			reply:   encodeOkReply(1, 0)[:9],
+			wantID:  1,
+			wantErr: "ok reply length",
+		},
+		{
+			name:    "truncated err missing code",
+			reply:   encodeErrReply(2, ErrNotLeader)[:9],
+			wantID:  2,
+			wantErr: "err reply length",
+		},
+		{
 			name:    "malformed empty",
 			reply:   nil,
 			wantID:  1,
@@ -236,10 +248,23 @@ func TestReadReplyRejectsWrongTag(t *testing.T) {
 }
 
 func TestReadRunResponseValidatesRequestID(t *testing.T) {
-	encodeRun := func(requestID uint64, status byte) []byte {
-		buf := make([]byte, 9)
+	encodeRun := func(requestID uint64, status byte, bodyLen uint32) []byte {
+		if status != 0 {
+			buf := make([]byte, 9)
+			binary.LittleEndian.PutUint64(buf[0:8], requestID)
+			buf[8] = status
+			return buf
+		}
+		buf := make([]byte, 13+int(bodyLen))
 		binary.LittleEndian.PutUint64(buf[0:8], requestID)
 		buf[8] = status
+		binary.LittleEndian.PutUint32(buf[9:13], bodyLen)
+		return buf
+	}
+	encodeTruncSuccess := func(requestID uint64) []byte {
+		buf := make([]byte, 9)
+		binary.LittleEndian.PutUint64(buf[0:8], requestID)
+		buf[8] = 0
 		return buf
 	}
 	writeRun := func(w *io.PipeWriter, payload []byte) {
@@ -260,10 +285,11 @@ func TestReadRunResponseValidatesRequestID(t *testing.T) {
 		wantID  uint64
 		wantErr string
 	}{
-		{name: "valid success", payload: encodeRun(9, 0), wantID: 9},
-		{name: "mismatched request id", payload: encodeRun(8, 0), wantID: 9, wantErr: "request_id mismatch"},
-		{name: "error status", payload: encodeRun(9, 1), wantID: 9, wantErr: "run status"},
-		{name: "truncated", payload: encodeRun(9, 0)[:8], wantID: 9, wantErr: "too short"},
+		{name: "valid success", payload: encodeRun(9, 0, 0), wantID: 9},
+		{name: "mismatched request id", payload: encodeRun(8, 0, 0), wantID: 9, wantErr: "request_id mismatch"},
+		{name: "error status", payload: encodeRun(9, 1, 0), wantID: 9, wantErr: "run status"},
+		{name: "truncated header", payload: encodeRun(9, 0, 0)[:8], wantID: 9, wantErr: "too short"},
+		{name: "truncated success missing length", payload: encodeTruncSuccess(9), wantID: 9, wantErr: "truncated"},
 	}
 
 	for _, tc := range tests {

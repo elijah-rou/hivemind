@@ -60,6 +60,10 @@ run_phase "Storage-mode smoke (volatile + experimental)" \
 run_phase "Launcher contract (smoke/bench/infra)" \
     bash -c "'$SCRIPT_DIR/launcher_contract_test.sh'"
 
+# --- Phase 4d: Bench deploy SSM wait fixtures (stub aws, no live AWS) ---
+run_phase "Bench deploy SSM wait fixtures" \
+    bash -c "'$SCRIPT_DIR/deploy_ssm_wait_test.sh'"
+
 # --- Phase 5: Containerd integration (Docker/OrbStack) ---
 if [ "$SKIP_CONTAINERD" = false ]; then
     if command -v docker &>/dev/null; then

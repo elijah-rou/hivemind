@@ -177,7 +177,7 @@ PROTOCOL_VERSION = 1 (2 bytes = 65535 possible versions)
 - States: `.normal`, `.view_change`, `.recovering`
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
-- Field-by-field serialization (no struct padding UB in release builds)
+- Field-by-field outer serialization; nested Command/Result use a fixed tag-first wire codec (validate tags before union materialization)
 - Disk persistence (experimental): optional `--data-dir` → `journal.bin` (`0600`) under data dir (`0700`) with staged writes + `fdatasync` group-commit barrier; PrepareOk/client/worker publication only after successful write/sync for the current `(op, checksum)` identity. Absent `--data-dir` is explicit volatile POC mode. No torn-write / power-loss guarantee or simulation; no production crash-durability claim.
 - Restart recovery (experimental best-effort): validate committed-prefix checksum chain; VOPR enforces canonical recovered-prefix and immutable committed-prefix contracts; corrupt/missing/truncated/wrong-sized journal fail-stop (nonzero exit); otherwise enter view_change to rejoin. Not validated under torn writes or power loss.
 - Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries

@@ -41,6 +41,16 @@ pub fn journalSlot(op: msg.OpNumber) usize {
     return @intCast(op % LOG_SIZE_MAX);
 }
 
+/// Prepare wire/semantics gate used before onPrepare mutates view/status/log.
+fn prepareSemanticsValid(prepare: msg.PrepareMsg) bool {
+    if (prepare.op_number == 0 or prepare.op_number > LOG_SIZE_MAX) return false;
+    if (prepare.commit_min > prepare.op_number) return false;
+    if (prepare.retention_floor > prepare.commit_min) return false;
+    if (prepare.entry.op_number != prepare.op_number) return false;
+    if (!prepare.entry.valid()) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Client table entry for request deduplication
 // ---------------------------------------------------------------------------
@@ -708,6 +718,10 @@ pub const Replica = struct {
         if (self.status == .recovering) return;
         if (from != self.leaderForView(prepare.view_number)) return;
 
+        // Reject malformed prepares before any view/status/log mutation.
+        // Unsigned underflow of (op_number - retention_floor) is possible otherwise.
+        if (!prepareSemanticsValid(prepare)) return;
+
         // If we see a Prepare from a higher view, we missed the view change.
         if (prepare.view_number > self.view_number) {
             // A higher-view leader may only safely reuse our committed prefix.
@@ -737,8 +751,6 @@ pub const Replica = struct {
         self.noteReplicaCommitMin(from, prepare.commit_min);
         self.retention_floor = prepare.retention_floor;
 
-        if (!prepare.entry.valid()) return;
-
         if (prepare.op_number <= self.op_number and prepare.op_number > self.commit_min) {
             if (self.journalGet(prepare.op_number)) |existing| {
                 if (existing.checksum != prepare.entry.checksum) {
@@ -753,7 +765,9 @@ pub const Replica = struct {
 
         if (prepare.op_number == self.op_number + 1) {
             // Pipeline depth guard: reject prepare that would wrap past the
-            // leader-advertised retained floor.
+            // leader-advertised retained floor. Preflight guarantees
+            // retention_floor <= op_number so this subtraction cannot underflow.
+            std.debug.assert(prepare.retention_floor <= prepare.op_number);
             if (prepare.op_number - prepare.retention_floor >= LOG_SIZE_MAX) return;
             // Lifetime cap: never accept an op beyond LOG_SIZE_MAX without snapshots.
             if (prepare.op_number > LOG_SIZE_MAX) return;
@@ -3290,4 +3304,63 @@ test "journalPut soft-drops zero and oversize op" {
     for (replica.journal_occupied) |occ| {
         try std.testing.expect(!occ);
     }
+}
+
+test "onPrepare rejects bad retention before mutating view_change status" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7011);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7011, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7011);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.op_number = 0;
+
+    var entry = msg.LogEntry{
+        .view_number = 2,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+    };
+    entry.checksum = entry.computeChecksum();
+
+    // Leader for view 2 with replica_count=3 is replica 2.
+    // retention_floor > commit_min must not promote out of view_change.
+    replica.onMessage(2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 5,
+        .entry = entry,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+
+    // Mismatched entry.op_number must also be ignored pre-mutation.
+    entry.op_number = 9;
+    entry.checksum = entry.computeChecksum();
+    replica.onMessage(2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
 }

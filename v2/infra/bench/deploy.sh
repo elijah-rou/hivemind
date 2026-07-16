@@ -87,7 +87,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
       \"if [[ -f /tmp/hivemind.pid ]]; then kill \\\$(cat /tmp/hivemind.pid) 2>/dev/null || true; fi\",
       \"cd /tmp && nohup $cmd_json > /tmp/hivemind.log 2>&1 & echo \\\$! > /tmp/hivemind.pid\",
       \"sleep 3\",
-      \"kill -0 \\\$(cat /tmp/hivemind.pid) 2>/dev/null && echo 'hivemind running' || echo 'FAILED TO START'\"
+      \"kill -0 \\\$(cat /tmp/hivemind.pid) 2>/dev/null && echo 'hivemind running' || { echo 'FAILED TO START'; exit 1; }\"
     ]" \
     --output text --query 'Command.CommandId')
   if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then

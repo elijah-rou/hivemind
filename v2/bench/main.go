@@ -220,10 +220,18 @@ func readFrame(conn net.Conn, buf []byte, timeout time.Duration) ([]byte, error)
 		return nil, err
 	}
 	flags := buf[4]
-	if flags&0x01 != 0 {
-		return nil, fmt.Errorf("encrypted frame not supported by bench client")
+	if flags != 0x00 {
+		return nil, fmt.Errorf("unsupported frame flags: 0x%02x", flags)
 	}
-	return buf[5 : 4+frameLen], nil
+	if frameLen < 3 {
+		return nil, fmt.Errorf("frame too short for version+tag: %d", frameLen)
+	}
+	body := buf[5 : 4+frameLen]
+	version := binary.LittleEndian.Uint16(body[0:2])
+	if version != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported protocol version: %d", version)
+	}
+	return body, nil
 }
 
 func findLeader(addrList []string) net.Conn {
@@ -340,17 +348,15 @@ func parseResult(reply []byte, expectedRequestID uint64) (CommandResult, error) 
 
 	switch reply[8] {
 	case ResultOk:
-		var entityID uint64
-		if len(reply) >= 17 {
-			entityID = binary.LittleEndian.Uint64(reply[9:17])
+		if len(reply) != 17 {
+			return CommandResult{}, fmt.Errorf("ok reply length %d, want 17", len(reply))
 		}
-		return CommandResult{OK: true, EntityID: entityID}, nil
+		return CommandResult{OK: true, EntityID: binary.LittleEndian.Uint64(reply[9:17])}, nil
 	case ResultErr:
-		var errCode byte
-		if len(reply) >= 10 {
-			errCode = reply[9]
+		if len(reply) != 10 {
+			return CommandResult{}, fmt.Errorf("err reply length %d, want 10", len(reply))
 		}
-		return CommandResult{OK: false, ErrCode: errCode}, nil
+		return CommandResult{OK: false, ErrCode: reply[9]}, nil
 	default:
 		return CommandResult{}, fmt.Errorf("unknown result type: %d", reply[8])
 	}
@@ -378,6 +384,15 @@ func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
 	status := raw[8]
 	if status != 0 {
 		return fmt.Errorf("run status %d", status)
+	}
+	// Success requires explicit body length: request_id(8)+status(1)+len(4)+body.
+	if len(raw) < 13 {
+		return fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
+	}
+	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
+	want := 13 + int(bodyLen)
+	if len(raw) != want {
+		return fmt.Errorf("run success length %d, want %d", len(raw), want)
 	}
 	return nil
 }

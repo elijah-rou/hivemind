@@ -371,15 +371,16 @@ pub const ConnectionManager = struct {
     }
 
     fn sendRunError(self: *ConnectionManager, client: *Conn, request_id: u64, status: u8) void {
-        _ = self;
-        var frame: [32]u8 = undefined;
-        const payload_size: u32 = 9; // request_id(8) + status(1)
-        @memcpy(frame[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, 2 + 1 + payload_size))); // version + tag + payload
-        @memcpy(frame[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
-        frame[6] = 0x23; // ClientTag.run_response
-        @memcpy(frame[FRAME_HEADER..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
-        frame[FRAME_HEADER + 8] = status;
-        writeAll(client.fd, frame[0 .. FRAME_HEADER + 9]) catch {};
+        // Same framing as successful run replies: flags byte via sendFrame.
+        var inner: [12]u8 = undefined;
+        @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
+        inner[2] = 0x23; // ClientTag.run_response
+        @memcpy(inner[3..11], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+        inner[11] = status;
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
+        self.sendFrame(client.fd, key, inner[0..12]) catch {
+            self.disconnectClient(client);
+        };
     }
 
     /// Dispatch queued run requests to agents. Called every tick from main.

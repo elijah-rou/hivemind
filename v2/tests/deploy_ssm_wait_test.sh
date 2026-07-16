@@ -51,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     --region) region="$2"; shift 2 ;;
     --command-id) command_id="$2"; shift 2 ;;
     --instance-id) instance_id="$2"; shift 2 ;;
+    --instance-ids) instance_id="$2"; shift 2 ;;
+    --document-name) shift 2 ;;
+    --parameters) shift 2 ;;
     --query) query="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     *) shift ;;
@@ -58,6 +61,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$cmd" in
+  send-command)
+    cid="cmd-${instance_id:-unknown}"
+    printf '%s\n' "$cid" >> "$STUB_STATE/send_command.log"
+    if [[ -f "$STUB_STATE/dead_start" ]]; then
+      printf '%s\n' Failed > "$STUB_STATE/${cid}.seq"
+      printf '%s\n' "FAILED TO START" > "$STUB_STATE/${cid}.stdout"
+    else
+      printf '%s\n' Success > "$STUB_STATE/${cid}.seq"
+    fi
+    printf '%s\n' "$cid"
+    exit 0
+    ;;
   get-command-invocation)
     [[ -n "$command_id" ]] || { echo "missing command-id" >&2; exit 2; }
     [[ -n "$instance_id" ]] || { echo "missing instance-id" >&2; exit 2; }
@@ -104,10 +119,16 @@ chmod +x "$STUB_BIN/aws"
 export STUB_STATE
 export PATH="$STUB_BIN:/usr/bin:/bin"
 
-# Override sleep to advance instantly while still counting intervals.
-# Invoked from sourced ssm_wait.sh during polls (export -f).
+# Deterministic wall clock for ssm_wait.sh deadline accounting.
+FAKE_NOW=1000000
+export FAKE_NOW
+
+# Advance fake clock on sleep (waiter uses hivemind_ssm_now).
 # shellcheck disable=SC2329
-sleep() { :; }
+sleep() {
+  local n="${1:-1}"
+  FAKE_NOW=$((FAKE_NOW + n))
+}
 export -f sleep
 
 if [[ ! -f "$WAIT_LIB" ]]; then
@@ -119,10 +140,14 @@ fi
 # shellcheck source=/dev/null
 source "$WAIT_LIB"
 
+# Override after source so wall-clock deadline is deterministic.
+hivemind_ssm_now() { echo "$FAKE_NOW"; }
+
 reset_state() {
   rm -f "$STUB_STATE"/*
   : > "$STUB_STATE/calls.log"
   : > "$STUB_STATE/seen_pairs.log"
+  FAKE_NOW=1000000
 }
 
 run_case() {
@@ -234,6 +259,29 @@ case_invalid_bounds() {
   grep -q 'SSM_POLL_INTERVAL_SEC' "$TMP_DIR/bounds.err"
 }
 
+
+# shellcheck disable=SC2329
+case_deploy_dead_process_fail_closed() {
+  touch "$STUB_STATE/dead_start"
+  cid=$(aws ssm send-command --region us-east-1 --instance-ids i-dead \
+    --document-name AWS-RunShellScript --parameters commands="[]" \
+    --output text --query 'Command.CommandId')
+  [[ "$cid" == "cmd-i-dead" ]] || { echo "bad command id: $cid" >&2; return 1; }
+  if SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
+    hivemind_ssm_wait_invocation "us-east-1" "$cid" "i-dead" 2>"$TMP_DIR/dead.err"; then
+    echo "expected dead-process wait failure" >&2
+    return 1
+  fi
+  grep -q 'terminal status=Failed' "$TMP_DIR/dead.err"
+  # Deploy remote check must exit nonzero on dead process (not echo-success).
+  if grep -qE "kill -0.*\|\| echo 'FAILED TO START'" "$DEPLOY"; then
+    echo "deploy still echo-succeeds on dead process" >&2
+    return 1
+  fi
+  grep -q 'exit 1' "$DEPLOY"
+  grep -q 'FAILED TO START' "$DEPLOY"
+}
+
 run_case "Pending/InProgress/Success" case_pending_inprogress_success
 run_case "terminal Failed" case_failed
 run_case "terminal TimedOut" case_timedout
@@ -242,6 +290,7 @@ run_case "API error" case_api_error
 run_case "bounded timeout" case_bounded_timeout
 run_case "per-node command IDs" case_per_node_command_ids
 run_case "invalid poll bounds" case_invalid_bounds
+run_case "deploy dead-process fail-closed" case_deploy_dead_process_fail_closed
 
 # Deploy script must source the waiter and poll captured CommandIds (not fire-and-forget).
 if [[ ! -f "$DEPLOY" ]]; then

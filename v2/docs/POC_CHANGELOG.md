@@ -44,6 +44,30 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Fixed nested wire codec and fail-closed bench/deploy gates
+
+What changed:
+- nested `Command`/`Result` deserialize now uses a fixed tag-first wire codec (validate raw tag before union construction) with bound/boolean checks for env/rule/binding counts, probe/killswitch bools, and secret flags
+- `Prepare` semantic preflight (`commit_min <= op <= LOG_SIZE_MAX`, `retention_floor <= commit_min`, `entry.op_number` match, checksum) runs before view/status/log mutation
+- outer message deserialize requires exact payload size; gateway run errors route through `sendFrame`
+- bench rejects truncated command/run successes and non-exact plaintext flags/version; deploy dead-process path exits nonzero; SSM wait uses a wall-clock deadline
+
+Why it matters:
+- closes the re-review release blockers for malformed peer traffic UB, benchmark false-success samples, and deploy reporting healthy clusters when processes are dead
+
+Progress after change:
+- Acceptance sections complete: `6 / 8` (unchanged)
+- Execution checklist complete: `16 / 16` for warm-cache evidence pack (unchanged)
+- Infra status: `up` (unchanged)
+
+Next steps:
+1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
+2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
+3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+
+Blockers / unknowns:
+- crash-consistent torn-write / power-loss durability remains unvalidated (experimental journal)
+
 ### 2026-07-16 — Peer-input safety and launcher fail-closed hardening
 
 What changed:
@@ -52,8 +76,8 @@ What changed:
 - VOPR liveness retries recovery after clearing transient faults without wiping durable state; checker `committed_by` widened to `u16` for 11-replica topologies
 
 Why it matters:
-- malformed peer traffic can no longer panic/UB-crash replicas or forge view-change votes by spoofed identity
-- launchers and smoke paths stop reporting false success or leaking paid infra / journal directories
+- peer identity/bound checks and launcher fail-closed paths reduce forged votes and false-success deploy reports
+- nested Command/Result wire safety was still incomplete at this entry; do not treat panic/UB immunity as landed until the fixed nested codec lands
 
 Progress after change:
 - Acceptance sections complete: `6 / 8` (unchanged)
