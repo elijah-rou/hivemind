@@ -23,6 +23,7 @@ pub const FRAME_HEADER: usize = 4 + 2 + 1; // len + version + tag
 const libc = struct {
     extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
     extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn pipe(pipe_fds: *[2]c_int) c_int;
 };
 
 // ---------------------------------------------------------------------------
@@ -157,26 +158,9 @@ pub const ConnectionManager = struct {
     }
 
     pub fn deinit(self: *ConnectionManager) void {
-        for (&self.workers) |*c| {
-            if (c.connected) {
-                self.replica.onWorkerDisconnect(c.worker_idx);
-                _ = libc.close(c.fd);
-                c.fd = -1;
-                c.connected = false;
-            }
-        }
-        for (&self.clients) |*c| {
-            if (c.connected) {
-                _ = libc.close(c.fd);
-                c.connected = false;
-            }
-        }
-        for (&self.peers) |*c| {
-            if (c.connected) {
-                _ = libc.close(c.fd);
-                c.connected = false;
-            }
-        }
+        for (&self.workers) |*worker| self.disconnectWorker(worker);
+        for (&self.clients) |*client| self.disconnectClient(client);
+        for (&self.peers) |*peer| disconnectPeer(peer);
         _ = libc.close(self.worker_listen_fd);
         _ = libc.close(self.client_listen_fd);
         if (self.peer_listen_fd >= 0) _ = libc.close(self.peer_listen_fd);
@@ -268,6 +252,7 @@ pub const ConnectionManager = struct {
             const tag_byte = frame_payload[2]; // version(2) + tag(1)
             const payload = frame_payload[3..];
             self.dispatchWorkerMessage(worker, tag_byte, payload);
+            if (!worker.connected) break;
         }
 
         shiftBuffer(&worker.frame_buf, &worker.frame_pos, consumed);
@@ -479,6 +464,20 @@ pub const ConnectionManager = struct {
         return null;
     }
 
+    /// Send a replica-owned StartPod/StopPod frame. The callback retains no
+    /// connection ownership; a failed synchronous write disconnects exactly once.
+    pub fn sendReplicaWorkerFrame(self: *ConnectionManager, worker_idx: usize, data: []const u8) void {
+        if (worker_idx >= self.worker_count) return;
+        const worker = &self.workers[worker_idx];
+        if (!worker.connected) return;
+
+        const frame_header: usize = 4;
+        if (data.len <= frame_header) return;
+        const inner = data[frame_header..];
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.worker_key else null;
+        self.sendFrame(worker.fd, key, inner) catch self.disconnectWorker(worker);
+    }
+
     /// Send a framed message to a connected worker with explicit outcome.
     pub fn sendToWorker(self: *ConnectionManager, worker_idx: usize, tag: msg.WorkerTag, payload: []const u8) !void {
         if (worker_idx >= self.worker_count) return error.WorkerUnavailable;
@@ -497,11 +496,14 @@ pub const ConnectionManager = struct {
     }
 
     fn disconnectWorker(self: *ConnectionManager, worker: *Conn) void {
+        if (!worker.connected) return;
         const worker_idx = worker.worker_idx;
-        _ = libc.close(worker.fd);
+        std.debug.assert(worker_idx < self.worker_count);
+        const fd = worker.fd;
         worker.fd = -1;
         worker.connected = false;
         worker.frame_pos = 0;
+        if (fd >= 0) _ = libc.close(fd);
         self.replica.onWorkerDisconnect(worker_idx);
 
         var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
@@ -659,7 +661,7 @@ pub const ConnectionManager = struct {
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
         self.sendFrame(client.fd, key, payload[0..pos]) catch {
-            client.connected = false;
+            self.disconnectClient(client);
         };
     }
 
@@ -794,7 +796,7 @@ pub const ConnectionManager = struct {
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
         self.sendFrame(client.fd, key, inner[0 .. 3 + pos]) catch {
-            client.connected = false;
+            self.disconnectClient(client);
         };
     }
 
@@ -904,11 +906,14 @@ pub const ConnectionManager = struct {
     }
 
     fn disconnectClient(self: *ConnectionManager, client: *Conn) void {
-        self.request_queue.cancelClient(client.client_id);
-        _ = libc.close(client.fd);
+        if (!client.connected) return;
+        const client_id = client.client_id;
+        const fd = client.fd;
         client.fd = -1;
         client.connected = false;
         client.frame_pos = 0;
+        self.request_queue.cancelClient(client_id);
+        if (fd >= 0) _ = libc.close(fd);
     }
 
     // -- Peer connections (VRR inter-replica TCP) --
@@ -1818,6 +1823,113 @@ fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Repli
     cm.poll_count = 0;
     cm.state_response_buf = undefined;
     cm.encryption = null;
+}
+
+test "worker side-effect and client error write failures clean all owned state and permit slot reuse" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7001);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7001, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7001);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    replica.workers[0].connected = true;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+    cm.client_count = 1;
+    var failed_worker_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_worker_pipe));
+    defer _ = libc.close(failed_worker_pipe[1]);
+    var failed_client_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_client_pipe));
+    defer _ = libc.close(failed_client_pipe[1]);
+    cm.workers[0] = .{ .fd = failed_worker_pipe[0], .connected = true, .worker_idx = 0 };
+    cm.clients[0] = .{ .fd = failed_client_pipe[0], .connected = true, .client_id = 71 };
+    try std.testing.expect(cm.request_queue.enqueue(1, 10, 71, "queued"));
+    _ = cm.request_queue.trackInFlightForWorker(11, 71, 0).?;
+
+    const start_pod_frame = [_]u8{ 3, 0, 0, 0, 1, 0, @intFromEnum(msg.WorkerTag.start_pod) };
+    cm.sendReplicaWorkerFrame(0, &start_pod_frame);
+
+    try std.testing.expectEqual(@as(c_int, -1), cm.workers[0].fd);
+    try std.testing.expect(!cm.workers[0].connected);
+    try std.testing.expect(!replica.workers[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_worker_pipe[0]));
+    try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
+    try std.testing.expect(!cm.clients[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    var replacement_worker: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &replacement_worker));
+    defer _ = libc.close(replacement_worker[0]);
+    defer _ = libc.close(replacement_worker[1]);
+    cm.workers[0] = .{ .fd = replacement_worker[0], .connected = true, .worker_idx = 0 };
+    replica.workers[0].connected = true;
+    cm.sendReplicaWorkerFrame(0, &start_pod_frame);
+    var worker_buf: [32]u8 = undefined;
+    const worker_bytes = try std.posix.read(replacement_worker[1], &worker_buf);
+    try std.testing.expect(worker_bytes >= 8);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expect(replica.workers[0].connected);
+}
+
+test "consensus reply write failure cleans client-owned run state and permits slot reuse" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7002);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7002, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7002);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.client_count = 1;
+    var failed_client_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_client_pipe));
+    defer _ = libc.close(failed_client_pipe[1]);
+    cm.clients[0] = .{ .fd = failed_client_pipe[0], .connected = true, .client_id = 72 };
+    try std.testing.expect(cm.request_queue.enqueue(1, 20, 72, "queued"));
+    _ = cm.request_queue.trackInFlightForWorker(21, 72, 0).?;
+
+    cm.sendClientReply(&cm.clients[0], 22, .{ .ok = .{ .entity_id = 9 } });
+
+    try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
+    try std.testing.expect(!cm.clients[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    var replacement_client: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &replacement_client));
+    defer _ = libc.close(replacement_client[0]);
+    defer _ = libc.close(replacement_client[1]);
+    cm.clients[0] = .{ .fd = replacement_client[0], .connected = true, .client_id = 73 };
+    cm.sendClientReply(&cm.clients[0], 23, .{ .ok = .{ .entity_id = 10 } });
+    var client_buf: [32]u8 = undefined;
+    const client_bytes = try std.posix.read(replacement_client[1], &client_buf);
+    try std.testing.expect(client_bytes >= 17);
+    try std.testing.expect(cm.clients[0].connected);
 }
 
 test "readWorkers disconnects agents from non-leader replicas" {
