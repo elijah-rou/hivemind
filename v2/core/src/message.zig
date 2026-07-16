@@ -259,14 +259,21 @@ pub const LogEntry = struct {
 
     pub fn computeChecksum(self: *const LogEntry) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(std.mem.asBytes(&self.parent_checksum));
-        hasher.update(std.mem.asBytes(&self.view_number));
-        hasher.update(std.mem.asBytes(&self.op_number));
-        var cmd_wire: [@sizeOf(Command)]u8 = undefined;
-        writeCommand(&cmd_wire, self.command);
+        var u64_wire: [8]u8 = undefined;
+        var u128_wire: [16]u8 = undefined;
+        std.mem.writeInt(u64, &u64_wire, self.parent_checksum, .little);
+        hasher.update(&u64_wire);
+        std.mem.writeInt(u64, &u64_wire, self.view_number, .little);
+        hasher.update(&u64_wire);
+        std.mem.writeInt(u64, &u64_wire, self.op_number, .little);
+        hasher.update(&u64_wire);
+        var cmd_wire: [COMMAND_CANONICAL_SIZE]u8 = undefined;
+        writeCanonicalCommand(&cmd_wire, self.command);
         hasher.update(&cmd_wire);
-        hasher.update(std.mem.asBytes(&self.client_id));
-        hasher.update(std.mem.asBytes(&self.request_id));
+        std.mem.writeInt(u128, &u128_wire, self.client_id, .little);
+        hasher.update(&u128_wire);
+        std.mem.writeInt(u128, &u128_wire, self.request_id, .little);
+        hasher.update(&u128_wire);
         return hasher.final();
     }
 
@@ -466,6 +473,30 @@ pub const COMMAND_PAYLOAD_MAX: usize = blk: {
     break :blk max;
 };
 
+fn canonicalSize(comptime T: type) usize {
+    if (T == void) return 0;
+    if (T == bool) return 1;
+    return switch (@typeInfo(T)) {
+        .int, .float, .@"enum" => @sizeOf(T),
+        .array => |array| array.len * canonicalSize(array.child),
+        .@"struct" => blk: {
+            var size: usize = 0;
+            inline for (std.meta.fields(T)) |field| size += canonicalSize(field.type);
+            break :blk size;
+        },
+        else => @compileError("unsupported canonical command field type"),
+    };
+}
+
+/// Stable tag-first little-endian Command size, independent of struct padding/ABI.
+pub const COMMAND_CANONICAL_SIZE: usize = blk: {
+    var max: usize = 0;
+    for (@typeInfo(Command).@"union".fields) |field| {
+        max = @max(max, canonicalSize(field.type));
+    }
+    break :blk 1 + max;
+};
+
 comptime {
     // Tag + max payload must fit in the in-memory Command storage we reserve on the wire.
     if (1 + COMMAND_PAYLOAD_MAX > @sizeOf(Command)) @compileError("Command wire payload exceeds @sizeOf(Command)");
@@ -625,6 +656,109 @@ pub fn readCommand(src: []const u8) !Command {
                 if (std.mem.eql(u8, field.name, name)) {
                     if (field.type == void) return @unionInit(Command, field.name, {});
                     const payload = try readStructFields(field.type, src[1..][0..@sizeOf(field.type)]);
+                    return @unionInit(Command, field.name, payload);
+                }
+            }
+            return error.InvalidCommandTag;
+        },
+    }
+}
+
+fn writeCanonicalValue(comptime T: type, dst: []u8, value: T) usize {
+    const size = canonicalSize(T);
+    std.debug.assert(dst.len >= size);
+    if (T == void) return 0;
+    if (T == bool) {
+        dst[0] = if (value) 1 else 0;
+        return 1;
+    }
+    switch (@typeInfo(T)) {
+        .int => std.mem.writeInt(T, dst[0..@sizeOf(T)], value, .little),
+        .float => {
+            const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+            std.mem.writeInt(Int, dst[0..@sizeOf(T)], @bitCast(value), .little);
+        },
+        .@"enum" => {
+            const TagInt = @typeInfo(T).@"enum".tag_type;
+            std.mem.writeInt(TagInt, dst[0..@sizeOf(TagInt)], @intFromEnum(value), .little);
+        },
+        .array => |array| {
+            var pos: usize = 0;
+            for (value) |element| pos += writeCanonicalValue(array.child, dst[pos..], element);
+            std.debug.assert(pos == size);
+        },
+        .@"struct" => {
+            var pos: usize = 0;
+            inline for (std.meta.fields(T)) |field| {
+                pos += writeCanonicalValue(field.type, dst[pos..], @field(value, field.name));
+            }
+            std.debug.assert(pos == size);
+        },
+        else => unreachable,
+    }
+    return size;
+}
+
+fn readCanonicalValue(comptime T: type, src: []const u8) !T {
+    const size = canonicalSize(T);
+    if (src.len < size) return error.MessageTooShort;
+    if (T == void) return {};
+    if (T == bool) return try validateBoolByte(src[0]);
+    return switch (@typeInfo(T)) {
+        .int => std.mem.readInt(T, src[0..@sizeOf(T)], .little),
+        .float => blk: {
+            const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+            break :blk @bitCast(std.mem.readInt(Int, src[0..@sizeOf(T)], .little));
+        },
+        .@"enum" => blk: {
+            const TagInt = @typeInfo(T).@"enum".tag_type;
+            const raw = std.mem.readInt(TagInt, src[0..@sizeOf(TagInt)], .little);
+            break :blk try enumFromIntChecked(T, raw);
+        },
+        .array => |array| blk: {
+            var out: T = undefined;
+            var pos: usize = 0;
+            for (&out) |*element| {
+                element.* = try readCanonicalValue(array.child, src[pos..]);
+                pos += canonicalSize(array.child);
+            }
+            break :blk out;
+        },
+        .@"struct" => blk: {
+            var out: T = undefined;
+            var pos: usize = 0;
+            inline for (std.meta.fields(T)) |field| {
+                @field(out, field.name) = try readCanonicalValue(field.type, src[pos..]);
+                pos += canonicalSize(field.type);
+            }
+            break :blk out;
+        },
+        else => unreachable,
+    };
+}
+
+pub fn writeCanonicalCommand(dst: []u8, command: Command) void {
+    std.debug.assert(dst.len >= COMMAND_CANONICAL_SIZE);
+    @memset(dst[0..COMMAND_CANONICAL_SIZE], 0);
+    dst[0] = @intFromEnum(std.meta.activeTag(command));
+    switch (command) {
+        .noop => {},
+        inline else => |payload| {
+            const written = writeCanonicalValue(@TypeOf(payload), dst[1..], payload);
+            std.debug.assert(written <= COMMAND_CANONICAL_SIZE - 1);
+        },
+    }
+}
+
+pub fn readCanonicalCommand(src: []const u8) !Command {
+    if (src.len < COMMAND_CANONICAL_SIZE) return error.MessageTooShort;
+    const tag = enumFromIntChecked(std.meta.Tag(Command), src[0]) catch return error.InvalidCommandTag;
+    switch (tag) {
+        inline else => |active_tag| {
+            const name = @tagName(active_tag);
+            inline for (std.meta.fields(Command)) |field| {
+                if (std.mem.eql(u8, field.name, name)) {
+                    const payload = try readCanonicalValue(field.type, src[1..]);
                     return @unionInit(Command, field.name, payload);
                 }
             }

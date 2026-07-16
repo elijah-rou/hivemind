@@ -138,7 +138,7 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
          │  │ State Machine       │   │  nodes, deployments, pods
          │  │ Scheduler           │   │  bin-packing on GPU/CPU/mem
          │  │ Request Queue       │   │  run requests (no consensus)
-         │  │ Disk Journal        │   │  experimental v1 single-copy; not torn-write safe
+         │  │ Disk Journal        │   │  experimental layout v2 single-copy; not torn-write safe
          │  │ S3 Backup           │   │  forked aws s3 cp (not atomic restore)
          │  │ Gossip              │   │  UDP, 5s broadcast, 30s stale
          │  └─────────────────────┘   │
@@ -302,7 +302,7 @@ Legacy deploy-mode benchmark, retained for historical context only:
 ## What's Working
 
 - [x] VRR 5-node consensus with view change, log repair, leader election
-- [x] Experimental v1 journal: write/sync-before-publication, I/O fail-stop, fail-closed 1024-op retention, best-effort restart recovery (not torn-write / power-loss safe)
+- [x] Experimental layout v2 journal: fixed little-endian fields, write/sync-before-publication, I/O fail-stop, fail-closed 1024-op retention, best-effort restart recovery (not torn-write / power-loss safe)
 - [x] Agent registration, heartbeat, pod dispatch
 - [x] Full pod lifecycle: pull → create → start → monitor → stop with bounded worker-side lifecycle concurrency
 - [x] Run requests (stateless, no consensus overhead)
@@ -328,7 +328,7 @@ Legacy deploy-mode benchmark, retained for historical context only:
 2. **Authentication** - No auth on API or agent connections. Need API keys + agent tokens.
 3. **Provider adapter** - No auto-provisioning of nodes. Manual VM setup required.
 4. **App spec model** - Current CreateDeployment is basic. Need full app spec (probes, scaling policy, env config, storage).
-5. **Crash-consistent versioned storage + torn-write simulation** - v1 single-copy journal has no torn-write/power-loss model; required before any production durability claim (separate from snapshots).
+5. **Crash-consistent versioned storage + torn-write simulation** - layout v2 single-copy journal has no torn-write/power-loss model; required before any production durability claim (separate from snapshots).
 6. **Log compaction / snapshots** - Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; need snapshots before removing the cap.
 
 ### Important (blocks Knative parity)
@@ -409,7 +409,7 @@ Recently trimmed/frozen:
 | `core/src/message.zig` | VRR message types, field-by-field serialization |
 | `core/src/gossip.zig` | Cross-region UDP gossip |
 | `core/src/s3_backup.zig` | Forked S3 journal upload |
-| `core/src/disk.zig` | Experimental v1 single-copy journal (not torn-write safe) |
+| `core/src/disk.zig` | Experimental layout v2 single-copy journal (not torn-write safe) |
 | `core/src/metrics.zig` | Prometheus metrics export |
 | `core/src/request_queue.zig` | Leader-local run request queue |
 | `core/src/vopr/vopr.zig` | VOPR simulation scenarios |

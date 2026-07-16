@@ -350,7 +350,7 @@ pub const SimulatedDisk = struct {
 // ---------------------------------------------------------------------------
 
 pub const FileDisk = struct {
-    pub const MAGIC: u64 = 0x484956454D494E44; // "HIVEMIND"
+    pub const MAGIC: u64 = 0x444E494D45564948; // little-endian bytes "HIVEMIND"
     pub const VERSION: u32 = 2;
     pub const LEGACY_VERSION: u32 = 1;
 
@@ -361,8 +361,8 @@ pub const FileDisk = struct {
     pub const BITMAP_OFFSET: usize = 128;
     pub const BITMAP_SIZE: usize = (replica_mod.LOG_SIZE_MAX + 7) / 8;
     pub const JOURNAL_OFFSET: usize = BITMAP_OFFSET + BITMAP_SIZE;
-    /// Tag-first Command region size matches message.writeCommand reservation.
-    pub const DISK_COMMAND_SIZE: usize = @sizeOf(msg.Command);
+    /// Fixed tag-first packed Command region, independent of Zig ABI padding.
+    pub const DISK_COMMAND_SIZE: usize = msg.COMMAND_CANONICAL_SIZE;
     pub const DISK_COMMAND_OFFSET: usize = 32; // after 4x u64 fields
     /// Explicit little-endian on-disk LogEntry size (not @sizeOf(LogEntry) as format).
     pub const ENTRY_SIZE: usize = 8 + 8 + 8 + 8 + DISK_COMMAND_SIZE + 16 + 16;
@@ -376,29 +376,33 @@ pub const FileDisk = struct {
         std.debug.assert(VERSION != LEGACY_VERSION);
     }
 
-    const Header = extern struct {
-        magic: u64 align(1) = MAGIC,
-        version: u32 align(1) = VERSION,
-        log_size_max: u32 align(1) = replica_mod.LOG_SIZE_MAX,
-        _reserved: [HEADER_SIZE - 16]u8 align(1) = std.mem.zeroes([HEADER_SIZE - 16]u8),
-    };
-
-    comptime {
-        std.debug.assert(@sizeOf(Header) == HEADER_SIZE);
+    pub fn encodeHeader(dst: *[HEADER_SIZE]u8) void {
+        @memset(dst, 0);
+        std.mem.writeInt(u64, dst[0..8], MAGIC, .little);
+        std.mem.writeInt(u32, dst[8..12], VERSION, .little);
+        std.mem.writeInt(u32, dst[12..16], replica_mod.LOG_SIZE_MAX, .little);
     }
 
-    const MetadataOnDisk = extern struct {
-        view_number: u64 align(1) = 0,
-        last_normal_view: u64 align(1) = 0,
-        op_number: u64 align(1) = 0,
-        commit_min: u64 align(1) = 0,
-        commit_max: u64 align(1) = 0,
-        written: u8 align(1) = 0,
-        _reserved: [METADATA_SIZE - 41]u8 align(1) = std.mem.zeroes([METADATA_SIZE - 41]u8),
-    };
+    fn encodeMetadata(dst: *[METADATA_SIZE]u8, metadata: Metadata, written: bool) void {
+        @memset(dst, 0);
+        writeU64Le(dst[0..8], metadata.view_number);
+        writeU64Le(dst[8..16], metadata.last_normal_view);
+        writeU64Le(dst[16..24], metadata.op_number);
+        writeU64Le(dst[24..32], metadata.commit_min);
+        writeU64Le(dst[32..40], metadata.commit_max);
+        dst[40] = if (written) 1 else 0;
+    }
 
-    comptime {
-        std.debug.assert(@sizeOf(MetadataOnDisk) == METADATA_SIZE);
+    fn decodeMetadata(src: *const [METADATA_SIZE]u8) !?Metadata {
+        if (src[40] > 1) return error.InvalidMetadataWritten;
+        if (src[40] == 0) return null;
+        return .{
+            .view_number = readU64Le(src[0..8]),
+            .last_normal_view = readU64Le(src[8..16]),
+            .op_number = readU64Le(src[16..24]),
+            .commit_min = readU64Le(src[24..32]),
+            .commit_max = readU64Le(src[32..40]),
+        };
     }
 
     /// Explicit little-endian on-disk LogEntry codec with tag-first Command encoding.
@@ -409,7 +413,7 @@ pub const FileDisk = struct {
         writeU64Le(dst[8..16], entry.parent_checksum);
         writeU64Le(dst[16..24], entry.view_number);
         writeU64Le(dst[24..32], entry.op_number);
-        msg.writeCommand(dst[DISK_COMMAND_OFFSET..][0..DISK_COMMAND_SIZE], entry.command);
+        msg.writeCanonicalCommand(dst[DISK_COMMAND_OFFSET..][0..DISK_COMMAND_SIZE], entry.command);
         writeU128Le(dst[DISK_COMMAND_OFFSET + DISK_COMMAND_SIZE ..][0..16], entry.client_id);
         writeU128Le(dst[DISK_COMMAND_OFFSET + DISK_COMMAND_SIZE + 16 ..][0..16], entry.request_id);
     }
@@ -421,7 +425,7 @@ pub const FileDisk = struct {
             .parent_checksum = readU64Le(src[8..16]),
             .view_number = readU64Le(src[16..24]),
             .op_number = readU64Le(src[24..32]),
-            .command = try msg.readCommand(src[DISK_COMMAND_OFFSET..][0..DISK_COMMAND_SIZE]),
+            .command = try msg.readCanonicalCommand(src[DISK_COMMAND_OFFSET..][0..DISK_COMMAND_SIZE]),
             .client_id = readU128Le(src[DISK_COMMAND_OFFSET + DISK_COMMAND_SIZE ..][0..16]),
             .request_id = readU128Le(src[DISK_COMMAND_OFFSET + DISK_COMMAND_SIZE + 16 ..][0..16]),
         };
@@ -494,11 +498,13 @@ pub const FileDisk = struct {
     fn initNewFile(self: *FileDisk) !void {
         if (std.c.ftruncate(self.fd, @intCast(TOTAL_SIZE)) != 0) return error.TruncateFailed;
 
-        const header = Header{};
-        try pwriteAll(self.fd, std.mem.asBytes(&header), HEADER_OFFSET);
+        var header: [HEADER_SIZE]u8 = undefined;
+        encodeHeader(&header);
+        try pwriteAll(self.fd, &header, HEADER_OFFSET);
 
-        const meta_disk = MetadataOnDisk{};
-        try pwriteAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET);
+        var meta_disk: [METADATA_SIZE]u8 = undefined;
+        encodeMetadata(&meta_disk, .{}, false);
+        try pwriteAll(self.fd, &meta_disk, METADATA_OFFSET);
 
         const zero_bitmap = std.mem.zeroes([BITMAP_SIZE]u8);
         try pwriteAll(self.fd, &zero_bitmap, BITMAP_OFFSET);
@@ -507,23 +513,23 @@ pub const FileDisk = struct {
     }
 
     fn loadExisting(self: *FileDisk) !void {
-        var header: Header = undefined;
-        try preadAll(self.fd, std.mem.asBytes(&header), HEADER_OFFSET);
-        if (header.magic != MAGIC) return error.BadMagic;
-        if (header.version == LEGACY_VERSION) return error.LegacyJournalVersion;
-        if (header.version != VERSION) return error.UnsupportedJournalVersion;
-        if (header.log_size_max != replica_mod.LOG_SIZE_MAX) return error.BadLogSize;
+        var header: [HEADER_SIZE]u8 = undefined;
+        try preadAll(self.fd, &header, HEADER_OFFSET);
+        if (std.mem.readInt(u64, header[0..8], .little) != MAGIC) return error.BadMagic;
+        const version = std.mem.readInt(u32, header[8..12], .little);
+        if (version == LEGACY_VERSION) return error.LegacyJournalVersion;
+        if (version != VERSION) return error.UnsupportedJournalVersion;
+        if (std.mem.readInt(u32, header[12..16], .little) != replica_mod.LOG_SIZE_MAX) return error.BadLogSize;
 
-        var meta_disk: MetadataOnDisk = undefined;
-        try preadAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET);
-        self.metadata_written = meta_disk.written != 0;
-        self.metadata = .{
-            .view_number = meta_disk.view_number,
-            .last_normal_view = meta_disk.last_normal_view,
-            .op_number = meta_disk.op_number,
-            .commit_min = meta_disk.commit_min,
-            .commit_max = meta_disk.commit_max,
-        };
+        var meta_disk: [METADATA_SIZE]u8 = undefined;
+        try preadAll(self.fd, &meta_disk, METADATA_OFFSET);
+        if (try decodeMetadata(&meta_disk)) |metadata| {
+            self.metadata = metadata;
+            self.metadata_written = true;
+        } else {
+            self.metadata = .{};
+            self.metadata_written = false;
+        }
 
         var bitmap: [BITMAP_SIZE]u8 = undefined;
         try preadAll(self.fd, &bitmap, BITMAP_OFFSET);
@@ -570,15 +576,9 @@ pub const FileDisk = struct {
     }
 
     pub fn writeMetadata(self: *FileDisk, meta: Metadata) DiskError!void {
-        const meta_disk = MetadataOnDisk{
-            .view_number = meta.view_number,
-            .last_normal_view = meta.last_normal_view,
-            .op_number = meta.op_number,
-            .commit_min = meta.commit_min,
-            .commit_max = meta.commit_max,
-            .written = 1,
-        };
-        pwriteAll(self.fd, std.mem.asBytes(&meta_disk), METADATA_OFFSET) catch return error.WriteFailed;
+        var meta_disk: [METADATA_SIZE]u8 = undefined;
+        encodeMetadata(&meta_disk, meta, true);
+        pwriteAll(self.fd, &meta_disk, METADATA_OFFSET) catch return error.WriteFailed;
         self.metadata = meta;
         self.metadata_written = true;
     }
@@ -1053,11 +1053,52 @@ test "FileDisk: decode rejects corrupt command tag without materializing union" 
 test "FileDisk: layout version and entry size are explicit" {
     try std.testing.expectEqual(@as(u32, 2), FileDisk.VERSION);
     try std.testing.expectEqual(@as(u32, 1), FileDisk.LEGACY_VERSION);
-    // Disk entry size is the codec layout, not a native LogEntry dump.
+    try std.testing.expectEqual(msg.COMMAND_CANONICAL_SIZE, FileDisk.DISK_COMMAND_SIZE);
     try std.testing.expectEqual(
         @as(usize, 8 + 8 + 8 + 8 + FileDisk.DISK_COMMAND_SIZE + 16 + 16),
         FileDisk.ENTRY_SIZE,
     );
     try std.testing.expectEqual(@as(usize, 32), FileDisk.DISK_COMMAND_OFFSET);
     try std.testing.expect(FileDisk.ENTRY_SIZE != 0);
+}
+
+test "FileDisk: header metadata and entry have static little-endian golden bytes" {
+    var header: [FileDisk.HEADER_SIZE]u8 = undefined;
+    FileDisk.encodeHeader(&header);
+    const header_prefix = [_]u8{
+        0x48, 0x49, 0x56, 0x45, 0x4d, 0x49, 0x4e, 0x44,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+    };
+    try std.testing.expectEqualSlices(u8, &header_prefix, header[0..header_prefix.len]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** (FileDisk.HEADER_SIZE - 16)), header[16..]);
+
+    var metadata: [FileDisk.METADATA_SIZE]u8 = undefined;
+    FileDisk.encodeMetadata(&metadata, .{
+        .view_number = 0x0102_0304_0506_0708,
+        .last_normal_view = 2,
+        .op_number = 3,
+        .commit_min = 4,
+        .commit_max = 5,
+    }, true);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 }, metadata[0..8]);
+    try std.testing.expectEqual(@as(u8, 1), metadata[40]);
+    const decoded_metadata = (try FileDisk.decodeMetadata(&metadata)).?;
+    try std.testing.expectEqual(@as(u64, 0x0102_0304_0506_0708), decoded_metadata.view_number);
+
+    const entry = msg.LogEntry{
+        .checksum = 0x0102_0304_0506_0708,
+        .parent_checksum = 0x1112_1314_1516_1718,
+        .view_number = 0x2122_2324_2526_2728,
+        .op_number = 0x3132_3334_3536_3738,
+        .command = .{ .deregister_node = .{ .node_id = 0x4142_4344_4546_4748 } },
+        .client_id = 0x5152_5354_5556_5758_6162_6364_6566_6768,
+        .request_id = 0x7172_7374_7576_7778_8182_8384_8586_8788,
+    };
+    var entry_bytes: [FileDisk.ENTRY_SIZE]u8 = undefined;
+    FileDisk.encodeLogEntry(&entry_bytes, &entry);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 }, entry_bytes[0..8]);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(std.meta.Tag(msg.Command).deregister_node)), entry_bytes[32]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41 }, entry_bytes[33..41]);
+    const client_offset = FileDisk.DISK_COMMAND_OFFSET + FileDisk.DISK_COMMAND_SIZE;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x68, 0x67, 0x66, 0x65 }, entry_bytes[client_offset..][0..4]);
 }
