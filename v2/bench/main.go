@@ -21,7 +21,9 @@ const (
 	ClientTagClusterStateResp    byte   = 0x25
 	CmdCreateDeploy              byte   = 3
 	ProtocolVersion              uint16 = 1
+	MaxFrameBytes                       = 64 * 1024
 	MaxRunPayload                       = 512
+	MaxRunResponseBody                  = 16*1024 - 9
 
 	ResultOk     byte = 0
 	ResultErr    byte = 1
@@ -139,7 +141,7 @@ func runWorkloadBenchmark(addrList []string, count int, depName string, payloadS
 		count, depName, payloadSize)
 
 	latencies := make([]time.Duration, 0, count)
-	recvBuf := make([]byte, 8192)
+	recvBuf := make([]byte, MaxFrameBytes)
 
 	totalStart := time.Now()
 
@@ -230,8 +232,8 @@ func readFrame(conn net.Conn, buf []byte, timeout time.Duration) ([]byte, error)
 	if flags != 0x00 {
 		return nil, fmt.Errorf("unsupported frame flags: 0x%02x", flags)
 	}
-	if frameLen < 3 {
-		return nil, fmt.Errorf("frame too short for version+tag: %d", frameLen)
+	if frameLen < 4 {
+		return nil, fmt.Errorf("frame too short for flags+version+tag: %d", frameLen)
 	}
 	body := buf[5 : 4+frameLen]
 	version := binary.LittleEndian.Uint16(body[0:2])
@@ -397,6 +399,9 @@ func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
 		return fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
 	}
 	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
+	if bodyLen > MaxRunResponseBody {
+		return fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
+	}
 	want := 13 + int(bodyLen)
 	if len(raw) != want {
 		return fmt.Errorf("run success length %d, want %d", len(raw), want)

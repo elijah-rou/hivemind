@@ -962,15 +962,16 @@ test "durable storage: write_fault_rate applies to clearSlot" {
     try std.testing.expect(sim.write_faults >= 1);
 }
 
-test "FileDisk: rejects legacy journal version 1" {
+test "FileDisk: actual legacy native-layout journal is rejected fail closed" {
     const path = "/tmp/hivemind_test_legacy_v1.bin";
     defer unlinkFile(path);
 
-    // Craft a correctly sized journal whose header still claims layout v1.
+    // Reproduce layout v1's native LogEntry sizing, not layout v2's size.
     const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
     try std.testing.expect(raw >= 0);
     defer _ = std.c.close(raw);
-    try std.testing.expect(std.c.ftruncate(raw, @intCast(FileDisk.TOTAL_SIZE)) == 0);
+    const legacy_total_size = FileDisk.JOURNAL_OFFSET + replica_mod.LOG_SIZE_MAX * @sizeOf(msg.LogEntry);
+    try std.testing.expect(std.c.ftruncate(raw, @intCast(legacy_total_size)) == 0);
 
     var header = [_]u8{0} ** FileDisk.HEADER_SIZE;
     std.mem.writeInt(u64, header[0..8], FileDisk.MAGIC, .little);
@@ -980,7 +981,9 @@ test "FileDisk: rejects legacy journal version 1" {
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try std.testing.expectError(error.LegacyJournalVersion, fd.openInPlace(path));
+    if (fd.openInPlace(path)) {
+        return error.ExpectedIncompatibleJournalRejection;
+    } else |_| {}
 }
 
 test "FileDisk: rejects corrupt command tag on open" {

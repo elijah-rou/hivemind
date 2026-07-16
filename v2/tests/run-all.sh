@@ -44,9 +44,13 @@ run_phase "Zig tests (Debug + ReleaseFast)" \
 run_phase "Rust tests (unit + integration)" \
     bash -c "cd '$REPO_ROOT/worker' && cargo test"
 
-# --- Phase 3: Go build ---
-run_phase "Go build" \
-    bash -c "cd '$REPO_ROOT/api' && go build ./..."
+# --- Phase 3: Go tests + build (separate modules) ---
+run_phase "Go API tests" \
+    bash -c "cd '$REPO_ROOT/api' && go test ./..."
+run_phase "Go bench tests" \
+    bash -c "cd '$REPO_ROOT/bench' && go test ./..."
+run_phase "Go build (API + bench)" \
+    bash -c "cd '$REPO_ROOT/api' && go build ./... && cd '$REPO_ROOT/bench' && go build ./..."
 
 # --- Phase 4: Infra POC script tests ---
 run_phase "Infra POC script tests" \

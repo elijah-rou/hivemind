@@ -82,6 +82,34 @@ fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
     return true;
 }
 
+/// Stateless peer-message semantics checked before a socket may claim identity.
+pub fn peerMessageSemanticsValid(message: msg.Message) bool {
+    return switch (message) {
+        .prepare => |m| prepareSemanticsValid(m),
+        // A late ack may report a commit watermark above the acked op.
+        .prepare_ok => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.commit_min <= LOG_SIZE_MAX,
+        .commit => |m| commitSemanticsValid(m),
+        .do_view_change => |m| blk: {
+            if (m.commit_min > m.op_number or m.op_number > LOG_SIZE_MAX) break :blk false;
+            if (m.retention_floor > m.commit_min) break :blk false;
+            if (m.log_entry_count > msg.DVC_LOG_MAX) break :blk false;
+            for (m.log_entries[0..m.log_entry_count]) |entry| {
+                if (entry.op_number == 0 or entry.op_number > m.op_number or !entry.valid()) break :blk false;
+            }
+            break :blk true;
+        },
+        .start_view => |m| startViewEntriesValid(m),
+        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX,
+        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid(),
+        .send_status => |m| m.commit_min <= m.op_number and m.op_number <= LOG_SIZE_MAX,
+        .request,
+        .reply,
+        .start_view_change,
+        .request_status,
+        => true,
+    };
+}
+
 /// Prospective StartView parent-chain gate against the local committed prefix and
 /// all incoming parent_checksum links. Gaps above commit_min remain allowed for
 /// transfer repair; unknown committed predecessors fail closed.

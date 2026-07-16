@@ -84,6 +84,41 @@ func TestWriteFrameIncludesFlagsByte(t *testing.T) {
 	_ = pr.Close()
 }
 
+func TestReadFrameAcceptsSharedMaximumBoundary(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	innerLen := MaxFrameBytes - 5
+	done := make(chan error, 1)
+	go func() {
+		inner := make([]byte, innerLen)
+		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+		inner[2] = ClientTagClusterStateResp
+		header := make([]byte, 5)
+		binary.LittleEndian.PutUint32(header[0:4], uint32(1+len(inner)))
+		header[4] = 0
+		if _, err := server.Write(header); err != nil {
+			done <- err
+			return
+		}
+		_, err := server.Write(inner)
+		done <- err
+	}()
+
+	buf := make([]byte, MaxFrameBytes)
+	frame, err := readFrame(client, buf, time.Second)
+	if err != nil {
+		t.Fatalf("read shared max frame: %v", err)
+	}
+	if len(frame) != innerLen {
+		t.Fatalf("frame length=%d want %d", len(frame), innerLen)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("write max frame: %v", err)
+	}
+}
+
 func TestReadFrameRoundTrip(t *testing.T) {
 	sr, cw := io.Pipe()
 	cr, sw := io.Pipe()

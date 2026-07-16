@@ -58,6 +58,7 @@ DEPLOY="$REPO_ROOT/infra/bench/deploy.sh"
 SERVICE="$REPO_ROOT/infra/poc/hivemind.service"
 BENCH_TF="$REPO_ROOT/infra/bench/main.tf"
 GPU_TEST="$REPO_ROOT/infra/gpu-test/run-tests.sh"
+RUN_ALL="$SCRIPT_DIR/run-all.sh"
 
 echo "==> Compatibility smoke wrappers"
 assert_exec_wrapper "$SMOKE" 'local-smoke\.sh'
@@ -123,6 +124,11 @@ assert_lacks "$SERVICE" '--agent-port'
 assert_file "$BENCH_TF"
 assert_contains "$BENCH_TF" '--worker-port'
 assert_lacks "$BENCH_TF" '--agent-port'
+
+echo "==> run-all executes both Go module tests"
+assert_file "$RUN_ALL"
+assert_contains "$RUN_ALL" 'REPO_ROOT/api.*go test ./\.\.\.'
+assert_contains "$RUN_ALL" 'REPO_ROOT/bench.*go test ./\.\.\.'
 
 echo "==> gpu-test uses worker/ (agent/ removed)"
 assert_file "$GPU_TEST"

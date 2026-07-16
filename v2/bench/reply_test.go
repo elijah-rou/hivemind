@@ -286,6 +286,8 @@ func TestReadRunResponseValidatesRequestID(t *testing.T) {
 		wantErr string
 	}{
 		{name: "valid success", payload: encodeRun(9, 0, 0), wantID: 9},
+		{name: "valid max body", payload: encodeRun(9, 0, MaxRunResponseBody), wantID: 9},
+		{name: "body over max", payload: encodeRun(9, 0, MaxRunResponseBody+1), wantID: 9, wantErr: "exceeds max"},
 		{name: "mismatched request id", payload: encodeRun(8, 0, 0), wantID: 9, wantErr: "request_id mismatch"},
 		{name: "error status", payload: encodeRun(9, 1, 0), wantID: 9, wantErr: "run status"},
 		{name: "truncated header", payload: encodeRun(9, 0, 0)[:8], wantID: 9, wantErr: "too short"},
@@ -300,7 +302,7 @@ func TestReadRunResponseValidatesRequestID(t *testing.T) {
 				writeRun(sw, tc.payload)
 				_ = sw.Close()
 			}()
-			buf := make([]byte, 256)
+			buf := make([]byte, MaxFrameBytes)
 			err := readRunResponse(client, buf, tc.wantID)
 			_ = cr.Close()
 			if tc.wantErr == "" {

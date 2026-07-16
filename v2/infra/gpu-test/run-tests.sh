@@ -34,6 +34,7 @@ export TF_WORKSPACE="$RUN_WORKSPACE"
 
 cleanup() {
   local status=$?
+  local cleanup_failed=0
   trap - EXIT INT TERM
   set +e
   if [[ "$KEEP_INFRA" == "1" ]]; then
@@ -44,14 +45,27 @@ cleanup() {
     rm -rf "$TF_DATA_DIR"
     exit "$status"
   fi
-  if [[ -n "$BUCKET" ]]; then
-    aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null || true
+  if [[ -n "$BUCKET" ]] && ! aws s3 rb "s3://$BUCKET" --force --region "$REGION"; then
+    echo "CLEANUP ERROR: s3 bucket removal failed: s3://$BUCKET" >&2
+    cleanup_failed=1
   fi
   cd "$SCRIPT_DIR"
-  terraform destroy -auto-approve 2>/dev/null || true
-  env -u TF_WORKSPACE terraform workspace select default >/dev/null 2>&1 || true
-  env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null 2>&1 || true
+  if ! terraform destroy -auto-approve; then
+    echo "CLEANUP ERROR: terraform destroy failed for workspace $RUN_WORKSPACE" >&2
+    cleanup_failed=1
+  fi
+  if ! env -u TF_WORKSPACE terraform workspace select default >/dev/null; then
+    echo "CLEANUP ERROR: terraform workspace select default failed in isolated state $TF_DATA_DIR" >&2
+    cleanup_failed=1
+  fi
+  if ! env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null; then
+    echo "CLEANUP ERROR: terraform workspace delete failed: $RUN_WORKSPACE" >&2
+    cleanup_failed=1
+  fi
   rm -rf "$TF_DATA_DIR"
+  if [[ "$status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
   exit "$status"
 }
 

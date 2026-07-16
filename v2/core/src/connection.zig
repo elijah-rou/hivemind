@@ -29,11 +29,14 @@ const libc = struct {
 // Per-connection state
 // ---------------------------------------------------------------------------
 
+const PeerDirection = enum { inbound, outbound };
+
 const Conn = struct {
     fd: c_int = -1,
     frame_buf: [MAX_FRAME_BYTES]u8 = undefined,
     frame_pos: usize = 0,
     connected: bool = false,
+    peer_direction: PeerDirection = .inbound,
 
     // For workers: the agent index in the replica's agent table
     worker_idx: usize = 0,
@@ -947,7 +950,11 @@ pub const ConnectionManager = struct {
             // malformed spoof frame cannot evict a healthy bound socket.
             const message = msg.deserialize(vrr_data) catch continue;
             if (!peerFrameIdentityValid(from_id, message)) continue;
-            if (!self.identifyPeerConnection(peer_idx, from_id)) continue;
+            if (!replica_mod.peerMessageSemanticsValid(message)) continue;
+            if (!self.identifyPeerConnection(peer_idx, from_id)) {
+                if (!peer.connected) break;
+                continue;
+            }
 
             self.replica.onMessage(from_id, message);
         }
@@ -1039,9 +1046,21 @@ pub const ConnectionManager = struct {
             if (!other.peer_id_known) continue;
             if (other.worker_idx != from_id) continue;
 
-            // An application frame is not an authenticated identity handshake.
-            // Preserve the established binding until its socket disconnects.
-            return false;
+            const preferred_direction: PeerDirection = if (self.replica_id < from_id) .outbound else .inbound;
+            if (peer.peer_direction != preferred_direction) {
+                disconnectPeer(peer);
+                return false;
+            }
+            if (other.peer_direction == preferred_direction) {
+                disconnectPeer(peer);
+                return false;
+            }
+
+            // The candidate frame passed framing, encryption, deserialization,
+            // identity, and semantic validation. Replace only now, retaining the
+            // established socket until the winner is ready to bind.
+            disconnectPeer(other);
+            break;
         }
 
         peer.worker_idx = from_id;
@@ -1092,6 +1111,7 @@ pub const ConnectionManager = struct {
             .fd = fd,
             .frame_pos = 0,
             .connected = true,
+            .peer_direction = .outbound,
             .worker_idx = peer_id,
             .peer_id_known = true,
         };
@@ -1945,6 +1965,73 @@ test "identifyPeerConnection rejects rebind to different replica id" {
     try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
 }
 
+test "identifyPeerConnection deterministically converges reciprocal sockets" {
+    var lower_outbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lower_outbound_fds));
+    defer _ = libc.close(lower_outbound_fds[1]);
+
+    var lower_inbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lower_inbound_fds));
+    defer _ = libc.close(lower_inbound_fds[1]);
+
+    const lower = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(lower);
+    lower.replica_id = 1;
+    lower.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    lower.peer_count = 2;
+    lower.peers[0] = .{
+        .fd = lower_outbound_fds[0],
+        .connected = true,
+        .worker_idx = 2,
+        .peer_id_known = true,
+        .peer_direction = .outbound,
+    };
+    lower.peers[1] = .{
+        .fd = lower_inbound_fds[0],
+        .connected = true,
+        .peer_direction = .inbound,
+    };
+
+    try std.testing.expect(!lower.identifyPeerConnection(1, 2));
+    try std.testing.expect(lower.peers[0].connected);
+    try std.testing.expectEqual(lower_outbound_fds[0], lower.peers[0].fd);
+    try std.testing.expect(!lower.peers[1].connected);
+    try std.testing.expectEqual(@as(c_int, -1), lower.peers[1].fd);
+
+    var higher_outbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &higher_outbound_fds));
+    defer _ = libc.close(higher_outbound_fds[1]);
+
+    var higher_inbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &higher_inbound_fds));
+    defer _ = libc.close(higher_inbound_fds[1]);
+
+    const higher = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(higher);
+    higher.replica_id = 2;
+    higher.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    higher.peer_count = 2;
+    higher.peers[0] = .{
+        .fd = higher_outbound_fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+        .peer_direction = .outbound,
+    };
+    higher.peers[1] = .{
+        .fd = higher_inbound_fds[0],
+        .connected = true,
+        .peer_direction = .inbound,
+    };
+
+    try std.testing.expect(higher.identifyPeerConnection(1, 1));
+    try std.testing.expect(!higher.peers[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), higher.peers[0].fd);
+    try std.testing.expect(higher.peers[1].connected);
+    try std.testing.expect(higher.peers[1].peer_id_known);
+    try std.testing.expectEqual(@as(usize, 1), higher.peers[1].worker_idx);
+}
+
 test "identifyPeerConnection preserves established duplicate peer socket" {
     var duplicate_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &duplicate_fds));
@@ -1973,6 +2060,96 @@ test "identifyPeerConnection preserves established duplicate peer socket" {
     try std.testing.expectEqual(duplicate_fds[0], cm.peers[0].fd);
     try std.testing.expect(cm.peers[0].connected);
     try std.testing.expect(!cm.peers[1].peer_id_known);
+}
+
+fn sendTestPeerMessage(cm: *ConnectionManager, to: u8, message: msg.Message) void {
+    var frame: [MAX_FRAME_BYTES]u8 = undefined;
+    const message_len = msg.serialize(message, frame[5..]);
+    std.mem.writeInt(u32, frame[0..4], @intCast(1 + message_len), .little);
+    frame[4] = cm.replica_id;
+    cm.sendToPeer(to, frame[0 .. 5 + message_len]);
+}
+
+fn disconnectTestPeers(cm: *ConnectionManager) void {
+    for (cm.peers[0..cm.peer_count]) |*peer| {
+        if (peer.fd >= 0) disconnectPeer(peer);
+    }
+}
+
+test "simultaneous reciprocal sockets converge and carry bidirectional VRR traffic" {
+    const allocator = std.testing.allocator;
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(9191, 2, &current_tick);
+
+    var lower_prng = @import("prng.zig").Prng.init(9192);
+    var lower_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&lower_prng, &current_tick, network, 0);
+    const lower_sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(lower_sm);
+    lower_sm.initInPlace(9192);
+    const lower_replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(lower_replica);
+    lower_replica.initInPlace(.{ .replica_id = 0, .replica_count = 2, .io = lower_io.io(), .state_machine = lower_sm });
+    lower_replica.status = .normal;
+
+    var higher_prng = @import("prng.zig").Prng.init(9193);
+    var higher_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&higher_prng, &current_tick, network, 1);
+    const higher_sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(higher_sm);
+    higher_sm.initInPlace(9193);
+    const higher_replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(higher_replica);
+    higher_replica.initInPlace(.{ .replica_id = 1, .replica_count = 2, .io = higher_io.io(), .state_machine = higher_sm });
+    higher_replica.status = .normal;
+
+    const lower = try allocator.create(ConnectionManager);
+    defer allocator.destroy(lower);
+    initTestConnectionManager(lower, lower_replica);
+    defer disconnectTestPeers(lower);
+    const higher = try allocator.create(ConnectionManager);
+    defer allocator.destroy(higher);
+    initTestConnectionManager(higher, higher_replica);
+    defer disconnectTestPeers(higher);
+
+    // Socket A is lower outbound / higher inbound. Socket B is the reciprocal.
+    var socket_a: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_a));
+    var socket_b: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_b));
+    ConnectionManager.setNonBlocking(socket_a[0]);
+    ConnectionManager.setNonBlocking(socket_a[1]);
+    ConnectionManager.setNonBlocking(socket_b[0]);
+    ConnectionManager.setNonBlocking(socket_b[1]);
+
+    lower.peer_count = 2;
+    lower.peers[0] = .{ .fd = socket_a[0], .connected = true, .peer_direction = .outbound, .worker_idx = 1, .peer_id_known = true };
+    lower.peers[1] = .{ .fd = socket_b[1], .connected = true, .peer_direction = .inbound };
+    higher.peer_count = 2;
+    higher.peers[0] = .{ .fd = socket_b[0], .connected = true, .peer_direction = .outbound, .worker_idx = 0, .peer_id_known = true };
+    higher.peers[1] = .{ .fd = socket_a[1], .connected = true, .peer_direction = .inbound };
+
+    // Both replicas send before either polls, reproducing symmetric startup.
+    sendTestPeerMessage(lower, 1, .{ .start_view_change = .{ .view_number = 1, .replica_id = 0 } });
+    sendTestPeerMessage(higher, 0, .{ .start_view_change = .{ .view_number = 1, .replica_id = 1 } });
+    lower.readPeers();
+    higher.readPeers();
+
+    try std.testing.expect(lower.peers[0].connected);
+    try std.testing.expect(!lower.peers[1].connected);
+    try std.testing.expect(!higher.peers[0].connected);
+    try std.testing.expect(higher.peers[1].connected);
+    try std.testing.expect(higher_replica.start_vc_total > 0);
+
+    sendTestPeerMessage(lower, 1, .{ .start_view_change = .{ .view_number = 2, .replica_id = 0 } });
+    sendTestPeerMessage(higher, 0, .{ .start_view_change = .{ .view_number = 2, .replica_id = 1 } });
+    lower.readPeers();
+    higher.readPeers();
+
+    try std.testing.expectEqual(@as(usize, 0), lower.peers[0].frame_pos);
+    try std.testing.expectEqual(@as(usize, 0), higher.peers[1].frame_pos);
+    try std.testing.expect(lower.hasPeerConnection(1));
+    try std.testing.expect(higher.hasPeerConnection(0));
 }
 
 test "peer frame buffer fits largest VRR view-change frame" {

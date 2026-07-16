@@ -48,9 +48,9 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 What changed:
 - run requests now use gateway-unique worker correlation IDs and restore the original client/request identity on reply; a full 1024-entry table backpressures before dequeue instead of evicting unrelated work
-- duplicate peer sockets cannot replace an established replica binding based on an application frame; invalid Prepare, Commit, and StartView frames leave the healthy binding intact
+- reciprocal peer sockets converge deterministically by replica ID and direction (lower ID outbound, higher ID inbound) only after a fully validated frame; invalid Prepare, Commit, and StartView frames leave the healthy binding intact
 - worker response bodies have one 16 KiB-minus-metadata bound across Rust, Zig, and Go; overflow becomes explicit status 4 instead of successful truncation; frame writers reject oversize before allocation/write
-- GPU tests use per-run Terraform workspaces and local metadata directories; a concurrent barrier fixture proves overlapping runs destroy only their own workspaces
+- GPU tests use per-run Terraform workspaces and local metadata directories; a concurrent barrier fixture proves overlapping runs destroy only their own workspaces; S3/Terraform teardown failures are recorded and fail an otherwise successful run without replacing the original test status
 - layout-v2 header, metadata, Command, LogEntry, and checksum inputs now use fixed-size little-endian codecs with static golden bytes
 - active storage docs retain the full-cluster-stop/fresh-data boundary and no rolling migration/incarnation claim
 
@@ -88,7 +88,7 @@ Live infra status: unchanged by this change
 What changed:
 - FileDisk journal format bumped to layout version 2
 - on-disk LogEntry uses an explicit little-endian codec with checked tag-first Command decoding (never native `@sizeOf(LogEntry)` / `asBytes`)
-- legacy layout v1 journals are rejected at open with a useful startup error; no migration
+- actual legacy layout v1 journals are rejected fail-closed as incompatible; no migration or specific error category is promised
 - corrupt Command tags fail during open/decode without materializing invalid unions
 - 1024-slot lifetime cap and complete-write/sync-before-publication semantics unchanged
 

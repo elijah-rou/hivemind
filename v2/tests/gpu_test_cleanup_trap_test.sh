@@ -55,7 +55,10 @@ case "${1:-}" in
     exit 1
     ;;
   output) echo "i-stub-${workspace}" ;;
-  destroy) printf '%s\n' "$workspace" >> "$STUB_STATE/destroyed.log" ;;
+  destroy)
+    printf '%s\n' "$workspace" >> "$STUB_STATE/destroyed.log"
+    [[ "${STUB_DESTROY:-success}" == "success" ]] || { echo "stub terraform destroy failed" >&2; exit 9; }
+    ;;
   *) echo "unexpected terraform call: $*" >&2; exit 2 ;;
 esac
 EOF
@@ -74,7 +77,10 @@ case "$*" in
   "ssm list-command-invocations"*"--details"*) echo "TESTS_COMPLETE" ;;
   "ssm list-command-invocations"*) echo "${STUB_REMOTE_STATUS:-Success}" ;;
   "s3 mb "*) echo bucket-created >> "$STUB_STATE/bucket-created.log" ;;
-  "s3 rb "*) echo bucket-removed >> "$STUB_STATE/bucket-removed.log" ;;
+  "s3 rb "*)
+    [[ "${STUB_S3_RB:-success}" == "success" ]] || { echo "stub s3 remove failed" >&2; exit 8; }
+    echo bucket-removed >> "$STUB_STATE/bucket-removed.log"
+    ;;
   "s3 cp "*) : ;;
   *) echo "unexpected aws call: $*" >&2; exit 2 ;;
 esac
@@ -146,6 +152,30 @@ if [[ "$RUN_RC" -eq 0 && -s "$STUB_STATE/destroyed.log" && -f "$STUB_STATE/bucke
   pass "success cleans the run workspace and bucket"
 else
   fail "success cleanup contract failed (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test success-destroy-failure KEEP_INFRA=0 STUB_APPLY=success STUB_REMOTE_STATUS=Success STUB_DESTROY=failure
+if [[ "$RUN_RC" -ne 0 ]] && grep -q 'CLEANUP ERROR: terraform destroy' "$TMP_DIR/success-destroy-failure.err"; then
+  pass "terraform teardown failure turns successful tests nonzero and is recorded"
+else
+  fail "terraform teardown failure must be recorded and fail success (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test success-s3-failure KEEP_INFRA=0 STUB_APPLY=success STUB_REMOTE_STATUS=Success STUB_S3_RB=failure
+if [[ "$RUN_RC" -ne 0 && -s "$STUB_STATE/destroyed.log" ]] && grep -q 'CLEANUP ERROR: s3 bucket removal' "$TMP_DIR/success-s3-failure.err"; then
+  pass "S3 teardown failure is recorded, fails success, and does not skip Terraform"
+else
+  fail "S3 teardown failure contract failed (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test failed-test-cleanup-failure KEEP_INFRA=0 STUB_APPLY=success STUB_REMOTE_STATUS=Failed STUB_DESTROY=failure
+if [[ "$RUN_RC" -eq 1 ]] && grep -q 'CLEANUP ERROR: terraform destroy' "$TMP_DIR/failed-test-cleanup-failure.err"; then
+  pass "cleanup failure preserves original test failure status"
+else
+  fail "cleanup must preserve original test failure status (rc=$RUN_RC)"
 fi
 
 # Two invocations synchronize inside apply. Distinct TF_WORKSPACE values prove
