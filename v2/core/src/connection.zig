@@ -10,6 +10,8 @@ const latency = @import("latency.zig");
 const MAX_WORKERS: usize = replica_mod.MAX_WORKERS;
 const MAX_CLIENTS: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Worker frame payload is bounded at 16 KiB; run metadata consumes 9 bytes.
+pub const MAX_RUN_RESPONSE_BODY: usize = 16 * 1024 - 9;
 const MAX_PEER_CONNECTIONS: usize = @as(usize, msg.REPLICA_COUNT_MAX) * 2;
 
 // Wire protocol version. Included in every client and agent frame.
@@ -298,29 +300,29 @@ pub const ConnectionManager = struct {
     fn handleRunResponse(self: *ConnectionManager, payload: []const u8) void {
         // Payload: request_id(u64) + status(u8) + response data
         if (payload.len < 9) return;
-        const request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        const worker_request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
         const status = payload[8];
         const response_data = payload[9..];
+        if (response_data.len > MAX_RUN_RESPONSE_BODY) return;
 
-        const client_id = self.request_queue.resolveResponse(request_id) orelse return;
+        const resolved = self.request_queue.resolveResponse(worker_request_id) orelse return;
 
         for (self.clients[0..self.client_count]) |*client| {
-            if (!client.connected or client.client_id != client_id) continue;
+            if (!client.connected or client.client_id != resolved.client_id) continue;
 
             // Build inner payload: [version(2)][tag(1)][request_id(8)][status(1)][len(4)][data...]
-            var inner: [8192]u8 = undefined;
+            var inner: [3 + 8 + 1 + 4 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
             @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
             inner[2] = 0x23; // ClientTag.run_response
             var pos: usize = 3;
-            @memcpy(inner[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+            @memcpy(inner[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, resolved.client_request_id)));
             pos += 8;
             inner[pos] = status;
             pos += 1;
-            const copy_len = @min(response_data.len, inner.len - pos - 4);
-            @memcpy(inner[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(copy_len)))));
+            @memcpy(inner[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(response_data.len)))));
             pos += 4;
-            @memcpy(inner[pos..][0..copy_len], response_data[0..copy_len]);
-            pos += copy_len;
+            @memcpy(inner[pos..][0..response_data.len], response_data);
+            pos += response_data.len;
 
             const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
             self.sendFrame(client.fd, key, inner[0..pos]) catch {
@@ -417,6 +419,8 @@ pub const ConnectionManager = struct {
 
             var batch: usize = 0;
             while (batch < 16) : (batch += 1) {
+                // Never dequeue work that cannot be tracked without eviction.
+                if (self.request_queue.activeInFlightCount() >= rq.MAX_IN_FLIGHT) break;
                 const req_opt = self.request_queue.queues[qi].dequeue();
                 const req = req_opt orelse break;
 
@@ -433,8 +437,8 @@ pub const ConnectionManager = struct {
 
                 const worker_idx = self.replica.findWorkerForNode(backends_buf[idx].node_id) orelse continue;
 
-                // Track for response routing
-                self.request_queue.trackInFlight(req.request_id, req.client_id);
+                // Translate the client-supplied ID to a gateway-unique worker correlation.
+                const worker_request_id = self.request_queue.trackInFlight(req.request_id, req.client_id) orelse unreachable;
 
                 const dispatch_now = @import("vopr/simulated_io.zig").nowTick(self.replica.io);
                 latency.record(.{ .phase = "dispatch_send", .op = "run_request", .deployment_id = req.deployment_id, .start_ms = dispatch_now, .end_ms = dispatch_now, .source = "core/src/connection.zig" });
@@ -443,7 +447,7 @@ pub const ConnectionManager = struct {
                 // Payload: request_id(u64) + deployment_id(u64) + payload_len(u32) + payload
                 var agent_payload: [rq.MAX_PAYLOAD + 20]u8 = undefined;
                 var pos: usize = 0;
-                @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, req.request_id)));
+                @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, worker_request_id)));
                 pos += 8;
                 @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, req.deployment_id)));
                 pos += 8;
@@ -1035,9 +1039,9 @@ pub const ConnectionManager = struct {
             if (!other.peer_id_known) continue;
             if (other.worker_idx != from_id) continue;
 
-            // The connection that just delivered a frame is provably live.
-            // Drop the older duplicate so routing converges on one socket.
-            disconnectPeer(other);
+            // An application frame is not an authenticated identity handshake.
+            // Preserve the established binding until its socket disconnects.
+            return false;
         }
 
         peer.worker_idx = from_id;
@@ -1789,6 +1793,30 @@ test "readWorkers disconnects agents from non-leader replicas" {
     try std.testing.expect(!cm.workers[0].connected);
 }
 
+test "handleRunResponse enforces exact shared response boundary without truncation" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.request_queue = rq.RequestQueue.init();
+    cm.clients = [_]Conn{.{}} ** MAX_CLIENTS;
+    cm.client_count = 0;
+
+    const exact_worker_id = cm.request_queue.trackInFlight(7, 100).?;
+    var exact: [9 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
+    @memcpy(exact[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, exact_worker_id)));
+    exact[8] = 0;
+    @memset(exact[9..], 0x5a);
+    cm.handleRunResponse(&exact);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    const over_worker_id = cm.request_queue.trackInFlight(8, 200).?;
+    var over: [10 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
+    @memcpy(over[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, over_worker_id)));
+    over[8] = 0;
+    @memset(over[9..], 0x6b);
+    cm.handleRunResponse(&over);
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+}
+
 test "handleRunResponse resolves in-flight request and replies to client" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(1234);
@@ -1822,10 +1850,10 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     defer _ = libc.close(fds[1]);
 
     cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 1234 };
-    cm.request_queue.trackInFlight(77, 1234);
+    const worker_request_id = cm.request_queue.trackInFlight(77, 1234).?;
 
     var payload: [32]u8 = undefined;
-    @memcpy(payload[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, 77)));
+    @memcpy(payload[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, worker_request_id)));
     payload[8] = 0;
     @memcpy(payload[9..13], "pong");
     cm.handleRunResponse(payload[0..13]);
@@ -1877,9 +1905,9 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
 
     cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 999 };
     try std.testing.expect(cm.request_queue.enqueue(7, 10, 999, "queued"));
-    cm.request_queue.trackInFlight(11, 999);
+    const disconnected_worker_id = cm.request_queue.trackInFlight(11, 999).?;
     try std.testing.expect(cm.request_queue.enqueue(7, 12, 555, "keep"));
-    cm.request_queue.trackInFlight(13, 555);
+    const kept_worker_id = cm.request_queue.trackInFlight(13, 555).?;
 
     cm.disconnectClient(&cm.clients[0]);
 
@@ -1887,8 +1915,8 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
     try std.testing.expect(!cm.clients[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
-    try std.testing.expect(cm.request_queue.resolveResponse(11) == null);
-    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponse(13).?);
+    try std.testing.expect(cm.request_queue.resolveResponse(disconnected_worker_id) == null);
+    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponse(kept_worker_id).?.client_id);
 }
 
 test "identifyPeerConnection rejects rebind to different replica id" {
@@ -1917,7 +1945,7 @@ test "identifyPeerConnection rejects rebind to different replica id" {
     try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
 }
 
-test "identifyPeerConnection drops older duplicate peer socket" {
+test "identifyPeerConnection preserves established duplicate peer socket" {
     var duplicate_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &duplicate_fds));
     defer _ = libc.close(duplicate_fds[1]);
@@ -1941,11 +1969,10 @@ test "identifyPeerConnection drops older duplicate peer socket" {
         .connected = true,
     };
 
-    try std.testing.expect(cm.identifyPeerConnection(1, 4));
-    try std.testing.expectEqual(@as(c_int, -1), cm.peers[0].fd);
-    try std.testing.expect(!cm.peers[0].connected);
-    try std.testing.expectEqual(@as(usize, 4), cm.peers[1].worker_idx);
-    try std.testing.expect(cm.peers[1].peer_id_known);
+    try std.testing.expect(!cm.identifyPeerConnection(1, 4));
+    try std.testing.expectEqual(duplicate_fds[0], cm.peers[0].fd);
+    try std.testing.expect(cm.peers[0].connected);
+    try std.testing.expect(!cm.peers[1].peer_id_known);
 }
 
 test "peer frame buffer fits largest VRR view-change frame" {
@@ -2109,7 +2136,7 @@ test "processPeerFrames drops out-of-range from_id" {
     try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
 }
 
-test "processPeerFrames malformed spoof cannot evict healthy peer socket" {
+test "invalid Prepare Commit and StartView cannot evict healthy peer socket" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(4245);
     var current_tick: i64 = 0;
@@ -2157,23 +2184,30 @@ test "processPeerFrames malformed spoof cannot evict healthy peer socket" {
         .frame_pos = 0,
     };
 
-    // Malformed VRR on unbound socket claiming replica 1 must not disconnect
-    // the healthy bound peer-1 socket or bind the spoof socket.
-    const inner_len: u32 = 1 + 1; // from_id + bad tag
-    std.mem.writeInt(u32, cm.peers[1].frame_buf[0..4], 1 + inner_len, .little);
-    cm.peers[1].frame_buf[4] = 0x00;
-    cm.peers[1].frame_buf[5] = 1;
-    cm.peers[1].frame_buf[6] = 0xFF;
-    cm.peers[1].frame_pos = 5 + inner_len;
+    const invalid_messages = [_]msg.Message{
+        .{ .prepare = .{} }, // op_number zero
+        .{ .commit = .{ .commit_min = 1, .op_number = 0 } },
+        .{ .start_view = .{ .op_number = replica_mod.LOG_SIZE_MAX + 1 } },
+    };
+    for (invalid_messages) |invalid_message| {
+        var vrr_buf: [MAX_FRAME_BYTES - 6]u8 = undefined;
+        const vrr_len = msg.serialize(invalid_message, &vrr_buf);
+        const inner_len: u32 = @intCast(1 + vrr_len);
+        std.mem.writeInt(u32, cm.peers[1].frame_buf[0..4], 1 + inner_len, .little);
+        cm.peers[1].frame_buf[4] = 0x00;
+        cm.peers[1].frame_buf[5] = 1;
+        @memcpy(cm.peers[1].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+        cm.peers[1].frame_pos = 5 + inner_len;
 
-    cm.processPeerFrames(1);
-    try std.testing.expect(cm.peers[0].connected);
-    try std.testing.expect(cm.peers[0].peer_id_known);
-    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
-    try std.testing.expectEqual(healthy_fds[0], cm.peers[0].fd);
-    try std.testing.expect(cm.peers[1].connected);
-    try std.testing.expect(!cm.peers[1].peer_id_known);
-    try std.testing.expectEqual(@as(usize, 0), cm.peers[1].frame_pos);
+        cm.processPeerFrames(1);
+        try std.testing.expect(cm.peers[0].connected);
+        try std.testing.expect(cm.peers[0].peer_id_known);
+        try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+        try std.testing.expectEqual(healthy_fds[0], cm.peers[0].fd);
+        try std.testing.expect(cm.peers[1].connected);
+        try std.testing.expect(!cm.peers[1].peer_id_known);
+        try std.testing.expectEqual(@as(usize, 0), cm.peers[1].frame_pos);
+    }
 }
 
 fn buildClientRunRequestPayload(request_id: u64, dep_name: []const u8, declared_len: u32, body: []const u8) []u8 {

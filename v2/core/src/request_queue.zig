@@ -62,11 +62,17 @@ pub const DeploymentQueue = struct {
 };
 
 // ---------------------------------------------------------------------------
-// In-flight tracking: request_id → client_id for response routing
+// In-flight tracking: gateway correlation ID → original client request
 // ---------------------------------------------------------------------------
 
+pub const ResolvedRequest = struct {
+    client_id: u128,
+    client_request_id: u64,
+};
+
 const InFlightEntry = struct {
-    request_id: u64 = 0,
+    worker_request_id: u64 = 0,
+    client_request_id: u64 = 0,
     client_id: u128 = 0,
     active: bool = false,
 };
@@ -80,7 +86,7 @@ pub const RequestQueue = struct {
     queue_count: usize,
 
     in_flight: [MAX_IN_FLIGHT]InFlightEntry,
-    in_flight_count: usize,
+    next_worker_request_id: u64,
 
     enqueue_total: u64,
     dispatch_total: u64,
@@ -94,7 +100,7 @@ pub const RequestQueue = struct {
             .queues = undefined,
             .queue_count = 0,
             .in_flight = [_]InFlightEntry{.{}} ** MAX_IN_FLIGHT,
-            .in_flight_count = 0,
+            .next_worker_request_id = 1,
             .enqueue_total = 0,
             .dispatch_total = 0,
             .resolve_total = 0,
@@ -125,13 +131,16 @@ pub const RequestQueue = struct {
         return ok;
     }
 
-    /// Look up client_id for a response. Removes the in-flight entry.
-    pub fn resolveResponse(self: *RequestQueue, request_id: u64) ?u128 {
+    /// Resolve a worker correlation ID to the original client request.
+    pub fn resolveResponse(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
         for (&self.in_flight) |*entry| {
-            if (entry.active and entry.request_id == request_id) {
+            if (entry.active and entry.worker_request_id == worker_request_id) {
                 entry.active = false;
                 self.resolve_total += 1;
-                return entry.client_id;
+                return .{
+                    .client_id = entry.client_id,
+                    .client_request_id = entry.client_request_id,
+                };
             }
         }
         return null;
@@ -207,28 +216,44 @@ pub const RequestQueue = struct {
         return &self.queues[self.queue_count - 1];
     }
 
-    pub fn trackInFlight(self: *RequestQueue, request_id: u64, client_id: u128) void {
-        self.dispatch_total += 1;
-        // Find empty (inactive) slot
+    /// Reserve a unique worker correlation ID. Returns null without mutation when full.
+    pub fn trackInFlight(self: *RequestQueue, client_request_id: u64, client_id: u128) ?u64 {
+        if (self.activeInFlightCount() >= MAX_IN_FLIGHT) return null;
+
         for (&self.in_flight) |*entry| {
-            if (!entry.active) {
-                entry.* = .{ .request_id = request_id, .client_id = client_id, .active = true };
-                return;
-            }
+            if (entry.active) continue;
+
+            const worker_request_id = self.allocateWorkerRequestId();
+            entry.* = .{
+                .worker_request_id = worker_request_id,
+                .client_request_id = client_request_id,
+                .client_id = client_id,
+                .active = true,
+            };
+            self.dispatch_total += 1;
+            return worker_request_id;
         }
-        // All slots active: find the oldest entry (lowest request_id) and reuse it.
-        var oldest_idx: usize = 0;
-        var oldest_id: u64 = self.in_flight[0].request_id;
-        for (self.in_flight[1..], 1..) |entry, i| {
-            if (entry.request_id < oldest_id) {
-                oldest_id = entry.request_id;
-                oldest_idx = i;
-            }
-        }
-        std.log.warn("in-flight table full ({d} entries), evicting oldest request_id={d}", .{ MAX_IN_FLIGHT, oldest_id });
-        self.in_flight[oldest_idx] = .{ .request_id = request_id, .client_id = client_id, .active = true };
+        unreachable;
     }
 
+    fn allocateWorkerRequestId(self: *RequestQueue) u64 {
+        var attempts: usize = 0;
+        while (attempts <= MAX_IN_FLIGHT) : (attempts += 1) {
+            const candidate = self.next_worker_request_id;
+            self.next_worker_request_id +%= 1;
+            if (self.next_worker_request_id == 0) self.next_worker_request_id = 1;
+
+            var active = false;
+            for (self.in_flight) |entry| {
+                if (entry.active and entry.worker_request_id == candidate) {
+                    active = true;
+                    break;
+                }
+            }
+            if (!active) return candidate;
+        }
+        unreachable;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -251,18 +276,55 @@ test "request queue: overflow returns false" {
     try std.testing.expect(!rq.enqueue(1, 999, 100, "x"));
 }
 
-test "request queue: resolve response" {
+test "request queue: resolve response restores original client identity" {
     var rq = RequestQueue.init();
-    rq.trackInFlight(42, 0xABCD);
+    const worker_request_id = rq.trackInFlight(42, 0xABCD).?;
     try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
-    const client = rq.resolveResponse(42);
-    try std.testing.expect(client != null);
-    try std.testing.expectEqual(@as(u128, 0xABCD), client.?);
+    const resolved = rq.resolveResponse(worker_request_id).?;
+    try std.testing.expectEqual(@as(u128, 0xABCD), resolved.client_id);
+    try std.testing.expectEqual(@as(u64, 42), resolved.client_request_id);
     try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
     try std.testing.expectEqual(@as(u64, 1), rq.dispatch_total);
     try std.testing.expectEqual(@as(u64, 1), rq.resolve_total);
-    // Second resolve returns null (consumed)
-    try std.testing.expect(rq.resolveResponse(42) == null);
+    try std.testing.expect(rq.resolveResponse(worker_request_id) == null);
+}
+
+test "request queue: same client request id receives unique worker correlations" {
+    var rq = RequestQueue.init();
+    const first = rq.trackInFlight(1, 100).?;
+    const second = rq.trackInFlight(1, 200).?;
+    try std.testing.expect(first != second);
+
+    const second_resolved = rq.resolveResponse(second).?;
+    const first_resolved = rq.resolveResponse(first).?;
+    try std.testing.expectEqual(@as(u128, 200), second_resolved.client_id);
+    try std.testing.expectEqual(@as(u64, 1), second_resolved.client_request_id);
+    try std.testing.expectEqual(@as(u128, 100), first_resolved.client_id);
+    try std.testing.expectEqual(@as(u64, 1), first_resolved.client_request_id);
+}
+
+test "request queue: wrapped correlation skips an active id" {
+    var rq = RequestQueue.init();
+    const first = rq.trackInFlight(1, 100).?;
+    try std.testing.expectEqual(@as(u64, 1), first);
+    rq.next_worker_request_id = 1;
+    const second = rq.trackInFlight(2, 200).?;
+    try std.testing.expectEqual(@as(u64, 2), second);
+}
+
+test "request queue: full in-flight table rejects without eviction" {
+    var rq = RequestQueue.init();
+    for (0..MAX_IN_FLIGHT) |i| {
+        try std.testing.expect(rq.trackInFlight(@intCast(i), @intCast(i + 1)) != null);
+    }
+    try std.testing.expect(rq.trackInFlight(9999, 9999) == null);
+    try std.testing.expectEqual(@as(usize, MAX_IN_FLIGHT), rq.activeInFlightCount());
+    try std.testing.expectEqual(@as(u64, MAX_IN_FLIGHT), rq.dispatch_total);
+
+    for (0..MAX_IN_FLIGHT) |i| {
+        const resolved = rq.resolveResponse(@intCast(i + 1)).?;
+        try std.testing.expectEqual(@as(u64, @intCast(i)), resolved.client_request_id);
+    }
 }
 
 test "request queue: per-deployment isolation" {
@@ -281,8 +343,8 @@ test "request queue: cancel client clears queued and in-flight requests only for
     try std.testing.expect(rq.enqueue(1, 10, 100, "a"));
     try std.testing.expect(rq.enqueue(1, 11, 200, "b"));
     try std.testing.expect(rq.enqueue(2, 20, 100, "c"));
-    rq.trackInFlight(30, 100);
-    rq.trackInFlight(31, 200);
+    const first_worker_id = rq.trackInFlight(30, 100).?;
+    const second_worker_id = rq.trackInFlight(31, 200).?;
 
     rq.cancelClient(100);
 
@@ -290,8 +352,8 @@ test "request queue: cancel client clears queued and in-flight requests only for
     try std.testing.expectEqual(@as(usize, 0), rq.depthFor(2));
     try std.testing.expectEqual(@as(usize, 1), rq.totalDepth());
     try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
-    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponse(31).?);
-    try std.testing.expect(rq.resolveResponse(30) == null);
+    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponse(second_worker_id).?.client_id);
+    try std.testing.expect(rq.resolveResponse(first_worker_id) == null);
     try std.testing.expectEqual(@as(u64, 2), rq.resolve_total);
 
     const remaining = rq.queues[0].dequeue().?;
