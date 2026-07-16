@@ -20,10 +20,11 @@ FAIL=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
 
-# Stub aws: scripted get-command-invocation Status sequences per command_id.
+# Stub aws: scripted get-command-invocation Status and API-error sequences per command_id.
 # State files:
-#   $STUB_STATE/<command_id>.seq  — newline-separated Status values consumed FIFO
-#   $STUB_STATE/<command_id>.fail_api — if present, get-command-invocation exits 1
+#   $STUB_STATE/<command_id>.seq — newline-separated Status values consumed FIFO
+#   $STUB_STATE/<command_id>.api_errors — newline-separated AWS error codes consumed FIFO
+#   $STUB_STATE/<command_id>.fail_api — if present, every invocation fails with its error code
 #   $STUB_STATE/calls.log — append-only call log
 cat > "$STUB_BIN/aws" <<'EOF'
 #!/usr/bin/env bash
@@ -78,7 +79,16 @@ case "$cmd" in
     [[ -n "$instance_id" ]] || { echo "missing instance-id" >&2; exit 2; }
     printf '%s\n' "$command_id|$instance_id" >> "$STUB_STATE/seen_pairs.log"
     if [[ -f "$STUB_STATE/${command_id}.fail_api" ]]; then
-      echo "simulated API error" >&2
+      error_code="$(cat "$STUB_STATE/${command_id}.fail_api")"
+      echo "An error occurred (${error_code:-InternalError}) when calling the GetCommandInvocation operation: simulated API error" >&2
+      exit 1
+    fi
+    error_file="$STUB_STATE/${command_id}.api_errors"
+    if [[ -s "$error_file" ]]; then
+      error_code="$(head -n1 "$error_file")"
+      tail -n +2 "$error_file" > "$error_file.tmp"
+      mv "$error_file.tmp" "$error_file"
+      echo "An error occurred ($error_code) when calling the GetCommandInvocation operation: simulated API error" >&2
       exit 1
     fi
     seq_file="$STUB_STATE/${command_id}.seq"
@@ -203,15 +213,56 @@ case_cancelled() {
 }
 
 # shellcheck disable=SC2329
-case_api_error() {
+case_eventual_visibility_then_success() {
+  printf '%s\n' InvocationDoesNotExist InvocationDoesNotExist > "$STUB_STATE/cmd-visible.api_errors"
+  printf '%s\n' Pending Success > "$STUB_STATE/cmd-visible.seq"
+  SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
+    hivemind_ssm_wait_invocation "us-east-1" "cmd-visible" "i-visible"
+  local status_calls
+  status_calls=$(grep -c 'get-command-invocation.*--query Status' "$STUB_STATE/calls.log" || true)
+  (( status_calls == 4 ))
+}
+
+# shellcheck disable=SC2329
+case_persistent_eventual_visibility_timeout() {
+  yes InvocationDoesNotExist | head -n 50 > "$STUB_STATE/cmd-not-visible.api_errors"
+  printf '%s\n' Success > "$STUB_STATE/cmd-not-visible.seq"
+  local start_now=$FAKE_NOW
+  local timeout_sec=5
+  if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=$timeout_sec \
+    hivemind_ssm_wait_invocation "us-east-1" "cmd-not-visible" "i-not-visible" 2>"$TMP_DIR/not-visible.err"; then
+    echo "expected eventual-visibility timeout" >&2
+    return 1
+  fi
+  grep -q 'SSM poll timeout after 5s' "$TMP_DIR/not-visible.err" || {
+    echo "missing eventual-visibility timeout" >&2
+    return 1
+  }
+  grep -q 'status=InvocationDoesNotExist' "$TMP_DIR/not-visible.err" || {
+    echo "missing eventual-visibility timeout status" >&2
+    return 1
+  }
+  if (( FAKE_NOW > start_now + timeout_sec )); then
+    echo "eventual-visibility deadline overrun" >&2
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2329
+case_permanent_api_error_fails_fast() {
   printf '%s\n' Pending > "$STUB_STATE/cmd-e.seq"
-  touch "$STUB_STATE/cmd-e.fail_api"
+  printf '%s\n' AccessDeniedException > "$STUB_STATE/cmd-e.fail_api"
+  local start_now=$FAKE_NOW
   if SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
     hivemind_ssm_wait_invocation "us-east-1" "cmd-e" "i-eee" 2>"$TMP_DIR/api.err"; then
-    echo "expected failure for API error" >&2
+    echo "expected failure for permanent API error" >&2
     return 1
   fi
   grep -q 'API error' "$TMP_DIR/api.err"
+  grep -q 'AccessDeniedException' "$TMP_DIR/api.err"
+  local status_calls
+  status_calls=$(grep -c 'get-command-invocation.*--query Status' "$STUB_STATE/calls.log" || true)
+  (( status_calls == 1 && FAKE_NOW == start_now ))
 }
 
 # shellcheck disable=SC2329
@@ -329,7 +380,9 @@ run_case "Pending/InProgress/Success" case_pending_inprogress_success
 run_case "terminal Failed" case_failed
 run_case "terminal TimedOut" case_timedout
 run_case "terminal Cancelled" case_cancelled
-run_case "API error" case_api_error
+run_case "eventual visibility then Pending/Success" case_eventual_visibility_then_success
+run_case "persistent eventual visibility reaches deadline" case_persistent_eventual_visibility_timeout
+run_case "permanent API error fails fast" case_permanent_api_error_fails_fast
 run_case "bounded timeout" case_bounded_timeout
 run_case "timeout diagnostics no deadline overrun" case_timeout_diagnostics_no_deadline_overrun
 run_case "per-node command IDs" case_per_node_command_ids

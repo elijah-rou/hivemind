@@ -61,7 +61,8 @@ hivemind_ssm_dump_invocation() {
 }
 
 # Wait until one command/instance reaches Success.
-# Fail-fast on Failed/TimedOut/Cancelled and on AWS API errors.
+# Retry SSM's eventual-visibility InvocationDoesNotExist response within the same
+# deadline. Fail fast on terminal statuses and every other AWS API error.
 # Returns 0 on Success; non-zero on terminal failure or wall-clock timeout.
 hivemind_ssm_wait_invocation() {
   local region="$1" command_id="$2" instance_id="$3"
@@ -86,13 +87,17 @@ hivemind_ssm_wait_invocation() {
       break
     fi
 
-    if ! status=$(hivemind_ssm_aws "$remaining" ssm get-command-invocation \
+    if status=$(hivemind_ssm_aws "$remaining" ssm get-command-invocation \
       --region "$region" \
       --command-id "$command_id" \
       --instance-id "$instance_id" \
       --query 'Status' \
-      --output text 2>/dev/null); then
-      echo "FAIL: aws ssm get-command-invocation API error for command_id=$command_id instance_id=$instance_id" >&2
+      --output text 2>&1); then
+      :
+    elif [[ "$status" == *'(InvocationDoesNotExist)'* ]]; then
+      status="InvocationDoesNotExist"
+    else
+      echo "FAIL: aws ssm get-command-invocation API error for command_id=$command_id instance_id=$instance_id: $status" >&2
       remaining="$(hivemind_ssm_remaining "$deadline")"
       hivemind_ssm_dump_invocation "$region" "$command_id" "$instance_id" "$remaining"
       return 1
@@ -109,7 +114,7 @@ hivemind_ssm_wait_invocation() {
         hivemind_ssm_dump_invocation "$region" "$command_id" "$instance_id" "$remaining"
         return 1
         ;;
-      Pending|InProgress|Delayed|""|None)
+      Pending|InProgress|Delayed|InvocationDoesNotExist|""|None)
         ;;
       *)
         echo "FAIL: unknown SSM status='$status' command_id=$command_id instance_id=$instance_id" >&2

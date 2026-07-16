@@ -63,9 +63,11 @@ assert_contains "$REPO_ROOT/AGENTS.md" 'v2/.*active'
 STATUS="$V2_ROOT/docs/STATUS.md"
 FINDINGS="$V2_ROOT/docs/FINDINGS_AND_ISSUES.md"
 ENGINEERING="$V2_ROOT/docs/ENGINEERING.md"
+POC_CHANGELOG="$V2_ROOT/docs/POC_CHANGELOG.md"
 assert_file "$STATUS"
 assert_file "$FINDINGS"
 assert_file "$ENGINEERING"
+assert_file "$POC_CHANGELOG"
 
 # Must not claim repo-root v1/ was removed while it is the frozen snapshot.
 assert_lacks "$STATUS" 'old `v1/`.*,.*are removed'
@@ -80,6 +82,8 @@ assert_contains "$STATUS" 'layout v2 journal|layout-v2 `journal\.bin`'
 assert_contains "$ENGINEERING" 'mixed-version peer clusters.*legacy-v1 journal upgrades'
 assert_contains "$ENGINEERING" 'stop the full cluster'
 assert_contains "$ENGINEERING" 'No rolling migration or incarnation protocol.*claimed'
+assert_lacks "$POC_CHANGELOG" 'active docs now state.*experimental v1 single-copy'
+assert_contains "$POC_CHANGELOG" 'FileDisk journal format bumped to layout version 2'
 
 assert_lacks "$FINDINGS" '`v1/` \| Removed old implementation'
 assert_lacks "$FINDINGS" '`v1/`, `hivemind/`, and `honeybee/` were removed from active tree'

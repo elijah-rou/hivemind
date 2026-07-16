@@ -150,7 +150,7 @@ Blockers / unknowns:
 ### 2026-07-16 — Withdraw unvalidated crash-durability claims
 
 What changed:
-- active docs now state the validated contract only: write/sync success before publication, fail-stop on complete I/O errors, fail-closed 1024-op retention, experimental v1 single-copy best-effort restart recovery
+- at this entry, active docs narrowed the validated contract to write/sync success before publication, fail-stop on complete I/O errors, fail-closed 1024-op retention, and the then-current experimental layout-v1 single-copy best-effort restart recovery; the later layout-v2 entry supersedes that format version
 - recorded canonical recovered-prefix (`observeRecovery`) and immutable committed-prefix validation; recorded HM-BLK-04/05 launcher repairs against maintained smoke/failover/bench paths
 - explicit non-claims: no torn-write/power-loss guarantee or simulation; S3 `journal.bin` copy is not an atomic restore artifact; no production crash-durability wording
 - FINDINGS adds crash-consistent versioned storage + torn-write simulation as a production blocker separate from snapshots
@@ -227,7 +227,7 @@ What changed:
 - retained log is fail-closed at `LOG_SIZE_MAX` (1024) with Zig `log_full`, API `ErrCodeLogFull`, and HTTP 507; no circular overwrite without snapshots
 - VOPR checker compares full entry checksums, treats commit regression as a violation, and fails loudly on history capacity exhaustion
 - deterministic filters: `durable storage`, `journal retention`, `group commit`, `checker rejects`
-- explicit non-claims in this entry: no torn-write/power-loss model; S3 journal copy is not an atomic restore; experimental v1 single-copy restart recovery only
+- explicit non-claims at this entry: no torn-write/power-loss model; S3 journal copy is not an atomic restore; restart recovery was limited to the then-current experimental layout-v1 single-copy journal (later superseded by layout v2)
 
 Why it matters:
 - closes previously acknowledged in-memory prepares/replies and wrap-around committed-overwrite classes under the validated write/sync and retention contract

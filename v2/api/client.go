@@ -267,7 +267,7 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	return result, timings, err
 }
 
-// Run-request error codes (match v2/src/connection.zig handleRunRequest + sendRunError).
+// Run-request error codes (match core/src/connection.zig handleRunRequest + sendRunError).
 const (
 	RunStatusOK               byte = 0
 	RunStatusNotFound         byte = 1 // deployment not found
