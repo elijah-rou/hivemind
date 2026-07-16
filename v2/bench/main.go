@@ -266,7 +266,7 @@ func findLeader(addrList []string) net.Conn {
 			continue
 		}
 
-		buf := make([]byte, 256)
+		buf := make([]byte, MaxFrameBytes)
 		isLeader, err := readLeaderProbe(c, buf)
 		if err != nil {
 			fmt.Printf("read failed\n")
