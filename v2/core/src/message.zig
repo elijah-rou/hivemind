@@ -363,6 +363,7 @@ pub const RequestPrepareMsg = struct {
     selected_tip_op: OpNumber = 0,
     selected_tip_checksum: u64 = 0,
     selected_commit_bound: OpNumber = 0,
+    expected_entry_checksum: u64 = 0,
 };
 
 pub const SendPrepareMsg = struct {
@@ -373,6 +374,7 @@ pub const SendPrepareMsg = struct {
     selected_tip_op: OpNumber = 0,
     selected_tip_checksum: u64 = 0,
     selected_commit_bound: OpNumber = 0,
+    expected_entry_checksum: u64 = 0,
 };
 
 pub const RequestStatusMsg = struct {

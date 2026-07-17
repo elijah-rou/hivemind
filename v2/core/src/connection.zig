@@ -199,6 +199,7 @@ pub const ConnectionManager = struct {
     /// Poll all connections: accept new, read messages, dispatch.
     pub fn poll(self: *ConnectionManager) void {
         self.poll_count += 1;
+        _ = self.request_queue.expireAbandoned(self.poll_count);
         self.acceptWorkers();
         self.acceptClients();
         self.acceptPeers();
@@ -347,9 +348,13 @@ pub const ConnectionManager = struct {
             return;
         }
 
-        const resolved = self.request_queue.resolveResponseForWorker(worker_request_id, worker.worker_idx) orelse {
-            self.disconnectWorker(worker);
-            return;
+        const resolved = switch (self.request_queue.classifyResponseForWorker(worker_request_id, worker.worker_idx)) {
+            .deliver => |request| request,
+            .abandoned => return,
+            .foreign, .unknown => {
+                self.disconnectWorker(worker);
+                return;
+            },
         };
 
         for (self.clients[0..self.client_count]) |*client| {
@@ -972,7 +977,7 @@ pub const ConnectionManager = struct {
         client.fd = -1;
         client.connected = false;
         client.frame_pos = 0;
-        self.request_queue.cancelClient(client_id);
+        self.request_queue.cancelClient(client_id, self.poll_count);
         if (fd >= 0) _ = libc.close(fd);
     }
 
@@ -2174,6 +2179,10 @@ test "consensus reply write failure cleans client-owned run state and permits sl
     try std.testing.expect(!cm.clients[0].connected);
     try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    // The already-sent request remains worker-owned so its late response can
+    // be consumed without punishing a healthy worker. Bounded expiry frees it.
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.expireAbandoned(cm.poll_count + rq.ABANDONED_TTL_TICKS));
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
 
     var replacement_client: [2]c_int = undefined;
@@ -2481,7 +2490,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     try std.testing.expect(std.mem.eql(u8, client_buf[21..23], "ok"));
 }
 
-test "disconnectClient clears abandoned queued and in-flight run requests" {
+test "disconnectClient tombstones sent work and owning late response is silent" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(4321);
     var current_tick: i64 = 0;
@@ -2507,6 +2516,12 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
     cm.client_count = 1;
+    cm.worker_count = 1;
+
+    var worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_fds));
+    defer _ = libc.close(worker_fds[1]);
+    cm.workers[0] = .{ .fd = worker_fds[0], .connected = true, .worker_idx = 0 };
 
     var fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
@@ -2523,8 +2538,15 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
     try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
     try std.testing.expect(!cm.clients[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 2), cm.request_queue.activeInFlightCount());
+
+    var late: [11]u8 = undefined;
+    std.mem.writeInt(u64, late[0..8], disconnected_worker_id, .little);
+    late[8] = @intFromEnum(RunStatus.ok);
+    @memcpy(late[9..11], "ok");
+    cm.handleRunResponse(&cm.workers[0], &late);
+    try std.testing.expect(cm.workers[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
-    try std.testing.expect(cm.request_queue.resolveResponseForWorker(disconnected_worker_id, 0) == null);
     try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponseForWorker(kept_worker_id, 0).?.client_id);
 }
 

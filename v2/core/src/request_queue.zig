@@ -5,6 +5,7 @@ pub const MAX_PAYLOAD: usize = 512;
 pub const MAX_QUEUE_DEPTH: usize = 64;
 pub const MAX_QUEUES: usize = 16;
 pub const MAX_IN_FLIGHT: usize = 1024;
+pub const ABANDONED_TTL_TICKS: u64 = 30_000;
 
 /// Cross-language /run outcome contract. Values are stable wire bytes.
 pub const RunStatus = enum(u8) {
@@ -88,11 +89,20 @@ pub const ResolvedRequest = struct {
     client_request_id: u64,
 };
 
+pub const ResponseResolution = union(enum) {
+    deliver: ResolvedRequest,
+    abandoned,
+    foreign,
+    unknown,
+};
+
 const InFlightEntry = struct {
     worker_request_id: u64 = 0,
     client_request_id: u64 = 0,
     client_id: u128 = 0,
     worker_idx: usize = 0,
+    abandoned: bool = false,
+    expires_at_tick: u64 = 0,
     active: bool = false,
 };
 
@@ -152,20 +162,29 @@ pub const RequestQueue = struct {
 
     /// Resolve only when one active entry atomically matches both the opaque
     /// correlation and the worker connection that owns it.
-    pub fn resolveResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ?ResolvedRequest {
+    pub fn classifyResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ResponseResolution {
         for (&self.in_flight) |*entry| {
             if (!entry.active) continue;
             if (entry.worker_request_id != worker_request_id) continue;
-            if (entry.worker_idx != worker_idx) return null;
+            if (entry.worker_idx != worker_idx) return .foreign;
 
-            entry.active = false;
-            self.resolve_total += 1;
-            return .{
+            const abandoned = entry.abandoned;
+            const resolved = ResolvedRequest{
                 .client_id = entry.client_id,
                 .client_request_id = entry.client_request_id,
             };
+            entry.* = .{};
+            self.resolve_total += 1;
+            return if (abandoned) .abandoned else .{ .deliver = resolved };
         }
-        return null;
+        return .unknown;
+    }
+
+    pub fn resolveResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ?ResolvedRequest {
+        return switch (self.classifyResponseForWorker(worker_request_id, worker_idx)) {
+            .deliver => |resolved| resolved,
+            .abandoned, .foreign, .unknown => null,
+        };
     }
 
     fn releaseInFlight(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
@@ -182,17 +201,20 @@ pub const RequestQueue = struct {
     }
 
     /// Atomically release every correlation owned by one worker connection.
+    /// Abandoned tombstones are released silently and omitted from client errors.
     pub fn releaseWorker(self: *RequestQueue, worker_idx: usize, released: *[MAX_IN_FLIGHT]ResolvedRequest) usize {
         var released_count: usize = 0;
         for (&self.in_flight) |*entry| {
             if (!entry.active or entry.worker_idx != worker_idx) continue;
-            std.debug.assert(released_count < released.len);
-            released[released_count] = .{
-                .client_id = entry.client_id,
-                .client_request_id = entry.client_request_id,
-            };
-            released_count += 1;
-            entry.active = false;
+            if (!entry.abandoned) {
+                std.debug.assert(released_count < released.len);
+                released[released_count] = .{
+                    .client_id = entry.client_id,
+                    .client_request_id = entry.client_request_id,
+                };
+                released_count += 1;
+            }
+            entry.* = .{};
             self.resolve_total += 1;
         }
         return released_count;
@@ -201,7 +223,7 @@ pub const RequestQueue = struct {
     /// Drop all queued and in-flight requests owned by a disconnected client.
     /// This prevents abandoned /run requests from leaking queue state across
     /// client reconnects after the caller has already timed out locally.
-    pub fn cancelClient(self: *RequestQueue, client_id: u128) void {
+    pub fn cancelClient(self: *RequestQueue, client_id: u128, now_tick: u64) void {
         for (self.queues[0..self.queue_count]) |*queue| {
             if (!queue.active or queue.count == 0) continue;
 
@@ -226,9 +248,21 @@ pub const RequestQueue = struct {
 
         for (&self.in_flight) |*entry| {
             if (!entry.active or entry.client_id != client_id) continue;
-            entry.active = false;
-            self.resolve_total += 1;
+            entry.abandoned = true;
+            entry.expires_at_tick = now_tick +| ABANDONED_TTL_TICKS;
         }
+    }
+
+    pub fn expireAbandoned(self: *RequestQueue, now_tick: u64) usize {
+        var expired: usize = 0;
+        for (&self.in_flight) |*entry| {
+            if (!entry.active or !entry.abandoned) continue;
+            if (now_tick < entry.expires_at_tick) continue;
+            entry.* = .{};
+            self.resolve_total += 1;
+            expired += 1;
+        }
+        return expired;
     }
 
     /// Total queued requests across all deployments.
@@ -248,10 +282,19 @@ pub const RequestQueue = struct {
         return 0;
     }
 
+    /// Total owned correlation slots, including abandoned tombstones.
     pub fn activeInFlightCount(self: *const RequestQueue) usize {
         var count: usize = 0;
         for (self.in_flight) |entry| {
             if (entry.active) count += 1;
+        }
+        return count;
+    }
+
+    pub fn abandonedInFlightCount(self: *const RequestQueue) usize {
+        var count: usize = 0;
+        for (self.in_flight) |entry| {
+            if (entry.active and entry.abandoned) count += 1;
         }
         return count;
     }
@@ -285,6 +328,8 @@ pub const RequestQueue = struct {
                 .client_request_id = client_request_id,
                 .client_id = client_id,
                 .worker_idx = worker_idx,
+                .abandoned = false,
+                .expires_at_tick = 0,
                 .active = true,
             };
             self.dispatch_total += 1;
@@ -432,12 +477,13 @@ test "request queue: cancel client clears queued and in-flight requests only for
     const first_worker_id = rq.trackInFlight(30, 100).?;
     const second_worker_id = rq.trackInFlight(31, 200).?;
 
-    rq.cancelClient(100);
+    rq.cancelClient(100, 10);
 
     try std.testing.expectEqual(@as(usize, 1), rq.depthFor(1));
     try std.testing.expectEqual(@as(usize, 0), rq.depthFor(2));
     try std.testing.expectEqual(@as(usize, 1), rq.totalDepth());
-    try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 2), rq.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 1), rq.abandonedInFlightCount());
     try std.testing.expectEqual(@as(u128, 200), rq.resolveResponseForWorker(second_worker_id, 0).?.client_id);
     try std.testing.expect(rq.resolveResponseForWorker(first_worker_id, 0) == null);
     try std.testing.expectEqual(@as(u64, 2), rq.resolve_total);
@@ -445,6 +491,48 @@ test "request queue: cancel client clears queued and in-flight requests only for
     const remaining = rq.queues[0].dequeue().?;
     try std.testing.expectEqual(@as(u64, 11), remaining.request_id);
     try std.testing.expectEqual(@as(u128, 200), remaining.client_id);
+}
+
+test "request queue: abandoned worker-owned response consumes silently without touching unrelated" {
+    var rq = RequestQueue.init();
+    const abandoned = rq.trackInFlightForWorker(30, 100, 3).?;
+    const unrelated = rq.trackInFlightForWorker(31, 200, 4).?;
+    rq.cancelClient(100, 50);
+
+    try std.testing.expectEqual(@as(usize, 2), rq.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 1), rq.abandonedInFlightCount());
+    try std.testing.expectEqual(ResponseResolution.abandoned, rq.classifyResponseForWorker(abandoned, 3));
+    try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
+    const delivered = rq.classifyResponseForWorker(unrelated, 4).deliver;
+    try std.testing.expectEqual(@as(u128, 200), delivered.client_id);
+    try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
+}
+
+test "request queue: abandoned saturation expires and reuses every slot" {
+    var rq = RequestQueue.init();
+    for (0..MAX_IN_FLIGHT) |i| {
+        _ = rq.trackInFlightForWorker(@intCast(i), 777, i % 2).?;
+    }
+    rq.cancelClient(777, 100);
+    try std.testing.expectEqual(MAX_IN_FLIGHT, rq.activeInFlightCount());
+    try std.testing.expectEqual(MAX_IN_FLIGHT, rq.abandonedInFlightCount());
+    try std.testing.expect(rq.trackInFlight(9999, 1) == null);
+    try std.testing.expectEqual(@as(usize, 0), rq.expireAbandoned(100 + ABANDONED_TTL_TICKS - 1));
+    try std.testing.expectEqual(MAX_IN_FLIGHT, rq.expireAbandoned(100 + ABANDONED_TTL_TICKS));
+    try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
+    for (0..MAX_IN_FLIGHT) |i| try std.testing.expect(rq.trackInFlight(@intCast(i), 1) != null);
+}
+
+test "request queue: worker disconnect releases tombstones without client errors" {
+    var rq = RequestQueue.init();
+    _ = rq.trackInFlightForWorker(10, 100, 3).?;
+    const live = rq.trackInFlightForWorker(11, 200, 3).?;
+    rq.cancelClient(100, 1);
+    var released: [MAX_IN_FLIGHT]ResolvedRequest = undefined;
+    try std.testing.expectEqual(@as(usize, 1), rq.releaseWorker(3, &released));
+    try std.testing.expectEqual(@as(u128, 200), released[0].client_id);
+    try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
+    try std.testing.expectEqual(ResponseResolution.unknown, rq.classifyResponseForWorker(live, 3));
 }
 
 test "request queue: worker failure releases owned correlations and reuses slots" {

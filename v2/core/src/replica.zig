@@ -108,8 +108,8 @@ pub fn peerMessageSemanticsValid(message: msg.Message) bool {
             break :blk true;
         },
         .start_view => |m| startViewEntriesValid(m),
-        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum),
-        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid() and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum),
+        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum) and ((m.selected_tip_checksum == 0) == (m.expected_entry_checksum == 0)),
+        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid() and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum) and ((m.selected_tip_checksum == 0) == (m.expected_entry_checksum == 0)),
         .send_status => |m| m.commit_min <= m.op_number and m.op_number <= LOG_SIZE_MAX and ((m.op_number == 0) == (m.tip_checksum == 0)) and ((m.commit_min == 0) == (m.commit_checksum == 0)),
         .request,
         .reply,
@@ -245,6 +245,9 @@ pub const Replica = struct {
     selected_retention_floor: msg.OpNumber,
     selected_target_view: msg.ViewNumber,
     selected_next_op: msg.OpNumber,
+    selected_expected_checksum: u64,
+    selected_sources_attempted: u16,
+    selected_sources_requested: u16,
 
     // I/O -- the single injectable interface
     io: Io,
@@ -363,6 +366,9 @@ pub const Replica = struct {
             .selected_retention_floor = 0,
             .selected_target_view = 0,
             .selected_next_op = 0,
+            .selected_expected_checksum = 0,
+            .selected_sources_attempted = 0,
+            .selected_sources_requested = 0,
             .repair_pending = false,
             .repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64),
             .repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool),
@@ -440,6 +446,9 @@ pub const Replica = struct {
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
         self.pending_view_selection = false;
+        self.selected_expected_checksum = 0;
+        self.selected_sources_attempted = 0;
+        self.selected_sources_requested = 0;
         self.repair_pending = false;
         self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
         self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
@@ -1165,6 +1174,17 @@ pub const Replica = struct {
         }
     }
 
+    fn dvcTipSemanticsValid(dvc: msg.DoViewChangeMsg) bool {
+        if (dvc.op_number == 0) return dvc.log_entry_count == 0;
+        var matching_tip_count: usize = 0;
+        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+            if (entry.op_number != dvc.op_number) continue;
+            if (!entry.valid()) return false;
+            matching_tip_count += 1;
+        }
+        return matching_tip_count == 1;
+    }
+
     fn onDoViewChange(self: *Replica, from: u8, dvc: msg.DoViewChangeMsg) void {
         if (self.status != .view_change) return;
         if (dvc.view_number != self.view_number) return;
@@ -1172,6 +1192,7 @@ pub const Replica = struct {
         if (!peerLogBoundsOk(dvc.commit_min, dvc.op_number)) return;
         if (dvc.retention_floor != 0) return;
         if (!peerLogEntriesOk(&dvc.log_entries, dvc.log_entry_count, msg.DVC_LOG_MAX)) return;
+        if (!dvcTipSemanticsValid(dvc)) return;
 
         const new_leader: u8 = @intCast(self.view_number % self.replica_count);
         if (new_leader != self.replica_id) return;
@@ -1323,6 +1344,9 @@ pub const Replica = struct {
         self.view_change_candidate.reset();
         self.pending_view_selection = false;
         self.selected_next_op = 0;
+        self.selected_expected_checksum = 0;
+        self.selected_sources_attempted = 0;
+        self.selected_sources_requested = 0;
     }
 
     fn abortSelectedView(self: *Replica) void {
@@ -1340,16 +1364,56 @@ pub const Replica = struct {
         return true;
     }
 
-    fn requestSelectedEntry(self: *Replica, op: msg.OpNumber) void {
-        self.sendTo(self.selected_source, .{ .request_prepare = .{
-            .view_number = self.selected_target_view,
-            .op_number = op,
-            .selected_source = self.selected_source,
-            .selected_last_normal_view = self.selected_last_normal_view,
-            .selected_tip_op = self.selected_tip_op,
-            .selected_tip_checksum = self.selected_tip_checksum,
-            .selected_commit_bound = self.selected_commit_bound,
-        } });
+    fn selectedEntryExpectedChecksum(self: *const Replica, op: msg.OpNumber) ?u64 {
+        if (op == self.selected_tip_op) return self.selected_tip_checksum;
+        if (op >= self.selected_tip_op) return null;
+        const child_op = op + 1;
+        if (child_op < self.view_change_candidate.metadata.base_op) return null;
+        const child_index: usize = @intCast(child_op - self.view_change_candidate.metadata.base_op);
+        if (child_index >= self.view_change_candidate.entries.len) return null;
+        if (!self.view_change_candidate.present[child_index]) return null;
+        return self.view_change_candidate.entries[child_index].parent_checksum;
+    }
+
+    fn requestSelectedEntry(self: *Replica, op: msg.OpNumber, expected_checksum: u64) void {
+        std.debug.assert(expected_checksum != 0);
+        if (self.leaderForView(self.selected_target_view) != self.replica_id) {
+            self.sendTo(self.selected_source, .{ .request_prepare = .{
+                .view_number = self.selected_target_view,
+                .op_number = op,
+                .selected_source = self.selected_source,
+                .selected_last_normal_view = self.selected_last_normal_view,
+                .selected_tip_op = self.selected_tip_op,
+                .selected_tip_checksum = self.selected_tip_checksum,
+                .selected_commit_bound = self.selected_commit_bound,
+                .expected_entry_checksum = expected_checksum,
+            } });
+            return;
+        }
+        for (0..self.replica_count) |source_index| {
+            // Local exact entries are consumed directly by advanceSelectedView;
+            // production peer transports intentionally have no self socket.
+            if (source_index == self.replica_id) continue;
+            if (!self.do_vc_received[source_index]) continue;
+            const source_bit = @as(u16, 1) << @intCast(source_index);
+            if (self.selected_sources_attempted & source_bit != 0) continue;
+            const source_dvc = &self.do_vc_msgs[source_index];
+            if (!msg.bitsetGet(&source_dvc.present_bitset, @intCast(op % LOG_SIZE_MAX))) continue;
+
+            self.selected_sources_attempted |= source_bit;
+            self.selected_sources_requested |= source_bit;
+            self.sendTo(@intCast(source_index), .{ .request_prepare = .{
+                .view_number = self.selected_target_view,
+                .op_number = op,
+                .selected_source = self.selected_source,
+                .selected_last_normal_view = self.selected_last_normal_view,
+                .selected_tip_op = self.selected_tip_op,
+                .selected_tip_checksum = self.selected_tip_checksum,
+                .selected_commit_bound = self.selected_commit_bound,
+                .expected_entry_checksum = expected_checksum,
+            } });
+            return;
+        }
     }
 
     fn advanceSelectedView(self: *Replica) void {
@@ -1384,13 +1448,39 @@ pub const Replica = struct {
             return;
         }
 
-        for (self.view_change_candidate.present, 0..) |present, index| {
-            if (present) continue;
-            self.selected_next_op = self.view_change_candidate.metadata.base_op + @as(msg.OpNumber, @intCast(index));
-            self.requestSelectedEntry(self.selected_next_op);
+        var op = self.selected_tip_op;
+        while (op >= self.view_change_candidate.metadata.base_op) : (op -= 1) {
+            const index: usize = @intCast(op - self.view_change_candidate.metadata.base_op);
+            if (self.view_change_candidate.present[index]) {
+                if (op == self.view_change_candidate.metadata.base_op) break;
+                continue;
+            }
+            const expected_checksum = self.selectedEntryExpectedChecksum(op) orelse {
+                if (op == self.view_change_candidate.metadata.base_op) break;
+                continue;
+            };
+            if (self.selected_next_op != op or self.selected_expected_checksum != expected_checksum) {
+                self.selected_next_op = op;
+                self.selected_expected_checksum = expected_checksum;
+                self.selected_sources_attempted = 0;
+                self.selected_sources_requested = 0;
+            }
+            if (self.journalGet(op)) |local_entry| {
+                if (local_entry.checksum == expected_checksum) {
+                    if (!self.addSelectedEntry(local_entry.*)) return;
+                    self.selected_sources_attempted = 0;
+                    self.selected_sources_requested = 0;
+                    if (self.view_change_candidate.complete()) {
+                        self.installCompletedCandidate();
+                        return;
+                    }
+                    if (op == self.view_change_candidate.metadata.base_op) break;
+                    continue;
+                }
+            }
+            self.requestSelectedEntry(op, expected_checksum);
             return;
         }
-        unreachable;
     }
 
     fn installCompletedCandidate(self: *Replica) void {
@@ -2046,23 +2136,24 @@ pub const Replica = struct {
 
         const selection_bound = rp.selected_tip_checksum != 0;
         if (selection_bound) {
-            if (rp.selected_source != self.replica_id) return;
             if (rp.selected_commit_bound > rp.selected_tip_op) return;
+            if (rp.expected_entry_checksum == 0) return;
+            if (rp.selected_tip_op == 0 or rp.op_number > rp.selected_tip_op) return;
             if (self.isLeader() and self.status == .normal and rp.view_number == self.view_number) {
-                if (rp.view_number != self.selected_target_view) return;
+                if (rp.selected_source != self.selected_source) return;
                 if (rp.selected_last_normal_view != self.selected_last_normal_view) return;
                 if (rp.selected_tip_op != self.selected_tip_op) return;
                 if (rp.selected_tip_checksum != self.selected_tip_checksum) return;
                 if (rp.selected_commit_bound != self.selected_commit_bound) return;
-                if (rp.op_number > self.selected_tip_op) return;
             } else {
                 if (rp.view_number > self.view_number) return;
                 if (from != self.leaderForView(rp.view_number)) return;
-                if (rp.selected_last_normal_view != self.last_normal_view) return;
-                if (rp.selected_tip_op == 0 or rp.selected_tip_op > self.op_number) return;
-                if (rp.op_number > rp.selected_tip_op) return;
-                const tip = self.journalGet(rp.selected_tip_op) orelse return;
-                if (tip.checksum != rp.selected_tip_checksum) return;
+                if (self.replica_id == rp.selected_source) {
+                    if (rp.selected_last_normal_view != self.last_normal_view) return;
+                    if (rp.selected_tip_op > self.op_number) return;
+                    const selected_tip = self.journalGet(rp.selected_tip_op) orelse return;
+                    if (selected_tip.checksum != rp.selected_tip_checksum) return;
+                }
             }
         } else {
             if (rp.view_number != self.view_number) return;
@@ -2070,6 +2161,7 @@ pub const Replica = struct {
 
         if (self.journalGet(rp.op_number)) |entry| {
             if (!selection_bound and from != self.leader() and rp.op_number > self.commit_min) return;
+            if (selection_bound and entry.checksum != rp.expected_entry_checksum) return;
             self.sendTo(from, .{ .send_prepare = .{
                 .view_number = rp.view_number,
                 .entry = entry.*,
@@ -2078,6 +2170,7 @@ pub const Replica = struct {
                 .selected_tip_op = rp.selected_tip_op,
                 .selected_tip_checksum = rp.selected_tip_checksum,
                 .selected_commit_bound = rp.selected_commit_bound,
+                .expected_entry_checksum = rp.expected_entry_checksum,
             } });
         }
     }
@@ -2088,13 +2181,24 @@ pub const Replica = struct {
         if (sp.entry.op_number == 0 or sp.entry.op_number > LOG_SIZE_MAX) return;
 
         if (self.status == .view_change and self.pending_view_selection) {
-            if (from != self.selected_source) return;
             if (sp.selected_source != self.selected_source) return;
             if (sp.selected_last_normal_view != self.selected_last_normal_view) return;
             if (sp.selected_tip_op != self.selected_tip_op) return;
             if (sp.selected_tip_checksum != self.selected_tip_checksum) return;
             if (sp.selected_commit_bound != self.selected_commit_bound) return;
+            if (sp.entry.op_number != self.selected_next_op) return;
+            if (sp.expected_entry_checksum != self.selected_expected_checksum) return;
+            if (self.leaderForView(self.selected_target_view) == self.replica_id) {
+                const source_bit = @as(u16, 1) << @intCast(from);
+                if (self.selected_sources_requested & source_bit == 0) return;
+            } else if (from != self.selected_source) return;
+            if (sp.entry.checksum != self.selected_expected_checksum) {
+                self.advanceSelectedView();
+                return;
+            }
             if (!self.addSelectedEntry(sp.entry)) return;
+            self.selected_sources_attempted = 0;
+            self.selected_sources_requested = 0;
             self.advanceSelectedView();
             return;
         }
@@ -2292,6 +2396,7 @@ pub const Replica = struct {
             }
         }
 
+        std.debug.assert(dvcTipSemanticsValid(dvc));
         return dvc;
     }
 
@@ -3853,6 +3958,66 @@ test "onDoViewChange rejects unbounded op_number" {
     try std.testing.expectEqual(@as(u8, 0), replica.do_vc_total);
 }
 
+test "DVC tip preflight rejects missing duplicate conflicting and zero-op tips before quorum" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD7C71F);
+    defer tc.deinit();
+    const leader = tc.replicas[1];
+    leader.status = .view_change;
+    leader.view_number = 1;
+
+    var tip = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    tip.checksum = tip.computeChecksum();
+    var conflicting = tip;
+    conflicting.client_id = 2;
+    conflicting.checksum = conflicting.computeChecksum();
+
+    const missing = msg.DoViewChangeMsg{ .view_number = 1, .replica_id = 0, .op_number = 1 };
+    leader.onMessage(0, .{ .do_view_change = missing });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var duplicate = missing;
+    duplicate.log_entry_count = 2;
+    duplicate.log_entries[0] = tip;
+    duplicate.log_entries[1] = tip;
+    leader.onMessage(0, .{ .do_view_change = duplicate });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var conflict = duplicate;
+    conflict.log_entries[1] = conflicting;
+    leader.onMessage(0, .{ .do_view_change = conflict });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var zero_with_tip = msg.DoViewChangeMsg{ .view_number = 1, .replica_id = 0, .op_number = 0, .log_entry_count = 1 };
+    zero_with_tip.log_entries[0] = tip;
+    leader.onMessage(0, .{ .do_view_change = zero_with_tip });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var valid = missing;
+    valid.log_entry_count = 1;
+    valid.log_entries[0] = tip;
+    leader.onMessage(0, .{ .do_view_change = valid });
+    try std.testing.expectEqual(@as(u8, 1), leader.do_vc_total);
+    try std.testing.expectEqual(tip.checksum, leader.do_vc_msgs[0].log_entries[0].checksum);
+}
+
+test "local and recovered DVC always contain exactly one matching tip" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD7C72F);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    replica.journalPut(entry);
+    replica.op_number = 1;
+    var dvc = replica.buildDvc();
+    try std.testing.expect(Replica.dvcTipSemanticsValid(dvc));
+
+    replica.recovered_from_disk = true;
+    dvc = replica.buildDvc();
+    try std.testing.expect(Replica.dvcTipSemanticsValid(dvc));
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), dvc.op_number);
+    try std.testing.expectEqual(entry.checksum, Replica.dvcEntryChecksum(&dvc, 1).?);
+}
+
 test "journalPut soft-drops zero and oversize op" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(7004);
@@ -4511,6 +4676,7 @@ test "selection-bound RequestPrepare serves retained source across later current
         .selected_tip_op = 3,
         .selected_tip_checksum = entries[2].checksum,
         .selected_commit_bound = 1,
+        .expected_entry_checksum = entries[0].checksum,
     };
     const send_tag = @intFromEnum(msg.Tag.send_prepare);
     const before = tc.network.stats.sent[send_tag];
