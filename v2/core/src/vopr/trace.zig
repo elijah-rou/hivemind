@@ -43,18 +43,20 @@ pub const JournalSnapshot = struct {
 };
 
 pub const MAX_EVENTS = 16384;
+pub const MAX_TRACE_COLLECTOR_BYTES: usize = 16 * 1024 * 1024;
 
 pub const TraceCollector = struct {
     events: [MAX_EVENTS]TraceEvent,
     count: usize,
     replica_count: u8,
 
-    pub fn init(replica_count: u8) TraceCollector {
-        return .{
-            .events = undefined,
-            .count = 0,
-            .replica_count = replica_count,
-        };
+    pub fn initInPlace(self: *TraceCollector, replica_count: u8) void {
+        self.count = 0;
+        self.replica_count = replica_count;
+    }
+
+    pub fn deinit(self: *TraceCollector) void {
+        self.count = 0;
     }
 
     pub fn push(self: *TraceCollector, event: TraceEvent) void {
@@ -145,6 +147,26 @@ pub const TraceCollector = struct {
         }
     }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(TraceCollector) > 1024 * 1024);
+    std.debug.assert(@sizeOf(TraceCollector) <= MAX_TRACE_COLLECTOR_BYTES);
+}
+
+test "multi-MiB trace collector supports explicit heap lifetime" {
+    const collector = try std.testing.allocator.create(TraceCollector);
+    collector.initInPlace(5);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    try std.testing.expect(@sizeOf(TraceCollector) > 1024 * 1024);
+    try std.testing.expect(@sizeOf(TraceCollector) <= MAX_TRACE_COLLECTOR_BYTES);
+    try std.testing.expectEqual(@as(usize, 0), collector.count);
+    collector.addInit(5, 7);
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+}
 
 fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
     return switch (event.kind) {
