@@ -47,11 +47,16 @@ case "$service:$operation" in
   s3api:put-object)
     exec 8>"$AWS_STUB_STATE/marker.lock"; flock -x 8
     [[ ! -f "$bucket_dir/marker" ]] || exit 1
-    if [[ "${AWS_SCENARIO:-success}" == put-timeout-mismatch ]]; then
-      metadata="${metadata/claim=*/claim=00000000000000000000000000000000}"
-    fi
+    case "${AWS_SCENARIO:-success}" in
+      put-timeout-token-mismatch) metadata="${metadata/token=*/token=00000000000000000000000000000000,claim=${metadata##*claim=}}" ;;
+      put-timeout-claim-mismatch) metadata="${metadata/claim=*/claim=00000000000000000000000000000000}" ;;
+      put-timeout-empty-token) metadata="${metadata/token=*/token=,claim=${metadata##*claim=}}" ;;
+      put-timeout-empty-claim) metadata="${metadata/claim=*/claim=}" ;;
+      put-timeout-committed|success) ;;
+      *) ;;
+    esac
     printf '%s\n' "$metadata" > "$bucket_dir/marker"
-    [[ "${AWS_SCENARIO:-success}" != put-timeout-committed && "${AWS_SCENARIO:-success}" != put-timeout-mismatch ]] || exit 124
+    case "${AWS_SCENARIO:-success}" in put-timeout-*) exit 124 ;; esac
     ;;
   s3api:head-object)
     [[ -f "$bucket_dir/marker" ]] || exit 1
@@ -64,7 +69,7 @@ case "$service:$operation" in
     fi
     token="$(sed -n 's/.*token=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
     claim="$(sed -n 's/.*claim=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
-    printf '%s %s\n' "$token" "$claim"
+    printf '%s:%s\n' "$token" "$claim"
     ;;
   s3:cp)
     if [[ "${AWS_SCENARIO:-success}" == hung-upload ]]; then
@@ -138,7 +143,7 @@ hivemind_artifact_cleanup 0
 grep -q 'delete-bucket .*89898989898989898989898989898989' "$AWS_CALLS"
 
 # An ambiguous failed write with a different marker never grants deletion authority.
-if AWS_SCENARIO=put-timeout-mismatch prepare 91919191919191919191919191919191 92929292929292929292929292929292; then
+if AWS_SCENARIO=put-timeout-claim-mismatch prepare 91919191919191919191919191919191 92929292929292929292929292929292; then
   echo 'mismatched ambiguous write unexpectedly passed' >&2; exit 1
 fi
 [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 0 ]]
@@ -148,6 +153,22 @@ hivemind_artifact_cleanup 1 || true
 if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
   echo 'ambiguous mismatched marker triggered deletion' >&2; exit 1
 fi
+
+assert_prepare_partial_rejected() {
+  local scenario="$1" token="$2" claim="$3"
+  if AWS_SCENARIO="$scenario" prepare "$token" "$claim"; then
+    echo "$scenario unexpectedly established ownership" >&2; exit 1
+  fi
+  [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 0 ]]
+  : > "$AWS_CALLS"
+  hivemind_artifact_cleanup 1 || true
+  if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+    echo "$scenario triggered deletion" >&2; exit 1
+  fi
+}
+assert_prepare_partial_rejected put-timeout-token-mismatch a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1 b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
+assert_prepare_partial_rejected put-timeout-empty-token a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2 b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
+assert_prepare_partial_rejected put-timeout-empty-claim a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3 b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3
 
 # A same-token race has one marker winner; the loser never removes the preserved bucket.
 : > "$AWS_CALLS"
@@ -211,17 +232,32 @@ if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
   echo 'stale marker observation triggered deletion' >&2; exit 1
 fi
 
-# Cleanup revalidates the invocation claim and refuses a changed marker.
-prepare abababababababababababababababab 12121212121212121212121212121212
-printf '%s\n' 'account=123456789012,token=abababababababababababababababab,claim=34343434343434343434343434343434' \
-  > "$TMP_DIR/state/buckets/$HIVEMIND_ARTIFACT_BUCKET/marker"
+assert_cleanup_partial_rejected() {
+  local token="$1" claim="$2" marker="$3" label="$4"
+  prepare "$token" "$claim"
+  printf '%s\n' "$marker" > "$TMP_DIR/state/buckets/$HIVEMIND_ARTIFACT_BUCKET/marker"
+  : > "$AWS_CALLS"
+  if hivemind_artifact_cleanup 0; then
+    echo "$label unexpectedly cleaned" >&2; exit 1
+  fi
+  if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+    echo "$label triggered deletion" >&2; exit 1
+  fi
+}
+assert_cleanup_partial_rejected abababababababababababababababab 12121212121212121212121212121212 \
+  'account=123456789012,token=00000000000000000000000000000000,claim=12121212121212121212121212121212' token-only-mismatch
+assert_cleanup_partial_rejected acacacacacacacacacacacacacacacac 23232323232323232323232323232323 \
+  'account=123456789012,token=acacacacacacacacacacacacacacacac,claim=00000000000000000000000000000000' claim-only-mismatch
+assert_cleanup_partial_rejected adadadadadadadadadadadadadadadad 24242424242424242424242424242424 \
+  'account=123456789012,token=,claim=24242424242424242424242424242424' empty-token
+assert_cleanup_partial_rejected aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae 25252525252525252525252525252525 \
+  'account=123456789012,token=aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae,claim=' empty-claim
+
+# A complete current marker remains deletable.
+prepare afafafafafafafafafafafafafafafaf 26262626262626262626262626262626
 : > "$AWS_CALLS"
-if hivemind_artifact_cleanup 0; then
-  echo 'mismatched ownership marker unexpectedly cleaned' >&2; exit 1
-fi
-if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
-  echo 'mismatched ownership marker triggered deletion' >&2; exit 1
-fi
+hivemind_artifact_cleanup 0
+grep -q 'delete-bucket .*afafafafafafafafafafafafafafafaf' "$AWS_CALLS"
 
 mkdir -p "$TMP_DIR/non-gnu"
 cat > "$TMP_DIR/non-gnu/timeout" <<'EOF'

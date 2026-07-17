@@ -34,16 +34,27 @@ hivemind_artifact_marker_read() {
     marker="$(hivemind_artifact_aws s3api head-object \
         --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
         --key "$HIVEMIND_ARTIFACT_MARKER_KEY" \
-        --query '[Metadata.token,Metadata.claim]' --output text \
+        --query "join(':', [Metadata.token,Metadata.claim])" --output text \
         --region "$HIVEMIND_ARTIFACT_REGION")" || return 1
-    read -r HIVEMIND_ARTIFACT_OBSERVED_TOKEN HIVEMIND_ARTIFACT_OBSERVED_CLAIM <<< "$marker"
-    [[ -n "$HIVEMIND_ARTIFACT_OBSERVED_TOKEN" ]]
-    [[ -n "$HIVEMIND_ARTIFACT_OBSERVED_CLAIM" ]]
+    HIVEMIND_ARTIFACT_OBSERVED_TOKEN="${marker%%:*}"
+    HIVEMIND_ARTIFACT_OBSERVED_CLAIM="${marker#*:}"
+    if [[ -z "$HIVEMIND_ARTIFACT_OBSERVED_TOKEN" ]]; then
+        return 1
+    fi
+    if [[ -z "$HIVEMIND_ARTIFACT_OBSERVED_CLAIM" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 hivemind_artifact_marker_matches() {
-    [[ "${HIVEMIND_ARTIFACT_OBSERVED_TOKEN:-}" == "$HIVEMIND_ARTIFACT_TOKEN" ]]
-    [[ "${HIVEMIND_ARTIFACT_OBSERVED_CLAIM:-}" == "$HIVEMIND_ARTIFACT_CLAIM" ]]
+    if [[ "${HIVEMIND_ARTIFACT_OBSERVED_TOKEN:-}" != "$HIVEMIND_ARTIFACT_TOKEN" ]]; then
+        return 1
+    fi
+    if [[ "${HIVEMIND_ARTIFACT_OBSERVED_CLAIM:-}" != "$HIVEMIND_ARTIFACT_CLAIM" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 hivemind_artifact_prepare() {
