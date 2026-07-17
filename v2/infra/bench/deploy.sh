@@ -81,10 +81,13 @@ hivemind_stop_verified /tmp/hivemind-current.pid /tmp/hivemind-runs
 cd /tmp
 nohup $cmd > '$run_dir/hivemind.log' 2>&1 &
 pid=\$!
-sleep 3
-actual=\$(readlink "/proc/\$pid/exe" 2>/dev/null || true)
-[[ "\$actual" == '$run_binary' ]] || { echo 'FAILED TO START'; exit 1; }
 hivemind_write_pid_state /tmp/hivemind-current.pid "\$pid" '$RUN_TOKEN' '$run_binary'
+sleep 3
+read -r recorded_pid recorded_start recorded_exe recorded_token < /tmp/hivemind-current.pid
+actual=\$(readlink "/proc/\$pid/exe" 2>/dev/null || true)
+actual_start=\$(hivemind_proc_start_time "\$pid" /proc 2>/dev/null || true)
+[[ "\$recorded_pid \$recorded_start \$recorded_exe \$recorded_token" == "\$pid \$actual_start $run_binary $RUN_TOKEN" ]] || { echo 'FAILED TO START'; exit 1; }
+[[ "\$actual" == '$run_binary' ]] || { echo 'FAILED TO START'; exit 1; }
 echo 'hivemind running'
 EOF
 )

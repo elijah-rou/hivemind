@@ -271,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         conn_mgr.dispatchRun();
-        if (metrics) |*m| m.poll();
+        if (metrics) |*m| m.poll(io_mod.nowTick(init.io));
         if (s3_backup) |*b| b.maybeTrigger(io_mod.nowTick(init.io));
         if (gossip) |*g| {
             const now = io_mod.nowTick(init.io);

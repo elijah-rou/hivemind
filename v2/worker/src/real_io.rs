@@ -220,17 +220,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn malformed_control_message_disconnects_session() {
+    fn assert_malformed_session_terminates(tag: u8, payload: &[u8]) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut io = RealIo::connect(&addr.to_string(), None).unwrap();
         let (mut server, _) = listener.accept().unwrap();
 
-        let mut malformed_start = vec![0u8; 797];
-        malformed_start[531] = 0xff;
         let mut frame = Vec::new();
-        protocol::write_frame(&mut frame, 0x02, &malformed_start).unwrap();
+        protocol::write_frame(&mut frame, tag, payload).unwrap();
         frame.extend_from_slice(&run_request_frame(9, 10, b"must-not-decode"));
         server.write_all(&frame).unwrap();
 
@@ -246,6 +243,23 @@ mod tests {
             "malformed control frame must terminate session"
         );
         assert!(io.recv().is_none());
+    }
+
+    #[test]
+    fn malformed_control_message_disconnects_session() {
+        let mut malformed_start = vec![0u8; 797];
+        malformed_start[531] = 0xff;
+        assert_malformed_session_terminates(0x02, &malformed_start);
+    }
+
+    #[test]
+    fn trailing_stop_pod_payload_disconnects_session() {
+        assert_malformed_session_terminates(0x03, &[0u8; 17]);
+    }
+
+    #[test]
+    fn trailing_probe_pod_payload_disconnects_session() {
+        assert_malformed_session_terminates(0x05, &[0u8; 9]);
     }
 
     #[test]

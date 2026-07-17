@@ -538,8 +538,6 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 // the peer self-identifies as the current VRR leader. No consensus, no state
 // mutation, no client_table entry — safe to call on every reconnect.
 func probeIsLeader(conn net.Conn, crypto *CryptoState) (bool, error) {
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	defer conn.SetWriteDeadline(time.Time{})
 	if err := writeFrameEncrypted(conn, TagClusterStateRequest, []byte{0x01}, crypto); err != nil {
 		return false, err
 	}
@@ -562,9 +560,18 @@ func probeIsLeader(conn net.Conn, crypto *CryptoState) (bool, error) {
 }
 
 // readFrameGeneric reads exactly one frame and returns [version(2)][tag(1)][payload...].
-func readFrameGeneric(conn net.Conn, buf []byte, timeout time.Duration, crypto *CryptoState) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+func readFrameGeneric(conn net.Conn, buf []byte, timeout time.Duration, crypto *CryptoState) (frame []byte, err error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil {
+			_ = conn.Close()
+			frame = nil
+			err = fmt.Errorf("clear read deadline: %w", clearErr)
+		}
+	}()
 
 	if len(buf) < 4 {
 		return nil, fmt.Errorf("frame buffer too small: %d", len(buf))

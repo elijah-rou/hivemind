@@ -136,6 +136,92 @@ func TestReadFrameGenericClearsReadDeadlineOnError(t *testing.T) {
 	}
 }
 
+type failingReadDeadlineConn struct {
+	deadlineTrackingConn
+	failSet   bool
+	failClear bool
+	closed    bool
+	readCalls int
+}
+
+func (c *failingReadDeadlineConn) Read(p []byte) (int, error) {
+	c.readCalls++
+	return c.deadlineTrackingConn.Read(p)
+}
+func (c *failingReadDeadlineConn) Close() error { c.closed = true; return nil }
+func (c *failingReadDeadlineConn) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() && c.failSet {
+		return errors.New("injected read deadline set failure")
+	}
+	if deadline.IsZero() && c.failClear {
+		return errors.New("injected read deadline clear failure")
+	}
+	c.lastReadDeadline = deadline
+	return nil
+}
+
+func TestCommandRunAndLeaderProbeFailClosedOnReadDeadlineErrors(t *testing.T) {
+	commandFrame := buildTestFrame(t, 0x00, ProtocolVersion, TagReply, make([]byte, 17), nil)
+	runFrame := buildTestFrame(t, 0x00, ProtocolVersion, TagRunResponse, buildRunResponseRaw(1, RunStatusOK, nil, false), nil)
+	probeFrame := buildClusterStateProbeFrame(true)
+	cases := []struct {
+		name  string
+		frame []byte
+		call  func(net.Conn) error
+	}{
+		{name: "command", frame: commandFrame, call: func(conn net.Conn) error { _, err := readReply(conn, make([]byte, 256)); return err }},
+		{name: "run", frame: runFrame, call: func(conn net.Conn) error { _, err := readRunResponse(conn, make([]byte, 256)); return err }},
+		{name: "leader probe", frame: probeFrame, call: func(conn net.Conn) error { _, err := probeIsLeader(conn, nil); return err }},
+	}
+	for _, tc := range cases {
+		for _, failure := range []string{"set", "clear"} {
+			t.Run(tc.name+"/"+failure, func(t *testing.T) {
+				conn := &failingReadDeadlineConn{
+					deadlineTrackingConn: deadlineTrackingConn{readBuf: bytes.NewReader(tc.frame)},
+					failSet:              failure == "set", failClear: failure == "clear",
+				}
+				if err := tc.call(conn); err == nil {
+					t.Fatal("expected injected deadline error")
+				}
+				if !conn.closed {
+					t.Fatal("deadline failure did not close connection")
+				}
+				if failure == "set" && conn.readCalls != 0 {
+					t.Fatalf("read calls = %d, want 0 after set failure", conn.readCalls)
+				}
+			})
+		}
+	}
+}
+
+func TestSendRunRequestReadDeadlineFailureClosesConnectionAndReleasesMutex(t *testing.T) {
+	validRun := buildTestFrame(t, 0x00, ProtocolVersion, TagRunResponse, buildRunResponseRaw(1, RunStatusOK, nil, false), nil)
+	for _, failure := range []string{"set", "clear"} {
+		t.Run(failure, func(t *testing.T) {
+			conn := &failingReadDeadlineConn{
+				deadlineTrackingConn: deadlineTrackingConn{readBuf: bytes.NewReader(validRun)},
+				failSet:              failure == "set",
+				failClear:            failure == "clear",
+			}
+			client := NewClient(nil, nil)
+			client.conn = conn
+			if _, err := client.SendRunRequest("dep", []byte("x")); !errors.Is(err, ErrRunOutcomeAmbiguous) {
+				t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
+			}
+			if !conn.closed || client.conn != nil {
+				t.Fatal("poisoned run connection remained reusable")
+			}
+			done := make(chan struct{})
+			go func() { _ = client.IsConnected(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("client mutex remained locked")
+			}
+		})
+	}
+}
+
 func buildTestFrame(t *testing.T, flags byte, version uint16, tag byte, payload []byte, crypto *CryptoState) []byte {
 	t.Helper()
 	inner := make([]byte, 3+len(payload))

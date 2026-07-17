@@ -13,9 +13,9 @@ cat > "$TMP_DIR/bin/kill-stub" <<'EOF'
 #!/usr/bin/env bash
 printf '%s %s\n' "$1" "$2" >> "$KILL_LOG"
 case "$KILL_MODE:$1" in
-  graceful:-TERM) rm -f "$PROC_ROOT/$2/exe" ;;
-  reused:-TERM) rm -f "$PROC_ROOT/$2/exe"; ln -s /usr/bin/sleep "$PROC_ROOT/$2/exe" ;;
-  stuck:-KILL) rm -f "$PROC_ROOT/$2/exe" ;;
+  graceful:-TERM) rm -f "$PROC_ROOT/$2/exe" "$PROC_ROOT/$2/stat" ;;
+  reused:-TERM) printf '101 (hivemind) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 9002\n' > "$PROC_ROOT/$2/stat" ;;
+  stuck:-KILL) rm -f "$PROC_ROOT/$2/exe" "$PROC_ROOT/$2/stat" ;;
 esac
 EOF
 chmod +x "$TMP_DIR/bin/kill-stub"
@@ -29,7 +29,8 @@ reset_target() {
   rm -rf "$TMP_DIR/proc/101"
   mkdir -p "$TMP_DIR/proc/101"
   ln -s "$TMP_DIR/runs/token-a/hivemind" "$TMP_DIR/proc/101/exe"
-  printf '101 token-a %s\n' "$TMP_DIR/runs/token-a/hivemind" > "$TMP_DIR/state"
+  printf '101 (hivemind) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 9001\n' > "$TMP_DIR/proc/101/stat"
+  printf '101 9001 %s token-a\n' "$TMP_DIR/runs/token-a/hivemind" > "$TMP_DIR/state"
   : > "$KILL_LOG"
 }
 
@@ -44,11 +45,18 @@ reset_target
 KILL_MODE=stuck hivemind_stop_verified "$TMP_DIR/state" "$TMP_DIR/runs" "$TMP_DIR/proc" "$TMP_DIR/bin/kill-stub"
 printf '%s\n' '-TERM 101' '-KILL 101' | diff -u - "$KILL_LOG"
 
-# PID reuse proves the old identity disappeared and never kills the replacement.
+# Same-executable PID reuse changes start-time and never signals the replacement.
 reset_target
 KILL_MODE=reused hivemind_stop_verified "$TMP_DIR/state" "$TMP_DIR/runs" "$TMP_DIR/proc" "$TMP_DIR/bin/kill-stub"
 grep -qx -- '-TERM 101' "$KILL_LOG"
-[[ "$(readlink "$TMP_DIR/proc/101/exe")" == /usr/bin/sleep ]]
+[[ "$(readlink "$TMP_DIR/proc/101/exe")" == "$TMP_DIR/runs/token-a/hivemind" ]]
+[[ "$(awk '{print $22}' "$TMP_DIR/proc/101/stat")" == 9002 ]]
+
+# A same-path replacement already present at the first check is never signalled.
+reset_target
+sed -i 's/9001$/9002/' "$TMP_DIR/proc/101/stat"
+KILL_MODE=timeout hivemind_stop_verified "$TMP_DIR/state" "$TMP_DIR/runs" "$TMP_DIR/proc" "$TMP_DIR/bin/kill-stub"
+[[ ! -s "$KILL_LOG" ]]
 
 # A process surviving both signals fails closed, preventing PID-state overwrite.
 reset_target
@@ -66,6 +74,16 @@ rm "$TMP_DIR/proc/101/exe"
 ln -s /usr/bin/sleep "$TMP_DIR/proc/101/exe"
 KILL_MODE=timeout hivemind_stop_verified "$TMP_DIR/state" "$TMP_DIR/runs" "$TMP_DIR/proc" "$TMP_DIR/bin/kill-stub"
 [[ ! -s "$KILL_LOG" ]]
+
+# State is atomically replaced and records all four identity fields.
+reset_target
+printf 'old partial state\n' > "$TMP_DIR/atomic-state"
+hivemind_write_pid_state "$TMP_DIR/atomic-state" 101 token-a "$TMP_DIR/runs/token-a/hivemind" "$TMP_DIR/proc"
+[[ "$(cat "$TMP_DIR/atomic-state")" == "101 9001 $TMP_DIR/runs/token-a/hivemind token-a" ]]
+if compgen -G "$TMP_DIR/atomic-state.tmp.*" >/dev/null; then
+  echo "atomic PID state left a temporary file" >&2
+  exit 1
+fi
 
 # The same launch lock serializes concurrent node launches.
 lock="$TMP_DIR/launch.lock"

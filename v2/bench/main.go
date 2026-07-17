@@ -287,8 +287,18 @@ func writeAll(conn net.Conn, data []byte) error {
 }
 
 // readFrame returns [version(2)][tag(1)][payload...].
-func readFrame(conn net.Conn, buf []byte, timeout time.Duration) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
+func readFrame(conn net.Conn, buf []byte, timeout time.Duration) (frame []byte, err error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil {
+			_ = conn.Close()
+			frame = nil
+			err = fmt.Errorf("clear read deadline: %w", clearErr)
+		}
+	}()
 	if _, err := readFull(conn, buf[:4]); err != nil {
 		return nil, err
 	}

@@ -535,10 +535,10 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
         }
 
         MSG_STOP_POD => {
-            if payload.len() < std::mem::size_of::<WireStopPod>() {
+            if payload.len() != std::mem::size_of::<WireStopPod>() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "StopPod payload too short",
+                    "StopPod payload length invalid",
                 ));
             }
             let wire: WireStopPod = from_bytes(payload);
@@ -549,10 +549,10 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
         }
 
         MSG_PROBE_POD => {
-            if payload.len() < std::mem::size_of::<WireProbePod>() {
+            if payload.len() != std::mem::size_of::<WireProbePod>() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "ProbePod payload too short",
+                    "ProbePod payload length invalid",
                 ));
             }
             let wire: WireProbePod = from_bytes(payload);
@@ -1120,6 +1120,26 @@ mod tests {
                 assert_eq!(cmd.grace_period_ms, 5000);
             }
             _ => panic!("expected StopPod"),
+        }
+    }
+
+    #[test]
+    fn fixed_control_payloads_require_exact_lengths() {
+        let stop = WireStopPod {
+            pod_id: 1,
+            grace_period_ms: 2,
+        };
+        let probe = WireProbePod { pod_id: 3 };
+
+        for (tag, exact) in [
+            (MSG_STOP_POD, as_bytes(&stop)),
+            (MSG_PROBE_POD, as_bytes(&probe)),
+        ] {
+            assert!(decode_control_message(tag, &exact[..exact.len() - 1]).is_err());
+            let mut trailing = exact.to_vec();
+            trailing.push(0xff);
+            assert!(decode_control_message(tag, &trailing).is_err());
+            assert!(decode_control_message(tag, exact).is_ok());
         }
     }
 
