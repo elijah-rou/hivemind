@@ -44,6 +44,34 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Durable StartView adoption and bounded catch-up liveness
+
+What changed:
+- higher-view Prepare/Commit/StartView traffic cannot promote a replica directly; StartView adoption remains behind its durability barrier
+- validated StartView chains may supersede durable prepares strictly above the local committed prefix, while committed conflicts remain fail-closed
+- selection-bound RequestPrepare can serve an older target view from the exact retained source/LNV/tip identity; ordinary repair remains current-view only
+- without snapshots, retention floor is fixed at zero and all 1024 lifetime-capped log entries remain available for repair
+- active candidate fetch uses only its fixed candidate deadline instead of being preempted by the shorter recovered/view-change timeout
+- deterministic gate passed Debug and ReleaseFast, all 17 prior liveness seeds, and `1000 / 1000` mutated threaded seeds with zero failures
+
+Why it matters:
+- recovered and concurrently lagging replicas can finish a bounded selected-chain fetch instead of repeatedly advancing the view
+- durable speculative suffixes remain replaceable only through quorum-selected StartView validation and sync
+
+Progress:
+- POC acceptance remains `6 / 8` sections complete
+- warm-cache execution checklist remains `16 / 16`
+- live infra status remains `up`; no live infrastructure was changed for this deterministic fix
+
+Next:
+1. run the broader 10k mutated core gate before refreshing the durable-safety evidence claim
+2. keep snapshot/compaction work separate from the fail-closed 1024-op lifetime contract
+3. continue the clean EKS and private-registry benchmark follow-ups
+
+Blockers / unknowns:
+- snapshots and post-1024 operation remain unsupported
+- torn-write and power-loss durability remain unvalidated
+
 ### 2026-07-16 — Phase 2 single-source DVC selection and bound suffix repair
 
 What changed:

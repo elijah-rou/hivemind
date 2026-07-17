@@ -1162,6 +1162,30 @@ test "group commit: write failure publishes nothing" {
     try std.testing.expect(tc.replicas[0].storage_failed);
 }
 
+test "no-snapshot retention keeps ops 1 through 14 and floor zero across crash" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0x14F100);
+    defer tc.deinit();
+
+    for (0..14) |_| {
+        tc.request(0, .{ .noop = {} });
+        tc.tick();
+    }
+    tc.advance(10);
+    try std.testing.expectEqual(@as(msg.OpNumber, 14), tc.replicas[0].commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[0].retention_floor);
+    var op: msg.OpNumber = 1;
+    while (op <= 14) : (op += 1) {
+        try std.testing.expect(tc.replicas[0].journalHas(op));
+        try std.testing.expect(tc.disks[0].readSlot(replica_mod.journalSlot(op)) != null);
+    }
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 14), tc.replicas[0].op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[0].retention_floor);
+    op = 1;
+    while (op <= 14) : (op += 1) try std.testing.expect(tc.replicas[0].journalHas(op));
+}
+
 test "journal retention: log_full before overwrite and restart reconstructs state" {
     const tc = try TestCluster.init(std.testing.allocator, 1, 0x7E01);
     defer tc.deinit();
@@ -1445,6 +1469,44 @@ test "follower StartView slot metadata and sync failures preserve volatile coher
         try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
         try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
         try std.testing.expectEqual(before, tc.network.stats.sent[prepare_ok_tag]);
+    }
+}
+
+test "recovered concurrent laggards keep candidate past generic timeout" {
+    const tc = try TestCluster.init(std.testing.allocator, 5, 0xCA7D1DA7E);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var first = msg.LogEntry{ .view_number = 4, .op_number = 1, .client_id = 1, .request_id = 1 };
+    first.checksum = first.computeChecksum();
+    var second = msg.LogEntry{ .view_number = 4, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = first.checksum };
+    second.checksum = second.computeChecksum();
+    const sv = msg.StartViewMsg{
+        .view_number = 5,
+        .selected_last_normal_view = 4,
+        .op_number = 2,
+        .tip_checksum = second.checksum,
+        .commit_min = 0,
+    };
+
+    for ([_]usize{ 1, 2 }) |replica_index| {
+        const follower = tc.replicas[replica_index];
+        follower.status = .view_change;
+        follower.view_number = 5;
+        follower.recovered_from_disk = true;
+        follower.onMessage(0, .{ .start_view = sv });
+        try std.testing.expect(follower.pending_view_selection);
+        try std.testing.expect(!follower.pending_start_view.active);
+    }
+
+    tc.current_tick = 60;
+    for ([_]usize{ 1, 2 }) |replica_index| {
+        const follower = tc.replicas[replica_index];
+        follower.tick();
+        try std.testing.expectEqual(@as(msg.ViewNumber, 5), follower.view_number);
+        try std.testing.expect(follower.pending_view_selection);
+        try std.testing.expect(!follower.pending_start_view.active);
     }
 }
 
@@ -2042,7 +2104,59 @@ test "committed suffix outranks later-view speculative suffix" {
     try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.op_number);
 }
 
-test "one quorum-intersection durable prepare blocks conflicting selected source" {
+test "five rotating leaders replace speculative prepares with committed StartView chain" {
+    for (0..5) |leader_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 5, 0xC0A017 + leader_index);
+        defer tc.deinit();
+        const leader = tc.replicas[leader_index];
+        const target_view: msg.ViewNumber = 5 + leader_index;
+        leader.status = .view_change;
+        leader.view_number = target_view;
+
+        var committed = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 10, .request_id = 1 };
+        committed.checksum = committed.computeChecksum();
+        var speculative = msg.LogEntry{ .view_number = leader_index + 1, .op_number = 2, .client_id = 20 + leader_index, .request_id = 2, .parent_checksum = committed.checksum };
+        speculative.checksum = speculative.computeChecksum();
+        var selected = msg.LogEntry{ .view_number = 4, .op_number = 2, .client_id = 99, .request_id = 2, .parent_checksum = committed.checksum };
+        selected.checksum = selected.computeChecksum();
+        try std.testing.expect(speculative.checksum != selected.checksum);
+
+        leader.journalPut(committed);
+        leader.journalPut(speculative);
+        leader.op_number = 2;
+        leader.commit_min = 1;
+        leader.commit_max = 1;
+        leader.durable_prepare_op[replica_mod.journalSlot(1)] = 1;
+        leader.durable_prepare_checksum[replica_mod.journalSlot(1)] = committed.checksum;
+        leader.durable_prepare_op[replica_mod.journalSlot(2)] = 2;
+        leader.durable_prepare_checksum[replica_mod.journalSlot(2)] = speculative.checksum;
+
+        const source_id: u8 = @intCast((leader_index + 1) % 5);
+        const third_id: u8 = @intCast((leader_index + 2) % 5);
+        var source = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = source_id, .last_normal_view = 4, .op_number = 2, .commit_min = 1, .log_entry_count = 2 };
+        source.log_entries[0] = selected;
+        source.log_entries[1] = committed;
+        var local = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = @intCast(leader_index), .last_normal_view = 3, .op_number = 2, .commit_min = 1, .log_entry_count = 2 };
+        local.log_entries[0] = speculative;
+        local.log_entries[1] = committed;
+        var third = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = third_id, .last_normal_view = 2, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+        third.log_entries[0] = committed;
+
+        tc.deliver(@intCast(leader_index), @intCast(leader_index), .{ .do_view_change = local });
+        tc.deliver(@intCast(leader_index), third_id, .{ .do_view_change = third });
+        tc.deliver(@intCast(leader_index), source_id, .{ .do_view_change = source });
+
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(selected.checksum, leader.journalGet(2).?.checksum);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.commit_min);
+        leader.tick();
+        try std.testing.expectEqual(msg.Status.normal, leader.status);
+        try std.testing.expectEqual(target_view, leader.view_number);
+        try std.testing.expectEqual(selected.checksum, leader.journalGet(2).?.checksum);
+    }
+}
+
+test "validated StartView replaces conflicting uncommitted durable prepare and survives crash" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0x1A7E25EC7);
     defer tc.deinit();
     const leader = tc.replicas[0];
@@ -2069,10 +2183,17 @@ test "one quorum-intersection durable prepare blocks conflicting selected source
     tc.deliver(0, 1, .{ .do_view_change = source });
 
     try std.testing.expectEqual(msg.Status.view_change, leader.status);
-    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
-    try std.testing.expect(!leader.pending_view_selection);
-    try std.testing.expectEqual(prepared.checksum, leader.journalGet(1).?.checksum);
-    try std.testing.expectEqual(prepared.checksum, leader.durable_prepare_checksum[slot]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(conflicting.checksum, leader.journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(u64, 0), leader.durable_prepare_checksum[slot]);
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expectEqual(conflicting.checksum, leader.durable_prepare_checksum[slot]);
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].op_number);
+    try std.testing.expectEqual(conflicting.checksum, tc.replicas[0].journalGet(1).?.checksum);
 }
 
 test "incomplete selected suffix remains view_change and accepts only bound source repair" {
