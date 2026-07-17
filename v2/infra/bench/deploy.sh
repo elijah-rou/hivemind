@@ -30,7 +30,7 @@ mapfile -t PRIVATE_IPS < <("${TF[@]}" output -json private_ips | python3 -c "imp
 BENCH_ADDRS=$("${TF[@]}" output -raw bench_addrs)
 RUN_TOKEN="${HIVEMIND_BENCH_RUN_TOKEN:-$(date +%s)-$$-$RANDOM}"
 [[ "$RUN_TOKEN" =~ ^[A-Za-z0-9._-]{1,96}$ ]] || { echo "FAIL: invalid run token" >&2; exit 1; }
-PID_LIBRARY_B64="$(base64 < "$SCRIPT_DIR/pid_lifecycle.sh" | tr -d '\n')"
+SYSTEMD_LIBRARY_B64="$(base64 < "$SCRIPT_DIR/systemd_lifecycle.sh" | tr -d '\n')"
 
 NODE_COUNT=${#INSTANCE_IDS[@]}
 echo "deploying to $NODE_COUNT nodes: ${INSTANCE_IDS[*]}"
@@ -51,44 +51,36 @@ fi
 
 echo "uploaded binary to s3://$BUCKET"
 
-# Preserve each start command as a single line (commands contain spaces).
-mapfile -t START_COMMANDS < <("${TF[@]}" output -json start_commands | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
+# Preserve each argument vector as a single line. Terraform values contain no whitespace-bearing arguments.
+mapfile -t START_ARGS < <("${TF[@]}" output -json start_args | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 
-if [[ ${#START_COMMANDS[@]} -ne $NODE_COUNT ]]; then
-  echo "FAIL: start_commands count (${#START_COMMANDS[@]}) != node count ($NODE_COUNT)" >&2
+if [[ ${#START_ARGS[@]} -ne $NODE_COUNT ]]; then
+  echo "FAIL: start_args count (${#START_ARGS[@]}) != node count ($NODE_COUNT)" >&2
   exit 1
 fi
 
 declare -a COMMAND_IDS=()
 for i in $(seq 0 $((NODE_COUNT - 1))); do
   id="${INSTANCE_IDS[$i]}"
-  cmd="${START_COMMANDS[$i]}"
+  args="${START_ARGS[$i]}"
 
   echo "starting node $i on $id (${PRIVATE_IPS[$i]})"
 
   run_dir="/tmp/hivemind-runs/$RUN_TOKEN"
   run_binary="$run_dir/hivemind"
-  cmd="${cmd/\.\/hivemind/$run_binary}"
+  unit="hivemind-bench-node-$i.service"
   remote_script=$(cat <<EOF
 set -euo pipefail
-source /tmp/hivemind-pid-lifecycle.sh
-mkdir -p '$run_dir'
+source /tmp/hivemind-systemd-lifecycle.sh
+mkdir -m 700 -p '$run_dir' '/var/lib/hivemind/node-$i'
 aws s3 cp 's3://$BUCKET/hivemind' '$run_binary' --region '$REGION'
 chmod 700 '$run_binary'
 exec 9>/tmp/hivemind-launch.lock
 flock -x 9
-hivemind_stop_verified /tmp/hivemind-current.pid /tmp/hivemind-runs
-cd /tmp
-nohup $cmd > '$run_dir/hivemind.log' 2>&1 &
-pid=\$!
-hivemind_write_pid_state /tmp/hivemind-current.pid "\$pid" '$RUN_TOKEN' '$run_binary'
-sleep 3
-read -r recorded_pid recorded_start recorded_exe recorded_token < /tmp/hivemind-current.pid
-actual=\$(readlink "/proc/\$pid/exe" 2>/dev/null || true)
-actual_start=\$(hivemind_proc_start_time "\$pid" /proc 2>/dev/null || true)
-[[ "\$recorded_pid \$recorded_start \$recorded_exe \$recorded_token" == "\$pid \$actual_start $run_binary $RUN_TOKEN" ]] || { echo 'FAILED TO START'; exit 1; }
-[[ "\$actual" == '$run_binary' ]] || { echo 'FAILED TO START'; exit 1; }
-echo 'hivemind running'
+hivemind_unit_stop_verified '$unit'
+read -r -a node_args <<< '$args'
+hivemind_unit_start_verified '$unit' '$run_binary' "\${node_args[@]}"
+echo 'hivemind running as $unit'
 EOF
 )
   remote_script_b64="$(printf '%s' "$remote_script" | base64 | tr -d '\n')"
@@ -97,8 +89,8 @@ EOF
     --instance-ids "$id" \
     --document-name "AWS-RunShellScript" \
     --parameters commands="[
-      \"printf '%s' '$PID_LIBRARY_B64' | base64 -d > /tmp/hivemind-pid-lifecycle.sh\",
-      \"chmod 700 /tmp/hivemind-pid-lifecycle.sh\",
+      \"printf '%s' '$SYSTEMD_LIBRARY_B64' | base64 -d > /tmp/hivemind-systemd-lifecycle.sh\",
+      \"chmod 700 /tmp/hivemind-systemd-lifecycle.sh\",
       \"printf '%s' '$remote_script_b64' | base64 -d | bash\",
       \"aws s3 cp s3://$BUCKET/bench /tmp/bench --region $REGION 2>/dev/null || true\",
       \"chmod +x /tmp/bench 2>/dev/null || true\"

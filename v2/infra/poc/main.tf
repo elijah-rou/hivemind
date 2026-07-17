@@ -189,6 +189,7 @@ resource "aws_instance" "worker_cpu" {
   user_data = base64encode(templatefile("${path.module}/worker-init.sh", {
     replica_addr   = ""
     encryption_key = var.encryption_key
+    http_helper    = file("${path.module}/http.sh")
   }))
 
   tags = {
@@ -213,6 +214,7 @@ resource "aws_instance" "worker_gpu" {
   user_data = base64encode(templatefile("${path.module}/worker-init.sh", {
     replica_addr   = ""
     encryption_key = var.encryption_key
+    http_helper    = file("${path.module}/http.sh")
   }))
 
   tags = {

@@ -273,10 +273,11 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (branch evidence; no new live durability run):**
-- 176 Zig unit tests passing (`zig test src/unit_tests.zig -lc`)
-- `zig build test` / ReleaseFast suites used on prior branch commits
+- 262 Zig unit tests passing in Debug and ReleaseFast (`zig test src/unit_tests.zig -lc`); `zig build test` passes
+- Go API tests and race tests pass; API and bench builds pass
 - local smoke: `16 passed, 0 failed` (`tests/local-smoke.sh`)
 - local failover smoke: PASS (`tests/local-failover-smoke.sh`)
+- `tests/run-all.sh`: 15/17 phases pass; containerd-in-Docker is blocked by nested overlay mount `EINVAL`, unrelated to this diff; its SSM fixture was subsequently updated and passes standalone
 - storage-mode smoke: volatile + experimental-journal startup contract (`tests/storage_mode_smoke_test.sh`)
 - launcher contract: stale smoke wrappers + bench/infra paths (`tests/launcher_contract_test.sh`)
 - Acceptance counts unchanged: `6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack; live infra status remains `up` from prior entries (no new live evidence in this docs pass)

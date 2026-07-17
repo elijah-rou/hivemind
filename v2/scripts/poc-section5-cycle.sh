@@ -9,6 +9,8 @@ set -euo pipefail
 #   SSH_KEY=$HOME/.ssh/id_ed25519 DESTROY_HIVEMIND_AFTER=true bash scripts/poc-section5-cycle.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../infra/poc/http.sh
+source "$ROOT_DIR/infra/poc/http.sh"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc}"

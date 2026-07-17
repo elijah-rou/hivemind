@@ -394,13 +394,10 @@ case_deploy_dead_process_fail_closed() {
     return 1
   fi
   grep -q 'terminal status=Failed' "$TMP_DIR/dead.err"
-  # Deploy remote check must exit nonzero on dead process (not echo-success).
-  if grep -qE "kill -0.*\|\| echo 'FAILED TO START'" "$DEPLOY"; then
-    echo "deploy still echo-succeeds on dead process" >&2
-    return 1
-  fi
-  grep -q 'exit 1' "$DEPLOY"
-  grep -q 'FAILED TO START' "$DEPLOY"
+  # Managed service start must verify active state and propagate failure.
+  grep -q 'hivemind_unit_start_verified' "$DEPLOY"
+  grep -q 'systemctl is-active --quiet' "$(dirname "$DEPLOY")/systemd_lifecycle.sh"
+  grep -q 'return 1' "$(dirname "$DEPLOY")/systemd_lifecycle.sh"
 }
 
 case_online_eventual_success() {
@@ -459,10 +456,10 @@ else
   else
     pass "deploy.sh does not background send-command CommandId capture"
   fi
-  if grep -q 'mapfile[[:space:]]\+-t[[:space:]]\+START_COMMANDS' "$DEPLOY"; then
-    pass "deploy.sh preserves mapfile START_COMMANDS"
+  if grep -q 'mapfile[[:space:]]\+-t[[:space:]]\+START_ARGS' "$DEPLOY"; then
+    pass "deploy.sh preserves mapfile START_ARGS"
   else
-    fail "deploy.sh must keep mapfile START_COMMANDS"
+    fail "deploy.sh must keep mapfile START_ARGS"
   fi
 fi
 

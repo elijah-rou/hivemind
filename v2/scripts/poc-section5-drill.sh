@@ -14,6 +14,8 @@ set -euo pipefail
 #   SECTION5_TIMEOUT_SECONDS=900 CPU_IMAGE=... bash scripts/poc-section5-drill.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../infra/poc/http.sh
+source "$ROOT_DIR/infra/poc/http.sh"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 GPU_TYPE="${GPU_TYPE:-t4}"

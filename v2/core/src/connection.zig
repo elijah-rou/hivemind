@@ -298,21 +298,24 @@ pub const ConnectionManager = struct {
     fn dispatchWorkerMessage(self: *ConnectionManager, worker: *Conn, tag_byte: u8, payload: []const u8) void {
         switch (tag_byte) {
             @intFromEnum(msg.WorkerTag.register) => {
-                const register = parseWorkerRegister(payload) orelse return;
+                const register = parseWorkerRegister(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerRegister(worker.worker_idx, register);
             },
             @intFromEnum(msg.WorkerTag.heartbeat) => {
-                if (payload.len < 23) return;
-                var heartbeat = msg.WorkerHeartbeatMsg{};
-                heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-                heartbeat.cpu_usage_pct = payload[8];
-                heartbeat.memory_used_mb = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[9..13]));
-                heartbeat.gpu_utilization = payload[13..21].*;
-                heartbeat.pods_running = std.mem.littleToNative(u16, std.mem.bytesToValue(u16, payload[21..23]));
+                const heartbeat = parseWorkerHeartbeat(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerHeartbeat(worker.worker_idx, heartbeat);
             },
             @intFromEnum(msg.WorkerTag.pod_status) => {
-                const status = parseWorkerPodStatus(payload) orelse return;
+                const status = parseWorkerPodStatus(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerPodStatus(worker.worker_idx, status);
             },
             @intFromEnum(msg.WorkerTag.run_response) => {
@@ -1368,7 +1371,7 @@ pub const ConnectionManager = struct {
 
     fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
         // Wire size is 138 (packed), not @sizeOf which includes alignment padding
-        if (payload.len < 138) return null;
+        if (payload.len != 138) return null;
         const gpu_type = msg.enumFromIntChecked(msg.GpuType, payload[72]) catch return null;
         var register = msg.WorkerRegisterMsg{};
         register.hostname = payload[0..64].*;
@@ -1381,8 +1384,19 @@ pub const ConnectionManager = struct {
         return register;
     }
 
+    fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
+        if (payload.len != 23) return null;
+        var heartbeat = msg.WorkerHeartbeatMsg{};
+        heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        heartbeat.cpu_usage_pct = payload[8];
+        heartbeat.memory_used_mb = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[9..13]));
+        heartbeat.gpu_utilization = payload[13..21].*;
+        heartbeat.pods_running = std.mem.littleToNative(u16, std.mem.bytesToValue(u16, payload[21..23]));
+        return heartbeat;
+    }
+
     fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
-        if (payload.len < 150) return null;
+        if (payload.len != 150) return null;
         const old_phase = msg.enumFromIntChecked(msg.PodPhase, payload[8]) catch return null;
         const new_phase = msg.enumFromIntChecked(msg.PodPhase, payload[9]) catch return null;
         var status = msg.WorkerPodStatusMsg{};
@@ -3062,5 +3076,69 @@ test "handleRunRequest enforces exact declared payload length" {
             try std.testing.expectEqual(@as(u8, 0x23), err_buf[7]);
             try std.testing.expectEqual(tc.expect_status.?, err_buf[16]);
         }
+    }
+}
+
+test "fixed worker payload parsers reject trailing bytes and accept exact frames" {
+    var register: [138]u8 = std.mem.zeroes([138]u8);
+    register[72] = @intFromEnum(msg.GpuType.none);
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&register) != null);
+    var register_trailing: [139]u8 = std.mem.zeroes([139]u8);
+    register_trailing[72] = @intFromEnum(msg.GpuType.none);
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&register_trailing) == null);
+
+    var heartbeat: [23]u8 = std.mem.zeroes([23]u8);
+    try std.testing.expect(ConnectionManager.parseWorkerHeartbeat(&heartbeat) != null);
+    var heartbeat_trailing: [24]u8 = std.mem.zeroes([24]u8);
+    try std.testing.expect(ConnectionManager.parseWorkerHeartbeat(&heartbeat_trailing) == null);
+
+    var pod_status: [150]u8 = std.mem.zeroes([150]u8);
+    pod_status[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&pod_status) != null);
+    var pod_status_trailing: [151]u8 = std.mem.zeroes([151]u8);
+    pod_status_trailing[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status_trailing[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&pod_status_trailing) == null);
+}
+
+test "trailing fixed worker frames disconnect sender and release correlations" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(97531);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(97531, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(97531);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+
+    var register: [139]u8 = std.mem.zeroes([139]u8);
+    register[72] = @intFromEnum(msg.GpuType.none);
+    var heartbeat: [24]u8 = std.mem.zeroes([24]u8);
+    var pod_status: [151]u8 = std.mem.zeroes([151]u8);
+    pod_status[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status[9] = @intFromEnum(msg.PodPhase.running);
+    const cases = [_]struct { tag: msg.WorkerTag, payload: []const u8 }{
+        .{ .tag = .register, .payload = &register },
+        .{ .tag = .heartbeat, .payload = &heartbeat },
+        .{ .tag = .pod_status, .payload = &pod_status },
+    };
+    for (cases, 0..) |case, index| {
+        cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
+        replica.workers[0].connected = true;
+        _ = cm.request_queue.trackInFlightForWorker(@intCast(index + 1), 77, 0).?;
+        cm.dispatchWorkerMessage(&cm.workers[0], @intFromEnum(case.tag), case.payload);
+        try std.testing.expect(!cm.workers[0].connected);
+        try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
     }
 }

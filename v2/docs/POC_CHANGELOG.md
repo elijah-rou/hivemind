@@ -44,6 +44,22 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Static safety findings closed at process and HTTP boundaries
+
+What changed:
+- bench deploy now serializes replacements and manages one transient systemd unit per node; bounded stop and inactive-state verification precede each `systemd-run`, with journal/status diagnostics on failure and no raw PID signaling
+- metrics listener initialization treats both `F_GETFL` and `F_SETFL` failures as fatal and closes the new descriptor
+- JSON mutation endpoints enforce endpoint-specific body limits, exact single-value decoding, wire string/array maxima, and stable 400/413 errors
+- active POC curl callers cross one connect/max-time helper while retaining narrower operation deadlines
+- fixed worker register, heartbeat, and pod-status payloads require exact lengths; malformed frames disconnect the sender and release its request correlations
+
+Why it matters:
+- removes PID-reuse/process replacement risk and prevents unbounded or ambiguous input at network boundaries without changing the POC architecture
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps: independent review, then live validation only when explicitly scheduled. Live infra status remains `up` from prior runs and was not touched.
+
 ### 2026-07-16 — Static safety gate follow-up: retries, dedup, statuses, launch PID, and nonblocking sockets
 
 What changed:

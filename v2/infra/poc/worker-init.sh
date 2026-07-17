@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+${http_helper}
+
 # Hivemind worker cloud-init script
 # Binaries are uploaded later by deploy.sh.
 #

@@ -10,6 +10,31 @@ const libc = struct {
     extern "c" fn close(fd: c_int) c_int;
 };
 
+const InitSyscalls = struct {
+    context: ?*anyopaque = null,
+    socket_fn: *const fn (?*anyopaque) c_int,
+    fcntl_fn: *const fn (?*anyopaque, c_int, c_int, c_int) c_int,
+    close_fn: *const fn (?*anyopaque, c_int) void,
+
+    fn productionSocket(_: ?*anyopaque) c_int {
+        return libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    }
+
+    fn productionFcntl(_: ?*anyopaque, fd: c_int, command: c_int, argument: c_int) c_int {
+        return std.c.fcntl(fd, command, argument);
+    }
+
+    fn productionClose(_: ?*anyopaque, fd: c_int) void {
+        _ = libc.close(fd);
+    }
+
+    const production = InitSyscalls{
+        .socket_fn = productionSocket,
+        .fcntl_fn = productionFcntl,
+        .close_fn = productionClose,
+    };
+};
+
 const BUF_SIZE = 65536;
 const REQUEST_SIZE_MAX = 1024;
 const RESPONSE_SIZE_MAX = BUF_SIZE + 256;
@@ -42,13 +67,23 @@ pub const MetricsServer = struct {
     clients: [CLIENT_COUNT_MAX]MetricsClient = [_]MetricsClient{.{}} ** CLIENT_COUNT_MAX,
 
     pub fn init(port: u16, replica: *replica_mod.Replica) !MetricsServer {
-        const fd = libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        return initWithSyscalls(port, replica, InitSyscalls.production);
+    }
+
+    fn initWithSyscalls(port: u16, replica: *replica_mod.Replica, syscalls: InitSyscalls) !MetricsServer {
+        const fd = syscalls.socket_fn(syscalls.context);
         if (fd < 0) return error.SocketCreateFailed;
 
-        // Set non-blocking
-        const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+        const flags = syscalls.fcntl_fn(syscalls.context, fd, std.posix.F.GETFL, 0);
+        if (flags < 0) {
+            syscalls.close_fn(syscalls.context, fd);
+            return error.GetFlagsFailed;
+        }
         const O_NONBLOCK: c_int = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
-        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
+        if (syscalls.fcntl_fn(syscalls.context, fd, std.posix.F.SETFL, flags | O_NONBLOCK) < 0) {
+            syscalls.close_fn(syscalls.context, fd);
+            return error.SetFlagsFailed;
+        }
 
         const optval: u32 = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&optval), @sizeOf(u32));
@@ -581,6 +616,55 @@ pub const MetricsServer = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+const FcntlFailureFixture = struct {
+    fail_command: c_int,
+    close_count: usize = 0,
+    closed_fd: c_int = -1,
+
+    fn socket(context: ?*anyopaque) c_int {
+        _ = context;
+        return 41;
+    }
+
+    fn fcntl(context: ?*anyopaque, _: c_int, command: c_int, _: c_int) c_int {
+        const self: *FcntlFailureFixture = @ptrCast(@alignCast(context.?));
+        if (command == self.fail_command) return -1;
+        return 0;
+    }
+
+    fn close(context: ?*anyopaque, fd: c_int) void {
+        const self: *FcntlFailureFixture = @ptrCast(@alignCast(context.?));
+        self.close_count += 1;
+        self.closed_fd = fd;
+    }
+
+    fn syscalls(self: *FcntlFailureFixture) InitSyscalls {
+        return .{ .context = self, .socket_fn = socket, .fcntl_fn = fcntl, .close_fn = close };
+    }
+};
+
+test "metrics init closes listener when F_GETFL fails" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 37);
+    defer tc.deinit();
+    var fixture = FcntlFailureFixture{ .fail_command = std.posix.F.GETFL };
+
+    try std.testing.expectError(error.GetFlagsFailed, MetricsServer.initWithSyscalls(9200, tc.replicas[0], fixture.syscalls()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.close_count);
+    try std.testing.expectEqual(@as(c_int, 41), fixture.closed_fd);
+}
+
+test "metrics init closes listener when F_SETFL fails" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 41);
+    defer tc.deinit();
+    var fixture = FcntlFailureFixture{ .fail_command = std.posix.F.SETFL };
+
+    try std.testing.expectError(error.SetFlagsFailed, MetricsServer.initWithSyscalls(9200, tc.replicas[0], fixture.syscalls()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.close_count);
+    try std.testing.expectEqual(@as(c_int, 41), fixture.closed_fd);
+}
 
 test "metrics write helper" {
     var buf: [BUF_SIZE]u8 = undefined;

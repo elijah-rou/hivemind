@@ -12,6 +12,46 @@ import (
 	"strings"
 )
 
+const (
+	createDeploymentJSONMax = 6*(64+256+128+64+256) + 512
+	updateDeploymentJSONMax = 6*256 + 256
+	scaleDeploymentJSONMax  = 64
+	trafficSplitJSONMax     = 256
+)
+
+func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("json body exceeds max %d bytes", limit))
+		} else {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		}
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: multiple JSON values")
+		} else {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("json body exceeds max %d bytes", limit))
+			} else {
+				writeErr(w, http.StatusBadRequest, "invalid json: trailing data: "+err.Error())
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func stringFitsWire(value string, maximum int) bool {
+	return len(value) <= maximum
+}
+
 func writeFixedStr(dst []byte, s string) {
 	n := copy(dst, s)
 	if n < len(dst) {
@@ -68,8 +108,7 @@ func handleCreateDeployment(client *HivemindClient, latency *LatencyRecorder) ht
 		handlerStart := nowWallMS()
 		var req request
 		decodeStart := nowWallMS()
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, createDeploymentJSONMax) {
 			return
 		}
 		decodeEnd := nowWallMS()
@@ -82,6 +121,12 @@ func handleCreateDeployment(client *HivemindClient, latency *LatencyRecorder) ht
 		}
 		if req.Image == "" {
 			writeErr(w, http.StatusBadRequest, "image is required")
+			return
+		}
+		if !stringFitsWire(req.Name, 64) || !stringFitsWire(req.Image, 256) ||
+			!stringFitsWire(req.ImagePullRegistry, 128) || !stringFitsWire(req.ImagePullUsername, 64) ||
+			!stringFitsWire(req.ImagePullPassword, 256) {
+			writeErr(w, http.StatusBadRequest, "string field exceeds wire maximum")
 			return
 		}
 		if req.Replicas == 0 {
@@ -281,12 +326,15 @@ func handleUpdateDeployment(client *HivemindClient) http.HandlerFunc {
 		}
 
 		var req request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, updateDeploymentJSONMax) {
 			return
 		}
 		if req.Image == "" {
 			writeErr(w, http.StatusBadRequest, "image is required")
+			return
+		}
+		if !stringFitsWire(req.Image, 256) {
+			writeErr(w, http.StatusBadRequest, "image exceeds wire maximum 256 bytes")
 			return
 		}
 
@@ -336,8 +384,7 @@ func handleScaleDeployment(client *HivemindClient, latency *LatencyRecorder) htt
 
 		var req request
 		decodeStart := nowWallMS()
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, scaleDeploymentJSONMax) {
 			return
 		}
 		decodeEnd := nowWallMS()
@@ -398,8 +445,7 @@ func handleSetTrafficSplit(client *HivemindClient) http.HandlerFunc {
 		}
 
 		var req request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, trafficSplitJSONMax) {
 			return
 		}
 

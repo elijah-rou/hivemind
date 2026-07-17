@@ -96,9 +96,13 @@ echo "==> infra/bench/deploy.sh contract"
 assert_file "$DEPLOY"
 assert_contains "$DEPLOY" 'SCRIPT_DIR='
 assert_contains "$DEPLOY" 'SCRIPT_DIR/.*/core/zig-out/bin/hivemind|\$\{SCRIPT_DIR\}/.*/hivemind'
-# Word-splitting START_COMMANDS=($(...)) breaks commands with spaces.
-assert_lacks "$DEPLOY" 'START_COMMANDS=\(\$\('
-assert_contains "$DEPLOY" 'mapfile[[:space:]]+-t[[:space:]]+START_COMMANDS'
+# Terraform arguments remain line-preserved and the remote launch is serialized.
+assert_lacks "$DEPLOY" 'START_ARGS=\(\$\('
+assert_contains "$DEPLOY" 'mapfile[[:space:]]+-t[[:space:]]+START_ARGS'
+assert_contains "$DEPLOY" 'flock[[:space:]]+-x'
+assert_contains "$DEPLOY" 'hivemind_unit_stop_verified'
+assert_contains "$DEPLOY" 'hivemind_unit_start_verified'
+assert_lacks "$DEPLOY" 'pid_lifecycle|nohup|kill[[:space:]]+-'
 # Terraform must be caller-CWD independent.
 assert_contains "$DEPLOY" '-chdir="\$SCRIPT_DIR"|-chdir=\$SCRIPT_DIR'
 # Broad pkill must not appear in this launcher.

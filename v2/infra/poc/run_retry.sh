@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Shared fail-closed /run retry helper. Source this file; do not execute it.
 
+_HIVEMIND_POC_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$_HIVEMIND_POC_HELPER_DIR/http.sh"
+unset _HIVEMIND_POC_HELPER_DIR
+
 hivemind_run_with_retry() {
     local name="$1" url="$2" payload_arg="$3" expected="$4"
     local attempts="${5:-12}" delay="${6:-5}" out_file="${7:-}"
@@ -36,8 +41,12 @@ hivemind_run_with_retry() {
             if [[ -n "$out_file" ]]; then
                 cp "$body_file" "$out_file"
             fi
+            # Outputs are consumed by scripts that source this helper.
+            # shellcheck disable=SC2034
             HIVEMIND_RUN_BODY="$(cat "$body_file")"
+            # shellcheck disable=SC2034
             HIVEMIND_RUN_TIME="$time_total"
+            # shellcheck disable=SC2034
             HIVEMIND_RUN_HTTP_STATUS="$http_code"
             echo "run ready: $name attempt=$i"
             rm -rf "$work_dir"

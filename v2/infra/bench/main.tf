@@ -140,11 +140,11 @@ output "peers_flag" {
   ]
 }
 
-output "start_commands" {
-  description = "Commands to start each hivemind node"
+output "start_args" {
+  description = "Arguments passed directly to each managed Hivemind service"
   value = [
     for i in range(local.node_count) :
-    "mkdir -m 700 -p /var/lib/hivemind && ./hivemind --node-id ${i} --replica-count ${local.node_count} --worker-port ${local.agent_base_port + i} --client-port ${local.client_base_port + i} --replica-port ${local.replica_base_port + i} --peers '${join(",", [for j in range(local.node_count) : "${j}@${aws_instance.node[j].private_ip}:${local.replica_base_port + j}" if j != i])}' --data-dir /var/lib/hivemind"
+    "--node-id ${i} --replica-count ${local.node_count} --worker-port ${local.agent_base_port + i} --client-port ${local.client_base_port + i} --replica-port ${local.replica_base_port + i} --peers ${join(",", [for j in range(local.node_count) : "${j}@${aws_instance.node[j].private_ip}:${local.replica_base_port + j}" if j != i])} --data-dir /var/lib/hivemind/node-${i}"
   ]
 }
 

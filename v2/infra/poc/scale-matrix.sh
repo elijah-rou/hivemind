@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=http.sh
+source "$SCRIPT_DIR/http.sh"
+
 # Hivemind scale benchmark matrix with phase timing.
 # Scenarios:
 #   1. one deployment: 0 -> 50 -> 1

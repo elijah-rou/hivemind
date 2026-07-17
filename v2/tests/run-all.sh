@@ -67,8 +67,8 @@ run_phase "Launcher contract (smoke/bench/infra)" \
 # --- Phase 4d: Bench deploy SSM wait fixtures (stub aws, no live AWS) ---
 run_phase "Bench deploy SSM wait fixtures" \
     bash -c "'$SCRIPT_DIR/deploy_ssm_wait_test.sh'"
-run_phase "Bench PID lifecycle fixtures" \
-    bash -c "'$SCRIPT_DIR/bench_pid_lifecycle_test.sh'"
+run_phase "Bench systemd lifecycle fixtures" \
+    bash -c "'$SCRIPT_DIR/bench_systemd_lifecycle_test.sh'"
 
 # --- Phase 4e: GPU-test cleanup trap fixture (stub terraform, no live infra) ---
 run_phase "GPU-test cleanup trap fixture" \
@@ -81,6 +81,8 @@ run_phase "Active docs layout path contract" \
 # --- Phase 4g: Shared /run retry safety fixtures + active caller coverage ---
 run_phase "Run retry fixtures" \
     bash -c "'$SCRIPT_DIR/run_retry_test.sh'"
+run_phase "Shared bounded HTTP fixtures" \
+    bash -c "'$SCRIPT_DIR/http_helper_test.sh'"
 
 run_phase "Operator workflow retry fixtures" \
     bash -c "'$SCRIPT_DIR/operator_workflow_retry_test.sh'"
