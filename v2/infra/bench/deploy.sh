@@ -38,16 +38,7 @@ echo "deploying to $NODE_COUNT nodes: ${INSTANCE_IDS[*]}"
 # Wait for SSM to be ready on all instances
 echo "waiting for SSM..."
 for id in "${INSTANCE_IDS[@]}"; do
-  for i in $(seq 1 30); do
-    status=$(aws ssm describe-instance-information --region "$REGION" \
-      --filters "Key=InstanceIds,Values=$id" \
-      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
-    if [[ "$status" == "Online" ]]; then
-      echo "  $id: online"
-      break
-    fi
-    sleep 5
-  done
+  hivemind_ssm_wait_online "$REGION" "$id"
 done
 
 # Upload binary to each instance via S3 (SSM can't do direct file transfer easily)
@@ -99,7 +90,7 @@ EOF
 )
   remote_script_b64="$(printf '%s' "$remote_script" | base64 | tr -d '\n')"
 
-  cmd_id=$(aws ssm send-command --region "$REGION" \
+  cmd_id=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
     --instance-ids "$id" \
     --document-name "AWS-RunShellScript" \
     --parameters commands="[

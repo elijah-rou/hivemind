@@ -439,7 +439,7 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             pos += 2;
             let gpu_count = payload[pos];
             pos += 1;
-            let gpu_type = u8_to_gpu_type(payload[pos]);
+            let gpu_type = u8_to_gpu_type(payload[pos])?;
             pos += 1;
             let cpu_millicores = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
@@ -472,7 +472,7 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
                 pos += 64;
                 let value = fixed_to_string(&payload[pos..pos + 256]);
                 pos += 256;
-                let is_secret_ref = payload[pos] != 0;
+                let is_secret_ref = decode_bool(payload[pos], "StartPod env secret flag")?;
                 pos += 1;
                 env_vars.push(EnvEntry {
                     name,
@@ -502,7 +502,8 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
                 pos += 64;
                 image_pull_password = fixed_to_string(&payload[pos..pos + 256]);
                 pos += 256;
-                image_pull_password_is_secret = payload[pos] != 0;
+                image_pull_password_is_secret =
+                    decode_bool(payload[pos], "StartPod image pull secret flag")?;
                 pos += 1;
             }
             if pos != payload.len() {
@@ -608,12 +609,32 @@ fn fixed_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
-fn u8_to_gpu_type(v: u8) -> GpuType {
-    // SAFETY: GpuType is repr(u8) with values 0-8
-    if v <= 8 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        GpuType::None
+fn decode_bool(value: u8, field: &'static str) -> io::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} must be 0 or 1, got {value}"),
+        )),
+    }
+}
+
+fn u8_to_gpu_type(v: u8) -> io::Result<GpuType> {
+    match v {
+        0 => Ok(GpuType::None),
+        1 => Ok(GpuType::A100_40),
+        2 => Ok(GpuType::A100_80),
+        3 => Ok(GpuType::H100Sxm),
+        4 => Ok(GpuType::H100Pcie),
+        5 => Ok(GpuType::H200),
+        6 => Ok(GpuType::L40s),
+        7 => Ok(GpuType::A10g),
+        8 => Ok(GpuType::T4),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid StartPod GPU type: {v}"),
+        )),
     }
 }
 
@@ -1201,10 +1222,46 @@ mod tests {
     #[test]
     fn gpu_type_round_trip() {
         for v in 0u8..=8 {
-            let gt = u8_to_gpu_type(v);
+            let gt = u8_to_gpu_type(v).unwrap();
             assert_eq!(gt as u8, v);
         }
-        assert_eq!(u8_to_gpu_type(99), GpuType::None);
+        assert_eq!(
+            u8_to_gpu_type(99).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn decode_start_pod_rejects_noncanonical_scalars() {
+        let mut invalid_gpu =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 9, 1, 1, "", "", "", &[]);
+        let err = decode_control_message(MSG_START_POD, &invalid_gpu).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut invalid_env_flag = build_start_pod_payload(
+            1,
+            2,
+            "img",
+            "",
+            0,
+            0,
+            0,
+            1,
+            1,
+            "",
+            "",
+            "",
+            &[("TOKEN".into(), "value".into(), false)],
+        );
+        invalid_env_flag[797 + 64 + 256] = 2;
+        let err = decode_control_message(MSG_START_POD, &invalid_env_flag).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        invalid_gpu[531] = 0;
+        append_start_pod_registry_trailer(&mut invalid_gpu, "registry", "user", "secret", false);
+        *invalid_gpu.last_mut().unwrap() = 2;
+        let err = decode_control_message(MSG_START_POD, &invalid_gpu).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

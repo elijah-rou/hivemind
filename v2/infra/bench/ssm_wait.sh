@@ -41,6 +41,33 @@ hivemind_ssm_aws() {
     timeout --signal=KILL "$remaining" aws "$@"
 }
 
+hivemind_ssm_wait_online() {
+  local region="$1" instance_id="$2" status="" start deadline remaining sleep_for
+  [[ -n "$region" && -n "$instance_id" ]] || { echo "FAIL: region and instance_id are required" >&2; return 1; }
+  hivemind_ssm_assert_poll_bounds || return 1
+  start="$(hivemind_ssm_now)"
+  deadline=$((start + SSM_POLL_TIMEOUT_SEC))
+  while true; do
+    remaining="$(hivemind_ssm_remaining "$deadline")"
+    (( remaining > 0 )) || break
+    status="$(hivemind_ssm_aws "$remaining" ssm describe-instance-information --region "$region" \
+      --filters "Key=InstanceIds,Values=$instance_id" \
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+    [[ "$status" == "Online" ]] && { echo "  $instance_id: online"; return 0; }
+    sleep_for=$SSM_POLL_INTERVAL_SEC
+    (( sleep_for <= remaining )) || sleep_for=$remaining
+    sleep "$sleep_for"
+  done
+  echo "FAIL: SSM instance never Online after ${SSM_POLL_TIMEOUT_SEC}s instance_id=$instance_id status=${status:-unknown}" >&2
+  return 1
+}
+
+hivemind_ssm_send_command() {
+  local remaining="$1"
+  shift
+  hivemind_ssm_aws "$remaining" ssm send-command "$@"
+}
+
 hivemind_ssm_dump_invocation() {
   local region="$1" command_id="$2" instance_id="$3" remaining="${4:-0}"
   echo "--- SSM invocation diagnostics ---" >&2

@@ -30,7 +30,10 @@ case "$RUN_RETRY_SCENARIO:$count" in
     transport:1) exit 7 ;;
     ambiguous:1) printf '%s' '{"error":"outcome_ambiguous","status":5}' > "$out"; printf '502 0.01\n' ;;
     forwarding:1) printf '%s' '{"error":"forwarding_failed","status":6}' > "$out"; printf '502 0.01\n' ;;
-    no_pod:1) printf '%s' '{"error":"no_running_pod","status":7}' > "$out"; printf '503 0.01\n' ;;
+    no_pod_then_success:1) printf '%s' '{"error":"no_running_pod","status":7}' > "$out"; printf '503 0.01\n' ;;
+    no_pod_then_success:2) printf '%s' '{"model":"ok"}' > "$out"; printf '200 0.02\n' ;;
+    invalid:1) printf '%s' '{"error":"invalid_payload","status":3}' > "$out"; printf '400 0.01\n' ;;
+    overflow:1) printf '%s' '{"error":"response_too_large","status":4}' > "$out"; printf '502 0.01\n' ;;
     malformed:1) printf '%s' 'not-json' > "$out"; printf '503 0.01\n' ;;
     *) echo "unexpected scenario=$RUN_RETRY_SCENARIO count=$count" >&2; exit 98 ;;
 esac
@@ -58,7 +61,9 @@ run_case queue_full_then_success 0 2
 run_case transport 1 1
 run_case ambiguous 1 1
 run_case forwarding 1 1
-run_case no_pod 1 1
+run_case no_pod_then_success 0 2
+run_case invalid 1 1
+run_case overflow 1 1
 run_case malformed 1 1
 
 for caller in \

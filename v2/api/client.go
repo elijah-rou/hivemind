@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -367,7 +368,11 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 	// From this boundary onward, resending could execute the request twice.
 	if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
 		c.closeLocked()
-		return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+		var writeErr *frameWriteError
+		if errors.As(err, &writeErr) && writeErr.attempted {
+			return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+		}
+		return nil, fmt.Errorf("%w: send failed before write: %v", ErrRunUnavailable, err)
 	}
 
 	buf := make([]byte, 65536)
@@ -446,12 +451,50 @@ func (c *HivemindClient) Leader() string {
 // Wire helpers
 
 const ProtocolVersion uint16 = 1
+const frameWriteTimeout = 2 * time.Second
+
+type frameWriteError struct {
+	attempted bool
+	err       error
+}
+
+func (e *frameWriteError) Error() string { return e.err.Error() }
+func (e *frameWriteError) Unwrap() error { return e.err }
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n < 0 || n > len(data) {
+			return &frameWriteError{attempted: true, err: fmt.Errorf("invalid write count %d for %d bytes", n, len(data))}
+		}
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return &frameWriteError{attempted: true, err: err}
+		}
+		if n == 0 {
+			return &frameWriteError{attempted: true, err: io.ErrShortWrite}
+		}
+	}
+	return nil
+}
 
 func writeFrame(conn net.Conn, tag byte, payload []byte) error {
 	return writeFrameEncrypted(conn, tag, payload, nil)
 }
 
-func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *CryptoState) error {
+func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *CryptoState) (err error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(frameWriteTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	attempted := false
+	defer func() {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); clearErr != nil && err == nil {
+			err = &frameWriteError{attempted: attempted, err: fmt.Errorf("clear write deadline: %w", clearErr)}
+		}
+	}()
+
 	// Build inner: [version(2)][tag(1)][payload...]
 	inner := make([]byte, 2+1+len(payload))
 	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
@@ -472,11 +515,11 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 			return err
 		}
 
-		if _, err := conn.Write(header); err != nil {
+		attempted = true
+		if err := writeAll(conn, header); err != nil {
 			return err
 		}
-		_, err = conn.Write(encrypted)
-		return err
+		return writeAll(conn, encrypted)
 	}
 
 	frameLen := uint32(1 + len(inner)) // flags + inner
@@ -484,11 +527,11 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 	binary.LittleEndian.PutUint32(header[0:4], frameLen)
 	header[4] = 0x00 // plaintext
 
-	if _, err := conn.Write(header); err != nil {
+	attempted = true
+	if err := writeAll(conn, header); err != nil {
 		return err
 	}
-	_, err := conn.Write(inner)
-	return err
+	return writeAll(conn, inner)
 }
 
 // probeIsLeader sends a read-only cluster_state_request and returns whether

@@ -74,8 +74,9 @@ case "$*" in
     [[ "${STUB_SIGNAL:-0}" == "1" ]] && echo "None" || echo "Online"
     ;;
   "ssm send-command"*) echo "cmd-stub" ;;
-  "ssm list-command-invocations"*"--details"*) echo "TESTS_COMPLETE" ;;
-  "ssm list-command-invocations"*) echo "${STUB_REMOTE_STATUS:-Success}" ;;
+  "ssm get-command-invocation"*"--query Status"*) echo "${STUB_REMOTE_STATUS:-Success}" ;;
+  "ssm get-command-invocation"*"--query StandardOutputContent"*) echo "TESTS_COMPLETE" ;;
+  "ssm get-command-invocation"*"--output json"*) echo '{"Status":"Failed"}' ;;
   "s3 mb "*) echo bucket-created >> "$STUB_STATE/bucket-created.log" ;;
   "s3 rb "*)
     [[ "${STUB_S3_RB:-success}" == "success" ]] || { echo "stub s3 remove failed" >&2; exit 8; }

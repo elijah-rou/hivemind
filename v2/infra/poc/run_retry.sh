@@ -61,7 +61,7 @@ PY
         fi
 
         case "$error_code" in
-            unavailable|queue_full)
+            unavailable|queue_full|no_running_pod)
                 if (( i < attempts )); then
                     sleep "$delay"
                 fi

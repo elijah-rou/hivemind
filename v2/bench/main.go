@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -243,7 +244,16 @@ func readRunResponse(conn net.Conn, buf []byte, expectedRequestID uint64) error 
 
 // writeFrame encodes plaintext client frames:
 // [4B len][1B flags=0x00][2B version][1B tag][payload...]
-func writeFrame(conn net.Conn, tag byte, payload []byte) error {
+func writeFrame(conn net.Conn, tag byte, payload []byte) (err error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear write deadline: %w", clearErr)
+		}
+	}()
+
 	inner := make([]byte, 2+1+len(payload))
 	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
 	inner[2] = tag
@@ -253,11 +263,27 @@ func writeFrame(conn net.Conn, tag byte, payload []byte) error {
 	header := make([]byte, 5)
 	binary.LittleEndian.PutUint32(header[0:4], frameLen)
 	header[4] = 0x00 // plaintext
-	if _, err := conn.Write(header); err != nil {
+	if err := writeAll(conn, header); err != nil {
 		return err
 	}
-	_, err := conn.Write(inner)
-	return err
+	return writeAll(conn, inner)
+}
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count %d for %d bytes", n, len(data))
+		}
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 // readFrame returns [version(2)][tag(1)][payload...].

@@ -86,6 +86,59 @@ func TestSendRunRequestRejectsOversizeBeforeWriting(t *testing.T) {
 	}
 }
 
+type boundedShortConn struct {
+	bytes.Buffer
+	max      int
+	deadline time.Time
+}
+
+func (c *boundedShortConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *boundedShortConn) Write(p []byte) (int, error) {
+	if len(p) > c.max {
+		p = p[:c.max]
+	}
+	return c.Buffer.Write(p)
+}
+func (c *boundedShortConn) Close() error                       { return nil }
+func (c *boundedShortConn) LocalAddr() net.Addr                { return pipeAddr("local") }
+func (c *boundedShortConn) RemoteAddr() net.Addr               { return pipeAddr("remote") }
+func (c *boundedShortConn) SetDeadline(t time.Time) error      { c.deadline = t; return nil }
+func (c *boundedShortConn) SetReadDeadline(time.Time) error    { return nil }
+func (c *boundedShortConn) SetWriteDeadline(t time.Time) error { c.deadline = t; return nil }
+
+func TestWriteFrameLoopsOnShortWritesAndClearsDeadline(t *testing.T) {
+	conn := &boundedShortConn{max: 2}
+	if err := writeFrame(conn, ClientTagRequest, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if conn.Len() != 5+3+len("payload") {
+		t.Fatalf("wrote %d bytes", conn.Len())
+	}
+	if !conn.deadline.IsZero() {
+		t.Fatalf("deadline not cleared: %v", conn.deadline)
+	}
+}
+
+func TestWriteFrameRejectsZeroNilWrite(t *testing.T) {
+	conn := &boundedShortConn{max: 0}
+	if err := writeFrame(conn, ClientTagRequest, nil); err == nil {
+		t.Fatal("expected short write error")
+	}
+}
+
+func TestWriteFrameBoundsStalledPipe(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	start := time.Now()
+	if err := writeFrame(client, ClientTagRequest, make([]byte, 64)); err == nil {
+		t.Fatal("expected deadline")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("write exceeded bound: %v", time.Since(start))
+	}
+}
+
 func TestWriteFrameIncludesFlagsByte(t *testing.T) {
 	pr, pw := io.Pipe()
 	client := &pipeConn{w: pw}

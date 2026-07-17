@@ -20,6 +20,11 @@ CLEANUP_INSTALLED=0
 RUN_WORKSPACE="hivemind-gpu-$(date +%s)-$$-$RANDOM"
 TF_DATA_DIR=""
 WORKER_ARCHIVE=""
+SSM_POLL_INTERVAL_SEC="${SSM_POLL_INTERVAL_SEC:-5}"
+SSM_POLL_TIMEOUT_SEC="${SSM_POLL_TIMEOUT_SEC:-600}"
+# shellcheck source=../bench/ssm_wait.sh disable=SC1091
+source "$SCRIPT_DIR/../bench/ssm_wait.sh"
+hivemind_ssm_assert_poll_bounds
 
 if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
   echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
@@ -98,22 +103,7 @@ echo "instance: $INSTANCE_ID"
 
 echo ""
 echo "=== Step 3: Wait for SSM ==="
-SSM_READY=0
-for _ in $(seq 1 60); do
-  status=$(aws ssm describe-instance-information --region "$REGION" \
-    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
-  if [[ "$status" == "Online" ]]; then
-    echo "SSM online"
-    SSM_READY=1
-    break
-  fi
-  sleep 5
-done
-if [[ "$SSM_READY" -ne 1 ]]; then
-  echo "FAIL: SSM never came online for $INSTANCE_ID" >&2
-  exit 1
-fi
+hivemind_ssm_wait_online "$REGION" "$INSTANCE_ID"
 
 echo ""
 echo "=== Step 4: Setup instance ==="
@@ -127,7 +117,7 @@ cd "$WORKER_DIR"
 tar czf "$WORKER_ARCHIVE" --exclude target --exclude .git -C .. worker/
 aws s3 cp "$WORKER_ARCHIVE" "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
 
-CMD_ID=$(aws ssm send-command --region "$REGION" \
+CMD_ID=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --timeout-seconds 600 \
@@ -148,27 +138,18 @@ echo ""
 echo "=== Step 5: Wait for tests ==="
 echo "(this may take 5-10 minutes for first build)"
 
-FINAL_STATUS="Pending"
-for _ in $(seq 1 120); do
-  status=$(aws ssm list-command-invocations --region "$REGION" \
-    --command-id "$CMD_ID" \
-    --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
-  if [[ "$status" == "Success" || "$status" == "Failed" || "$status" == "Cancelled" || "$status" == "TimedOut" ]]; then
-    FINAL_STATUS="$status"
-    echo "status: $status"
-    break
-  fi
-  sleep 5
-done
+if ! hivemind_ssm_wait_invocation "$REGION" "$CMD_ID" "$INSTANCE_ID"; then
+  echo "FAIL: remote tests did not reach terminal Success" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== Test Output ==="
-aws ssm list-command-invocations --region "$REGION" \
-  --command-id "$CMD_ID" --details \
-  --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text
-
-if [[ "$FINAL_STATUS" != "Success" ]]; then
-  echo "FAIL: remote tests ended with status=$FINAL_STATUS" >&2
+# Diagnostic retrieval is independently bounded and cannot hang cleanup.
+if ! hivemind_ssm_aws "$SSM_POLL_TIMEOUT_SEC" ssm get-command-invocation --region "$REGION" \
+  --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' --output text; then
+  echo "FAIL: bounded remote test output retrieval failed" >&2
   exit 1
 fi
 

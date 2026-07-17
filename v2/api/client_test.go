@@ -464,6 +464,66 @@ func (c *failingWriteConn) SetDeadline(time.Time) error      { return nil }
 func (c *failingWriteConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *failingWriteConn) SetWriteDeadline(time.Time) error { return nil }
 
+type shortWriteConn struct {
+	deadlineTrackingConn
+	max int
+}
+
+func (c *shortWriteConn) Write(p []byte) (int, error) {
+	if len(p) > c.max {
+		p = p[:c.max]
+	}
+	return c.writeBuf.Write(p)
+}
+
+func TestWriteFrameLoopsOnShortWritesAndClearsDeadline(t *testing.T) {
+	conn := &shortWriteConn{deadlineTrackingConn: deadlineTrackingConn{readBuf: bytes.NewReader(nil)}, max: 2}
+	if err := writeFrame(conn, TagRequest, []byte("payload")); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if conn.writeBuf.Len() != 5+3+len("payload") {
+		t.Fatalf("written bytes = %d", conn.writeBuf.Len())
+	}
+	if !conn.lastWriteDeadline.IsZero() {
+		t.Fatalf("write deadline not cleared: %v", conn.lastWriteDeadline)
+	}
+}
+
+type zeroWriteConn struct{ failingWriteConn }
+
+func (c *zeroWriteConn) Write([]byte) (int, error) { c.writeCalls++; return 0, nil }
+
+func TestSendRunRequestZeroNilWriteIsAmbiguousAndReleasesMutex(t *testing.T) {
+	conn := &zeroWriteConn{}
+	client := NewClient(nil, nil)
+	client.conn = conn
+	_, err := client.SendRunRequest("dep", []byte("x"))
+	if !errors.Is(err, ErrRunOutcomeAmbiguous) {
+		t.Fatalf("error = %v", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = client.IsConnected(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client mutex remained locked after write failure")
+	}
+}
+
+func TestWriteFrameDeadlineBoundsStalledPipe(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	start := time.Now()
+	err := writeFrame(client, TagRequest, make([]byte, 64))
+	if err == nil {
+		t.Fatal("expected stalled write deadline")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("write exceeded bound: %v", time.Since(start))
+	}
+}
+
 func TestSendRunRequestDoesNotResendAfterWriteFailure(t *testing.T) {
 	conn := &failingWriteConn{}
 	client := NewClient([]string{"127.0.0.1:1"}, nil)

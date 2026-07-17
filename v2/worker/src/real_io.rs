@@ -1,5 +1,5 @@
 use std::io::{self, ErrorKind, Read};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::io::Io;
@@ -62,7 +62,9 @@ impl RealIo {
                 match protocol::decode_control_message(msg_type, &self.read_buf[..payload_len]) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
-                        eprintln!("decode failed: {e}");
+                        eprintln!("decode failed; terminating control session: {e}");
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                        self.connected = false;
                         None
                     }
                 }
@@ -216,6 +218,34 @@ mod tests {
             }
             _ => panic!("expected second run request"),
         }
+    }
+
+    #[test]
+    fn malformed_control_message_disconnects_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut io = RealIo::connect(&addr.to_string(), None).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mut malformed_start = vec![0u8; 797];
+        malformed_start[531] = 0xff;
+        let mut frame = Vec::new();
+        protocol::write_frame(&mut frame, 0x02, &malformed_start).unwrap();
+        frame.extend_from_slice(&run_request_frame(9, 10, b"must-not-decode"));
+        server.write_all(&frame).unwrap();
+
+        for _ in 0..32 {
+            assert!(io.recv().is_none());
+            if !io.is_connected() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !io.is_connected(),
+            "malformed control frame must terminate session"
+        );
+        assert!(io.recv().is_none());
     }
 
     #[test]

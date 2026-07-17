@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
     --instance-id) instance_id="$2"; shift 2 ;;
     --instance-ids) instance_id="$2"; shift 2 ;;
     --document-name) shift 2 ;;
-    --parameters) shift 2 ;;
+    --parameters|--filters) shift 2 ;;
     --query) query="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     *) shift ;;
@@ -62,6 +62,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$cmd" in
+  describe-instance-information)
+    if [[ -f "$STUB_STATE/hang_describe" ]]; then /bin/sleep 5; fi
+    status_file="$STUB_STATE/ping.seq"
+    status="None"
+    if [[ -s "$status_file" ]]; then
+      status="$(head -n1 "$status_file")"
+      tail -n +2 "$status_file" > "$status_file.tmp"
+      mv "$status_file.tmp" "$status_file"
+    fi
+    printf '%s\n' "$status"
+    ;;
   send-command)
     cid="cmd-${instance_id:-unknown}"
     printf '%s\n' "$cid" >> "$STUB_STATE/send_command.log"
@@ -392,6 +403,34 @@ case_deploy_dead_process_fail_closed() {
   grep -q 'FAILED TO START' "$DEPLOY"
 }
 
+case_online_eventual_success() {
+  printf '%s\n' None Offline Online > "$STUB_STATE/ping.seq"
+  SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=5 \
+    hivemind_ssm_wait_online us-east-1 i-online
+  [[ "$(grep -c 'describe-instance-information' "$STUB_STATE/calls.log")" -eq 3 ]]
+}
+
+case_online_deadline_exhaustion() {
+  yes Offline | head -n 20 > "$STUB_STATE/ping.seq"
+  if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=5 \
+    hivemind_ssm_wait_online us-east-1 i-offline 2>"$TMP_DIR/offline.err"; then
+    return 1
+  fi
+  grep -q 'never Online' "$TMP_DIR/offline.err"
+}
+
+case_hung_cli_is_bounded() {
+  touch "$STUB_STATE/hang_describe"
+  local start=$SECONDS
+  if hivemind_ssm_aws 1 ssm describe-instance-information --region us-east-1 >/dev/null 2>&1; then
+    return 1
+  fi
+  (( SECONDS - start <= 2 ))
+}
+
+run_case "readiness eventual success" case_online_eventual_success
+run_case "readiness deadline exhaustion" case_online_deadline_exhaustion
+run_case "hung AWS CLI bounded" case_hung_cli_is_bounded
 run_case "Pending/InProgress/Success" case_pending_inprogress_success
 run_case "terminal Failed" case_failed
 run_case "terminal TimedOut" case_timedout

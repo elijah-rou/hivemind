@@ -1134,10 +1134,10 @@ The `/run` status byte is one non-overlapping enum across Zig, Rust, the Go API,
 | 4 | `response_too_large` | no |
 | 5 | `outcome_ambiguous` | no |
 | 6 | `forwarding_failed` | no |
-| 7 | `no_running_pod` | no |
+| 7 | `no_running_pod` | yes |
 | 8 | `unavailable` | yes |
 
-`outcome_ambiguous` means the worker may have accepted the request before a write failure or disconnect. `forwarding_failed` means a selected running pod's HTTP forwarding operation failed. `no_running_pod` means the worker had no eligible pod. `unavailable` is emitted only when no request bytes were sent. HTTP errors always include the matching machine-readable `error` and numeric `status`. Operator automation retries only exact, valid JSON `unavailable` and `queue_full`; it aborts on transport errors, malformed responses, ambiguous outcomes, and every other status.
+`outcome_ambiguous` means the worker may have accepted the request before a write failure or disconnect. `forwarding_failed` means a selected running pod's HTTP forwarding operation failed. `no_running_pod` means the worker had no eligible pod. `unavailable` is emitted only when no request bytes were sent. HTTP errors always include the matching machine-readable `error` and numeric `status`. Operator automation retries only exact, valid JSON `unavailable`, `queue_full`, and `no_running_pod`; it aborts on transport errors, malformed responses, ambiguous outcomes, forwarding failures, overflow, and permanent statuses.
 
 ## Peer identity limitation
 
