@@ -16,6 +16,8 @@ TF=(terraform -chdir="$SCRIPT_DIR")
 
 # shellcheck source=ssm_wait.sh disable=SC1091
 source "$SCRIPT_DIR/ssm_wait.sh"
+# shellcheck source=artifact_lifecycle.sh disable=SC1091
+source "$SCRIPT_DIR/artifact_lifecycle.sh"
 hivemind_ssm_assert_poll_bounds
 
 if [[ ! -f "$BINARY" ]]; then
@@ -28,9 +30,7 @@ fi
 mapfile -t INSTANCE_IDS < <("${TF[@]}" output -json instance_ids | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 mapfile -t PRIVATE_IPS < <("${TF[@]}" output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 BENCH_ADDRS=$("${TF[@]}" output -raw bench_addrs)
-RUN_TOKEN="${HIVEMIND_BENCH_RUN_TOKEN:-$(date +%s)-$$-$RANDOM}"
 REMOTE_REPLACE_TIMEOUT_SEC="${HIVEMIND_REMOTE_REPLACE_TIMEOUT_SEC:-30}"
-[[ "$RUN_TOKEN" =~ ^[A-Za-z0-9._-]{1,96}$ ]] || { echo "FAIL: invalid run token" >&2; exit 1; }
 [[ "$REMOTE_REPLACE_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: invalid remote replacement timeout" >&2; exit 1; }
 SYSTEMD_LIBRARY_B64="$(base64 < "$SCRIPT_DIR/systemd_lifecycle.sh" | tr -d '\n')"
 
@@ -43,15 +43,27 @@ for id in "${INSTANCE_IDS[@]}"; do
   hivemind_ssm_wait_online "$REGION" "$id"
 done
 
-# Upload binary to each instance via S3 (SSM can't do direct file transfer easily)
-BUCKET="hivemind-bench-$(date +%s)"
-aws s3 mb "s3://$BUCKET" --region "$REGION" 2>/dev/null || true
-aws s3 cp "$BINARY" "s3://$BUCKET/hivemind" --region "$REGION"
+hivemind_deploy_cleanup() {
+  local prior_status=$?
+  trap - EXIT
+  hivemind_artifact_cleanup "$prior_status"
+  exit $?
+}
+
+# Install cleanup as the immediate next operation after ownership succeeds.
+hivemind_artifact_prepare "$REGION"
+trap hivemind_deploy_cleanup EXIT
+
+RUN_TOKEN="$HIVEMIND_ARTIFACT_ACCOUNT-$HIVEMIND_ARTIFACT_TOKEN"
+hivemind_artifact_upload "$BINARY" hivemind
+HIVEMIND_BINARY_URI="$HIVEMIND_ARTIFACT_URI"
+HIVEMIND_BENCH_URI=""
 if [[ -f "$BENCH" ]]; then
-  aws s3 cp "$BENCH" "s3://$BUCKET/bench" --region "$REGION"
+  hivemind_artifact_upload "$BENCH" bench
+  HIVEMIND_BENCH_URI="$HIVEMIND_ARTIFACT_URI"
 fi
 
-echo "uploaded binary to s3://$BUCKET"
+echo "uploaded immutable artifacts under s3://$HIVEMIND_ARTIFACT_BUCKET/$HIVEMIND_ARTIFACT_PREFIX"
 
 # Preserve each argument vector as a single line. Terraform values contain no whitespace-bearing arguments.
 mapfile -t START_ARGS < <("${TF[@]}" output -json start_args | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
@@ -75,7 +87,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
 set -euo pipefail
 source /tmp/hivemind-systemd-lifecycle.sh
 mkdir -m 700 -p '$run_dir' '/var/lib/hivemind/node-$i'
-aws s3 cp 's3://$BUCKET/hivemind' '$run_binary' --region '$REGION'
+aws s3 cp '$HIVEMIND_BINARY_URI' '$run_binary' --region '$REGION'
 chmod 700 '$run_binary'
 export HIVEMIND_SYSTEMD_TIMEOUT_SEC='$REMOTE_REPLACE_TIMEOUT_SEC'
 hivemind_transaction_begin
@@ -92,6 +104,10 @@ echo 'hivemind running as $unit'
 EOF
 )
   remote_script_b64="$(printf '%s' "$remote_script" | base64 | tr -d '\n')"
+  bench_copy_command=":"
+  if [[ -n "$HIVEMIND_BENCH_URI" ]]; then
+    bench_copy_command="aws s3 cp '$HIVEMIND_BENCH_URI' /tmp/bench --region '$REGION' && chmod 700 /tmp/bench"
+  fi
 
   cmd_id=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
     --instance-ids "$id" \
@@ -100,8 +116,7 @@ EOF
       \"printf '%s' '$SYSTEMD_LIBRARY_B64' | base64 -d > /tmp/hivemind-systemd-lifecycle.sh\",
       \"chmod 700 /tmp/hivemind-systemd-lifecycle.sh\",
       \"printf '%s' '$remote_script_b64' | base64 -d | bash\",
-      \"aws s3 cp s3://$BUCKET/bench /tmp/bench --region $REGION 2>/dev/null || true\",
-      \"chmod +x /tmp/bench 2>/dev/null || true\"
+      \"$bench_copy_command\"
     ]" \
     --output text --query 'Command.CommandId')
   if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then
@@ -134,6 +149,5 @@ echo "to run bench from instance 0:"
 echo "  aws ssm start-session --target ${INSTANCE_IDS[0]} --region $REGION"
 echo "  /tmp/bench -addrs $BENCH_ADDRS -n 100"
 echo ""
-echo "cleanup:"
-echo "  aws s3 rb s3://$BUCKET --force --region $REGION"
-echo "  terraform -chdir=\"$SCRIPT_DIR\" destroy -auto-approve"
+echo "artifacts are removed automatically on exit unless HIVEMIND_KEEP_ARTIFACTS=1."
+echo "terraform cleanup: terraform -chdir=\"$SCRIPT_DIR\" destroy -auto-approve"

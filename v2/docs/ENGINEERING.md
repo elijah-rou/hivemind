@@ -63,7 +63,8 @@ Design rule: Hivemind should not clone broad Kubernetes APIs by default. Build p
 ## Bounded operational boundaries
 
 - Bench replacement is serialized per node and owned by a uniquely named transient systemd service. A deploy must bound `systemctl stop`, verify the old unit is inactive, and start the expected executable/argument vector with journald diagnostics. Raw PID files and numeric signaling are not part of the contract.
-- Active POC shell HTTP calls use `infra/poc/http.sh`, which always sets explicit connect and total request timeouts. Operation-specific callers may narrow the total timeout.
+- Bench transfer artifacts use an AWS-account-scoped 128-bit run identity, content-addressed object keys, and an ownership-installed exit trap. Creation and upload fail closed; cleanup removes only the owned run prefix and bucket unless explicit keep mode is enabled.
+- Active POC shell HTTP calls use `infra/poc/http.sh`, which always sets explicit connect and total request timeouts. Operation-specific callers may narrow the total timeout. Retry helpers must clean temporary workspaces on every post-creation return and fail if a requested response artifact cannot be copied.
 - Go JSON mutation handlers bound bytes before decoding, accept exactly one JSON value, and validate fixed-wire string and array maxima.
 - Fixed-size worker register, heartbeat, and pod-status messages require exact payload lengths. Malformed worker frames close the sender so owned correlations are released.
 

@@ -69,6 +69,8 @@ run_phase "Bench deploy SSM wait fixtures" \
     bash -c "'$SCRIPT_DIR/deploy_ssm_wait_test.sh'"
 run_phase "Bench systemd lifecycle fixtures" \
     bash -c "'$SCRIPT_DIR/bench_systemd_lifecycle_test.sh'"
+run_phase "Bench artifact lifecycle fixtures" \
+    bash -c "'$SCRIPT_DIR/bench_artifact_lifecycle_test.sh'"
 
 # --- Phase 4e: GPU-test cleanup trap fixture (stub terraform, no live infra) ---
 run_phase "GPU-test cleanup trap fixture" \

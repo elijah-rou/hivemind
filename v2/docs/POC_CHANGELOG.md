@@ -44,6 +44,27 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-17 — Ownership-scoped bench artifacts and retry cleanup
+
+What changed:
+- bench deploy artifacts now use an AWS-account-scoped 128-bit random run identity and immutable SHA-256 object keys
+- bucket ownership is established fail-closed before an exit trap is installed; all exits remove only the owned run prefix and bucket unless `HIVEMIND_KEEP_ARTIFACTS=1`
+- creation/upload failures are fatal and remote nodes receive the exact immutable object URIs
+- `/run` retry workspaces are cleaned on every post-creation return; requested response artifact copy/read failures cannot report success
+- active status now records protocol version 5 and one fresh local verification result
+
+Why it matters:
+- concurrent deploys cannot share second-resolution buckets or overwrite shared keys, and failed deploys no longer leak owned transfer artifacts
+- evidence scripts cannot leave retry workspaces or claim a preserved response that was never written
+
+Progress:
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used only local stubs and tests
+
+Residual risks:
+- no live AWS deploy was performed
+- containerd-in-Docker was intentionally skipped; provider-dependent Terraform validation may remain unavailable offline
+
 ### 2026-07-16 — Durable StartView adoption and bounded catch-up liveness
 
 What changed:

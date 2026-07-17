@@ -36,12 +36,7 @@ Latest state after the fresh AWS redeploy, corrected smoke pass, POC acceptance 
   - macOS `infra/poc/deploy.sh --build` path without Docker/`cross`
   - abandoned `/run` queue entries leaking `In-Flight` state after client timeout/disconnect
   - GPU containerd runtime selection via CDI devices (`nvidia.com/gpu=N`) with `io.containerd.runc.v2`
-- Current local verification is green:
-  - Zig tests: `124/124` in Debug, `124/124` in ReleaseFast, `zig build test` pass
-  - core fuzz: `10000/10000` mutated seeds, `0` failures
-  - worker tests: pass (`91` lib tests + main/integration suites after bounded lifecycle concurrency)
-  - worker fuzz: `10000/10000` mutated seeds, `0` failures
-  - local smoke: `16 passed, 0 failed`
+- Historical validation for that POC milestone included 10,000-seed core and worker fuzz sweeps plus a 16/16 local smoke pass. The single current branch verification record is maintained in **Test Coverage** below.
 - Fresh AWS redeploy/smoke gate is now closed. Corrected live smoke passed end-to-end on fresh infra, including remote GPU checks and CPU/GPU `/run` paths.
 - POC progress is `6 / 8` acceptance sections complete with Sections 7-8 provisional, and `16 / 16` execution checklist items complete for the warm-cache evidence pack. Functional/resilience gates through Section 6 are complete; Section 7 benchmark/economic acceptance still needs a clean EKS rerun after GPU-node sandbox failures are resolved.
 - Latest repeatability run `poc-20260428195031` passed smoke, real workloads, operator workflow, placement-asserted failure drills, final log capture, and teardown. Latest latency reruns left Hivemind infra and EKS nodegroups up for reuse. EKS control-plane deletion still requires elevated IAM or an exception for explicit `eks:DeleteCluster` deny.
@@ -163,7 +158,7 @@ Client/Agent frames (plaintext): [4B LE len][1B flags=0x00][2B LE version][1B ta
 Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext][16B tag]
 Peer frames (plaintext):         [4B LE len][1B flags=0x00][1B from_id][VRR payload]
 Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(from_id+VRR)][16B tag]
-PROTOCOL_VERSION = 4 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
+PROTOCOL_VERSION = 5 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
 ```
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)
@@ -273,15 +268,15 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 ## Test Coverage
 
-**Current local verification (branch evidence; no new live durability run):**
-- 262 Zig unit tests passing in Debug and ReleaseFast (`zig test src/unit_tests.zig -lc`); `zig build test` passes
-- Go API tests and race tests pass; API and bench builds pass
-- local smoke: `16 passed, 0 failed` (`tests/local-smoke.sh`)
-- local failover smoke: PASS (`tests/local-failover-smoke.sh`)
-- `tests/run-all.sh`: 15/17 phases pass; containerd-in-Docker is blocked by nested overlay mount `EINVAL`, unrelated to this diff; its SSM fixture was subsequently updated and passes standalone
-- storage-mode smoke: volatile + experimental-journal startup contract (`tests/storage_mode_smoke_test.sh`)
-- launcher contract: stale smoke wrappers + bench/infra paths (`tests/launcher_contract_test.sh`)
-- Acceptance counts unchanged: `6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack; live infra status remains `up` from prior entries (no new live evidence in this docs pass)
+**Current local verification (2026-07-17, branch evidence; no live infrastructure touched):**
+- Zig: `312 / 312` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
+- Rust: `125` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Go: API and bench module tests and builds pass.
+- `tests/run-all.sh --skip-containerd`: `17 passed, 0 failed`, including storage-mode, launcher, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
+- Local smoke within run-all: `16 passed, 0 failed`.
+- Shell: changed files pass `bash -n` and ShellCheck at style severity.
+- Residual validation: no live AWS deploy; containerd-in-Docker not run; Terraform provider-dependent offline validation is reported separately when unavailable.
+- Acceptance counts remain `6 / 8` POC v1 sections and `16 / 16` warm-cache execution items. Historical live-infra state is unchanged by this verification.
 
 **VOPR simulation coverage:**
 - VRR consensus under faults (partitions, crashes, restarts)

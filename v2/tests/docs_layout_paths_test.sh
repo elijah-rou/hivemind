@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Contract regexes contain literal Markdown backticks.
 # Contract: active docs must describe the repo-root v1 frozen / v2 active layout,
 # and every path asserted by this fixture must exist on disk.
 set -euo pipefail
@@ -80,6 +81,9 @@ assert_contains "$STATUS" 'no rolling migration or incarnation protocol claim'
 assert_lacks "$STATUS" '[Ee]xperimental v1 journal|v1 single-copy journal'
 assert_contains "$STATUS" 'layout v2 journal|layout-v2 `journal\.bin`'
 assert_contains "$STATUS" '[Aa]ctual legacy v1 journals.*fail-closed as incompatible'
+assert_contains "$STATUS" 'PROTOCOL_VERSION = 5'
+assert_contains "$STATUS" '312 / 312'
+assert_lacks "$STATUS" '124/124|262 Zig|15/17|PROTOCOL_VERSION = 4'
 assert_contains "$ENGINEERING" 'mixed-version peer clusters.*legacy-v1 journal upgrades'
 assert_contains "$ENGINEERING" '[Aa]ctual legacy.*fail-closed as incompatible'
 assert_contains "$ENGINEERING" 'stop the full cluster'

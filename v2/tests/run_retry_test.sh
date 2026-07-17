@@ -40,7 +40,7 @@ esac
 STUB
 chmod +x "$TMP_DIR/bin/curl"
 
-# shellcheck source=../infra/poc/run_retry.sh
+# shellcheck disable=SC1091
 source "$ROOT_DIR/infra/poc/run_retry.sh"
 
 run_case() {
@@ -65,6 +65,31 @@ run_case no_pod_then_success 0 2
 run_case invalid 1 1
 run_case overflow 1 1
 run_case malformed 1 1
+
+# Every post-mktemp failure removes its workspace.
+cleanup_tmp="$TMP_DIR/workspaces"
+mkdir -p "$cleanup_tmp"
+state="$TMP_DIR/missing-pattern"
+mkdir -p "$state"
+set +e
+TMPDIR="$cleanup_tmp" PATH="$TMP_DIR/bin:$PATH" RUN_RETRY_STATE="$state" RUN_RETRY_SCENARIO=unavailable_then_success \
+    hivemind_run_with_retry fixture http://fixture/run '{}' 'missing-pattern' 3 0 >"$state/out" 2>&1
+status=$?
+set -e
+[[ "$status" -eq 1 ]]
+[[ -z "$(find "$cleanup_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+# Artifact preservation failure is fatal and also cleans the workspace.
+state="$TMP_DIR/missing-output"
+mkdir -p "$state"
+set +e
+TMPDIR="$cleanup_tmp" PATH="$TMP_DIR/bin:$PATH" RUN_RETRY_STATE="$state" RUN_RETRY_SCENARIO=unavailable_then_success \
+    hivemind_run_with_retry fixture http://fixture/run '{}' '"model"' 3 0 "$TMP_DIR/no-such-parent/result.json" >"$state/out" 2>&1
+status=$?
+set -e
+[[ "$status" -eq 1 ]]
+[[ ! -e "$TMP_DIR/no-such-parent/result.json" ]]
+[[ -z "$(find "$cleanup_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
 for caller in \
     tests/local-smoke.sh \
