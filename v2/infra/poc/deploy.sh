@@ -64,8 +64,26 @@ if (( ${#REPLICA_IPS[@]} != ${#REPLICA_PUBLIC_IPS[@]} )); then
     echo "FAIL: private/public replica output counts differ (${#REPLICA_IPS[@]} != ${#REPLICA_PUBLIC_IPS[@]})" >&2
     exit 1
 fi
-AGENT_CPU_IP=$(terraform output -raw worker_cpu_ip)
-AGENT_GPU_IP=$(terraform output -raw worker_gpu_ip)
+if ! AGENT_CPU_IP="$(terraform output -raw worker_cpu_ip)"; then
+    echo "FAIL: unable to read Terraform output: worker_cpu_ip" >&2
+    exit 1
+fi
+if ! AGENT_GPU_IP="$(terraform output -raw worker_gpu_ip)"; then
+    echo "FAIL: unable to read Terraform output: worker_gpu_ip" >&2
+    exit 1
+fi
+if ! AGENT_CPU_PUBLIC="$(terraform output -raw worker_cpu_public_ip)"; then
+    echo "FAIL: unable to read Terraform output: worker_cpu_public_ip" >&2
+    exit 1
+fi
+if ! AGENT_GPU_PUBLIC="$(terraform output -raw worker_gpu_public_ip)"; then
+    echo "FAIL: unable to read Terraform output: worker_gpu_public_ip" >&2
+    exit 1
+fi
+if [[ -z "$AGENT_CPU_IP" || -z "$AGENT_GPU_IP" ]]; then
+    echo "FAIL: required worker private IP Terraform output is empty" >&2
+    exit 1
+fi
 
 REPLICA_COUNT=${#REPLICA_IPS[@]}
 echo "    Replicas: ${REPLICA_IPS[*]}"
@@ -132,9 +150,6 @@ for i in $(seq 0 $((REPLICA_COUNT - 1))); do
     if [ -n "$AGENT_REPLICA_ADDR" ]; then AGENT_REPLICA_ADDR="$AGENT_REPLICA_ADDR,"; fi
     AGENT_REPLICA_ADDR="${AGENT_REPLICA_ADDR}${REPLICA_IPS[$i]}:9000"
 done
-
-AGENT_CPU_PUBLIC=$(terraform output -raw worker_cpu_public_ip 2>/dev/null || echo "")
-AGENT_GPU_PUBLIC=$(terraform output -raw worker_gpu_public_ip 2>/dev/null || echo "")
 
 for AGENT_PAIR in "cpu:$AGENT_CPU_PUBLIC" "gpu:$AGENT_GPU_PUBLIC"; do
     ROLE="${AGENT_PAIR%%:*}"

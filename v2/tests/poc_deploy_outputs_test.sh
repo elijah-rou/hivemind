@@ -29,11 +29,14 @@ if [[ "${2:-}" == -json ]]; then
   exit 0
 fi
 [[ "${2:-}" == -raw ]]
+if [[ "$DEPLOY_OUTPUT_SCENARIO" == "raw-failure-$3" ]]; then
+  exit 1
+fi
 case "$3" in
   worker_cpu_ip) printf '10.0.1.10' ;;
   worker_gpu_ip) printf '10.0.1.11' ;;
-  worker_cpu_public_ip) printf '198.51.100.20' ;;
-  worker_gpu_public_ip) printf '198.51.100.21' ;;
+  worker_cpu_public_ip) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.20' ;;
+  worker_gpu_public_ip) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.21' ;;
   *) exit 2 ;;
 esac
 EOF
@@ -84,6 +87,17 @@ run_failure malformed-json
 run_failure partial-jq
 run_failure empty
 run_failure mismatch
+run_failure raw-failure-worker_cpu_ip
+run_failure raw-failure-worker_gpu_ip
+run_failure raw-failure-worker_cpu_public_ip
+run_failure raw-failure-worker_gpu_public_ip
+
+: > "$DEPLOY_MUTATIONS"
+DEPLOY_OUTPUT_SCENARIO=empty-public bash "$DEPLOY" >"$TMP_DIR/empty-public.out" 2>&1
+[[ -s "$DEPLOY_MUTATIONS" ]]
+if grep -Eq '198\.51\.100\.(20|21)' "$DEPLOY_MUTATIONS"; then
+  echo 'empty optional worker output triggered worker SSH' >&2; exit 1
+fi
 
 : > "$DEPLOY_MUTATIONS"
 DEPLOY_OUTPUT_SCENARIO=valid bash "$DEPLOY" >"$TMP_DIR/valid.out" 2>&1
