@@ -78,6 +78,37 @@ func TestRunHandlerReturnsStableAmbiguousAndUnavailableErrors(t *testing.T) {
 	}
 }
 
+func TestRunHandlerRejectsInvalidDeploymentNameBeforeFrame(t *testing.T) {
+	conn := &failingWriteConn{}
+	client := NewClient(nil, nil)
+	client.conn = conn
+	handler := handleRunRequest(client)
+
+	for _, deployment := range []string{strings.Repeat("d", 65), "valid\x00hidden"} {
+		req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader("request"))
+		req.SetPathValue("name", deployment)
+		rr := httptest.NewRecorder()
+		handler(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("deployment %q status = %d, want 400: %s", deployment, rr.Code, rr.Body.String())
+		}
+	}
+	if conn.writeCalls != 0 {
+		t.Fatalf("invalid names wrote %d frames", conn.writeCalls)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader("request"))
+	req.SetPathValue("name", strings.Repeat("d", 64))
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+	if rr.Code == http.StatusBadRequest {
+		t.Fatalf("exact 64-byte name rejected: %s", rr.Body.String())
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("exact 64-byte name write calls = %d, want 1", conn.writeCalls)
+	}
+}
+
 func TestWriteResultLogFullMapsTo507(t *testing.T) {
 	rr := httptest.NewRecorder()
 	writeResult(rr, CommandResult{OK: false, ErrCode: ErrCodeLogFull}, nil)
@@ -151,6 +182,42 @@ func TestMutationEndpointsRejectUnboundedAndAmbiguousJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMutationEndpointsRejectEmbeddedNULInFixedWireStrings(t *testing.T) {
+	client := NewClient(nil, nil)
+	latency := &LatencyRecorder{}
+	createFields := []string{"name", "image", "image_pull_registry", "image_pull_username", "image_pull_password"}
+	for _, field := range createFields {
+		t.Run("create "+field, func(t *testing.T) {
+			body := map[string]any{"name": "name", "image": "image"}
+			body[field] = "visible\x00hidden"
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/deployments", strings.NewReader(string(encoded)))
+			rr := httptest.NewRecorder()
+			handleCreateDeployment(client, latency)(rr, req)
+			if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "NUL") {
+				t.Fatalf("status/body = %d %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	t.Run("update image", func(t *testing.T) {
+		encoded, err := json.Marshal(map[string]any{"image": "visible\x00hidden"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPut, "/v1/deployments/1", strings.NewReader(string(encoded)))
+		req.SetPathValue("id", "1")
+		rr := httptest.NewRecorder()
+		handleUpdateDeployment(client)(rr, req)
+		if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "NUL") {
+			t.Fatalf("status/body = %d %s", rr.Code, rr.Body.String())
+		}
+	})
 }
 
 func TestDecodeBoundedJSONRejectsMalformedTrailingData(t *testing.T) {

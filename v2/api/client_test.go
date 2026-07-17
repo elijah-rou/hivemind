@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -735,6 +736,37 @@ func TestRunStatusWireGolden(t *testing.T) {
 		if status.String() != name {
 			t.Fatalf("wire %d = %q, want %q", wire, status.String(), name)
 		}
+	}
+}
+
+func TestSendRunRequestRejectsInvalidDeploymentNameBeforeFrame(t *testing.T) {
+	cases := []struct {
+		name       string
+		deployment string
+	}{
+		{name: "65 bytes", deployment: strings.Repeat("d", 65)},
+		{name: "embedded NUL", deployment: "valid\x00hidden"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &deadlineTrackingConn{readBuf: bytes.NewReader(nil)}
+			client := NewClient(nil, nil)
+			client.conn = conn
+			if _, err := client.SendRunRequest(tc.deployment, []byte("request")); err == nil {
+				t.Fatal("invalid deployment name accepted")
+			}
+			if conn.writeBuf.Len() != 0 {
+				t.Fatalf("wrote %d bytes before rejecting deployment name", conn.writeBuf.Len())
+			}
+		})
+	}
+
+	conn := &failingWriteConn{}
+	client := NewClient(nil, nil)
+	client.conn = conn
+	_, _ = client.SendRunRequest(strings.Repeat("d", 64), []byte("request"))
+	if conn.writeCalls != 1 {
+		t.Fatalf("exact 64-byte deployment name did not reach frame write: calls=%d", conn.writeCalls)
 	}
 }
 

@@ -29,7 +29,9 @@ mapfile -t INSTANCE_IDS < <("${TF[@]}" output -json instance_ids | python3 -c "i
 mapfile -t PRIVATE_IPS < <("${TF[@]}" output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 BENCH_ADDRS=$("${TF[@]}" output -raw bench_addrs)
 RUN_TOKEN="${HIVEMIND_BENCH_RUN_TOKEN:-$(date +%s)-$$-$RANDOM}"
+REMOTE_REPLACE_TIMEOUT_SEC="${HIVEMIND_REMOTE_REPLACE_TIMEOUT_SEC:-30}"
 [[ "$RUN_TOKEN" =~ ^[A-Za-z0-9._-]{1,96}$ ]] || { echo "FAIL: invalid run token" >&2; exit 1; }
+[[ "$REMOTE_REPLACE_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: invalid remote replacement timeout" >&2; exit 1; }
 SYSTEMD_LIBRARY_B64="$(base64 < "$SCRIPT_DIR/systemd_lifecycle.sh" | tr -d '\n')"
 
 NODE_COUNT=${#INSTANCE_IDS[@]}
@@ -75,8 +77,14 @@ source /tmp/hivemind-systemd-lifecycle.sh
 mkdir -m 700 -p '$run_dir' '/var/lib/hivemind/node-$i'
 aws s3 cp 's3://$BUCKET/hivemind' '$run_binary' --region '$REGION'
 chmod 700 '$run_binary'
+export HIVEMIND_SYSTEMD_TIMEOUT_SEC='$REMOTE_REPLACE_TIMEOUT_SEC'
+hivemind_transaction_begin
 exec 9>/tmp/hivemind-launch.lock
-flock -x 9
+lock_wait="\$(hivemind_deadline_remaining)"
+if ! flock -x -w "\$lock_wait" 9; then
+  echo 'FAIL: timed out waiting for Hivemind replacement lock' >&2
+  exit 1
+fi
 hivemind_unit_stop_verified '$unit'
 read -r -a node_args <<< '$args'
 hivemind_unit_start_verified '$unit' '$run_binary' "\${node_args[@]}"

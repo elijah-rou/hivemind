@@ -44,6 +44,20 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Bench replacement deadline and fixed-wire string boundaries
+
+What changed:
+- bench remote replacement uses one wall-clock deadline across bounded lock acquisition, systemctl state queries, stop/reset, transient start, stabilization, and diagnostics
+- transient units must remain active with the same nonzero `MainPID` through stabilization before deploy success
+- Go API and client reject `/run` deployment names beyond 64 bytes or containing NUL before frame construction; mutation endpoints reject NUL in every JSON string copied into fixed-width wire fields
+
+Why it matters:
+- prevents blocked remote replacements and false-success transient starts, and prevents HTTP strings from being silently truncated at the core `fixedToSlice` boundary
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps: independent review, then live validation only when explicitly scheduled. Live infra status remains `up` from prior runs and was not touched.
+
 ### 2026-07-16 — Static safety findings closed at process and HTTP boundaries
 
 What changed:

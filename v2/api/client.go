@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -335,6 +336,13 @@ type RunResponse struct {
 // appropriate HTTP (or other) outcome; Body is the raw container payload with
 // the wire header already stripped.
 func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunResponse, error) {
+	if len(depName) > 64 {
+		return nil, fmt.Errorf("run deployment name exceeds wire maximum 64 bytes")
+	}
+	if strings.ContainsRune(depName, '\x00') {
+		return nil, fmt.Errorf("run deployment name contains NUL")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

@@ -49,7 +49,7 @@ func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, dst any, limit in
 }
 
 func stringFitsWire(value string, maximum int) bool {
-	return len(value) <= maximum
+	return len(value) <= maximum && !strings.ContainsRune(value, '\x00')
 }
 
 func writeFixedStr(dst []byte, s string) {
@@ -126,7 +126,7 @@ func handleCreateDeployment(client *HivemindClient, latency *LatencyRecorder) ht
 		if !stringFitsWire(req.Name, 64) || !stringFitsWire(req.Image, 256) ||
 			!stringFitsWire(req.ImagePullRegistry, 128) || !stringFitsWire(req.ImagePullUsername, 64) ||
 			!stringFitsWire(req.ImagePullPassword, 256) {
-			writeErr(w, http.StatusBadRequest, "string field exceeds wire maximum")
+			writeErr(w, http.StatusBadRequest, "string field exceeds wire maximum or contains NUL")
 			return
 		}
 		if req.Replicas == 0 {
@@ -209,6 +209,10 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 		name := r.PathValue("name")
 		if name == "" {
 			writeErr(w, http.StatusBadRequest, "deployment name is required")
+			return
+		}
+		if !stringFitsWire(name, 64) {
+			writeErr(w, http.StatusBadRequest, "deployment name exceeds wire maximum 64 bytes or contains NUL")
 			return
 		}
 
@@ -334,7 +338,7 @@ func handleUpdateDeployment(client *HivemindClient) http.HandlerFunc {
 			return
 		}
 		if !stringFitsWire(req.Image, 256) {
-			writeErr(w, http.StatusBadRequest, "image exceeds wire maximum 256 bytes")
+			writeErr(w, http.StatusBadRequest, "image exceeds wire maximum 256 bytes or contains NUL")
 			return
 		}
 

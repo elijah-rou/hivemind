@@ -99,7 +99,9 @@ assert_contains "$DEPLOY" 'SCRIPT_DIR/.*/core/zig-out/bin/hivemind|\$\{SCRIPT_DI
 # Terraform arguments remain line-preserved and the remote launch is serialized.
 assert_lacks "$DEPLOY" 'START_ARGS=\(\$\('
 assert_contains "$DEPLOY" 'mapfile[[:space:]]+-t[[:space:]]+START_ARGS'
-assert_contains "$DEPLOY" 'flock[[:space:]]+-x'
+assert_contains "$DEPLOY" 'flock[[:space:]]+-x[[:space:]]+-w'
+assert_contains "$DEPLOY" 'hivemind_transaction_begin'
+assert_contains "$DEPLOY" 'hivemind_deadline_remaining'
 assert_contains "$DEPLOY" 'hivemind_unit_stop_verified'
 assert_contains "$DEPLOY" 'hivemind_unit_start_verified'
 assert_lacks "$DEPLOY" 'pid_lifecycle|nohup|kill[[:space:]]+-'
