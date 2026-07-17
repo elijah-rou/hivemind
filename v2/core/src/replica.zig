@@ -16,6 +16,7 @@ const StateMachine = @import("state_machine.zig").StateMachine;
 const sched = @import("scheduler.zig");
 const disk_mod = @import("disk.zig");
 const latency = @import("latency.zig");
+const view_candidate = @import("view_change_candidate.zig");
 pub const DiskInterface = disk_mod.DiskInterface;
 
 // ---------------------------------------------------------------------------
@@ -191,6 +192,9 @@ pub const WorkerSendFn = *const fn (ctx: *anyopaque, worker_idx: usize, data: []
 // ---------------------------------------------------------------------------
 
 pub const ReplicaConfig = struct {
+    // Test-only default bounds mechanical churn in direct unit constructors.
+    // Production and TestCluster owners inject their allocator explicitly.
+    allocator: std.mem.Allocator = std.testing.allocator,
     replica_id: u8,
     replica_count: u8,
     io: Io,
@@ -222,6 +226,8 @@ pub const WorkerConnection = struct {
 
 pub const Replica = struct {
     // Configuration
+    allocator: std.mem.Allocator,
+    view_change_candidate: view_candidate.ViewChangeCandidate,
     replica_id: u8,
     replica_count: u8,
     quorum_size: u8,
@@ -352,6 +358,8 @@ pub const Replica = struct {
         const f = (config.replica_count - 1) / 2;
 
         return .{
+            .allocator = config.allocator,
+            .view_change_candidate = .{ .allocator = config.allocator },
             .replica_id = config.replica_id,
             .replica_count = config.replica_count,
             .quorum_size = @intCast(f + 1),
@@ -435,6 +443,8 @@ pub const Replica = struct {
     pub fn initInPlace(self: *Replica, config: ReplicaConfig) void {
         std.debug.assert(config.replica_count >= 1 and config.replica_count <= msg.REPLICA_COUNT_MAX);
         const f = (config.replica_count - 1) / 2;
+        self.allocator = config.allocator;
+        self.view_change_candidate = .{ .allocator = config.allocator };
         self.replica_id = config.replica_id;
         self.replica_count = config.replica_count;
         self.quorum_size = @intCast(f + 1);
@@ -497,6 +507,27 @@ pub const Replica = struct {
         self.pod_scheduled_fn = config.pod_scheduled_fn;
         self.worker_send_ctx = config.worker_send_ctx;
         self.worker_send_fn = config.worker_send_fn;
+        self.assertCandidateOwnership();
+    }
+
+    fn assertCandidateOwnership(self: *const Replica) void {
+        std.debug.assert(self.view_change_candidate.allocator != null);
+        if (self.view_change_candidate.phase == .idle) {
+            std.debug.assert(self.view_change_candidate.entries.len == 0);
+            std.debug.assert(self.view_change_candidate.present.len == 0);
+        }
+    }
+
+    pub fn deinit(self: *Replica) void {
+        self.view_change_candidate.deinit();
+        std.debug.assert(self.view_change_candidate.allocator == null);
+        std.debug.assert(self.view_change_candidate.entries.len == 0);
+        std.debug.assert(self.view_change_candidate.present.len == 0);
+    }
+
+    pub fn resetInPlace(self: *Replica, config: ReplicaConfig) void {
+        self.deinit();
+        self.initInPlace(config);
     }
 
     /// Recover state from disk after a crash. Restores metadata and journal
@@ -2813,6 +2844,11 @@ const ClientReplyCapture = struct {
         capture.result = result;
     }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Replica) <= 8 * 1024 * 1024);
+    std.debug.assert(@sizeOf(view_candidate.ViewChangeCandidate) <= 256);
+}
 
 test "stale client request is ignored instead of relabeling newer result" {
     const allocator = std.testing.allocator;

@@ -9,6 +9,7 @@ const Prng = @import("../prng.zig").Prng;
 const StateChecker = @import("checker.zig").StateChecker;
 const SimulatedDisk = @import("../disk.zig").SimulatedDisk;
 const gossip_mod = @import("../gossip.zig");
+const view_candidate = @import("../view_change_candidate.zig");
 
 /// Lightweight test harness for a VRR cluster with integrated state checking.
 /// Every tick validates consensus safety invariants via the StateChecker.
@@ -51,6 +52,7 @@ pub const TestCluster = struct {
             tc.disks[i] = SimulatedDisk.init();
             tc.replicas[i] = try allocator.create(replica_mod.Replica);
             tc.replicas[i].initInPlace(.{
+                .allocator = allocator,
                 .replica_id = id,
                 .replica_count = replica_count,
                 .io = tc.sim_ios[i].io(),
@@ -64,6 +66,7 @@ pub const TestCluster = struct {
 
     pub fn deinit(self: *TestCluster) void {
         for (0..self.replica_count) |i| {
+            self.replicas[i].deinit();
             self.allocator.destroy(self.replicas[i]);
             self.allocator.destroy(self.state_machines[i]);
         }
@@ -208,7 +211,8 @@ pub const TestCluster = struct {
         self.disks[i].crash();
         self.state_machines[i].initInPlace(self.state_machines[i].seed);
 
-        self.replicas[i].initInPlace(.{
+        self.replicas[i].resetInPlace(.{
+            .allocator = self.allocator,
             .replica_id = id,
             .replica_count = self.replica_count,
             .io = self.sim_ios[i].io(),
@@ -1107,7 +1111,8 @@ test "durable storage: corrupt committed slot fails recovery" {
     try tc.disks[0].sync();
 
     tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
-    tc.replicas[0].initInPlace(.{
+    tc.replicas[0].resetInPlace(.{
+        .allocator = tc.allocator,
         .replica_id = 0,
         .replica_count = 1,
         .io = tc.sim_ios[0].io(),
@@ -1413,7 +1418,8 @@ test "recovery rejects metadata commit_max above op_number" {
     try tc.disks[0].sync();
 
     tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
-    tc.replicas[0].initInPlace(.{
+    tc.replicas[0].resetInPlace(.{
+        .allocator = tc.allocator,
         .replica_id = 0,
         .replica_count = 1,
         .io = tc.sim_ios[0].io(),
@@ -1691,4 +1697,71 @@ test "incomplete selected suffix remains view_change and accepts only bound sour
     try std.testing.expectEqual(msg.Status.normal, leader.status);
     try std.testing.expect(!leader.pending_view_selection);
     try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+}
+
+test "Replica candidate ownership survives crash reset and frees on teardown" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xCAAD1DA7E);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+    replica.view_change_candidate = try view_candidate.ViewChangeCandidate.allocate(replica.allocator, .{
+        .source_replica = 0,
+        .target_view = 1,
+        .source_last_normal_view = 0,
+        .base_op = 1,
+        .tip_op = 1,
+        .tip_checksum = 1,
+        .commit_bound = 0,
+        .deadline_tick = 10,
+    });
+    try std.testing.expect(replica.view_change_candidate.entries.len == 1);
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, tc.replicas[0].view_change_candidate.phase);
+    try std.testing.expectEqual(@as(usize, 0), tc.replicas[0].view_change_candidate.entries.len);
+    try std.testing.expect(tc.replicas[0].view_change_candidate.allocator != null);
+}
+
+test "Replica candidate deinit reset and allocation failure are leak free" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA110CA7E);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+
+    replica.deinit();
+    replica.deinit();
+    try std.testing.expect(replica.view_change_candidate.allocator == null);
+    replica.initInPlace(.{
+        .allocator = tc.allocator,
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    replica.view_change_candidate.reset();
+    replica.allocator = fixed.allocator();
+    replica.view_change_candidate = .{ .allocator = replica.allocator };
+    try std.testing.expectError(error.OutOfMemory, view_candidate.ViewChangeCandidate.allocate(replica.allocator, .{
+        .source_replica = 0,
+        .target_view = 1,
+        .source_last_normal_view = 0,
+        .base_op = 1,
+        .tip_op = 1,
+        .tip_checksum = 1,
+        .commit_bound = 0,
+        .deadline_tick = 10,
+    }));
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, replica.view_change_candidate.phase);
+
+    replica.resetInPlace(.{
+        .allocator = tc.allocator,
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+    try std.testing.expect(replica.view_change_candidate.allocator != null);
 }

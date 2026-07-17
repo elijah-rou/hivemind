@@ -140,13 +140,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
     replica.initInPlace(.{
+        .allocator = allocator,
         .replica_id = node_id,
         .replica_count = replica_count,
         .io = init.io,
         .state_machine = sm,
         .disk = if (file_disk) |fd| fd.diskInterface() else null,
     });
+
+    defer replica.deinit();
 
     // Recover from disk if we have one
     if (file_disk != null) {
