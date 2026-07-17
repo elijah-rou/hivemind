@@ -55,6 +55,8 @@ run_phase "Go build (API + bench)" \
 # --- Phase 4: Infra POC script tests ---
 run_phase "Infra POC script tests" \
     bash -c "'$REPO_ROOT/infra/poc/test-worker-env.sh'"
+run_phase "POC deploy output fixtures" \
+    bash -c "'$SCRIPT_DIR/poc_deploy_outputs_test.sh'"
 
 # --- Phase 4b: Storage-mode smoke (real binary, no live infra) ---
 run_phase "Storage-mode smoke (volatile + experimental)" \

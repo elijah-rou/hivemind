@@ -272,7 +272,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Zig: `313 / 313` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
 - Rust: `128` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Go: API and bench module tests and builds pass.
-- `tests/run-all.sh --skip-containerd`: `17 passed, 0 failed`, including storage-mode, launcher, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
+- `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
 - Local smoke within run-all: `16 passed, 0 failed`.
 - Shell: changed files pass `bash -n` and ShellCheck at style severity.
 - Residual validation: no live AWS deploy; containerd-in-Docker not run; Terraform provider-dependent offline validation is reported separately when unavailable.

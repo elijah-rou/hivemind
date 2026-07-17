@@ -22,6 +22,16 @@ done
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$SSH_KEY")
 
+capture_terraform_string_array() {
+    local output_name="$1" output_file="$2"
+    if ! terraform output -json "$output_name" | jq -r \
+        'if type != "array" then error("expected array") elif any(.[]; type != "string") then error("expected string elements") else .[] end' \
+        > "$output_file"; then
+        echo "FAIL: invalid Terraform output: $output_name" >&2
+        return 1
+    fi
+}
+
 # --- Build Linux binaries ---
 if [ "$BUILD" = true ]; then
     "$SCRIPT_DIR/build-binaries.sh" --output-dir "$SCRIPT_DIR"
@@ -32,8 +42,28 @@ fi
 echo "==> Reading Terraform outputs..."
 cd "$SCRIPT_DIR"
 
-mapfile -t REPLICA_IPS < <(terraform output -json replica_ips | jq -r '.[]')
-mapfile -t REPLICA_PUBLIC_IPS < <(terraform output -json replica_public_ips | jq -r '.[]')
+terraform_output_dir="$(mktemp -d)" || { echo "FAIL: cannot create Terraform output workspace" >&2; exit 1; }
+trap 'rm -rf "$terraform_output_dir"' EXIT
+capture_terraform_string_array replica_ips "$terraform_output_dir/replica_ips"
+capture_terraform_string_array replica_public_ips "$terraform_output_dir/replica_public_ips"
+declare -a REPLICA_IPS=()
+declare -a REPLICA_PUBLIC_IPS=()
+mapfile -t REPLICA_IPS < "$terraform_output_dir/replica_ips"
+mapfile -t REPLICA_PUBLIC_IPS < "$terraform_output_dir/replica_public_ips"
+rm -rf "$terraform_output_dir"
+trap - EXIT
+if (( ${#REPLICA_IPS[@]} == 0 )); then
+    echo "FAIL: Terraform replica_ips output is empty" >&2
+    exit 1
+fi
+if (( ${#REPLICA_PUBLIC_IPS[@]} == 0 )); then
+    echo "FAIL: Terraform replica_public_ips output is empty" >&2
+    exit 1
+fi
+if (( ${#REPLICA_IPS[@]} != ${#REPLICA_PUBLIC_IPS[@]} )); then
+    echo "FAIL: private/public replica output counts differ (${#REPLICA_IPS[@]} != ${#REPLICA_PUBLIC_IPS[@]})" >&2
+    exit 1
+fi
 AGENT_CPU_IP=$(terraform output -raw worker_cpu_ip)
 AGENT_GPU_IP=$(terraform output -raw worker_gpu_ip)
 
