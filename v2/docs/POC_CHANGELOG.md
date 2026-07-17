@@ -48,7 +48,7 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 What changed:
 - bench deploy artifacts now use an internally generated AWS-account-scoped 128-bit random run identity and immutable SHA-256 object keys; callers cannot supply a reusable production identity
-- bucket ownership is established through an atomic conditional marker claim before the exit trap is installed; cleanup revalidates that exact claim, so us-east-1 already-owned success and same-token races cannot delete a prior bucket
+- the exit trap is installed before preparation and remains inert until an atomic conditional marker succeeds or an ambiguous write reconciles to the exact token and claim; cleanup revalidates that claim, so later failures are cleaned without letting us-east-1 already-owned success or same-token races delete a prior bucket
 - artifact AWS calls use GNU `timeout` to TERM and then KILL the complete process group on a bounded deadline; all exits remove only the owned run prefix and bucket unless `HIVEMIND_KEEP_ARTIFACTS=1`
 - creation/upload failures are fatal and remote nodes receive the exact immutable object URIs
 - `/run` retry workspaces are cleaned on every post-creation return; requested response artifact copy/read failures cannot report success

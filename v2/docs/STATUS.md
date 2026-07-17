@@ -1,6 +1,6 @@
 # Hivemind Status Report
 
-*Last updated: 2026-07-16*
+*Last updated: 2026-07-17*
 
 
 ## Current Presentation Gate (2026-05-05)
@@ -269,8 +269,8 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (2026-07-17, branch evidence; no live infrastructure touched):**
-- Zig: `312 / 312` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
-- Rust: `125` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Zig: `313 / 313` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
+- Rust: `128` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `17 passed, 0 failed`, including storage-mode, launcher, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
 - Local smoke within run-all: `16 passed, 0 failed`.

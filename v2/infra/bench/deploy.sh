@@ -50,9 +50,9 @@ hivemind_deploy_cleanup() {
   exit $?
 }
 
-# Install cleanup as the immediate next operation after ownership succeeds.
-hivemind_artifact_prepare "$REGION"
+# Cleanup is armed before prepare and remains a no-op until exact ownership is proven.
 trap hivemind_deploy_cleanup EXIT
+hivemind_artifact_prepare "$REGION"
 
 RUN_ID="$HIVEMIND_ARTIFACT_ACCOUNT-$HIVEMIND_ARTIFACT_TOKEN"
 hivemind_artifact_upload "$BINARY" hivemind

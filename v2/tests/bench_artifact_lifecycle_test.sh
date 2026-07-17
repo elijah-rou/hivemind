@@ -11,12 +11,8 @@ mkdir -p "$TMP_DIR/bin" "$TMP_DIR/state/buckets" "$TMP_DIR/state/random"
 cat > "$TMP_DIR/bin/openssl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$*" == "rand -hex 16" ]]
-count_file="$AWS_STUB_STATE/random/$PPID"
-exec 9>"$count_file.lock"; flock -x 9
-count=0; [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
-count=$((count + 1)); printf '%s' "$count" > "$count_file"
-if (( count % 2 == 1 )); then printf '%s\n' "$TEST_RANDOM_TOKEN"; else printf '%s\n' "$TEST_RANDOM_CLAIM"; fi
+[[ "$*" == "rand -hex 32" ]]
+printf '%s%s\n' "$TEST_RANDOM_TOKEN" "$TEST_RANDOM_CLAIM"
 EOF
 
 cat > "$TMP_DIR/bin/aws" <<'EOF'
@@ -51,12 +47,24 @@ case "$service:$operation" in
   s3api:put-object)
     exec 8>"$AWS_STUB_STATE/marker.lock"; flock -x 8
     [[ ! -f "$bucket_dir/marker" ]] || exit 1
+    if [[ "${AWS_SCENARIO:-success}" == put-timeout-mismatch ]]; then
+      metadata="${metadata/claim=*/claim=00000000000000000000000000000000}"
+    fi
     printf '%s\n' "$metadata" > "$bucket_dir/marker"
+    [[ "${AWS_SCENARIO:-success}" != put-timeout-committed && "${AWS_SCENARIO:-success}" != put-timeout-mismatch ]] || exit 124
     ;;
   s3api:head-object)
     [[ -f "$bucket_dir/marker" ]] || exit 1
+    [[ "${AWS_SCENARIO:-success}" != head-always-fail ]] || exit 1
+    if [[ "${AWS_SCENARIO:-success}" == verify-failure-once ]]; then
+      verify_count="$bucket_dir/verify-count"
+      count=0; [[ ! -f "$verify_count" ]] || count="$(cat "$verify_count")"
+      count=$((count + 1)); printf '%s' "$count" > "$verify_count"
+      (( count > 1 )) || exit 1
+    fi
+    token="$(sed -n 's/.*token=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
     claim="$(sed -n 's/.*claim=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
-    printf '%s\n' "$claim"
+    printf '%s %s\n' "$token" "$claim"
     ;;
   s3:cp)
     if [[ "${AWS_SCENARIO:-success}" == hung-upload ]]; then
@@ -67,7 +75,7 @@ case "$service:$operation" in
     fi
     [[ "${AWS_SCENARIO:-success}" != upload-failure ]]
     ;;
-  s3:rm) rm -f "$bucket_dir/marker" ;;
+  s3:rm) rm -f "$bucket_dir/marker" "$bucket_dir/verify-count" ;;
   s3api:delete-bucket) rmdir "$bucket_dir" ;;
   *) exit 97 ;;
 esac
@@ -106,6 +114,40 @@ if prepare cccccccccccccccccccccccccccccccc 33333333333333333333333333333333; th
   echo 'pre-existing bucket unexpectedly claimed' >&2; exit 1
 fi
 [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 0 ]]
+: > "$AWS_CALLS"
+hivemind_artifact_cleanup 1 || true
+[[ -d "$TMP_DIR/state/buckets/hivemind-bench-123456789012-cccccccccccccccccccccccccccccccc" ]]
+if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+  echo 'prior bucket was touched without ownership' >&2; exit 1
+fi
+
+# A timed-out conditional write that committed is reconciled to exact ownership.
+AWS_SCENARIO=put-timeout-committed prepare 67676767676767676767676767676767 78787878787878787878787878787878
+[[ "$HIVEMIND_ARTIFACT_OWNED" == 1 ]]
+: > "$AWS_CALLS"
+hivemind_artifact_cleanup 0
+grep -q 'delete-bucket .*67676767676767676767676767676767' "$AWS_CALLS"
+
+# Conditional success establishes provisional ownership before later read failure.
+if AWS_SCENARIO=verify-failure-once prepare 89898989898989898989898989898989 90909090909090909090909090909090; then
+  echo 'verification failure unexpectedly passed' >&2; exit 1
+fi
+[[ "$HIVEMIND_ARTIFACT_OWNED" == 1 ]]
+: > "$AWS_CALLS"
+hivemind_artifact_cleanup 0
+grep -q 'delete-bucket .*89898989898989898989898989898989' "$AWS_CALLS"
+
+# An ambiguous failed write with a different marker never grants deletion authority.
+if AWS_SCENARIO=put-timeout-mismatch prepare 91919191919191919191919191919191 92929292929292929292929292929292; then
+  echo 'mismatched ambiguous write unexpectedly passed' >&2; exit 1
+fi
+[[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 0 ]]
+: > "$AWS_CALLS"
+hivemind_artifact_cleanup 1 || true
+[[ -d "$TMP_DIR/state/buckets/hivemind-bench-123456789012-91919191919191919191919191919191" ]]
+if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+  echo 'ambiguous mismatched marker triggered deletion' >&2; exit 1
+fi
 
 # A same-token race has one marker winner; the loser never removes the preserved bucket.
 : > "$AWS_CALLS"
@@ -159,6 +201,16 @@ prepare 99999999999999999999999999999999 88888888888888888888888888888888
 HIVEMIND_KEEP_ARTIFACTS=1 hivemind_artifact_cleanup 0
 [[ ! -s "$AWS_CALLS" ]]
 
+# A failed current marker read cannot reuse stale observed ownership.
+prepare 13131313131313131313131313131313 14141414141414141414141414141414
+: > "$AWS_CALLS"
+if AWS_SCENARIO=head-always-fail hivemind_artifact_cleanup 0; then
+  echo 'failed current marker read unexpectedly cleaned' >&2; exit 1
+fi
+if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+  echo 'stale marker observation triggered deletion' >&2; exit 1
+fi
+
 # Cleanup revalidates the invocation claim and refuses a changed marker.
 prepare abababababababababababababababab 12121212121212121212121212121212
 printf '%s\n' 'account=123456789012,token=abababababababababababababababab,claim=34343434343434343434343434343434' \
@@ -181,7 +233,9 @@ if PATH="$TMP_DIR/non-gnu:$PATH" HIVEMIND_ARTIFACT_TIMEOUT_READY=0 hivemind_arti
   echo 'non-GNU timeout unexpectedly accepted' >&2; exit 1
 fi
 
-grep -q 'trap .*hivemind_deploy_cleanup.*EXIT' "$DEPLOY"
+trap_line="$(grep -n 'trap .*hivemind_deploy_cleanup.*EXIT' "$DEPLOY" | cut -d: -f1)"
+prepare_line="$(grep -n 'hivemind_artifact_prepare' "$DEPLOY" | cut -d: -f1)"
+[[ "$trap_line" -lt "$prepare_line" ]]
 grep -q 'HIVEMIND_ARTIFACT_URI' "$DEPLOY"
 if grep -q 'HIVEMIND_RUN_TOKEN' "$DEPLOY"; then
   echo 'deploy accepts externally reusable run identity' >&2; exit 1

@@ -18,25 +18,45 @@ hivemind_artifact_aws() {
     timeout --signal=TERM --kill-after="${kill_after_sec}s" "${timeout_sec}s" aws "$@"
 }
 
-hivemind_artifact_random_token() {
-    local token
+hivemind_artifact_random_identity() {
+    local identity
     command -v openssl >/dev/null 2>&1 || { echo 'FAIL: openssl is required for artifact run identity' >&2; return 1; }
-    token="$(openssl rand -hex 16)" || { echo 'FAIL: unable to generate artifact run identity' >&2; return 1; }
-    token="${token,,}"
-    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || { echo 'FAIL: invalid 128-bit artifact run identity' >&2; return 1; }
-    printf '%s\n' "$token"
+    identity="$(openssl rand -hex 32)" || { echo 'FAIL: unable to generate artifact run identity' >&2; return 1; }
+    identity="${identity,,}"
+    [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || { echo 'FAIL: invalid artifact run identity and claim' >&2; return 1; }
+    printf '%s\n' "$identity"
+}
+
+hivemind_artifact_marker_read() {
+    local marker
+    HIVEMIND_ARTIFACT_OBSERVED_TOKEN=""
+    HIVEMIND_ARTIFACT_OBSERVED_CLAIM=""
+    marker="$(hivemind_artifact_aws s3api head-object \
+        --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
+        --key "$HIVEMIND_ARTIFACT_MARKER_KEY" \
+        --query '[Metadata.token,Metadata.claim]' --output text \
+        --region "$HIVEMIND_ARTIFACT_REGION")" || return 1
+    read -r HIVEMIND_ARTIFACT_OBSERVED_TOKEN HIVEMIND_ARTIFACT_OBSERVED_CLAIM <<< "$marker"
+    [[ -n "$HIVEMIND_ARTIFACT_OBSERVED_TOKEN" ]]
+    [[ -n "$HIVEMIND_ARTIFACT_OBSERVED_CLAIM" ]]
+}
+
+hivemind_artifact_marker_matches() {
+    [[ "${HIVEMIND_ARTIFACT_OBSERVED_TOKEN:-}" == "$HIVEMIND_ARTIFACT_TOKEN" ]]
+    [[ "${HIVEMIND_ARTIFACT_OBSERVED_CLAIM:-}" == "$HIVEMIND_ARTIFACT_CLAIM" ]]
 }
 
 hivemind_artifact_prepare() {
-    local region="$1" account token claim observed_claim marker_key
+    local region="$1" account identity token claim marker_key marker_write_ok=0
     HIVEMIND_ARTIFACT_OWNED=0
     account="$(hivemind_artifact_aws sts get-caller-identity --query Account --output text)" || {
         echo 'FAIL: unable to determine AWS account for artifact ownership' >&2
         return 1
     }
     [[ "$account" =~ ^[0-9]{12}$ ]] || { echo "FAIL: invalid AWS account: $account" >&2; return 1; }
-    token="$(hivemind_artifact_random_token)" || return 1
-    claim="$(hivemind_artifact_random_token)" || return 1
+    identity="$(hivemind_artifact_random_identity)" || return 1
+    token="${identity:0:32}"
+    claim="${identity:32:32}"
 
     export HIVEMIND_ARTIFACT_ACCOUNT="$account"
     export HIVEMIND_ARTIFACT_TOKEN="$token"
@@ -63,28 +83,32 @@ hivemind_artifact_prepare() {
 
     # S3 us-east-1 may report success for an already-owned bucket. The
     # conditional marker is the atomic ownership boundary for same-token races.
-    if ! hivemind_artifact_aws s3api put-object \
+    if hivemind_artifact_aws s3api put-object \
         --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
         --key "$marker_key" \
         --body /dev/null \
         --if-none-match '*' \
         --metadata "account=$account,token=$token,claim=$claim" \
         --region "$region" >/dev/null; then
-        echo "FAIL: artifact ownership marker collision: $HIVEMIND_ARTIFACT_BUCKET" >&2
+        marker_write_ok=1
+        # Conditional success proves this exact invocation created the marker.
+        HIVEMIND_ARTIFACT_OWNED=1
+    fi
+
+    if ! hivemind_artifact_marker_read; then
+        if [[ "$marker_write_ok" -eq 0 ]]; then
+            echo "FAIL: artifact ownership marker write was not confirmed: $HIVEMIND_ARTIFACT_BUCKET" >&2
+        else
+            echo 'FAIL: unable to verify artifact ownership marker' >&2
+        fi
         return 1
     fi
-    observed_claim="$(hivemind_artifact_aws s3api head-object \
-        --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
-        --key "$marker_key" \
-        --query Metadata.claim --output text \
-        --region "$region")" || {
-        echo 'FAIL: unable to verify artifact ownership marker' >&2
-        return 1
-    }
-    [[ "$observed_claim" == "$claim" ]] || {
+    if ! hivemind_artifact_marker_matches; then
         echo 'FAIL: artifact ownership marker verification mismatch' >&2
         return 1
-    }
+    fi
+    # A timed-out/failed write may still have committed. Exact token + claim
+    # reconciliation is sufficient to establish provisional cleanup ownership.
     HIVEMIND_ARTIFACT_OWNED=1
 }
 
@@ -109,19 +133,15 @@ PY
 }
 
 hivemind_artifact_cleanup() {
-    local prior_status="$1" cleanup_status=0 observed_claim
+    local prior_status="$1" cleanup_status=0
     [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 1 ]] || return "$prior_status"
     if [[ "${HIVEMIND_KEEP_ARTIFACTS:-0}" == 1 ]]; then
         echo "keeping owned artifact bucket: $HIVEMIND_ARTIFACT_BUCKET" >&2
         return "$prior_status"
     fi
 
-    observed_claim="$(hivemind_artifact_aws s3api head-object \
-        --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
-        --key "$HIVEMIND_ARTIFACT_MARKER_KEY" \
-        --query Metadata.claim --output text \
-        --region "$HIVEMIND_ARTIFACT_REGION")" || cleanup_status=1
-    if [[ "$observed_claim" != "$HIVEMIND_ARTIFACT_CLAIM" ]]; then
+    hivemind_artifact_marker_read || cleanup_status=1
+    if ! hivemind_artifact_marker_matches; then
         echo 'FAIL: refusing cleanup without exact artifact ownership marker' >&2
         cleanup_status=1
     else
