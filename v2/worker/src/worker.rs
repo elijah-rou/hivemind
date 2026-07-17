@@ -229,9 +229,15 @@ impl Worker {
                     }
                     Err(e) => {
                         eprintln!("inference forward failed: {e}");
+                        let status = match &e {
+                            RuntimeError::ResponseTooLarge(_) => {
+                                crate::protocol::RUN_STATUS_RESPONSE_TOO_LARGE
+                            }
+                            _ => crate::protocol::RUN_STATUS_FORWARDING_FAILED,
+                        };
                         io.send(WorkerMessage::RunResponse(RunResponseMsg {
                             request_id: cmd.request_id,
-                            status: crate::protocol::RUN_STATUS_FORWARDING_FAILED,
+                            status,
                             payload: e.to_string().into_bytes(),
                         }));
                     }
@@ -1195,21 +1201,21 @@ mod tests {
 
     struct ForwardingRuntime {
         seen: Mutex<Vec<(String, u16, Vec<u8>)>>,
-        fail: bool,
+        fail_status: Option<u8>,
     }
 
     impl ForwardingRuntime {
         fn new() -> Self {
             Self {
                 seen: Mutex::new(Vec::new()),
-                fail: false,
+                fail_status: None,
             }
         }
 
         fn failing() -> Self {
             Self {
                 seen: Mutex::new(Vec::new()),
-                fail: true,
+                fail_status: Some(crate::protocol::RUN_STATUS_FORWARDING_FAILED),
             }
         }
     }
@@ -1238,7 +1244,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((handle.container_id.clone(), port, payload.to_vec()));
-            if self.fail {
+            if let Some(status) = self.fail_status {
+                if status == crate::protocol::RUN_STATUS_RESPONSE_TOO_LARGE {
+                    return Err(RuntimeError::ResponseTooLarge("overflow".into()));
+                }
                 return Err(RuntimeError::Internal("forward exploded".into()));
             }
             Ok(br#"{"status":"ok"}"#.to_vec())
@@ -1405,6 +1414,27 @@ mod tests {
             WorkerMessage::RunResponse(resp) => {
                 assert_eq!(resp.status, crate::protocol::RUN_STATUS_FORWARDING_FAILED);
                 assert_ne!(resp.status, crate::protocol::RUN_STATUS_NO_RUNNING_POD);
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
+
+        io.sent.clear();
+        let oversized = ForwardingRuntime {
+            seen: Mutex::new(Vec::new()),
+            fail_status: Some(crate::protocol::RUN_STATUS_RESPONSE_TOO_LARGE),
+        };
+        worker.handle_run_request(
+            &mut io,
+            &oversized,
+            RunRequestCmd {
+                request_id: 11,
+                deployment_id: 60,
+                payload: b"request".to_vec(),
+            },
+        );
+        match &io.sent[0] {
+            WorkerMessage::RunResponse(resp) => {
+                assert_eq!(resp.status, crate::protocol::RUN_STATUS_RESPONSE_TOO_LARGE);
             }
             other => panic!("unexpected worker message: {other:?}"),
         }

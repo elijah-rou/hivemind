@@ -355,6 +355,12 @@ pub const ConnectionManager = struct {
             self.disconnectWorker(worker);
             return;
         };
+        // not_leader is emitted only by core before enqueue; a worker claiming
+        // it is faulty and must never induce a client retry.
+        if (status == .not_leader) {
+            self.disconnectWorker(worker);
+            return;
+        }
         const response_data = payload[9..];
         if (response_data.len > MAX_RUN_RESPONSE_BODY) {
             self.disconnectWorker(worker);
@@ -537,6 +543,7 @@ pub const ConnectionManager = struct {
             const worker_idx = self.replica.findWorkerForNode(backends[backend_idx].node_id) orelse continue;
             if (worker_idx >= self.worker_count) continue;
             if (!self.workers[worker_idx].connected) continue;
+            if (self.request_queue.workerHasInFlight(worker_idx)) continue;
             self.request_queue.dispatch_idx[queue_idx] = backend_idx + 1;
             return worker_idx;
         }
@@ -2342,7 +2349,7 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     try std.testing.expect(std.mem.eql(u8, buf[21..25], "pong"));
 }
 
-test "malformed and foreign run responses disconnect only sender and release owned saturated slots" {
+test "malformed foreign and worker not_leader responses disconnect only sender" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(2468);
     var current_tick: i64 = 0;
@@ -2350,7 +2357,6 @@ test "malformed and foreign run responses disconnect only sender and release own
     defer allocator.destroy(network);
     network.initInPlace(2468, 1, &current_tick);
     var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
-
     const sm = try allocator.create(sm_mod.StateMachine);
     defer allocator.destroy(sm);
     sm.initInPlace(2468);
@@ -2360,7 +2366,6 @@ test "malformed and foreign run responses disconnect only sender and release own
     replica.worker_count = 2;
     replica.workers[0].connected = true;
     replica.workers[1].connected = true;
-
     const cm = try allocator.create(ConnectionManager);
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
@@ -2368,76 +2373,33 @@ test "malformed and foreign run responses disconnect only sender and release own
     cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
     cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
 
-    var worker_ids: [2][rq.MAX_IN_FLIGHT / 2]u64 = undefined;
-    for (0..rq.MAX_IN_FLIGHT) |i| {
-        const owner = i % 2;
-        worker_ids[owner][i / 2] = cm.request_queue.trackInFlightForWorker(@intCast(i + 1), @intCast(i + 100), owner).?;
-    }
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT, cm.request_queue.activeInFlightCount());
-
-    // An oversized response carrying worker 0's known ID fails the connection
-    // and releases every worker-0 correlation, while worker 1 remains intact.
-    var oversized: [10 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
-    std.mem.writeInt(u64, oversized[0..8], worker_ids[0][0], .little);
-    oversized[8] = 0;
-    @memset(oversized[9..], 0xaa);
-    cm.handleRunResponse(&cm.workers[0], &oversized);
-    try std.testing.expect(!cm.workers[0].connected);
-    try std.testing.expect(cm.workers[1].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2, cm.request_queue.activeInFlightCount());
-
-    // Reusing every released slot restores saturation without disturbing worker 1.
-    cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
-    replica.workers[0].connected = true;
-    for (0..rq.MAX_IN_FLIGHT / 2) |i| {
-        worker_ids[0][i] = cm.request_queue.trackInFlightForWorker(@intCast(10_000 + i), @intCast(20_000 + i), 0).?;
-    }
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT, cm.request_queue.activeInFlightCount());
-
-    // Worker 1 cannot resolve worker 0's correlation. Only worker 1 is failed,
-    // and all worker-0 entries remain available for their real owner.
+    const owned_zero = cm.request_queue.trackInFlightForWorker(1, 100, 0).?;
+    const owned_one = cm.request_queue.trackInFlightForWorker(2, 200, 1).?;
     var foreign = std.mem.zeroes([9]u8);
-    std.mem.writeInt(u64, foreign[0..8], worker_ids[0][0], .little);
+    std.mem.writeInt(u64, foreign[0..8], owned_zero, .little);
     cm.handleRunResponse(&cm.workers[1], &foreign);
     try std.testing.expect(!cm.workers[1].connected);
     try std.testing.expect(cm.workers[0].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2, cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(rq.ResponseResolution.unknown, cm.request_queue.classifyResponseForWorker(owned_one, 1));
 
-    // Exact maximum-size and ordinary responses from the owner remain valid.
-    var exact: [9 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
-    std.mem.writeInt(u64, exact[0..8], worker_ids[0][0], .little);
-    exact[8] = 0;
+    cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
+    replica.workers[1].connected = true;
+    _ = cm.request_queue.trackInFlightForWorker(3, 300, 1).?;
+    var forbidden = std.mem.zeroes([9]u8);
+    std.mem.writeInt(u64, forbidden[0..8], owned_zero, .little);
+    forbidden[8] = @intFromEnum(RunStatus.not_leader);
+    cm.handleRunResponse(&cm.workers[1], &forbidden);
+    try std.testing.expect(!cm.workers[1].connected);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+
+    var exact = std.mem.zeroes([9 + MAX_RUN_RESPONSE_BODY]u8);
+    std.mem.writeInt(u64, exact[0..8], owned_zero, .little);
     @memset(exact[9..], 0x5a);
     cm.handleRunResponse(&cm.workers[0], &exact);
     try std.testing.expect(cm.workers[0].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2 - 1, cm.request_queue.activeInFlightCount());
-
-    var valid = std.mem.zeroes([11]u8);
-    std.mem.writeInt(u64, valid[0..8], worker_ids[0][1], .little);
-    @memcpy(valid[9..11], "ok");
-    cm.handleRunResponse(&cm.workers[0], &valid);
-    try std.testing.expect(cm.workers[0].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2 - 2, cm.request_queue.activeInFlightCount());
-
-    // An unknown correlation fails only its sender and cannot release worker 0.
-    cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
-    replica.workers[1].connected = true;
-    _ = cm.request_queue.trackInFlightForWorker(30_000, 40_000, 1).?;
-    var unknown = std.mem.zeroes([9]u8);
-    std.mem.writeInt(u64, unknown[0..8], std.math.maxInt(u64), .little);
-    cm.handleRunResponse(&cm.workers[1], &unknown);
-    try std.testing.expect(!cm.workers[1].connected);
-    try std.testing.expect(cm.workers[0].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2 - 2, cm.request_queue.activeInFlightCount());
-
-    // A structurally short response also releases only its sender's entries.
-    cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
-    replica.workers[1].connected = true;
-    _ = cm.request_queue.trackInFlightForWorker(50_000, 60_000, 1).?;
-    cm.handleRunResponse(&cm.workers[1], &[_]u8{0} ** 8);
-    try std.testing.expect(!cm.workers[1].connected);
-    try std.testing.expect(cm.workers[0].connected);
-    try std.testing.expectEqual(rq.MAX_IN_FLIGHT / 2 - 2, cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
 }
 
 test "dispatchRun preserves queued work without worker and fails accepted work on send or disconnect" {
@@ -2520,7 +2482,9 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     replica.workers[0].connected = true;
     cm.workers[0] = .{ .fd = success_worker_fds[0], .connected = true, .worker_idx = 0 };
     try std.testing.expect(cm.request_queue.enqueue(dep_id, 3, 55, "three"));
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 4, 55, "four"));
     cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
     var worker_buf: [128]u8 = undefined;
     const worker_n = try std.posix.read(success_worker_fds[1], &worker_buf);
     try std.testing.expect(worker_n >= 28);
@@ -2536,6 +2500,10 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     try std.testing.expectEqual(@as(u8, 0), client_buf[16]);
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, client_buf[17..21], .little));
     try std.testing.expect(std.mem.eql(u8, client_buf[21..23], "ok"));
+
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
 }
 
 test "disconnectClient tombstones sent work and owning late response is silent" {
@@ -2564,7 +2532,7 @@ test "disconnectClient tombstones sent work and owning late response is silent" 
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
     cm.client_count = 1;
-    cm.worker_count = 1;
+    cm.worker_count = 2;
 
     var worker_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_fds));
@@ -2579,7 +2547,7 @@ test "disconnectClient tombstones sent work and owning late response is silent" 
     try std.testing.expect(cm.request_queue.enqueue(7, 10, 999, "queued"));
     const disconnected_worker_id = cm.request_queue.trackInFlight(11, 999).?;
     try std.testing.expect(cm.request_queue.enqueue(7, 12, 555, "keep"));
-    const kept_worker_id = cm.request_queue.trackInFlight(13, 555).?;
+    const kept_worker_id = cm.request_queue.trackInFlightForWorker(13, 555, 1).?;
 
     cm.disconnectClient(&cm.clients[0]);
 
@@ -2595,7 +2563,7 @@ test "disconnectClient tombstones sent work and owning late response is silent" 
     cm.handleRunResponse(&cm.workers[0], &late);
     try std.testing.expect(cm.workers[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
-    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponseForWorker(kept_worker_id, 0).?.client_id);
+    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponseForWorker(kept_worker_id, 1).?.client_id);
 }
 
 test "identifyPeerConnection rejects rebind to different replica id" {

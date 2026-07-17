@@ -2282,7 +2282,7 @@ test "incomplete selected suffix repairs backward by exact content identity" {
         entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
         entry.checksum = entry.computeChecksum();
         parent = entry.checksum;
-        tc.replicas[1].journalPut(entry.*);
+        if (i >= 2) tc.replicas[1].journalPut(entry.*);
     }
     tc.replicas[1].op_number = 10;
     tc.replicas[1].last_normal_view = 2;
@@ -2291,7 +2291,7 @@ test "incomplete selected suffix repairs backward by exact content identity" {
 
     var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
     for (0..8) |i| source.log_entries[i] = entries[9 - i];
-    for (1..11) |op| msg.bitsetSet(&source.present_bitset, op % replica_mod.LOG_SIZE_MAX);
+    for (3..11) |op| msg.bitsetSet(&source.present_bitset, op % replica_mod.LOG_SIZE_MAX);
     // Replica 2 retains the exact interior ancestors but contributes no DVC hint.
     tc.replicas[2].journalPut(entries[0]);
     tc.replicas[2].journalPut(entries[1]);
@@ -2310,7 +2310,7 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     var wrong_identity = entries[1];
     wrong_identity.client_id +%= 1;
     wrong_identity.checksum = wrong_identity.computeChecksum();
-    tc.deliver(0, 1, .{ .send_prepare = .{
+    tc.deliver(0, 2, .{ .send_prepare = .{
         .view_number = 3, .entry = wrong_identity, .selected_source = 1,
         .selected_last_normal_view = 2, .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
@@ -2319,6 +2319,10 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.selected_next_op);
     try std.testing.expectEqual(@as(usize, 8), leader.view_change_candidate.present_count);
 
+    // The selected source receives the real request but has neither the bit nor
+    // the interior entry. The next tick boundedly advances to replica 2.
+    tc.tick();
+    tc.tick();
     tc.deliver(0, 2, .{ .send_prepare = .{
         .view_number = 3, .entry = entries[1], .selected_source = 1,
         .selected_last_normal_view = 2, .selected_tip_op = 10,
@@ -2331,13 +2335,15 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     var wrong_parent = entries[0];
     wrong_parent.client_id +%= 1;
     wrong_parent.checksum = wrong_parent.computeChecksum();
-    tc.deliver(0, 1, .{ .send_prepare = .{
+    tc.deliver(0, 2, .{ .send_prepare = .{
         .view_number = 3, .entry = wrong_parent, .selected_source = 1,
         .selected_last_normal_view = 2, .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[0].checksum,
     } });
     try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.selected_next_op);
+    tc.tick();
+    tc.tick();
 
     const syncs_before = tc.disks[0].syncs;
     tc.deliver(0, 2, .{ .send_prepare = .{

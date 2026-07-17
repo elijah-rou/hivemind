@@ -139,7 +139,7 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
             .get_port(&handle.container_id)
             .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
 
-        crate::runtime::process::forward_run(port, payload).map_err(RuntimeError::Internal)
+        crate::runtime::process::forward_run(port, payload)
     }
 
     fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
@@ -192,7 +192,7 @@ pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
 }
 
 /// Send an HTTP POST to a process "container" and return the response body.
-pub fn forward_run(port: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+pub fn forward_run(port: u16, payload: &[u8]) -> Result<Vec<u8>, RuntimeError> {
     forward_run_with_deadline(port, payload, Duration::from_secs(25))
 }
 
@@ -200,7 +200,7 @@ fn forward_run_with_deadline(
     port: u16,
     payload: &[u8],
     hard_deadline: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RuntimeError> {
     assert!(!hard_deadline.is_zero(), "run deadline must be positive");
     let url = format!("http://127.0.0.1:{port}/inference");
     let agent = ureq::AgentBuilder::new()
@@ -215,16 +215,18 @@ fn forward_run_with_deadline(
     let response = match response {
         Ok(resp) => resp,
         Err(ureq::Error::Status(_, resp)) => resp,
-        Err(ureq::Error::Transport(err)) => return Err(format!("request: {err}")),
+        Err(ureq::Error::Transport(err)) => {
+            return Err(RuntimeError::Internal(format!("request: {err}")))
+        }
     };
     if let Some(content_length) = response.header("Content-Length") {
         let declared = content_length
             .parse::<usize>()
-            .map_err(|_| "invalid Content-Length".to_string())?;
+            .map_err(|_| RuntimeError::Internal("invalid Content-Length".into()))?;
         if declared > MAX_RUN_RESPONSE_BODY {
-            return Err(format!(
-                "response body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
-            ));
+            return Err(RuntimeError::ResponseTooLarge(format!(
+                "body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
+            )));
         }
     }
 
@@ -234,11 +236,11 @@ fn forward_run_with_deadline(
     let mut body = Vec::with_capacity(MAX_RUN_RESPONSE_BODY.min(4096));
     reader
         .read_to_end(&mut body)
-        .map_err(|e| format!("read body: {e}"))?;
+        .map_err(|e| RuntimeError::Internal(format!("read body: {e}")))?;
     if body.len() > MAX_RUN_RESPONSE_BODY {
-        return Err(format!(
-            "response body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
-        ));
+        return Err(RuntimeError::ResponseTooLarge(format!(
+            "body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
+        )));
     }
     Ok(body)
 }
@@ -317,18 +319,20 @@ mod tests {
             MAX_RUN_RESPONSE_BODY + 1
         )
         .into_bytes();
-        assert!(forward_run(serve_response(declared), b"x")
-            .unwrap_err()
-            .contains("exceeds"));
+        assert!(matches!(
+            forward_run(serve_response(declared), b"x"),
+            Err(RuntimeError::ResponseTooLarge(_))
+        ));
 
         let body = vec![b'y'; MAX_RUN_RESPONSE_BODY + 1];
         let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
         chunked.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
         chunked.extend_from_slice(&body);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        assert!(forward_run(serve_response(chunked), b"x")
-            .unwrap_err()
-            .contains("exceeds"));
+        assert!(matches!(
+            forward_run(serve_response(chunked), b"x"),
+            Err(RuntimeError::ResponseTooLarge(_))
+        ));
     }
 
     #[test]

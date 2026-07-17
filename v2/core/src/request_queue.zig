@@ -303,6 +303,13 @@ pub const RequestQueue = struct {
         return count;
     }
 
+    pub fn workerHasInFlight(self: *const RequestQueue, worker_idx: usize) bool {
+        for (self.in_flight) |entry| {
+            if (entry.active and entry.worker_idx == worker_idx) return true;
+        }
+        return false;
+    }
+
     pub fn abandonedInFlightCount(self: *const RequestQueue) usize {
         var count: usize = 0;
         for (self.in_flight) |entry| {
@@ -329,6 +336,7 @@ pub const RequestQueue = struct {
     }
 
     pub fn trackInFlightForWorker(self: *RequestQueue, client_request_id: u64, client_id: u128, worker_idx: usize) ?u64 {
+        if (self.workerHasInFlight(worker_idx)) return null;
         if (self.activeInFlightCount() >= MAX_IN_FLIGHT) return null;
 
         for (&self.in_flight) |*entry| {
@@ -433,13 +441,24 @@ test "request queue: response ownership requires correlation and worker match at
     try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
 }
 
+test "request queue: one active or abandoned correlation per worker" {
+    var rq = RequestQueue.init();
+    const first = rq.trackInFlightForWorker(1, 100, 3).?;
+    try std.testing.expect(rq.workerHasInFlight(3));
+    try std.testing.expect(rq.trackInFlightForWorker(2, 200, 3) == null);
+    rq.cancelClient(100, 10);
+    try std.testing.expect(rq.trackInFlightForWorker(3, 300, 3) == null);
+    try std.testing.expectEqual(ResponseResolution.abandoned, rq.classifyResponseForWorker(first, 3));
+    try std.testing.expect(rq.trackInFlightForWorker(4, 400, 3) != null);
+}
+
 test "request queue: same client request id receives unique worker correlations" {
     var rq = RequestQueue.init();
-    const first = rq.trackInFlight(1, 100).?;
-    const second = rq.trackInFlight(1, 200).?;
+    const first = rq.trackInFlightForWorker(1, 100, 0).?;
+    const second = rq.trackInFlightForWorker(1, 200, 1).?;
     try std.testing.expect(first != second);
 
-    const second_resolved = rq.resolveResponseForWorker(second, 0).?;
+    const second_resolved = rq.resolveResponseForWorker(second, 1).?;
     const first_resolved = rq.resolveResponseForWorker(first, 0).?;
     try std.testing.expectEqual(@as(u128, 200), second_resolved.client_id);
     try std.testing.expectEqual(@as(u64, 1), second_resolved.client_request_id);
@@ -449,24 +468,24 @@ test "request queue: same client request id receives unique worker correlations"
 
 test "request queue: wrapped correlation skips an active id" {
     var rq = RequestQueue.init();
-    const first = rq.trackInFlight(1, 100).?;
+    const first = rq.trackInFlightForWorker(1, 100, 0).?;
     try std.testing.expectEqual(@as(u64, 1), first);
     rq.next_worker_request_id = 1;
-    const second = rq.trackInFlight(2, 200).?;
+    const second = rq.trackInFlightForWorker(2, 200, 1).?;
     try std.testing.expectEqual(@as(u64, 2), second);
 }
 
 test "request queue: full in-flight table rejects without eviction" {
     var rq = RequestQueue.init();
     for (0..MAX_IN_FLIGHT) |i| {
-        try std.testing.expect(rq.trackInFlight(@intCast(i), @intCast(i + 1)) != null);
+        try std.testing.expect(rq.trackInFlightForWorker(@intCast(i), @intCast(i + 1), i) != null);
     }
     try std.testing.expect(rq.trackInFlight(9999, 9999) == null);
     try std.testing.expectEqual(@as(usize, MAX_IN_FLIGHT), rq.activeInFlightCount());
     try std.testing.expectEqual(@as(u64, MAX_IN_FLIGHT), rq.dispatch_total);
 
     for (0..MAX_IN_FLIGHT) |i| {
-        const resolved = rq.resolveResponseForWorker(@intCast(i + 1), 0).?;
+        const resolved = rq.resolveResponseForWorker(@intCast(i + 1), i).?;
         try std.testing.expectEqual(@as(u64, @intCast(i)), resolved.client_request_id);
     }
 }
@@ -487,8 +506,8 @@ test "request queue: cancel client clears queued and in-flight requests only for
     try std.testing.expect(rq.enqueue(1, 10, 100, "a"));
     try std.testing.expect(rq.enqueue(1, 11, 200, "b"));
     try std.testing.expect(rq.enqueue(2, 20, 100, "c"));
-    const first_worker_id = rq.trackInFlight(30, 100).?;
-    const second_worker_id = rq.trackInFlight(31, 200).?;
+    const first_worker_id = rq.trackInFlightForWorker(30, 100, 0).?;
+    const second_worker_id = rq.trackInFlightForWorker(31, 200, 1).?;
 
     rq.cancelClient(100, 10);
 
@@ -497,7 +516,7 @@ test "request queue: cancel client clears queued and in-flight requests only for
     try std.testing.expectEqual(@as(usize, 1), rq.totalDepth());
     try std.testing.expectEqual(@as(usize, 2), rq.activeInFlightCount());
     try std.testing.expectEqual(@as(usize, 1), rq.abandonedInFlightCount());
-    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponseForWorker(second_worker_id, 0).?.client_id);
+    try std.testing.expectEqual(@as(u128, 200), rq.resolveResponseForWorker(second_worker_id, 1).?.client_id);
     try std.testing.expect(rq.resolveResponseForWorker(first_worker_id, 0) == null);
     try std.testing.expectEqual(@as(u64, 2), rq.resolve_total);
 
@@ -524,7 +543,7 @@ test "request queue: abandoned worker-owned response consumes silently without t
 test "request queue: abandoned saturation expires and reuses every slot" {
     var rq = RequestQueue.init();
     for (0..MAX_IN_FLIGHT) |i| {
-        _ = rq.trackInFlightForWorker(@intCast(i), 777, i % 2).?;
+        _ = rq.trackInFlightForWorker(@intCast(i), 777, i).?;
     }
     rq.cancelClient(777, 100);
     try std.testing.expectEqual(MAX_IN_FLIGHT, rq.activeInFlightCount());
@@ -532,24 +551,22 @@ test "request queue: abandoned saturation expires and reuses every slot" {
     try std.testing.expect(rq.trackInFlight(9999, 1) == null);
     var expired_workers: [MAX_IN_FLIGHT]usize = undefined;
     try std.testing.expectEqual(@as(usize, 0), rq.expiredAbandonedWorkers(100 + ABANDONED_TTL_TICKS - 1, &expired_workers));
-    try std.testing.expectEqual(@as(usize, 2), rq.expiredAbandonedWorkers(100 + ABANDONED_TTL_TICKS, &expired_workers));
+    try std.testing.expectEqual(MAX_IN_FLIGHT, rq.expiredAbandonedWorkers(100 + ABANDONED_TTL_TICKS, &expired_workers));
     var released: [MAX_IN_FLIGHT]ResolvedRequest = undefined;
-    _ = rq.releaseWorker(expired_workers[0], &released);
-    _ = rq.releaseWorker(expired_workers[1], &released);
+    for (expired_workers[0..MAX_IN_FLIGHT]) |worker_idx| _ = rq.releaseWorker(worker_idx, &released);
     try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
-    for (0..MAX_IN_FLIGHT) |i| try std.testing.expect(rq.trackInFlight(@intCast(i), 1) != null);
+    for (0..MAX_IN_FLIGHT) |i| try std.testing.expect(rq.trackInFlightForWorker(@intCast(i), 1, i) != null);
 }
 
 test "request queue: worker disconnect releases tombstones without client errors" {
     var rq = RequestQueue.init();
     _ = rq.trackInFlightForWorker(10, 100, 3).?;
-    const live = rq.trackInFlightForWorker(11, 200, 3).?;
+    const live = rq.trackInFlightForWorker(11, 200, 4).?;
     rq.cancelClient(100, 1);
     var released: [MAX_IN_FLIGHT]ResolvedRequest = undefined;
-    try std.testing.expectEqual(@as(usize, 1), rq.releaseWorker(3, &released));
-    try std.testing.expectEqual(@as(u128, 200), released[0].client_id);
-    try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
-    try std.testing.expectEqual(ResponseResolution.unknown, rq.classifyResponseForWorker(live, 3));
+    try std.testing.expectEqual(@as(usize, 0), rq.releaseWorker(3, &released));
+    try std.testing.expectEqual(@as(usize, 1), rq.activeInFlightCount());
+    try std.testing.expectEqual(@as(u128, 200), rq.classifyResponseForWorker(live, 4).deliver.client_id);
 }
 
 test "request queue: worker failure releases owned correlations and reuses slots" {

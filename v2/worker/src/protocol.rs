@@ -26,7 +26,6 @@ pub enum RunStatus {
     ForwardingFailed = 6,
     NoRunningPod = 7,
     Unavailable = 8,
-    NotLeader = 9,
 }
 
 pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = RunStatus::ResponseTooLarge as u8;
@@ -709,7 +708,6 @@ mod tests {
             (RunStatus::ForwardingFailed, 6),
             (RunStatus::NoRunningPod, 7),
             (RunStatus::Unavailable, 8),
-            (RunStatus::NotLeader, 9),
         ];
         for (status, wire) in statuses {
             assert_eq!(status as u8, wire);
