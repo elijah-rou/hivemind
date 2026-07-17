@@ -355,11 +355,19 @@ pub const StartViewMsg = struct {
 pub const RequestPrepareMsg = struct {
     view_number: ViewNumber = 0,
     op_number: OpNumber = 0,
+    selected_source: u8 = 0,
+    selected_last_normal_view: ViewNumber = 0,
+    selected_tip_op: OpNumber = 0,
+    selected_tip_checksum: u64 = 0,
 };
 
 pub const SendPrepareMsg = struct {
     view_number: ViewNumber = 0,
     entry: LogEntry = .{},
+    selected_source: u8 = 0,
+    selected_last_normal_view: ViewNumber = 0,
+    selected_tip_op: OpNumber = 0,
+    selected_tip_checksum: u64 = 0,
 };
 
 pub const RequestStatusMsg = struct {
@@ -990,6 +998,26 @@ test "serialize/deserialize round-trip" {
     try std.testing.expectEqual(decoded.prepare_ok.replica_id, 2);
     try std.testing.expectEqual(decoded.prepare_ok.commit_min, 11);
     try std.testing.expectEqual(decoded.prepare_ok.entry_checksum, 0xCAFE);
+}
+
+test "source-bound repair round-trip" {
+    var buf: [4096]u8 = undefined;
+    const message = Message{ .request_prepare = .{
+        .view_number = 9,
+        .op_number = 17,
+        .selected_source = 2,
+        .selected_last_normal_view = 8,
+        .selected_tip_op = 24,
+        .selected_tip_checksum = 0xCAFE,
+    } };
+    const len = serialize(message, &buf);
+    const decoded = try deserialize(buf[0..len]);
+    try std.testing.expectEqual(@as(ViewNumber, 9), decoded.request_prepare.view_number);
+    try std.testing.expectEqual(@as(OpNumber, 17), decoded.request_prepare.op_number);
+    try std.testing.expectEqual(@as(u8, 2), decoded.request_prepare.selected_source);
+    try std.testing.expectEqual(@as(ViewNumber, 8), decoded.request_prepare.selected_last_normal_view);
+    try std.testing.expectEqual(@as(OpNumber, 24), decoded.request_prepare.selected_tip_op);
+    try std.testing.expectEqual(@as(u64, 0xCAFE), decoded.request_prepare.selected_tip_checksum);
 }
 
 test "deserialize rejects unknown tag" {

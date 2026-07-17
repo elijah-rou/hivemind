@@ -163,7 +163,7 @@ Client/Agent frames (plaintext): [4B LE len][1B flags=0x00][2B LE version][1B ta
 Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext][16B tag]
 Peer frames (plaintext):         [4B LE len][1B flags=0x00][1B from_id][VRR payload]
 Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(from_id+VRR)][16B tag]
-PROTOCOL_VERSION = 2 (2 bytes = 65535 possible versions; v1 peers/workers fail closed)
+PROTOCOL_VERSION = 3 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
 ```
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)
@@ -177,9 +177,10 @@ PROTOCOL_VERSION = 2 (2 bytes = 65535 possible versions; v1 peers/workers fail c
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
 - Full view change protocol: StartViewChange → DoViewChange → StartView
-- Log repair via RequestPrepare/SendPrepare
+- A DVC quorum selects one classic-VRR source by `(last_normal_view, op_number)`; equal-rank sources must agree on tip and overlap identities. Incomplete fixed tails remain in view change while RequestPrepare/SendPrepare fetches a source/view/tip-bound suffix from that source only.
+- Log repair via RequestPrepare/SendPrepare; protocol-v3 repair messages carry optional selected-source/view/tip binding for pre-StartView suffix materialization
 - Field-by-field outer serialization; nested Command/Result use a fixed tag-first wire codec (validate tags before union materialization)
-- Disk persistence (experimental): optional `--data-dir` → layout-v2 `journal.bin` (`0600`) under data dir (`0700`) with explicit little-endian LogEntry codec (tag-first Command), staged writes + `fdatasync` group-commit barrier; protocol-v2 PrepareOk binds each vote to the exact durable `(view, op, entry_checksum)` identity, and client/worker publication waits for the covering barrier. Actual legacy v1 journals are rejected fail-closed as incompatible (the startup error may be a size or version rejection). For this POC change, mixed-version peer clusters and legacy-v1 journal upgrades are unsupported: stop the full cluster, then start v2 with fresh data directories or data explicitly archived/replaced out of band. There is no rolling migration or incarnation protocol claim. Absent `--data-dir` is explicit volatile POC mode. No torn-write / power-loss guarantee or simulation; no production crash-durability claim.
+- Disk persistence (experimental): optional `--data-dir` → layout-v2 `journal.bin` (`0600`) under data dir (`0700`) with explicit little-endian LogEntry codec (tag-first Command), staged writes + `fdatasync` group-commit barrier; protocol-v3 PrepareOk binds each vote to the exact durable `(view, op, entry_checksum)` identity, and client/worker publication waits for the covering barrier. Actual legacy v1 journals are rejected fail-closed as incompatible (the startup error may be a size or version rejection). For this POC change, mixed-version peer clusters and legacy-v1 journal upgrades are unsupported: stop the full cluster, then start v2 with fresh data directories or data explicitly archived/replaced out of band. There is no rolling migration or incarnation protocol claim. Absent `--data-dir` is explicit volatile POC mode. No torn-write / power-loss guarantee or simulation; no production crash-durability claim.
 - Restart recovery (experimental best-effort): validate committed-prefix checksum chain; VOPR enforces canonical recovered-prefix and immutable committed-prefix contracts; corrupt/missing/truncated/wrong-sized journal fail-stop (nonzero exit); otherwise enter view_change to rejoin. Not validated under torn writes or power loss.
 - Retained log: fail-closed at `LOG_SIZE_MAX` (1024) ops with `log_full` / HTTP 507 until snapshots exist; no circular overwrite of committed entries
 - S3 journal backup: periodic `aws s3 cp` of mutable v2 `journal.bin` — not an atomic crash-consistent restore artifact

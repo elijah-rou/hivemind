@@ -84,6 +84,11 @@ fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
     return true;
 }
 
+fn selectionBindingValid(source: u8, tip_op: msg.OpNumber, tip_checksum: u64) bool {
+    if (tip_checksum == 0) return source == 0 and tip_op == 0;
+    return source < msg.REPLICA_COUNT_MAX and tip_op > 0 and tip_op <= LOG_SIZE_MAX;
+}
+
 /// Stateless peer-message semantics checked before a socket may claim identity.
 pub fn peerMessageSemanticsValid(message: msg.Message) bool {
     return switch (message) {
@@ -101,8 +106,8 @@ pub fn peerMessageSemanticsValid(message: msg.Message) bool {
             break :blk true;
         },
         .start_view => |m| startViewEntriesValid(m),
-        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX,
-        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid(),
+        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum),
+        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid() and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum),
         .send_status => |m| m.commit_min <= m.op_number and m.op_number <= LOG_SIZE_MAX,
         .request,
         .reply,
@@ -257,6 +262,14 @@ pub const Replica = struct {
     do_vc_received: [msg.REPLICA_COUNT_MAX]bool,
     do_vc_msgs: [msg.REPLICA_COUNT_MAX]msg.DoViewChangeMsg,
     do_vc_total: u8,
+    pending_view_selection: bool,
+    selected_source: u8,
+    selected_last_normal_view: msg.ViewNumber,
+    selected_tip_op: msg.OpNumber,
+    selected_tip_checksum: u64,
+    selected_commit_bound: msg.OpNumber,
+    selected_target_view: msg.ViewNumber,
+    selected_next_op: msg.OpNumber,
 
     // I/O -- the single injectable interface
     io: Io,
@@ -362,6 +375,14 @@ pub const Replica = struct {
             .do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool),
             .do_vc_msgs = undefined,
             .do_vc_total = 0,
+            .pending_view_selection = false,
+            .selected_source = 0,
+            .selected_last_normal_view = 0,
+            .selected_tip_op = 0,
+            .selected_tip_checksum = 0,
+            .selected_commit_bound = 0,
+            .selected_target_view = 0,
+            .selected_next_op = 0,
             .repair_pending = false,
             .repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64),
             .repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool),
@@ -434,6 +455,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.pending_view_selection = false;
         self.repair_pending = false;
         self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
         self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
@@ -552,6 +574,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.pending_view_selection = false;
 
         return true;
     }
@@ -694,6 +717,7 @@ pub const Replica = struct {
                 }
             },
             .view_change => {
+                if (self.pending_view_selection and self.isLeader()) self.advanceSelectedView();
                 const timeout = if (self.recovered_from_disk)
                     RECOVERED_VIEW_CHANGE_TIMEOUT
                 else
@@ -1062,6 +1086,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.pending_view_selection = false;
 
         self.start_vc_count[self.replica_id] = true;
         self.start_vc_total = 1;
@@ -1086,6 +1111,7 @@ pub const Replica = struct {
             self.start_vc_total = 0;
             self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
             self.do_vc_total = 0;
+            self.pending_view_selection = false;
             self.start_vc_count[self.replica_id] = true;
             self.start_vc_total = 1;
 
@@ -1145,227 +1171,182 @@ pub const Replica = struct {
 
     fn maybeStartView(self: *Replica) void {
         if (self.do_vc_total < self.quorum_size) return;
+        if (self.pending_view_selection) {
+            self.advanceSelectedView();
+            return;
+        }
 
-        // Nack protocol: for each uncommitted op, count how many DVCs
-        // DON'T have it. If nacks >= quorum_nack_prepare, the op could NOT
-        // have been committed, so truncate.
-
-        // Step 1: Find max_commit and max_op across all DVCs.
+        var selected_index: ?usize = null;
+        var selected_tip_checksum: u64 = 0;
         var max_commit: msg.OpNumber = 0;
-        var max_op: msg.OpNumber = 0;
+        for (0..self.replica_count) |i| {
+            if (!self.do_vc_received[i]) continue;
+            const candidate = &self.do_vc_msgs[i];
+            max_commit = @max(max_commit, candidate.commit_min);
+            const candidate_tip_checksum = dvcEntryChecksum(candidate, candidate.op_number) orelse return;
+
+            if (selected_index) |current_index| {
+                const current = &self.do_vc_msgs[current_index];
+                if (candidate.last_normal_view < current.last_normal_view) continue;
+                if (candidate.last_normal_view == current.last_normal_view and candidate.op_number < current.op_number) continue;
+                if (candidate.last_normal_view == current.last_normal_view and candidate.op_number == current.op_number) {
+                    if (candidate_tip_checksum != selected_tip_checksum) return;
+                    if (!dvcOverlapEqual(candidate, current)) return;
+                    if (candidate.replica_id > current.replica_id) continue;
+                }
+            }
+            selected_index = i;
+            selected_tip_checksum = candidate_tip_checksum;
+        }
+
+        const source_index = selected_index orelse return;
+        const selected = &self.do_vc_msgs[source_index];
+        if (max_commit > selected.op_number) return;
+        if (!dvcTailChainValid(selected)) return;
+        // Any committed identity exposed by the quorum must agree with the one
+        // selected source. This is a fail-closed guard for implementations that
+        // learned a commit after preparing a different suffix.
+        for (0..self.replica_count) |i| {
+            if (!self.do_vc_received[i]) continue;
+            const evidence = &self.do_vc_msgs[i];
+            for (evidence.log_entries[0..evidence.log_entry_count]) |committed_entry| {
+                if (committed_entry.op_number > evidence.commit_min) continue;
+                for (selected.log_entries[0..selected.log_entry_count]) |selected_entry| {
+                    if (selected_entry.op_number == committed_entry.op_number and selected_entry.checksum != committed_entry.checksum) return;
+                }
+            }
+        }
+
+        self.pending_view_selection = true;
+        self.selected_source = selected.replica_id;
+        self.selected_last_normal_view = selected.last_normal_view;
+        self.selected_tip_op = selected.op_number;
+        self.selected_tip_checksum = selected_tip_checksum;
+        self.selected_commit_bound = max_commit;
+        self.selected_target_view = self.view_number;
+        self.selected_next_op = self.commit_min + 1;
+        self.advanceSelectedView();
+    }
+
+    fn dvcEntryChecksum(dvc: *const msg.DoViewChangeMsg, op: msg.OpNumber) ?u64 {
+        if (op == 0) return 0;
+        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+            if (entry.op_number == op and entry.valid()) return entry.checksum;
+        }
+        return null;
+    }
+
+    fn dvcOverlapEqual(a: *const msg.DoViewChangeMsg, b: *const msg.DoViewChangeMsg) bool {
+        for (a.log_entries[0..a.log_entry_count]) |a_entry| {
+            for (b.log_entries[0..b.log_entry_count]) |b_entry| {
+                if (a_entry.op_number == b_entry.op_number and a_entry.checksum != b_entry.checksum) return false;
+            }
+        }
+        return true;
+    }
+
+    fn dvcTailChainValid(dvc: *const msg.DoViewChangeMsg) bool {
+        for (dvc.log_entries[0..dvc.log_entry_count]) |child| {
+            if (!child.valid()) return false;
+            for (dvc.log_entries[0..dvc.log_entry_count]) |parent| {
+                if (parent.op_number + 1 == child.op_number and child.parent_checksum != parent.checksum) return false;
+            }
+        }
+        return true;
+    }
+
+    fn selectedDvcEntry(self: *const Replica, op: msg.OpNumber) ?msg.LogEntry {
+        const dvc = &self.do_vc_msgs[self.selected_source];
+        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+            if (entry.op_number == op and entry.valid()) return entry;
+        }
+        return null;
+    }
+
+    fn selectedParentChecksum(self: *const Replica, op: msg.OpNumber) ?u64 {
+        if (op == 1) return 0;
+        const parent = self.journalGet(op - 1) orelse return null;
+        return parent.checksum;
+    }
+
+    fn installSelectedEntry(self: *Replica, entry: msg.LogEntry) bool {
+        if (!self.pending_view_selection) return false;
+        if (entry.op_number != self.selected_next_op) return false;
+        const parent_checksum = self.selectedParentChecksum(entry.op_number) orelse return false;
+        if (entry.parent_checksum != parent_checksum) return false;
+        if (self.journalGet(entry.op_number)) |existing| {
+            if (existing.checksum == entry.checksum) return true;
+            if (self.isDurablePrepare(entry.op_number)) return false;
+        }
+        self.journalPut(entry);
+        const installed = self.journalGet(entry.op_number) orelse return false;
+        return installed.checksum == entry.checksum;
+    }
+
+    fn requestSelectedEntry(self: *Replica, op: msg.OpNumber) void {
+        self.sendTo(self.selected_source, .{ .request_prepare = .{
+            .view_number = self.selected_target_view,
+            .op_number = op,
+            .selected_source = self.selected_source,
+            .selected_last_normal_view = self.selected_last_normal_view,
+            .selected_tip_op = self.selected_tip_op,
+            .selected_tip_checksum = self.selected_tip_checksum,
+        } });
+    }
+
+    fn advanceSelectedView(self: *Replica) void {
+        if (!self.pending_view_selection) return;
+        if (self.status != .view_change) return;
+        if (self.view_number != self.selected_target_view) return;
+
+        while (self.selected_next_op <= self.selected_tip_op) {
+            const op = self.selected_next_op;
+            var entry = self.selectedDvcEntry(op);
+            if (entry == null and self.selected_source == self.replica_id) {
+                if (self.journalGet(op)) |local| entry = local.*;
+            }
+            const selected_entry = entry orelse {
+                self.requestSelectedEntry(op);
+                return;
+            };
+            if (!self.installSelectedEntry(selected_entry)) return;
+            self.selected_next_op += 1;
+        }
+        self.startViewCandidateReady();
+    }
+
+    fn startViewCandidateReady(self: *Replica) void {
+        if (!self.pending_view_selection) return;
+        if (self.selected_tip_op > 0) {
+            const tip = self.journalGet(self.selected_tip_op) orelse return;
+            if (tip.checksum != self.selected_tip_checksum) return;
+        }
+        if (self.selected_commit_bound > self.selected_tip_op) return;
+        if (self.hasSelectedChainGap()) return;
+
+        self.truncateAbove(self.selected_tip_op);
+        if (self.logHighOp() > self.selected_tip_op) return;
+        self.op_number = self.selected_tip_op;
+        if (self.selected_commit_bound > self.commit_min) self.commitUpTo(self.selected_commit_bound);
+        if (self.commit_min != self.selected_commit_bound) return;
+        self.commit_max = self.commit_min;
         var carried_retention_floor = self.effectiveRetentionFloor();
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
-            max_commit = @max(max_commit, self.do_vc_msgs[i].commit_min);
-            max_op = @max(max_op, self.do_vc_msgs[i].op_number);
             carried_retention_floor = @min(carried_retention_floor, self.do_vc_msgs[i].retention_floor);
         }
-
-        // Step 2: Install committed entries. Only replicas that themselves
-        // report an op as committed may contribute its value here. Otherwise a
-        // higher-view but uncommitted suffix entry could overwrite a value that
-        // another replica proved committed via commit_min.
-        // Conflicting committed identities fail closed: remain in view_change.
-        // Preflight the full candidate set before any journalPut.
-        var committed_source_lnv = std.mem.zeroes([LOG_SIZE_MAX]msg.ViewNumber);
-        var committed_source_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
-        var committed_source_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
-        var committed_source_set = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        for (0..self.replica_count) |i| self.replica_commit_min[i] = carried_retention_floor;
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
-            const dvc = &self.do_vc_msgs[i];
-            for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
-                if (!entry.valid()) continue;
-                if (entry.op_number > max_commit) continue;
-                if (entry.op_number > dvc.commit_min) continue;
-
-                const slot = journalSlot(entry.op_number);
-                if (committed_source_set[slot] and
-                    committed_source_op[slot] == entry.op_number and
-                    committed_source_checksum[slot] != entry.checksum)
-                {
-                    return;
-                }
-                // Local committed prefix must also agree.
-                if (entry.op_number <= self.commit_min) {
-                    if (self.journalGet(entry.op_number)) |local| {
-                        if (local.checksum != entry.checksum) return;
-                    }
-                }
-
-                const should_install = !committed_source_set[slot] or
-                    committed_source_op[slot] != entry.op_number or
-                    dvc.last_normal_view >= committed_source_lnv[slot];
-                if (!should_install) continue;
-
-                committed_source_set[slot] = true;
-                committed_source_op[slot] = entry.op_number;
-                committed_source_checksum[slot] = entry.checksum;
-                committed_source_lnv[slot] = dvc.last_normal_view;
-            }
+            self.replica_commit_min[i] = self.do_vc_msgs[i].commit_min;
         }
-        for (0..self.replica_count) |i| {
-            if (!self.do_vc_received[i]) continue;
-            const dvc = &self.do_vc_msgs[i];
-            for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
-                if (!entry.valid()) continue;
-                if (entry.op_number > max_commit) continue;
-                if (entry.op_number > dvc.commit_min) continue;
-                const slot = journalSlot(entry.op_number);
-                if (!committed_source_set[slot]) continue;
-                if (committed_source_op[slot] != entry.op_number) continue;
-                if (committed_source_checksum[slot] != entry.checksum) continue;
-                self.journalPut(entry);
-                // Clear so each winning identity is installed once.
-                committed_source_set[slot] = false;
-            }
-        }
-
-        // Collect present_bitsets from DVCs for targeted repair later
-        self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
-        for (0..self.replica_count) |i| {
-            if (!self.do_vc_received[i]) continue;
-            self.repair_present[i] = self.do_vc_msgs[i].present_bitset;
-        }
-
-        // Step 3: For each uncommitted op, run nack protocol.
-        var highest_kept = max_commit;
-        var repair_target = highest_kept;
-        var op = max_commit + 1;
-        while (op <= max_op) : (op += 1) {
-            var nacks: u8 = 0;
-            var candidate_entries: [msg.REPLICA_COUNT_MAX]msg.LogEntry = undefined;
-            var candidate_counts: [msg.REPLICA_COUNT_MAX]u8 = std.mem.zeroes([msg.REPLICA_COUNT_MAX]u8);
-            var candidate_lnvs: [msg.REPLICA_COUNT_MAX]msg.ViewNumber = std.mem.zeroes([msg.REPLICA_COUNT_MAX]msg.ViewNumber);
-            var candidate_len: usize = 0;
-
-            for (0..self.replica_count) |i| {
-                if (!self.do_vc_received[i]) continue;
-                var has_bitsets = false;
-                for (self.do_vc_msgs[i].present_bitset) |word| {
-                    if (word != 0) has_bitsets = true;
-                }
-                for (self.do_vc_msgs[i].nack_bitset) |word| {
-                    if (word != 0) has_bitsets = true;
-                }
-
-                const has_op = if (has_bitsets)
-                    msg.bitsetGet(&self.do_vc_msgs[i].present_bitset, @intCast(op % LOG_SIZE_MAX))
-                else
-                    self.dvcHasOp(i, op);
-
-                if (has_op) {
-                    const candidate_lnv = self.do_vc_msgs[i].last_normal_view;
-                    for (self.do_vc_msgs[i].log_entries[0..self.do_vc_msgs[i].log_entry_count]) |entry| {
-                        if (entry.op_number == op and entry.valid()) {
-                            var matched = false;
-                            var idx: usize = 0;
-                            while (idx < candidate_len) : (idx += 1) {
-                                if (candidate_entries[idx].checksum == entry.checksum) {
-                                    candidate_counts[idx] += 1;
-                                    candidate_lnvs[idx] = @max(candidate_lnvs[idx], candidate_lnv);
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if (!matched) {
-                                candidate_entries[candidate_len] = entry;
-                                candidate_counts[candidate_len] = 1;
-                                candidate_lnvs[candidate_len] = candidate_lnv;
-                                candidate_len += 1;
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    nacks += 1;
-                }
-            }
-
-            if (nacks >= self.quorum_nack_prepare) break;
-
-            var selected: ?msg.LogEntry = null;
-            var selected_support: u8 = 0;
-            var selected_lnv: msg.ViewNumber = 0;
-            var idx: usize = 0;
-            while (idx < candidate_len) : (idx += 1) {
-                if (selected == null or
-                    candidate_lnvs[idx] > selected_lnv or
-                    (candidate_lnvs[idx] == selected_lnv and candidate_counts[idx] > selected_support))
-                {
-                    selected = candidate_entries[idx];
-                    selected_support = candidate_counts[idx];
-                    selected_lnv = candidate_lnvs[idx];
-                }
-            }
-
-            // If quorum nacks could not rule the op out, preserve the best
-            // old-view candidate rather than dropping the slot. Requiring a
-            // full current DVC checksum quorum is too strong: a previously
-            // committed/prepared value may intersect the new DVC quorum in only
-            // one replica.
-            const entry = selected orelse {
-                repair_target = max_op;
-                break;
-            };
-
-            if (entry.op_number != highest_kept + 1) {
-                repair_target = max_op;
-                break;
-            }
-
-            self.journalPut(entry);
-            highest_kept = op;
-            repair_target = highest_kept;
-        }
-
-        if (highest_kept > max_commit) {
-            var ack_op = max_commit + 1;
-            while (ack_op <= highest_kept) : (ack_op += 1) {
-                if (!self.journalHas(ack_op)) continue;
-                const slot = journalSlot(ack_op);
-                if (self.isDurablePrepare(ack_op)) {
-                    self.prepare_ok_counts[slot] = 1;
-                    self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
-                } else {
-                    self.pending_prepare_broadcast[slot] = true;
-                }
-            }
-        }
-
-        // Step 4: Truncate divergent entries above highest_kept, then set op_number.
-        // Committed entries (op_number <= commit_min) are preserved by truncateAbove.
-        // op_number must be >= commit_min to maintain the invariant.
-        self.truncateAbove(highest_kept);
-        self.op_number = @max(@max(repair_target, self.logHighOp()), self.commit_min);
-
-        if (max_commit > self.commit_min) {
-            self.commitUpTo(max_commit);
-        }
-        self.commit_max = self.commit_min;
-
-        // Seed retention floor from DVC messages
-        {
-            var i: usize = 0;
-            while (i < self.replica_count) : (i += 1) {
-                self.replica_commit_min[i] = carried_retention_floor;
-            }
-            i = 0;
-            while (i < self.replica_count) : (i += 1) {
-                if (!self.do_vc_received[i]) continue;
-                self.replica_commit_min[i] = self.do_vc_msgs[i].commit_min;
-            }
-            self.replica_commit_min[self.replica_id] = self.commit_min;
-            self.recomputeRetentionFloor();
-        }
+        self.replica_commit_min[self.replica_id] = self.commit_min;
+        self.recomputeRetentionFloor();
 
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
-
-        // Self-ack only durable matching identities; otherwise queue Prepare publish.
         var ack_op = self.commit_min + 1;
         while (ack_op <= self.op_number) : (ack_op += 1) {
-            if (!self.journalHas(ack_op)) continue;
             const slot = journalSlot(ack_op);
             if (self.isDurablePrepare(ack_op)) {
                 self.prepare_ok_counts[slot] = 1;
@@ -1374,19 +1355,30 @@ pub const Replica = struct {
                 self.pending_prepare_broadcast[slot] = true;
             }
         }
-
+        self.pending_view_selection = false;
         self.status = .normal;
         self.last_normal_view = self.view_number;
         const now_tick = io_mod.nowTick(self.io);
         self.last_heartbeat = now_tick;
         self.last_leader_activity = now_tick;
-
         self.sendToAllOthers(.{ .start_view = self.buildStartView() });
-
-        // Always enter repair phase after view change
         self.repair_pending = true;
         self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.repair_status_count = 0;
+    }
+
+    fn hasSelectedChainGap(self: *const Replica) bool {
+        var parent_checksum: u64 = if (self.commit_min == 0) 0 else blk: {
+            const committed = self.journalGet(self.commit_min) orelse return true;
+            break :blk committed.checksum;
+        };
+        var op = self.commit_min + 1;
+        while (op <= self.selected_tip_op) : (op += 1) {
+            const entry = self.journalGet(op) orelse return true;
+            if (!entry.valid() or entry.parent_checksum != parent_checksum) return true;
+            parent_checksum = entry.checksum;
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -1901,25 +1893,47 @@ pub const Replica = struct {
         if (rp.view_number != self.view_number) return;
         if (rp.op_number == 0 or rp.op_number > LOG_SIZE_MAX) return;
 
+        const selection_bound = rp.selected_tip_checksum != 0;
+        if (selection_bound) {
+            if (rp.selected_source != self.replica_id) return;
+            if (from != self.leaderForView(rp.view_number)) return;
+            if (rp.selected_last_normal_view != self.last_normal_view) return;
+            if (rp.selected_tip_op != self.op_number) return;
+            const tip = self.journalGet(self.op_number) orelse return;
+            if (tip.checksum != rp.selected_tip_checksum) return;
+        }
+
         if (self.journalGet(rp.op_number)) |entry| {
-            // Only the leader may source uncommitted suffix entries. Followers
-            // can safely help each other recover committed gaps, but serving a
-            // locally-held uncommitted op to another follower can resurrect a
-            // divergent suffix after view change.
-            if (from != self.leader() and rp.op_number > self.commit_min) return;
+            if (!selection_bound and from != self.leader() and rp.op_number > self.commit_min) return;
             self.sendTo(from, .{ .send_prepare = .{
                 .view_number = self.view_number,
                 .entry = entry.*,
+                .selected_source = rp.selected_source,
+                .selected_last_normal_view = rp.selected_last_normal_view,
+                .selected_tip_op = rp.selected_tip_op,
+                .selected_tip_checksum = rp.selected_tip_checksum,
             } });
         }
     }
 
     fn onSendPrepare(self: *Replica, from: u8, sp: msg.SendPrepareMsg) void {
-        if (self.status != .normal) return;
         if (sp.view_number != self.view_number) return;
         if (!sp.entry.valid()) return;
         if (sp.entry.op_number == 0 or sp.entry.op_number > LOG_SIZE_MAX) return;
 
+        if (self.status == .view_change and self.pending_view_selection and self.isLeader()) {
+            if (from != self.selected_source) return;
+            if (sp.selected_source != self.selected_source) return;
+            if (sp.selected_last_normal_view != self.selected_last_normal_view) return;
+            if (sp.selected_tip_op != self.selected_tip_op) return;
+            if (sp.selected_tip_checksum != self.selected_tip_checksum) return;
+            if (!self.installSelectedEntry(sp.entry)) return;
+            self.selected_next_op += 1;
+            self.advanceSelectedView();
+            return;
+        }
+
+        if (self.status != .normal) return;
         const entry = sp.entry;
         const sender_committed = entry.op_number <= self.replica_commit_min[from];
         if (!sender_committed and !self.entryFitsLog(entry)) return;

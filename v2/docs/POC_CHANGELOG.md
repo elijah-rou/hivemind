@@ -44,6 +44,19 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Phase 2 single-source DVC selection and bound suffix repair
+
+What changed:
+- view change selects exactly one DVC source by highest `(last_normal_view, op_number)` instead of composing per-op candidates; equal-rank sources must agree on tip and every overlapping entry before source-ID tie-break
+- the prospective leader retains a bounded pending selection binding source, source last-normal view, target view, commit bound, and tip identity
+- incomplete eight-entry DVC tails remain in view_change and fetch each missing operation only from the bound source; wrong source/view/tip responses fail closed
+- `startViewCandidateReady` is the sole handoff after the selected parent-checksum chain is complete; protocol version 3 carries repair binding fields
+
+Why it matters:
+- StartView can no longer publish a synthetic log assembled from unrelated DVC sources or enter normal while the selected suffix is incomplete
+
+Current acceptance progress: unchanged. This unpublished phase does not add the phase-3 disk barrier before StartView publication, so no final safety or 10k claim is made.
+
 ### 2026-07-16 — Phase 1 durable prepare identity binding
 
 What changed:

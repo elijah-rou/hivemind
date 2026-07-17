@@ -21,7 +21,7 @@ const PEER_RETRY_INTERVAL_TICKS: u64 = 2_000;
 // Wire protocol version. Included in every client and agent frame.
 // Frame format: [4B LE len][2B LE version][1B tag][payload...]
 // len = 2 (version) + 1 (tag) + payload_len
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const FRAME_HEADER: usize = 4 + 2 + 1; // len + version + tag
 
 const libc = struct {
