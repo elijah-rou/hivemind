@@ -8,6 +8,9 @@ const enc = @import("encryption.zig");
 const latency = @import("latency.zig");
 
 const MAX_WORKERS: usize = replica_mod.MAX_WORKERS;
+comptime {
+    std.debug.assert(MAX_WORKERS == rq.MAX_WORKERS);
+}
 const MAX_CLIENTS: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Worker frame payload is bounded at 16 KiB; run metadata consumes 9 bytes.
