@@ -228,6 +228,8 @@ pub const Replica = struct {
     // Configuration
     allocator: std.mem.Allocator,
     view_change_candidate: view_candidate.ViewChangeCandidate,
+    pending_start_view: view_candidate.PendingStartView,
+    deferred_view_target: msg.ViewNumber,
     replica_id: u8,
     replica_count: u8,
     quorum_size: u8,
@@ -360,6 +362,8 @@ pub const Replica = struct {
         return .{
             .allocator = config.allocator,
             .view_change_candidate = .{ .allocator = config.allocator },
+            .pending_start_view = .{},
+            .deferred_view_target = 0,
             .replica_id = config.replica_id,
             .replica_count = config.replica_count,
             .quorum_size = @intCast(f + 1),
@@ -445,6 +449,8 @@ pub const Replica = struct {
         const f = (config.replica_count - 1) / 2;
         self.allocator = config.allocator;
         self.view_change_candidate = .{ .allocator = config.allocator };
+        self.pending_start_view = .{};
+        self.deferred_view_target = 0;
         self.replica_id = config.replica_id;
         self.replica_count = config.replica_count;
         self.quorum_size = @intCast(f + 1);
@@ -515,6 +521,11 @@ pub const Replica = struct {
         if (self.view_change_candidate.phase == .idle) {
             std.debug.assert(self.view_change_candidate.entries.len == 0);
             std.debug.assert(self.view_change_candidate.present.len == 0);
+            std.debug.assert(!self.pending_start_view.active);
+        }
+        if (self.pending_start_view.active) {
+            std.debug.assert(self.pending_start_view.role == .leader);
+            std.debug.assert(self.view_change_candidate.phase == .persisting_start_view);
         }
     }
 
@@ -748,20 +759,24 @@ pub const Replica = struct {
                 }
             },
             .view_change => {
-                if (self.pending_view_selection and self.isLeader()) {
-                    const deadline_tick = self.view_change_candidate.metadata.deadline_tick;
-                    if (deadline_tick > 0 and now_tick >= 0 and @as(u64, @intCast(now_tick)) >= deadline_tick) {
-                        self.abortSelectedView();
-                    } else {
-                        self.advanceSelectedView();
+                if (self.pending_start_view.active) {
+                    std.debug.assert(self.view_change_candidate.phase == .persisting_start_view);
+                } else {
+                    if (self.pending_view_selection and self.isLeader()) {
+                        const deadline_tick = self.view_change_candidate.metadata.deadline_tick;
+                        if (deadline_tick > 0 and now_tick >= 0 and @as(u64, @intCast(now_tick)) >= deadline_tick) {
+                            self.abortSelectedView();
+                        } else {
+                            self.advanceSelectedView();
+                        }
                     }
-                }
-                const timeout = if (self.recovered_from_disk)
-                    RECOVERED_VIEW_CHANGE_TIMEOUT
-                else
-                    VIEW_CHANGE_TIMEOUT * 2;
-                if (now_tick - self.last_leader_activity >= timeout) {
-                    self.initiateViewChange();
+                    const timeout = if (self.recovered_from_disk)
+                        RECOVERED_VIEW_CHANGE_TIMEOUT
+                    else
+                        VIEW_CHANGE_TIMEOUT * 2;
+                    if (now_tick - self.last_leader_activity >= timeout) {
+                        self.initiateViewChange();
+                    }
                 }
             },
             .recovering => {},
@@ -774,11 +789,30 @@ pub const Replica = struct {
     // Message dispatch
     // -----------------------------------------------------------------------
 
+    fn deferredHigherViewTarget(self: *const Replica, from: u8, message: msg.Message) ?msg.ViewNumber {
+        return switch (message) {
+            .start_view_change => |m| if (m.replica_id == from) m.view_number else null,
+            .prepare => |m| if (from == self.leaderForView(m.view_number) and prepareSemanticsValid(m)) m.view_number else null,
+            .commit => |m| if (from == self.leaderForView(m.view_number) and commitSemanticsValid(m)) m.view_number else null,
+            .start_view => |m| if (from == self.leaderForView(m.view_number) and startViewEntriesValid(m)) m.view_number else null,
+            else => null,
+        };
+    }
+
     pub fn onMessage(self: *Replica, from: u8, message: msg.Message) void {
         if (self.storage_failed) return;
         // Peer-sourced `from` must be a live cluster member. Out-of-range IDs
         // would OOB-index vote/status arrays or forge quorum identity.
         if (from >= self.replica_count) return;
+        if (self.pending_start_view.active) {
+            if (self.deferredHigherViewTarget(from, message)) |message_view| {
+                if (message_view > self.pending_start_view.target_view) {
+                    self.deferred_view_target = @max(self.deferred_view_target, message_view);
+                }
+            }
+            // The installed candidate is immutable until its publication point.
+            if (message != .request and message != .reply) return;
+        }
         switch (message) {
             .request => |m| self.onRequest(from, m),
             .prepare => |m| self.onPrepare(from, m),
@@ -1110,7 +1144,12 @@ pub const Replica = struct {
     // -----------------------------------------------------------------------
 
     fn initiateViewChange(self: *Replica) void {
-        const new_view = self.view_number + 1;
+        self.initiateViewChangeTo(self.view_number + 1);
+    }
+
+    fn initiateViewChangeTo(self: *Replica, new_view: msg.ViewNumber) void {
+        std.debug.assert(new_view > self.view_number);
+        std.debug.assert(!self.pending_start_view.active);
 
         self.status = .view_change;
         self.view_number = new_view;
@@ -1440,25 +1479,29 @@ pub const Replica = struct {
             self.journalPutFromValidatedStartView(entry);
         }
         self.selected_next_op = self.selected_tip_op + 1;
-        self.view_change_candidate.reset();
         self.startViewCandidateReady();
     }
 
     fn startViewCandidateReady(self: *Replica) void {
-        if (!self.pending_view_selection) return;
+        if (!self.pending_view_selection or self.pending_start_view.active) return;
         if (self.selected_tip_op > 0) {
             const tip = self.journalGet(self.selected_tip_op) orelse return;
             if (tip.checksum != self.selected_tip_checksum) return;
         }
+        if (self.selected_commit_bound < self.commit_min) return;
         if (self.selected_commit_bound > self.selected_tip_op) return;
         if (self.hasSelectedChainGap()) return;
 
-        self.truncateAbove(self.selected_tip_op);
-        if (self.logHighOp() > self.selected_tip_op) return;
-        self.op_number = self.selected_tip_op;
-        if (self.selected_commit_bound > self.commit_min) self.commitUpTo(self.selected_commit_bound);
-        if (self.commit_min != self.selected_commit_bound) return;
-        self.commit_max = self.commit_min;
+        // A non-empty candidate was installed in one validated truncate+replace
+        // pass. The empty suffix still needs its one tombstone pass here.
+        if (self.view_change_candidate.phase == .idle) {
+            self.truncateAboveFromValidatedStartView(self.selected_tip_op);
+        } else {
+            std.debug.assert(self.view_change_candidate.phase == .candidate_complete);
+        }
+        if (self.logHighOp() != self.selected_tip_op) return;
+        std.debug.assert(!self.hasSelectedChainGap());
+
         var carried_retention_floor = self.effectiveRetentionFloor();
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
@@ -1469,31 +1512,40 @@ pub const Replica = struct {
             if (!self.do_vc_received[i]) continue;
             self.replica_commit_min[i] = self.do_vc_msgs[i].commit_min;
         }
-        self.replica_commit_min[self.replica_id] = self.commit_min;
-        self.recomputeRetentionFloor();
 
+        self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
-        var ack_op = self.commit_min + 1;
-        while (ack_op <= self.op_number) : (ack_op += 1) {
-            const slot = journalSlot(ack_op);
-            if (self.isDurablePrepare(ack_op)) {
-                self.prepare_ok_counts[slot] = 1;
-                self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
-            } else {
-                self.pending_prepare_broadcast[slot] = true;
-            }
+        self.pending_start_view = .{
+            .active = true,
+            .role = .leader,
+            .source_replica = self.selected_source,
+            .target_view = self.selected_target_view,
+            .source_last_normal_view = self.selected_last_normal_view,
+            .tip_checksum = self.selected_tip_checksum,
+            .op_number = self.selected_tip_op,
+            .commit_min = self.selected_commit_bound,
+            .last_normal_view = self.selected_target_view,
+        };
+        self.view_change_candidate.phase = .persisting_start_view;
+        self.metadata_dirty = true;
+        self.assertPendingStartViewChain();
+    }
+
+    fn assertPendingStartViewChain(self: *const Replica) void {
+        if (!self.pending_start_view.active) return;
+        const pending = self.pending_start_view;
+        std.debug.assert(pending.role == .leader);
+        std.debug.assert(self.status == .view_change);
+        std.debug.assert(self.logHighOp() == pending.op_number);
+        std.debug.assert(pending.commit_min >= self.commit_min);
+        std.debug.assert(pending.commit_min <= pending.op_number);
+        if (pending.op_number > 0) {
+            const tip = self.journalGet(pending.op_number) orelse unreachable;
+            std.debug.assert(tip.checksum == pending.tip_checksum);
         }
-        self.resetSelectedView();
-        self.status = .normal;
-        self.last_normal_view = self.view_number;
-        const now_tick = io_mod.nowTick(self.io);
-        self.last_heartbeat = now_tick;
-        self.last_leader_activity = now_tick;
-        self.sendToAllOthers(.{ .start_view = self.buildStartView() });
-        self.repair_pending = true;
-        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
-        self.repair_status_count = 0;
+        std.debug.assert(!self.hasSelectedChainGap());
     }
 
     fn hasSelectedChainGap(self: *const Replica) bool {
@@ -2455,20 +2507,87 @@ pub const Replica = struct {
         self.storage_failures += 1;
     }
 
+    fn metadataForPersistence(self: *const Replica) disk_mod.Metadata {
+        if (self.pending_start_view.active) {
+            const pending = self.pending_start_view;
+            self.assertPendingStartViewChain();
+            return .{
+                .view_number = pending.target_view,
+                .last_normal_view = pending.last_normal_view,
+                .op_number = pending.op_number,
+                .commit_min = pending.commit_min,
+                .commit_max = pending.commit_min,
+            };
+        }
+        return .{
+            .view_number = self.view_number,
+            .last_normal_view = self.last_normal_view,
+            .op_number = self.op_number,
+            .commit_min = self.commit_min,
+            .commit_max = self.commit_max,
+        };
+    }
+
+    fn syncPendingStartView(self: *Replica, disk: *DiskInterface) bool {
+        self.assertPendingStartViewChain();
+        const meta = self.metadataForPersistence();
+        std.debug.assert(meta.op_number == self.logHighOp());
+        std.debug.assert(meta.commit_min == self.pending_start_view.commit_min);
+        std.debug.assert(meta.commit_max == meta.commit_min);
+
+        for (0..LOG_SIZE_MAX) |i| {
+            if (!self.journal_dirty[i]) continue;
+            if (self.journal_occupied[i]) {
+                disk.writeSlot(i, &self.journal[i]) catch {
+                    self.markStorageFailed();
+                    return false;
+                };
+            } else {
+                disk.clearSlot(i) catch {
+                    self.markStorageFailed();
+                    return false;
+                };
+            }
+        }
+        disk.writeMetadata(meta) catch {
+            self.markStorageFailed();
+            return false;
+        };
+        self.metadata_dirty = true;
+        disk.sync() catch {
+            self.markStorageFailed();
+            return false;
+        };
+        std.debug.assert(disk.metadataEquals(meta));
+        for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
+        self.metadata_dirty = false;
+        return true;
+    }
+
     /// Group-commit flush: stage all dirty journal/metadata, one durability
     /// barrier, then publish pending Prepare/PrepareOk/client/worker traffic.
     fn flushDurableState(self: *Replica) void {
         if (self.storage_failed) return;
         var disk = self.disk orelse {
-            // No disk backend: treat memory as durable and publish immediately.
+            // Volatile mode explicitly uses the same publication transition,
+            // synchronously, with memory as the durability boundary.
             for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
             const before = self.durable_prepare_through;
+            const through = if (self.pending_start_view.active) self.pending_start_view.op_number else self.op_number;
             self.metadata_dirty = false;
-            self.publishPendingAfterBarrier(before, self.op_number);
+            self.publishPendingAfterBarrier(before, through);
             self.metadata_dirty = false;
             self.publishCommitEffects();
             return;
         };
+
+        if (self.pending_start_view.active) {
+            const before = self.durable_prepare_through;
+            const through = self.pending_start_view.op_number;
+            if (!self.syncPendingStartView(&disk)) return;
+            self.publishPendingAfterBarrier(before, through);
+            return;
+        }
 
         var barriers: u8 = 0;
         while (barriers < FLUSH_BARRIER_MAX) : (barriers += 1) {
@@ -2491,13 +2610,7 @@ pub const Replica = struct {
                 }
             }
 
-            const meta = disk_mod.Metadata{
-                .view_number = self.view_number,
-                .last_normal_view = self.last_normal_view,
-                .op_number = self.op_number,
-                .commit_min = self.commit_min,
-                .commit_max = self.commit_max,
-            };
+            const meta = self.metadataForPersistence();
             const need_meta = self.metadata_dirty or any_journal_dirty or !disk.metadataEquals(meta);
             if (need_meta) {
                 disk.writeMetadata(meta) catch {
@@ -2516,13 +2629,14 @@ pub const Replica = struct {
                 self.markStorageFailed();
                 return;
             };
+            std.debug.assert(disk.metadataEquals(meta));
 
             for (0..LOG_SIZE_MAX) |i| {
                 self.journal_dirty[i] = false;
             }
             self.metadata_dirty = false;
 
-            self.publishPendingAfterBarrier(prepare_through_before, self.op_number);
+            self.publishPendingAfterBarrier(prepare_through_before, meta.op_number);
 
             if (!self.metadata_dirty and !anyJournalDirty(self)) break;
         }
@@ -2548,8 +2662,67 @@ pub const Replica = struct {
         }
     }
 
+    fn publishPendingStartViewAfterBarrier(self: *Replica) void {
+        if (!self.pending_start_view.active) return;
+        const pending = self.pending_start_view;
+        const deferred_view = self.deferred_view_target;
+        self.assertPendingStartViewChain();
+        std.debug.assert(pending.role == .leader);
+
+        self.view_number = pending.target_view;
+        self.last_normal_view = pending.last_normal_view;
+        self.op_number = pending.op_number;
+        self.commit_max = @max(self.commit_max, pending.commit_min);
+        if (pending.commit_min > self.commit_min) self.commitUpTo(pending.commit_min);
+        std.debug.assert(self.commit_min == pending.commit_min);
+        self.commit_max = self.commit_min;
+        self.replica_commit_min[self.replica_id] = self.commit_min;
+        self.recomputeRetentionFloor();
+
+        self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
+        self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
+        var ack_op = self.commit_min + 1;
+        while (ack_op <= self.op_number) : (ack_op += 1) {
+            std.debug.assert(self.isDurablePrepare(ack_op));
+            const slot = journalSlot(ack_op);
+            self.prepare_ok_counts[slot] = 1;
+            self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+        }
+
+        self.status = .normal;
+        const now_tick = io_mod.nowTick(self.io);
+        self.last_heartbeat = now_tick;
+        self.last_leader_activity = now_tick;
+        self.repair_pending = true;
+        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.repair_status_count = 0;
+        self.metadata_dirty = false;
+
+        const start_view = self.buildStartView();
+        self.sendToAllOthers(.{ .start_view = start_view });
+
+        self.view_change_candidate.reset();
+        self.pending_view_selection = false;
+        self.selected_next_op = 0;
+        self.pending_start_view = .{};
+        self.deferred_view_target = 0;
+        if (self.disk) |disk| std.debug.assert(disk.metadataEquals(self.metadataForPersistence()));
+
+        if (deferred_view > self.view_number) self.initiateViewChangeTo(deferred_view);
+    }
+
     fn publishPendingAfterBarrier(self: *Replica, prepare_through_before: msg.OpNumber, prepare_through_after: msg.OpNumber) void {
         _ = prepare_through_before;
+
+        var durable_op: msg.OpNumber = 1;
+        while (durable_op <= prepare_through_after) : (durable_op += 1) {
+            if (!self.journalHas(durable_op)) continue;
+            const slot = journalSlot(durable_op);
+            self.durable_prepare_op[slot] = durable_op;
+            self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
+        }
+        self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
+        self.publishPendingStartViewAfterBarrier();
 
         var op: msg.OpNumber = 1;
         while (op <= prepare_through_after) : (op += 1) {
@@ -2590,8 +2763,6 @@ pub const Replica = struct {
                 self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
             }
         }
-        self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
-
         if (self.isLeader() and self.status == .normal) {
             self.advanceCommit();
         }
@@ -4277,6 +4448,43 @@ test "same-view conflicting Prepare preserves durable prepared identity" {
     follower.journalPut(entry_b);
     try std.testing.expectEqual(entry_a.checksum, follower.journalGet(1).?.checksum);
     try std.testing.expectEqual(entry_a.checksum, follower.durable_prepare_checksum[slot]);
+}
+
+test "leader StartView durable sync survives crash before broadcast" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD07AB1E);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+    leader.pending_view_selection = true;
+    leader.selected_source = 1;
+    leader.selected_last_normal_view = 2;
+    leader.selected_target_view = 3;
+    leader.selected_commit_bound = 0;
+
+    var first = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    first.checksum = first.computeChecksum();
+    var second = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = first.checksum };
+    second.checksum = second.computeChecksum();
+    leader.journalPutFromValidatedStartView(first);
+    leader.journalPutFromValidatedStartView(second);
+    leader.selected_tip_op = 2;
+    leader.selected_tip_checksum = second.checksum;
+    leader.view_change_candidate.phase = .candidate_complete;
+    leader.startViewCandidateReady();
+    try std.testing.expect(leader.pending_start_view.active);
+
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+    var disk = leader.disk.?;
+    try std.testing.expect(leader.syncPendingStartView(&disk));
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(before, tc.network.stats.sent[start_view_tag]);
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), tc.replicas[0].op_number);
+    try std.testing.expectEqual(second.checksum, tc.replicas[0].journalGet(2).?.checksum);
 }
 
 test "sendCommitHeartbeat never emits zero checksum for advancing target" {

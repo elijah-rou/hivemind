@@ -18,6 +18,26 @@ pub const ViewSelectionPhase = enum {
     persisting_start_view,
 };
 
+pub const PendingStartViewRole = enum { none, leader };
+
+/// Compact publication record. StartView is reconstructed from the installed log.
+pub const PendingStartView = struct {
+    active: bool = false,
+    role: PendingStartViewRole = .none,
+    source_replica: u8 = 0,
+    target_view: msg.ViewNumber = 0,
+    source_last_normal_view: msg.ViewNumber = 0,
+    tip_checksum: u64 = 0,
+    op_number: msg.OpNumber = 0,
+    commit_min: msg.OpNumber = 0,
+    last_normal_view: msg.ViewNumber = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(PendingStartView) <= 80);
+    std.debug.assert(@sizeOf(PendingStartView) < @sizeOf(msg.StartViewMsg));
+}
+
 pub const Metadata = struct {
     source_replica: u8,
     target_view: msg.ViewNumber,

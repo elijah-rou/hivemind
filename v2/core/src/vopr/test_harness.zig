@@ -1592,6 +1592,26 @@ test "view change rejects equal-rank conflicting tips" {
     try std.testing.expect(!leader.pending_view_selection);
 }
 
+fn stageTwoEntryLeaderStartView(tc: *TestCluster) [2]msg.LogEntry {
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [2]msg.LogEntry = undefined;
+    entries[0] = .{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entries[0].checksum = entries[0].computeChecksum();
+    entries[1] = .{ .view_number = 2, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = entries[0].checksum };
+    entries[1].checksum = entries[1].computeChecksum();
+
+    var selected = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 2, .log_entry_count = 2 };
+    selected.log_entries[0] = entries[1];
+    selected.log_entries[1] = entries[0];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = selected });
+    return entries;
+}
+
 test "view change selects one source chain instead of mixing per-op candidates" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0x51A6E);
     defer tc.deinit();
@@ -1613,11 +1633,111 @@ test "view change selects one source chain instead of mixing per-op candidates" 
     var other = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 1, .log_entry_count = 1 };
     other.log_entries[0] = b1;
 
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const prepare_tag = @intFromEnum(msg.Tag.prepare);
+    const start_view_before = tc.network.stats.sent[start_view_tag];
+    const prepare_before = tc.network.stats.sent[prepare_tag];
     tc.deliver(0, 0, .{ .do_view_change = other });
     tc.deliver(0, 1, .{ .do_view_change = selected });
-    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(start_view_before, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
+    tc.requestWithIdentity(0, 99, 99, .{ .noop = {} });
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
     try std.testing.expectEqual(a1.checksum, leader.journalGet(1).?.checksum);
     try std.testing.expectEqual(a2.checksum, leader.journalGet(2).?.checksum);
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expectEqual(start_view_before + 2, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
+    leader.tick();
+    try std.testing.expectEqual(start_view_before + 2, tc.network.stats.sent[start_view_tag]);
+}
+
+test "leader StartView write and sync failures publish nothing" {
+    inline for (.{ "write", "sync" }) |fault_kind| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, if (std.mem.eql(u8, fault_kind, "write")) 0xD001 else 0xD002);
+        defer tc.deinit();
+        const leader = tc.replicas[0];
+        _ = stageTwoEntryLeaderStartView(tc);
+        const start_view_tag = @intFromEnum(msg.Tag.start_view);
+        const before = tc.network.stats.sent[start_view_tag];
+        if (std.mem.eql(u8, fault_kind, "write")) {
+            tc.disks[0].fail_next_write = true;
+        } else {
+            tc.disks[0].fail_next_sync = true;
+        }
+
+        leader.tick();
+        try std.testing.expect(leader.storage_failed);
+        try std.testing.expectEqual(msg.Status.view_change, leader.status);
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
+        try std.testing.expectEqual(before, tc.network.stats.sent[start_view_tag]);
+    }
+}
+
+test "leader StartView volatile mode uses the same one-shot publication path" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD003);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.disk = null;
+    _ = stageTwoEntryLeaderStartView(tc);
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+    leader.tick();
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+}
+
+test "leader StartView defers higher view and timeout until durable publication" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD004);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    _ = stageTwoEntryLeaderStartView(tc);
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+
+    tc.current_tick = @intCast(leader.view_change_candidate.metadata.deadline_tick + 1);
+    tc.deliver(0, 1, .{ .start_view_change = .{ .view_number = 6, .replica_id = 2 } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), leader.deferred_view_target);
+    tc.deliver(0, 2, .{ .start_view_change = .{ .view_number = 5, .replica_id = 2 } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 5), leader.deferred_view_target);
+    try std.testing.expect(leader.pending_start_view.active);
+
+    leader.tick();
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 5), leader.view_number);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+}
+
+test "leader StartView crash before sync recovers old state and after sync recovers selected tip" {
+    const pre = try TestCluster.init(std.testing.allocator, 3, 0xD005);
+    defer pre.deinit();
+    _ = stageTwoEntryLeaderStartView(pre);
+    try std.testing.expect(pre.replicas[0].pending_start_view.active);
+    pre.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), pre.replicas[0].op_number);
+    try std.testing.expect(pre.replicas[0].journalGet(1) == null);
+
+    const post = try TestCluster.init(std.testing.allocator, 3, 0xD006);
+    defer post.deinit();
+    const entries = stageTwoEntryLeaderStartView(post);
+    post.replicas[0].tick();
+    try std.testing.expectEqual(entries[1].checksum, post.disks[0].readSlot(replica_mod.journalSlot(2)).?.checksum);
+    post.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), post.replicas[0].op_number);
+    try std.testing.expectEqual(entries[1].checksum, post.replicas[0].journalGet(2).?.checksum);
 }
 
 test "one quorum-intersection durable prepare blocks conflicting selected source" {
@@ -1697,10 +1817,23 @@ test "incomplete selected suffix remains view_change and accepts only bound sour
     try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.selected_next_op);
     try std.testing.expectEqual(msg.Status.view_change, leader.status);
 
+    const syncs_before = tc.disks[0].syncs;
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const start_views_before = tc.network.stats.sent[start_view_tag];
     tc.deliver(0, 1, .{ .send_prepare = .{ .view_number = 3, .entry = entries[1], .selected_source = 1, .selected_last_normal_view = 2, .selected_tip_op = 10, .selected_tip_checksum = entries[9].checksum } });
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expect(leader.pending_view_selection);
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(start_views_before, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+
+    leader.tick();
+    try std.testing.expectEqual(syncs_before + 1, tc.disks[0].syncs);
     try std.testing.expectEqual(msg.Status.normal, leader.status);
     try std.testing.expect(!leader.pending_view_selection);
-    try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expectEqual(start_views_before + 2, tc.network.stats.sent[start_view_tag]);
     try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
 }
 
