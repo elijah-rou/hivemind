@@ -28,6 +28,9 @@ fi
 mapfile -t INSTANCE_IDS < <("${TF[@]}" output -json instance_ids | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 mapfile -t PRIVATE_IPS < <("${TF[@]}" output -json private_ips | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)))")
 BENCH_ADDRS=$("${TF[@]}" output -raw bench_addrs)
+RUN_TOKEN="${HIVEMIND_BENCH_RUN_TOKEN:-$(date +%s)-$$-$RANDOM}"
+[[ "$RUN_TOKEN" =~ ^[A-Za-z0-9._-]{1,96}$ ]] || { echo "FAIL: invalid run token" >&2; exit 1; }
+PID_LIBRARY_B64="$(base64 < "$SCRIPT_DIR/pid_lifecycle.sh" | tr -d '\n')"
 
 NODE_COUNT=${#INSTANCE_IDS[@]}
 echo "deploying to $NODE_COUNT nodes: ${INSTANCE_IDS[*]}"
@@ -72,22 +75,39 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
 
   echo "starting node $i on $id (${PRIVATE_IPS[$i]})"
 
-  # Escape for JSON string embedding: backslash and double-quote.
-  cmd_json=${cmd//\\/\\\\}
-  cmd_json=${cmd_json//\"/\\\"}
+  run_dir="/tmp/hivemind-runs/$RUN_TOKEN"
+  run_binary="$run_dir/hivemind"
+  cmd="${cmd/\.\/hivemind/$run_binary}"
+  remote_script=$(cat <<EOF
+set -euo pipefail
+source /tmp/hivemind-pid-lifecycle.sh
+mkdir -p '$run_dir'
+aws s3 cp 's3://$BUCKET/hivemind' '$run_binary' --region '$REGION'
+chmod 700 '$run_binary'
+exec 9>/tmp/hivemind-launch.lock
+flock -x 9
+hivemind_stop_verified /tmp/hivemind-current.pid /tmp/hivemind-runs
+cd /tmp
+nohup $cmd > '$run_dir/hivemind.log' 2>&1 &
+pid=\$!
+sleep 3
+actual=\$(readlink "/proc/\$pid/exe" 2>/dev/null || true)
+[[ "\$actual" == '$run_binary' ]] || { echo 'FAILED TO START'; exit 1; }
+hivemind_write_pid_state /tmp/hivemind-current.pid "\$pid" '$RUN_TOKEN' '$run_binary'
+echo 'hivemind running'
+EOF
+)
+  remote_script_b64="$(printf '%s' "$remote_script" | base64 | tr -d '\n')"
 
   cmd_id=$(aws ssm send-command --region "$REGION" \
     --instance-ids "$id" \
     --document-name "AWS-RunShellScript" \
     --parameters commands="[
-      \"aws s3 cp s3://$BUCKET/hivemind /tmp/hivemind --region $REGION\",
-      \"chmod +x /tmp/hivemind\",
+      \"printf '%s' '$PID_LIBRARY_B64' | base64 -d > /tmp/hivemind-pid-lifecycle.sh\",
+      \"chmod 700 /tmp/hivemind-pid-lifecycle.sh\",
+      \"printf '%s' '$remote_script_b64' | base64 -d | bash\",
       \"aws s3 cp s3://$BUCKET/bench /tmp/bench --region $REGION 2>/dev/null || true\",
-      \"chmod +x /tmp/bench 2>/dev/null || true\",
-      \"if [[ -f /tmp/hivemind.pid ]]; then kill \\\$(cat /tmp/hivemind.pid) 2>/dev/null || true; fi\",
-      \"cd /tmp && nohup $cmd_json > /tmp/hivemind.log 2>&1 & echo \\\$! > /tmp/hivemind.pid\",
-      \"sleep 3\",
-      \"kill -0 \\\$(cat /tmp/hivemind.pid) 2>/dev/null && echo 'hivemind running' || { echo 'FAILED TO START'; exit 1; }\"
+      \"chmod +x /tmp/bench 2>/dev/null || true\"
     ]" \
     --output text --query 'Command.CommandId')
   if [[ -z "$cmd_id" || "$cmd_id" == "None" ]]; then

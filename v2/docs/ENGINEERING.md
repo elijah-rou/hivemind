@@ -1121,9 +1121,23 @@ fn test_scheduler_under_network_partition() {
 
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
-Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid. Status `4` is reserved for an explicit worker response-too-large result. Status `5` is `outcome_ambiguous`: the worker may have accepted the request before a write failure or disconnect, so clients and operator automation must not replay it. Failure to obtain a leader connection before sending any request bytes is reported separately as `unavailable` and is safe to retry.
+Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid.
 
-The HTTP `/run` error body uses stable `error` values. In particular, ambiguous outcomes return `{"error":"outcome_ambiguous","status":5}` and safe pre-send failures return `{"error":"unavailable"}`. Operator retries are limited to the explicit safe values `unavailable` and `queue_full`.
+The `/run` status byte is one non-overlapping enum across Zig, Rust, the Go API, the Go bench, and shell automation:
+
+| byte | name | retry automatically |
+|---:|---|---|
+| 0 | `ok` | n/a |
+| 1 | `deployment_not_found` | no |
+| 2 | `queue_full` | yes |
+| 3 | `invalid_payload` | no |
+| 4 | `response_too_large` | no |
+| 5 | `outcome_ambiguous` | no |
+| 6 | `forwarding_failed` | no |
+| 7 | `no_running_pod` | no |
+| 8 | `unavailable` | yes |
+
+`outcome_ambiguous` means the worker may have accepted the request before a write failure or disconnect. `forwarding_failed` means a selected running pod's HTTP forwarding operation failed. `no_running_pod` means the worker had no eligible pod. `unavailable` is emitted only when no request bytes were sent. HTTP errors always include the matching machine-readable `error` and numeric `status`. Operator automation retries only exact, valid JSON `unavailable` and `queue_full`; it aborts on transport errors, malformed responses, ambiguous outcomes, and every other status.
 
 ## Peer identity limitation
 

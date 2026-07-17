@@ -14,11 +14,19 @@ count=0
 [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
+out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -w|--max-time|-X|-H|--data-binary) shift 2 ;;
+        *) shift ;;
+    esac
+done
 case "$CURL_STUB_SCENARIO:$count" in
-    ambiguous:1) printf '{"error":"outcome_ambiguous","status":5}\n\n502' ;;
-    unavailable_then_success:1) printf '{"error":"unavailable"}\n\n503' ;;
-    unavailable_then_success:2) printf 'served\n200' ;;
-    permanent:1) printf '{"error":"worker_error","status":99}\n\n502' ;;
+    ambiguous:1) printf '%s' '{"error":"outcome_ambiguous","status":5}' > "$out"; printf '502 0.01\n' ;;
+    unavailable_then_success:1) printf '%s' '{"error":"unavailable","status":8}' > "$out"; printf '503 0.01\n' ;;
+    unavailable_then_success:2) printf '%s' 'served' > "$out"; printf '200 0.02\n' ;;
+    permanent:1) printf '%s' '{"error":"forwarding_failed","status":6}' > "$out"; printf '502 0.01\n' ;;
     *) echo "unexpected curl call scenario=$CURL_STUB_SCENARIO count=$count" >&2; exit 97 ;;
 esac
 STUB
@@ -57,7 +65,7 @@ run_case() {
 }
 
 run_case ambiguous 1 1 outcome_ambiguous
-run_case unavailable_then_success 0 2 'pass: run fixture attempt=2'
-run_case permanent 1 1 worker_error
+run_case unavailable_then_success 0 2 'run ready: fixture attempt=2'
+run_case permanent 1 1 forwarding_failed
 
 echo "operator workflow retry fixtures: PASS"

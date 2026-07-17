@@ -353,6 +353,22 @@ case_invalid_bounds() {
   grep -q 'SSM_POLL_INTERVAL_SEC' "$TMP_DIR/bounds.err"
 }
 
+# shellcheck disable=SC2329
+case_missing_timeout_fails_before_aws() {
+  local empty_path="$TMP_DIR/no-timeout"
+  mkdir -p "$empty_path"
+  local calls_before calls_after
+  calls_before="$(wc -l < "$STUB_STATE/calls.log")"
+  if PATH="$empty_path" SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
+    hivemind_ssm_wait_invocation "us-east-1" "cmd-no-timeout" "i-no-timeout" 2>"$TMP_DIR/no-timeout.err"; then
+    echo "expected missing timeout failure" >&2
+    return 1
+  fi
+  calls_after="$(wc -l < "$STUB_STATE/calls.log")"
+  [[ "$calls_after" -eq "$calls_before" ]]
+  grep -q 'timeout(1) is required' "$TMP_DIR/no-timeout.err"
+}
+
 
 # shellcheck disable=SC2329
 case_deploy_dead_process_fail_closed() {
@@ -387,6 +403,7 @@ run_case "bounded timeout" case_bounded_timeout
 run_case "timeout diagnostics no deadline overrun" case_timeout_diagnostics_no_deadline_overrun
 run_case "per-node command IDs" case_per_node_command_ids
 run_case "invalid poll bounds" case_invalid_bounds
+run_case "missing timeout fails before AWS" case_missing_timeout_fails_before_aws
 run_case "deploy dead-process fail-closed" case_deploy_dead_process_fail_closed
 
 # Deploy script must source the waiter and poll captured CommandIds (not fire-and-forget).

@@ -9,6 +9,9 @@ set -euo pipefail
 
 API_URL="${1:?Usage: ./smoke-test.sh <api-url> [--gpu-worker <ip>] [--ssh-key <path>] [--gpu-type <type>] [--gpu-ssh-user <user>]}"
 shift
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+source "$SCRIPT_DIR/run_retry.sh"
 
 GPU_WORKER_IP="${GPU_WORKER_IP:-}"
 SSH_KEY="${SSH_KEY:-}"
@@ -111,20 +114,11 @@ wait_for_run() {
     local max_attempts="${5:-12}"
     local delay="${6:-5}"
 
-    for i in $(seq 1 "$max_attempts"); do
-        local result
-        result=$(curl -s -X POST "$url" \
-            -H "Content-Type: application/json" \
-            -d "$payload" 2>/dev/null || echo "")
-        if echo "$result" | grep -q "$expected" && [ "$result" != "$payload" ]; then
-            echo "  PASS: $name (attempt $i)"
-            PASS=$((PASS + 1))
-            return 0
-        fi
-        echo "    waiting for run response... ($i/$max_attempts)"
-        sleep "$delay"
-    done
-    echo "  FAIL: $name (timed out after $((max_attempts * delay))s)"
+    if hivemind_run_with_retry "$name" "$url" "$payload" "$expected" "$max_attempts" "$delay"; then
+        PASS=$((PASS + 1))
+        return 0
+    fi
+    echo "  FAIL: $name"
     FAIL=$((FAIL + 1))
     return 1
 }

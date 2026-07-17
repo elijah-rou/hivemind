@@ -9,6 +9,8 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../infra/poc/run_retry.sh
+source "$REPO_ROOT/infra/poc/run_retry.sh"
 BUILD=false
 PIDS=""
 REPLICA_PID=""
@@ -162,20 +164,11 @@ wait_for_run_response() {
     local max_attempts="${5:-12}"
     local delay="${6:-2}"
 
-    for i in $(seq 1 "$max_attempts"); do
-        local result
-        result=$(curl -sf -X POST "$url" \
-            -H "Content-Type: application/json" \
-            -d "$payload" || echo "")
-        if echo "$result" | grep -q "$expected" && [ "$result" != "$payload" ]; then
-            echo "  PASS: $name (attempt $i)"
-            PASS=$((PASS + 1))
-            return 0
-        fi
-        sleep "$delay"
-    done
-
-    echo "  FAIL: $name (timed out after $((max_attempts * delay))s)"
+    if hivemind_run_with_retry "$name" "$url" "$payload" "$expected" "$max_attempts" "$delay"; then
+        PASS=$((PASS + 1))
+        return 0
+    fi
+    echo "  FAIL: $name"
     FAIL=$((FAIL + 1))
     return 1
 }

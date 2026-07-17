@@ -247,6 +247,19 @@ func TestReadReplyRejectsWrongTag(t *testing.T) {
 	}
 }
 
+func TestRunStatusWireGolden(t *testing.T) {
+	want := []string{
+		"ok", "deployment_not_found", "queue_full", "invalid_payload",
+		"response_too_large", "outcome_ambiguous", "forwarding_failed",
+		"no_running_pod", "unavailable",
+	}
+	for wire, name := range want {
+		if got := runStatusName(RunStatus(wire)); got != name {
+			t.Fatalf("wire %d = %q, want %q", wire, got, name)
+		}
+	}
+}
+
 func TestReadRunResponseValidatesRequestID(t *testing.T) {
 	encodeRun := func(requestID uint64, status byte, bodyLen uint32) []byte {
 		if status != 0 {

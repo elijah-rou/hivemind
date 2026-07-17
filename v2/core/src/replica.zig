@@ -23,7 +23,9 @@ pub const DiskInterface = disk_mod.DiskInterface;
 // ---------------------------------------------------------------------------
 
 pub const LOG_SIZE_MAX: usize = msg.LOG_BITSET_BITS;
-pub const CLIENT_TABLE_MAX: usize = 64;
+/// One committed operation can introduce one unique client. Retain dedup for
+/// the entire unsnapshotted journal lifetime.
+pub const CLIENT_TABLE_MAX: usize = LOG_SIZE_MAX;
 pub const MAX_WORKERS: usize = 128;
 pub const HEARTBEAT_INTERVAL: i64 = 100;
 pub const VIEW_CHANGE_TIMEOUT: i64 = 2000;
@@ -156,6 +158,12 @@ const ClientEntry = struct {
     result: msg.Result,
     active: bool,
 };
+
+pub const CLIENT_TABLE_MEMORY_BYTES: usize = CLIENT_TABLE_MAX * @sizeOf(ClientEntry);
+comptime {
+    std.debug.assert(CLIENT_TABLE_MAX >= LOG_SIZE_MAX);
+    std.debug.assert(CLIENT_TABLE_MEMORY_BYTES <= 128 * 1024);
+}
 
 const StopDispatch = struct {
     worker_idx: usize,
@@ -761,10 +769,15 @@ pub const Replica = struct {
         // be acknowledged from the in-memory client table.
         if (self.hasPendingClientReply(request.client_id, request.request_id)) return;
         if (self.findClient(request.client_id)) |entry| {
-            if (entry.request_id >= request.request_id) {
-                // Replay committed result without mutating the journal.
+            if (entry.request_id > request.request_id) {
+                // A stale request must never receive a newer result relabeled
+                // with its older request ID.
+                return;
+            }
+            if (entry.request_id == request.request_id) {
+                // Exact replay of the committed request/result pair.
                 if (self.client_reply_fn) |cb| {
-                    cb(self.client_reply_ctx.?, request.client_id, request.request_id, entry.result);
+                    cb(self.client_reply_ctx.?, request.client_id, entry.request_id, entry.result);
                 }
                 return;
             }
@@ -2619,15 +2632,14 @@ pub const Replica = struct {
                 return;
             }
         }
-        if (self.client_count < CLIENT_TABLE_MAX) {
-            self.client_table[self.client_count] = .{
-                .client_id = client_id,
-                .request_id = request_id,
-                .result = result,
-                .active = true,
-            };
-            self.client_count += 1;
-        }
+        std.debug.assert(self.client_count < CLIENT_TABLE_MAX);
+        self.client_table[self.client_count] = .{
+            .client_id = client_id,
+            .request_id = request_id,
+            .result = result,
+            .active = true,
+        };
+        self.client_count += 1;
     }
 
     // -----------------------------------------------------------------------
@@ -2751,6 +2763,105 @@ const ReplicaDispatchCapture = struct {
         capture.count += 1;
     }
 };
+
+const ClientReplyCapture = struct {
+    count: usize = 0,
+    client_id: u128 = 0,
+    request_id: msg.RequestId = 0,
+    result: msg.Result = .{ .ok = .{ .entity_id = 0 } },
+
+    fn reply(ctx: *anyopaque, client_id: u128, request_id: msg.RequestId, result: msg.Result) void {
+        const capture: *ClientReplyCapture = @ptrCast(@alignCast(ctx));
+        capture.count += 1;
+        capture.client_id = client_id;
+        capture.request_id = request_id;
+        capture.result = result;
+    }
+};
+
+test "stale client request is ignored instead of relabeling newer result" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(1201);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(1201, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(1201);
+    var capture = ClientReplyCapture{};
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+        .client_reply_ctx = &capture,
+        .client_reply_fn = ClientReplyCapture.reply,
+    });
+    replica.updateClientTable(77, 9, .{ .ok = .{ .entity_id = 900 } });
+
+    replica.onRequest(0, .{ .client_id = 77, .request_id = 8, .command = .{ .noop = {} } });
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(@as(u64, 0), replica.op_number);
+
+    replica.onRequest(0, .{ .client_id = 77, .request_id = 9, .command = .{ .noop = {} } });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u128, 9), capture.request_id);
+    try std.testing.expectEqual(@as(u64, 900), capture.result.ok.entity_id);
+    try std.testing.expectEqual(@as(u64, 0), replica.op_number);
+}
+
+test "restart rebuild preserves dedup beyond 64 unique clients" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(1202);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(1202, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(1202);
+    var capture = ClientReplyCapture{};
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+        .client_reply_ctx = &capture,
+        .client_reply_fn = ClientReplyCapture.reply,
+    });
+
+    var parent_checksum: u64 = 0;
+    for (1..97) |op| {
+        var entry = msg.LogEntry{
+            .view_number = 0,
+            .op_number = @intCast(op),
+            .command = .{ .noop = {} },
+            .client_id = @intCast(10_000 + op),
+            .request_id = 1,
+            .parent_checksum = parent_checksum,
+        };
+        entry.checksum = entry.computeChecksum();
+        replica.journalPut(entry);
+        parent_checksum = entry.checksum;
+    }
+    replica.op_number = 96;
+    replica.commit_min = 96;
+    replica.commit_max = 96;
+    try replica.rebuildCommittedState(96);
+    try std.testing.expectEqual(@as(usize, 96), replica.client_count);
+
+    replica.onRequest(0, .{ .client_id = 10_001, .request_id = 1, .command = .{ .noop = {} } });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u128, 1), capture.request_id);
+    try std.testing.expectEqual(@as(u64, 96), replica.op_number);
+}
 
 test "duplicate in-flight scheduler request is ignored before commit" {
     const allocator = std.testing.allocator;

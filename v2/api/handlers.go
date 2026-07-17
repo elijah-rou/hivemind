@@ -187,7 +187,8 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 				})
 			case errors.Is(err, ErrRunUnavailable):
 				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-					"error": "unavailable",
+					"error":  RunStatusUnavailable.String(),
+					"status": RunStatusUnavailable,
 				})
 			default:
 				writeErr(w, http.StatusBadGateway, err.Error())
@@ -219,20 +220,20 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 // runStatusToHTTP maps a nonzero run-request status to an HTTP status + reason.
 // Values 1-2 come from the gateway (v2/src/connection.zig), everything else
 // comes from the worker runtime.
-func runStatusToHTTP(status byte) (int, string) {
+func runStatusToHTTP(status RunStatus) (int, string) {
 	switch status {
-	case RunStatusNotFound:
-		return http.StatusNotFound, "deployment_not_found"
+	case RunStatusDeploymentNotFound:
+		return http.StatusNotFound, status.String()
 	case RunStatusQueueFull:
-		return http.StatusServiceUnavailable, "queue_full"
+		return http.StatusServiceUnavailable, status.String()
 	case RunStatusInvalidPayload:
-		return http.StatusBadRequest, "invalid_payload"
-	case RunStatusResponseTooLarge:
-		return http.StatusBadGateway, "response_too_large"
-	case RunStatusOutcomeAmbiguous:
-		return http.StatusBadGateway, "outcome_ambiguous"
+		return http.StatusBadRequest, status.String()
+	case RunStatusResponseTooLarge, RunStatusOutcomeAmbiguous, RunStatusForwardingFailed:
+		return http.StatusBadGateway, status.String()
+	case RunStatusNoRunningPod, RunStatusUnavailable:
+		return http.StatusServiceUnavailable, status.String()
 	default:
-		return http.StatusBadGateway, "worker_error"
+		return http.StatusBadGateway, "unknown_status"
 	}
 }
 

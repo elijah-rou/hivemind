@@ -44,6 +44,23 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Static safety gate follow-up: retries, dedup, statuses, launch PID, and nonblocking sockets
+
+What changed:
+- all active Hivemind `/run` retry loops use one fail-closed helper that retries only valid JSON `unavailable` and `queue_full`; transport, malformed, ambiguous, and all other responses abort
+- the `/run` wire status enum is explicit and identical across Zig, Rust, Go API/bench, HTTP JSON, scripts, tests, and docs; forwarding failure and no-running-pod are distinct
+- stale client request IDs are ignored instead of receiving newer cached results, while exact IDs replay the exact cached result
+- the fixed dedup table now matches the full 1,024-operation retained journal; per-replica memory rises from 4,096 to 65,536 bytes (+61,440 bytes)
+- bench launches use a run-scoped binary path, a per-node `flock`, and verified PID state; a PID is killed only when `/proc/$pid/exe`, the recorded token, and expected run binary all match
+- SSM polling requires `timeout(1)` before any AWS call; socket nonblocking setup reports either `fcntl` failure and closes before connect/accept registration
+
+Why it matters:
+- prevents unsafe workload replay, stale-result mislabeling, dedup loss after 64 clients, reused-PID kills, unbounded AWS calls, and accidental blocking peer connects
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
 ### 2026-07-16 — Ambiguous run outcomes, bounded peer handshakes, and StartPod parsing closed
 
 What changed:

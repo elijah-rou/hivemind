@@ -268,15 +268,45 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	return result, timings, err
 }
 
-// Run-request error codes (match core/src/connection.zig handleRunRequest + sendRunError).
+// RunStatus is the stable cross-language /run wire enum.
+type RunStatus byte
+
 const (
-	RunStatusOK               byte = 0
-	RunStatusNotFound         byte = 1 // deployment not found
-	RunStatusQueueFull        byte = 2
-	RunStatusInvalidPayload   byte = 3 // declared length mismatch / over MAX_PAYLOAD
-	RunStatusResponseTooLarge byte = 4 // explicit worker response overflow only
-	RunStatusOutcomeAmbiguous byte = 5 // worker may have accepted the request before disconnect
+	RunStatusOK                 RunStatus = 0
+	RunStatusDeploymentNotFound RunStatus = 1
+	RunStatusQueueFull          RunStatus = 2
+	RunStatusInvalidPayload     RunStatus = 3
+	RunStatusResponseTooLarge   RunStatus = 4
+	RunStatusOutcomeAmbiguous   RunStatus = 5
+	RunStatusForwardingFailed   RunStatus = 6
+	RunStatusNoRunningPod       RunStatus = 7
+	RunStatusUnavailable        RunStatus = 8
 )
+
+func (s RunStatus) String() string {
+	switch s {
+	case RunStatusOK:
+		return "ok"
+	case RunStatusDeploymentNotFound:
+		return "deployment_not_found"
+	case RunStatusQueueFull:
+		return "queue_full"
+	case RunStatusInvalidPayload:
+		return "invalid_payload"
+	case RunStatusResponseTooLarge:
+		return "response_too_large"
+	case RunStatusOutcomeAmbiguous:
+		return "outcome_ambiguous"
+	case RunStatusForwardingFailed:
+		return "forwarding_failed"
+	case RunStatusNoRunningPod:
+		return "no_running_pod"
+	case RunStatusUnavailable:
+		return "unavailable"
+	default:
+		return "unknown"
+	}
+}
 
 // MaxRunPayload is the shared run-request body bound (matches core request_queue.MAX_PAYLOAD).
 const MaxRunPayload = 512
@@ -295,8 +325,8 @@ var ErrRunUnavailable = errors.New("run unavailable before send")
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
 	RequestID uint64
-	Status    byte   // 0 = ok, nonzero = error (worker or gateway-side)
-	Body      []byte // status==0: container response body; status!=0: error detail (may be empty)
+	Status    RunStatus // ok or one explicit error outcome
+	Body      []byte    // status==0: container response body; status!=0: error detail (may be empty)
 }
 
 // SendRunRequest sends a workload request (no consensus) and returns the
@@ -371,7 +401,10 @@ func parseRunResponse(raw []byte) (*RunResponse, error) {
 	}
 	resp := &RunResponse{
 		RequestID: binary.LittleEndian.Uint64(raw[0:8]),
-		Status:    raw[8],
+		Status:    RunStatus(raw[8]),
+	}
+	if resp.Status > RunStatusUnavailable {
+		return nil, fmt.Errorf("unknown run status: %d", resp.Status)
 	}
 	if len(raw) == 9 {
 		if resp.Status == RunStatusOK {

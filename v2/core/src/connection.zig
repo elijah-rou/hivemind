@@ -12,7 +12,7 @@ const MAX_CLIENTS: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Worker frame payload is bounded at 16 KiB; run metadata consumes 9 bytes.
 pub const MAX_RUN_RESPONSE_BODY: usize = 16 * 1024 - 9;
-const RUN_STATUS_OUTCOME_AMBIGUOUS: u8 = 5;
+const RunStatus = rq.RunStatus;
 const MAX_PEER_CONNECTIONS: usize = @as(usize, msg.REPLICA_COUNT_MAX) * 2;
 const PEER_CONNECT_TIMEOUT_TICKS: u64 = 2_000;
 const PEER_IDENTITY_TIMEOUT_TICKS: u64 = 2_000;
@@ -28,6 +28,24 @@ const libc = struct {
     extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
     extern "c" fn close(fd: c_int) c_int;
     extern "c" fn pipe(pipe_fds: *[2]c_int) c_int;
+};
+
+const FcntlOps = struct {
+    get_flags: *const fn (c_int) c_int,
+    set_flags: *const fn (c_int, c_int) c_int,
+
+    fn systemGetFlags(fd: c_int) c_int {
+        return std.c.fcntl(fd, std.posix.F.GETFL);
+    }
+
+    fn systemSetFlags(fd: c_int, flags: c_int) c_int {
+        return std.c.fcntl(fd, std.posix.F.SETFL, flags);
+    }
+
+    const system = FcntlOps{
+        .get_flags = systemGetFlags,
+        .set_flags = systemSetFlags,
+    };
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +117,7 @@ pub const ConnectionManager = struct {
 
     // Frame encryption (optional, PSK-based)
     encryption: ?*enc.EncryptionState,
+    fcntl_ops: FcntlOps,
 
     pub fn init(replica: *replica_mod.Replica, worker_port: u16, client_port: u16, peer_port: u16) !ConnectionManager {
         const agent_fd = try listenOn(worker_port);
@@ -129,6 +148,8 @@ pub const ConnectionManager = struct {
             .peer_target_count = 0,
             .last_retry_tick = 0,
             .poll_count = 0,
+            .encryption = null,
+            .fcntl_ops = FcntlOps.system,
         };
     }
 
@@ -163,6 +184,7 @@ pub const ConnectionManager = struct {
         self.poll_count = 0;
         self.state_response_buf = std.mem.zeroes([131072]u8);
         self.encryption = null;
+        self.fcntl_ops = FcntlOps.system;
     }
 
     pub fn deinit(self: *ConnectionManager) void {
@@ -193,7 +215,10 @@ pub const ConnectionManager = struct {
         while (true) {
             const fd = std.c.accept(self.worker_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             var slot: ?usize = null;
             for (0..self.worker_count) |i| {
@@ -309,7 +334,10 @@ pub const ConnectionManager = struct {
             return;
         }
         const worker_request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-        const status = payload[8];
+        const status = msg.enumFromIntChecked(RunStatus, payload[8]) catch {
+            self.disconnectWorker(worker);
+            return;
+        };
         const response_data = payload[9..];
         if (response_data.len > MAX_RUN_RESPONSE_BODY) {
             self.disconnectWorker(worker);
@@ -331,7 +359,7 @@ pub const ConnectionManager = struct {
             var pos: usize = 3;
             @memcpy(inner[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, resolved.client_request_id)));
             pos += 8;
-            inner[pos] = status;
+            inner[pos] = @intFromEnum(status);
             pos += 1;
             @memcpy(inner[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(response_data.len)))));
             pos += 4;
@@ -358,7 +386,7 @@ pub const ConnectionManager = struct {
         const declared_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[72..76]));
         const body = payload[76..];
         if (declared_len > rq.MAX_PAYLOAD or body.len != @as(usize, declared_len)) {
-            self.sendRunError(client, request_id, 3); // invalid payload length
+            self.sendRunError(client, request_id, .invalid_payload);
             return;
         }
         const req_payload = body;
@@ -367,23 +395,23 @@ pub const ConnectionManager = struct {
         // Look up deployment by name
         const dep = self.replica.state_machine.findDeploymentByName(dep_name) orelse {
             // Deployment not found -- send error response
-            self.sendRunError(client, request_id, 1);
+            self.sendRunError(client, request_id, .deployment_not_found);
             return;
         };
 
         // Enqueue for dispatch
         if (!self.request_queue.enqueue(dep.id, request_id, client.client_id, req_payload)) {
-            self.sendRunError(client, request_id, 2); // queue full
+            self.sendRunError(client, request_id, .queue_full);
         }
     }
 
-    fn sendRunError(self: *ConnectionManager, client: *Conn, request_id: u64, status: u8) void {
+    fn sendRunError(self: *ConnectionManager, client: *Conn, request_id: u64, status: RunStatus) void {
         // Same framing as successful run replies: flags byte via sendFrame.
         var inner: [12]u8 = undefined;
         @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
         inner[2] = 0x23; // ClientTag.run_response
         @memcpy(inner[3..11], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
-        inner[11] = status;
+        inner[11] = @intFromEnum(status);
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
         self.sendFrame(client.fd, key, inner[0..12]) catch {
             self.disconnectClient(client);
@@ -535,11 +563,11 @@ pub const ConnectionManager = struct {
         var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
         const released_count = self.request_queue.releaseWorker(worker_idx, &released);
         for (released[0..released_count]) |request| {
-            self.sendRunErrorToClientId(request.client_id, request.client_request_id, RUN_STATUS_OUTCOME_AMBIGUOUS);
+            self.sendRunErrorToClientId(request.client_id, request.client_request_id, .outcome_ambiguous);
         }
     }
 
-    fn sendRunErrorToClientId(self: *ConnectionManager, client_id: u128, request_id: u64, status: u8) void {
+    fn sendRunErrorToClientId(self: *ConnectionManager, client_id: u128, request_id: u64, status: RunStatus) void {
         for (self.clients[0..self.client_count]) |*client| {
             if (!client.connected or client.client_id != client_id) continue;
             self.sendRunError(client, request_id, status);
@@ -553,7 +581,10 @@ pub const ConnectionManager = struct {
         while (true) {
             const fd = std.c.accept(self.client_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             var slot: ?usize = null;
             for (0..self.client_count) |i| {
@@ -949,7 +980,10 @@ pub const ConnectionManager = struct {
         while (true) {
             const fd = std.c.accept(self.peer_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             const slot = self.acquirePeerSlot() orelse {
                 _ = libc.close(fd);
@@ -1198,7 +1232,10 @@ pub const ConnectionManager = struct {
     fn connectToPeerInner(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
         const fd = libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         if (fd < 0) return;
-        setNonBlocking(fd);
+        setNonBlockingWith(fd, self.fcntl_ops) catch {
+            _ = libc.close(fd);
+            return;
+        };
 
         var addr: std.posix.sockaddr.in = .{
             .port = std.mem.nativeToBig(u16, port),
@@ -1240,7 +1277,7 @@ pub const ConnectionManager = struct {
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = libc.close(fd);
 
-        setNonBlocking(fd);
+        try setNonBlockingWith(fd, FcntlOps.system);
 
         const optval: u32 = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&optval), @sizeOf(u32));
@@ -1255,10 +1292,16 @@ pub const ConnectionManager = struct {
         return fd;
     }
 
-    fn setNonBlocking(fd: c_int) void {
-        const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    fn setNonBlocking(fd: c_int) !void {
+        return setNonBlockingWith(fd, FcntlOps.system);
+    }
+
+    fn setNonBlockingWith(fd: c_int, ops: FcntlOps) !void {
+        std.debug.assert(fd >= 0);
+        const flags = ops.get_flags(fd);
+        if (flags < 0) return error.GetFlagsFailed;
         const O_NONBLOCK: c_int = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
-        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
+        if (ops.set_flags(fd, flags | O_NONBLOCK) != 0) return error.SetFlagsFailed;
     }
 
     fn acquirePeerSlot(self: *ConnectionManager) ?usize {
@@ -1640,7 +1683,7 @@ test "writeAll retries when nonblocking peer writes hit EAGAIN" {
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     const send_buf: c_int = 4096;
     _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&send_buf), @sizeOf(c_int));
@@ -1661,7 +1704,7 @@ test "writeAll returns WouldBlock after bounded EAGAIN retries" {
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     const send_buf: c_int = 4096;
     _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&send_buf), @sizeOf(c_int));
@@ -1679,7 +1722,7 @@ test "readConn ignores EAGAIN on nonblocking sockets" {
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     var conn = Conn{
         .fd = fds[0],
@@ -1975,6 +2018,53 @@ fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Repli
     cm.poll_count = 0;
     cm.state_response_buf = undefined;
     cm.encryption = null;
+    cm.fcntl_ops = FcntlOps.system;
+}
+
+fn fcntlGetFails(_: c_int) c_int {
+    return -1;
+}
+
+fn fcntlGetSucceeds(_: c_int) c_int {
+    return 0;
+}
+
+fn fcntlSetFails(_: c_int, _: c_int) c_int {
+    return -1;
+}
+
+fn fcntlSetSucceeds(_: c_int, _: c_int) c_int {
+    return 0;
+}
+
+test "setNonBlocking reports both fcntl failure boundaries" {
+    const get_failure = FcntlOps{ .get_flags = fcntlGetFails, .set_flags = fcntlSetSucceeds };
+    try std.testing.expectError(error.GetFlagsFailed, ConnectionManager.setNonBlockingWith(1, get_failure));
+    const set_failure = FcntlOps{ .get_flags = fcntlGetSucceeds, .set_flags = fcntlSetFails };
+    try std.testing.expectError(error.SetFlagsFailed, ConnectionManager.setNonBlockingWith(1, set_failure));
+}
+
+test "peer connect never registers a socket when nonblocking setup fails" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7000);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7000, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7000);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.fcntl_ops = .{ .get_flags = fcntlGetFails, .set_flags = fcntlSetSucceeds };
+
+    cm.connectToPeerInner(1, 0, 1);
+    try std.testing.expectEqual(@as(usize, 0), cm.peer_count);
 }
 
 test "worker side-effect and client error write failures clean all owned state and permit slot reuse" {
@@ -2334,7 +2424,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     var client_buf: [128]u8 = undefined;
     var n = try std.posix.read(client_fds[1], &client_buf);
     try std.testing.expect(n >= 17);
-    try std.testing.expectEqual(RUN_STATUS_OUTCOME_AMBIGUOUS, client_buf[16]);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.outcome_ambiguous), client_buf[16]);
 
     // Accepted dispatch followed by disconnect releases its owned correlation.
     var worker_fds: [2]c_int = undefined;
@@ -2349,7 +2439,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
     n = try std.posix.read(client_fds[1], &client_buf);
     try std.testing.expect(n >= 17);
-    try std.testing.expectEqual(RUN_STATUS_OUTCOME_AMBIGUOUS, client_buf[16]);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.outcome_ambiguous), client_buf[16]);
 
     // A replacement connection reuses the released slot and completes normally.
     var success_worker_fds: [2]c_int = undefined;
@@ -2602,10 +2692,10 @@ test "simultaneous reciprocal sockets converge and carry bidirectional VRR traff
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_a));
     var socket_b: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_b));
-    ConnectionManager.setNonBlocking(socket_a[0]);
-    ConnectionManager.setNonBlocking(socket_a[1]);
-    ConnectionManager.setNonBlocking(socket_b[0]);
-    ConnectionManager.setNonBlocking(socket_b[1]);
+    try ConnectionManager.setNonBlocking(socket_a[0]);
+    try ConnectionManager.setNonBlocking(socket_a[1]);
+    try ConnectionManager.setNonBlocking(socket_b[0]);
+    try ConnectionManager.setNonBlocking(socket_b[1]);
 
     lower.peer_count = 2;
     lower.peers[0] = .{ .fd = socket_a[0], .connected = true, .peer_direction = .outbound, .configured_peer_id = 1, .configured_peer_id_known = true, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
@@ -2922,7 +3012,7 @@ test "handleRunRequest enforces exact declared payload length" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
-    ConnectionManager.setNonBlocking(fds[1]);
+    try ConnectionManager.setNonBlocking(fds[1]);
     cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 55 };
 
     const Case = struct {

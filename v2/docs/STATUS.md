@@ -173,7 +173,7 @@ PROTOCOL_VERSION = 1 (2 bytes = 65535 possible versions)
 ## VRR Consensus
 
 - 5-node clusters, regionally scoped
-- LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=64
+- LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=1024 so dedup spans the full retained journal
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
 - Full view change protocol: StartViewChange → DoViewChange → StartView
@@ -265,6 +265,10 @@ Legacy deploy-mode benchmark, retained for historical context only:
 | p999 | 8.3ms | 287.1ms | 35x |
 
 *Deploy-mode (consensus path). 1000 deployments, 100 concurrent. Not the current POC verdict.*
+
+## Dedup resource bound
+
+The fixed client dedup table now has 1,024 entries, matching the complete retained operation window. `ClientEntry` is 64 bytes in the pinned Zig ABI, so the table is 65,536 bytes per replica. This is a 61,440-byte increase from the former 64-entry table (4,096 bytes). Compile-time assertions require `CLIENT_TABLE_MAX >= LOG_SIZE_MAX` and cap the table at 128 KiB.
 
 ## Test Coverage
 

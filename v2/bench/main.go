@@ -12,6 +12,45 @@ import (
 	"time"
 )
 
+type RunStatus byte
+
+const (
+	RunStatusOK                 RunStatus = 0
+	RunStatusDeploymentNotFound RunStatus = 1
+	RunStatusQueueFull          RunStatus = 2
+	RunStatusInvalidPayload     RunStatus = 3
+	RunStatusResponseTooLarge   RunStatus = 4
+	RunStatusOutcomeAmbiguous   RunStatus = 5
+	RunStatusForwardingFailed   RunStatus = 6
+	RunStatusNoRunningPod       RunStatus = 7
+	RunStatusUnavailable        RunStatus = 8
+)
+
+func runStatusName(status RunStatus) string {
+	switch status {
+	case RunStatusOK:
+		return "ok"
+	case RunStatusDeploymentNotFound:
+		return "deployment_not_found"
+	case RunStatusQueueFull:
+		return "queue_full"
+	case RunStatusInvalidPayload:
+		return "invalid_payload"
+	case RunStatusResponseTooLarge:
+		return "response_too_large"
+	case RunStatusOutcomeAmbiguous:
+		return "outcome_ambiguous"
+	case RunStatusForwardingFailed:
+		return "forwarding_failed"
+	case RunStatusNoRunningPod:
+		return "no_running_pod"
+	case RunStatusUnavailable:
+		return "unavailable"
+	default:
+		return "unknown"
+	}
+}
+
 const (
 	ClientTagRequest             byte   = 0x20
 	ClientTagReply               byte   = 0x21
@@ -396,9 +435,12 @@ func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
 	if replyRequestID != expectedRequestID {
 		return fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
 	}
-	status := raw[8]
-	if status != 0 {
-		return fmt.Errorf("run status %d", status)
+	status := RunStatus(raw[8])
+	if status > RunStatusUnavailable {
+		return fmt.Errorf("unknown run status %d", status)
+	}
+	if status != RunStatusOK {
+		return fmt.Errorf("run status %s (%d)", runStatusName(status), status)
 	}
 	// Success requires explicit body length: request_id(8)+status(1)+len(4)+body.
 	if len(raw) < 13 {

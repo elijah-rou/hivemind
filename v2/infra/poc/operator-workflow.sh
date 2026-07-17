@@ -17,6 +17,9 @@ RUN_ID="${RUN_ID:-$(date +%s)}"
 CPU_NAME="op-cpu-${RUN_ID}"
 GPU_NAME="op-gpu-${RUN_ID}"
 mkdir -p "$OUT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+source "$SCRIPT_DIR/run_retry.sh"
 
 TMP_FILES=()
 cleanup() {
@@ -50,42 +53,9 @@ wait_for() {
 }
 run_with_retry() {
     local deployment_name="$1" payload_file="$2" out_file="$3" attempts="${4:-36}" delay="${5:-5}"
-    local response http_status error_code
-    for i in $(seq 1 "$attempts"); do
-        if ! response="$(curl -sS -X POST "$API_URL/v1/deployments/$deployment_name/run" \
-            -H 'Content-Type: application/json' \
-            --data-binary "@$payload_file" \
-            -w $'\n%{http_code}')"; then
-            echo "abort: run $deployment_name transport outcome is not explicitly retryable" >&2
-            return 1
-        fi
-        http_status="${response##*$'\n'}"
-        printf '%s' "${response%$'\n'*}" > "$out_file"
-        if [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
-            echo "pass: run $deployment_name attempt=$i"
-            return 0
-        fi
-
-        error_code="$(python3 -c 'import json,sys; value=json.load(sys.stdin).get("error", ""); print(value if isinstance(value, str) else "")' < "$out_file" 2>/dev/null || true)"
-        case "$error_code" in
-            outcome_ambiguous)
-                echo "abort: run $deployment_name outcome_ambiguous; request will not be replayed" >&2
-                return 1
-                ;;
-            unavailable|queue_full)
-                rm -f "$out_file"
-                if (( i < attempts )); then
-                    sleep "$delay"
-                fi
-                ;;
-            *)
-                echo "abort: run $deployment_name permanent error=${error_code:-unknown} http_status=$http_status" >&2
-                return 1
-                ;;
-        esac
-    done
-    echo "timeout: run $deployment_name" >&2
-    return 1
+    hivemind_run_with_retry "$deployment_name" \
+        "$API_URL/v1/deployments/$deployment_name/run" \
+        "@$payload_file" '' "$attempts" "$delay" "$out_file"
 }
 
 if [[ "${OPERATOR_WORKFLOW_RETRY_FIXTURE:-false}" == "true" ]]; then

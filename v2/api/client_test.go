@@ -356,16 +356,16 @@ func TestParseResultRejectsMismatchedRequestID(t *testing.T) {
 	}
 }
 
-func buildRunResponseRaw(requestID uint64, status byte, body []byte, extraTrailing bool) []byte {
+func buildRunResponseRaw(requestID uint64, status RunStatus, body []byte, extraTrailing bool) []byte {
 	if body == nil && status != RunStatusOK {
 		raw := make([]byte, 9)
 		binary.LittleEndian.PutUint64(raw[0:8], requestID)
-		raw[8] = status
+		raw[8] = byte(status)
 		return raw
 	}
 	raw := make([]byte, 13+len(body))
 	binary.LittleEndian.PutUint64(raw[0:8], requestID)
-	raw[8] = status
+	raw[8] = byte(status)
 	binary.LittleEndian.PutUint32(raw[9:13], uint32(len(body)))
 	copy(raw[13:], body)
 	if extraTrailing {
@@ -400,7 +400,7 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 		},
 		{
 			name: "gateway error without length",
-			raw:  buildRunResponseRaw(7, RunStatusNotFound, nil, false),
+			raw:  buildRunResponseRaw(7, RunStatusDeploymentNotFound, nil, false),
 		},
 		{
 			name: "ambiguous gateway error without length",
@@ -408,7 +408,7 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 		},
 		{
 			name:    "missing response length",
-			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, RunStatusOK},
+			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, byte(RunStatusOK)},
 			wantErr: "missing length",
 		},
 		{
@@ -423,7 +423,7 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 		},
 		{
 			name:    "partial length field",
-			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, RunStatusOK, 1, 0},
+			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, byte(RunStatusOK), 1, 0},
 			wantErr: "missing length",
 		},
 	}
@@ -575,6 +575,20 @@ func TestSendRunRequestParsesExplicitAmbiguousStatusAsSentinel(t *testing.T) {
 	}
 	if resp == nil || resp.Status != RunStatusOutcomeAmbiguous {
 		t.Fatalf("response = %+v, want explicit ambiguous status", resp)
+	}
+}
+
+func TestRunStatusWireGolden(t *testing.T) {
+	want := []string{
+		"ok", "deployment_not_found", "queue_full", "invalid_payload",
+		"response_too_large", "outcome_ambiguous", "forwarding_failed",
+		"no_running_pod", "unavailable",
+	}
+	for wire, name := range want {
+		status := RunStatus(wire)
+		if status.String() != name {
+			t.Fatalf("wire %d = %q, want %q", wire, status.String(), name)
+		}
 	}
 }
 

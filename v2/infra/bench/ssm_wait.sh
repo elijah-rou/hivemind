@@ -14,6 +14,8 @@ hivemind_ssm_assert_poll_bounds() {
     || { echo "FAIL: SSM_POLL_TIMEOUT_SEC must be a positive integer (got: ${SSM_POLL_TIMEOUT_SEC})" >&2; return 1; }
   (( SSM_POLL_TIMEOUT_SEC >= SSM_POLL_INTERVAL_SEC )) \
     || { echo "FAIL: SSM_POLL_TIMEOUT_SEC ($SSM_POLL_TIMEOUT_SEC) < SSM_POLL_INTERVAL_SEC ($SSM_POLL_INTERVAL_SEC)" >&2; return 1; }
+  command -v timeout >/dev/null 2>&1 \
+    || { echo "FAIL: timeout(1) is required before any AWS polling" >&2; return 1; }
 }
 
 hivemind_ssm_now() {
@@ -34,14 +36,9 @@ hivemind_ssm_aws() {
   if (( remaining < 1 )); then
     return 124
   fi
-  # Bound connect/read via AWS CLI knobs and an outer timeout(1) when available.
-  if command -v timeout >/dev/null 2>&1; then
-    AWS_CLI_CONNECT_TIMEOUT="$remaining" AWS_CLI_READ_TIMEOUT="$remaining" \
-      timeout --signal=KILL "$remaining" aws "$@"
-  else
-    AWS_CLI_CONNECT_TIMEOUT="$remaining" AWS_CLI_READ_TIMEOUT="$remaining" \
-      aws "$@"
-  fi
+  # timeout(1) availability is asserted before any AWS call.
+  AWS_CLI_CONNECT_TIMEOUT="$remaining" AWS_CLI_READ_TIMEOUT="$remaining" \
+    timeout --signal=KILL "$remaining" aws "$@"
 }
 
 hivemind_ssm_dump_invocation() {

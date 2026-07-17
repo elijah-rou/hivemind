@@ -14,7 +14,23 @@ const MSG_RUN_REQUEST: u8 = 0x04;
 pub const MAX_RUN_PAYLOAD: usize = 512;
 /// Shared worker response-body bound. RunResponse metadata consumes 9 frame-payload bytes.
 pub const MAX_RUN_RESPONSE_BODY: usize = MAX_FRAME_PAYLOAD - 9;
-pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = 4;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Ok = 0,
+    DeploymentNotFound = 1,
+    QueueFull = 2,
+    InvalidPayload = 3,
+    ResponseTooLarge = 4,
+    OutcomeAmbiguous = 5,
+    ForwardingFailed = 6,
+    NoRunningPod = 7,
+    Unavailable = 8,
+}
+
+pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = RunStatus::ResponseTooLarge as u8;
+pub const RUN_STATUS_FORWARDING_FAILED: u8 = RunStatus::ForwardingFailed as u8;
+pub const RUN_STATUS_NO_RUNNING_POD: u8 = RunStatus::NoRunningPod as u8;
 
 const MSG_NODE_REGISTER: u8 = 0x10;
 const MSG_NODE_HEARTBEAT: u8 = 0x11;
@@ -657,6 +673,24 @@ mod tests {
         let error = write_frame(&mut output, 0x42, &payload).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn run_status_wire_golden() {
+        let statuses = [
+            (RunStatus::Ok, 0),
+            (RunStatus::DeploymentNotFound, 1),
+            (RunStatus::QueueFull, 2),
+            (RunStatus::InvalidPayload, 3),
+            (RunStatus::ResponseTooLarge, 4),
+            (RunStatus::OutcomeAmbiguous, 5),
+            (RunStatus::ForwardingFailed, 6),
+            (RunStatus::NoRunningPod, 7),
+            (RunStatus::Unavailable, 8),
+        ];
+        for (status, wire) in statuses {
+            assert_eq!(status as u8, wire);
+        }
     }
 
     #[test]

@@ -6,6 +6,24 @@ pub const MAX_QUEUE_DEPTH: usize = 64;
 pub const MAX_QUEUES: usize = 16;
 pub const MAX_IN_FLIGHT: usize = 1024;
 
+/// Cross-language /run outcome contract. Values are stable wire bytes.
+pub const RunStatus = enum(u8) {
+    ok = 0,
+    deployment_not_found = 1,
+    queue_full = 2,
+    invalid_payload = 3,
+    response_too_large = 4,
+    outcome_ambiguous = 5,
+    forwarding_failed = 6,
+    no_running_pod = 7,
+    unavailable = 8,
+};
+
+comptime {
+    std.debug.assert(@intFromEnum(RunStatus.ok) == 0);
+    std.debug.assert(@intFromEnum(RunStatus.unavailable) == 8);
+}
+
 // ---------------------------------------------------------------------------
 // Per-request state
 // ---------------------------------------------------------------------------
@@ -298,6 +316,23 @@ pub const RequestQueue = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "run status wire golden" {
+    const statuses = [_]RunStatus{
+        .ok,
+        .deployment_not_found,
+        .queue_full,
+        .invalid_payload,
+        .response_too_large,
+        .outcome_ambiguous,
+        .forwarding_failed,
+        .no_running_pod,
+        .unavailable,
+    };
+    for (statuses, 0..) |status, wire| {
+        try std.testing.expectEqual(@as(u8, @intCast(wire)), @intFromEnum(status));
+    }
+}
 
 test "request queue: enqueue and dequeue" {
     var rq = RequestQueue.init();

@@ -13,6 +13,9 @@ set -euo pipefail
 
 API_URL="${1:?Usage: failure-drills.sh <api-url> --ssh-key <key> --replica-ips <ips> --cpu-worker-ip <ip>}"
 shift
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+source "$SCRIPT_DIR/run_retry.sh"
 
 SSH_KEY=""
 REPLICA_IPS_CSV=""
@@ -212,24 +215,16 @@ run_expect_field() {
     local expected_field="$3"
     local max="${4:-12}"
     local delay="${5:-5}"
-    local result=""
-
     RUN_RESULT=""
-    for i in $(seq 1 "$max"); do
-        result="$(curl -s --max-time 30 -X POST "$API_URL/v1/deployments/$DRILL_NAME/run" \
-            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || echo "")"
-        if echo "$result" | grep -q "\"$expected_field\""; then
-            echo "  PASS: $name (attempt $i)"
-            PASS=$((PASS + 1))
-            RUN_RESULT="$result"
-            return 0
-        fi
-        sleep "$delay"
-    done
-
-    echo "  FAIL: $name (expected field '$expected_field', got '$result')" >&2
+    if hivemind_run_with_retry "$name" \
+        "$API_URL/v1/deployments/$DRILL_NAME/run" "$payload" \
+        "\"$expected_field\"" "$max" "$delay" '' 30; then
+        RUN_RESULT="$HIVEMIND_RUN_BODY"
+        PASS=$((PASS + 1))
+        return 0
+    fi
+    echo "  FAIL: $name" >&2
     FAIL=$((FAIL + 1))
-    RUN_RESULT="$result"
     return 1
 }
 
@@ -487,20 +482,16 @@ CPU_WORKER_STOPPED=false
 sleep 20
 
 echo "[B5] Verify /run recovers after worker restart..."
-for i in $(seq 1 12); do
-    RECOVERED="$(curl -s --max-time 10 -X POST "$API_URL/v1/deployments/$DRILL_NAME/run" \
-        -H 'Content-Type: application/json' -d '{"text":"recovered"}' 2>/dev/null || echo "")"
-    if echo "$RECOVERED" | grep -q '"model"'; then
-        echo "  PASS: run recovered (attempt $i)"
-        PASS=$((PASS + 1))
-        break
-    fi
-    if [[ $i -eq 12 ]]; then
-        echo "  FAIL: run did not recover"
-        FAIL=$((FAIL + 1))
-    fi
-    sleep 5
-done
+RECOVERED=""
+if hivemind_run_with_retry "worker recovery" \
+    "$API_URL/v1/deployments/$DRILL_NAME/run" '{"text":"recovered"}' \
+    '"model"' 12 5 '' 10; then
+    RECOVERED="$HIVEMIND_RUN_BODY"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: run did not recover"
+    FAIL=$((FAIL + 1))
+fi
 
 cat > "$OUT_DIR/worker-loss.txt" <<EOF
 cpu_worker=$CPU_WORKER_IP
