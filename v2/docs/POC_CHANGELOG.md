@@ -52,7 +52,8 @@ What changed:
 - selection-bound RequestPrepare can serve an older target view from the exact retained source/LNV/tip identity; ordinary repair remains current-view only
 - without snapshots, retention floor is fixed at zero and all 1024 lifetime-capped log entries remain available for repair; a three-replica boundary test commits and recovers op 1024, then rejects op 1025 without mutation
 - active candidate fetch uses only its fixed candidate deadline instead of being preempted by the shorter recovered/view-change timeout
-- deterministic gate passed Debug and ReleaseFast, all 17 prior liveness seeds, and `1000 / 1000` mutated threaded seeds with zero failures
+- DVC source selection ranks the entire valid quorum by `(last_normal_view, op_number)` while carrying the independently computed maximum commit watermark as the candidate adoption bound
+- deterministic gate passed Debug and ReleaseFast, all six final-10k safety regressions, all 20 historical safety/liveness seeds, and `1000 / 1000` mutated threaded seeds with zero failures
 
 Why it matters:
 - recovered and concurrently lagging replicas can finish a bounded selected-chain fetch instead of repeatedly advancing the view
@@ -64,7 +65,7 @@ Progress:
 - live infra status remains `up`; no live infrastructure was changed for this deterministic fix
 
 Next:
-1. run the broader 10k mutated core gate before refreshing the durable-safety evidence claim
+1. rerun the broader 10k mutated core gate after parent review before refreshing the durable-safety evidence claim
 2. keep snapshot/compaction work separate from the fail-closed 1024-op lifetime contract
 3. continue the clean EKS and private-registry benchmark follow-ups
 

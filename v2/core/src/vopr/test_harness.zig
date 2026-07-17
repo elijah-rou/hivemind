@@ -2123,32 +2123,58 @@ test "leader StartView crash before sync recovers old state and after sync recov
     try std.testing.expectEqual(entries[1].checksum, post.replicas[0].journalGet(2).?.checksum);
 }
 
-test "committed suffix outranks later-view speculative suffix" {
-    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB17);
+test "DVC source rank is independent from commit watermark" {
+    inline for (.{ "higher last-normal view", "higher op at equal last-normal view" }, 0..) |case_name, case_index| {
+        _ = case_name;
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB17 + case_index);
+        defer tc.deinit();
+        const leader = tc.replicas[0];
+        leader.status = .view_change;
+        leader.view_number = 3;
+
+        var committed = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
+        committed.checksum = committed.computeChecksum();
+        var extension = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 3, .request_id = 2, .parent_checksum = committed.checksum };
+        extension.checksum = extension.computeChecksum();
+
+        const selected_lnv: msg.ViewNumber = if (case_index == 0) 2 else 1;
+        var selected = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = selected_lnv, .op_number = 2, .commit_min = 0, .log_entry_count = 2 };
+        selected.log_entries[0] = extension;
+        selected.log_entries[1] = committed;
+        var committed_source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+        committed_source.log_entries[0] = committed;
+
+        tc.deliver(0, 1, .{ .do_view_change = selected });
+        tc.deliver(0, 2, .{ .do_view_change = committed_source });
+
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(@as(u8, 1), leader.pending_start_view.source_replica);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.pending_start_view.commit_min);
+        try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.pending_start_view.op_number);
+        try std.testing.expectEqual(extension.checksum, leader.journalGet(2).?.checksum);
+    }
+}
+
+test "DVC selected source tip below quorum commit bound aborts" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB19);
     defer tc.deinit();
     const leader = tc.replicas[0];
     leader.status = .view_change;
     leader.view_number = 3;
 
-    var speculative_a = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
-    speculative_a.checksum = speculative_a.computeChecksum();
-    var committed_b = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
-    committed_b.checksum = committed_b.computeChecksum();
-    try std.testing.expect(speculative_a.checksum != committed_b.checksum);
+    var committed = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
+    committed.checksum = committed.computeChecksum();
+    const empty_high_rank = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 0, .commit_min = 0 };
+    var committed_source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+    committed_source.log_entries[0] = committed;
 
-    var a = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .commit_min = 0, .log_entry_count = 1 };
-    a.log_entries[0] = speculative_a;
-    var b = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
-    b.log_entries[0] = committed_b;
+    tc.deliver(0, 1, .{ .do_view_change = empty_high_rank });
+    tc.deliver(0, 2, .{ .do_view_change = committed_source });
 
-    tc.deliver(0, 1, .{ .do_view_change = a });
-    tc.deliver(0, 2, .{ .do_view_change = b });
-
-    try std.testing.expect(leader.pending_start_view.active);
-    try std.testing.expectEqual(@as(u8, 2), leader.pending_start_view.source_replica);
-    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.pending_start_view.commit_min);
-    try std.testing.expectEqual(committed_b.checksum, leader.journalGet(1).?.checksum);
-    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.op_number);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
 }
 
 test "five rotating leaders replace speculative prepares with committed StartView chain" {

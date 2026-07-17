@@ -1219,10 +1219,6 @@ pub const Replica = struct {
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
             const candidate = &self.do_vc_msgs[i];
-            // Once any quorum member exposes a commit watermark, speculative
-            // suffixes from replicas below that watermark cannot outrank it by
-            // carrying a later last_normal_view.
-            if (candidate.commit_min != max_commit) continue;
             const candidate_tip_checksum = dvcEntryChecksum(candidate, candidate.op_number) orelse return;
 
             if (selected_index) |current_index| {
