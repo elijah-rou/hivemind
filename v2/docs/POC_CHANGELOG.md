@@ -50,7 +50,7 @@ What changed:
 - higher-view Prepare/Commit/StartView traffic cannot promote a replica directly; StartView adoption remains behind its durability barrier
 - validated StartView chains may supersede durable prepares strictly above the local committed prefix, while committed conflicts remain fail-closed
 - selection-bound RequestPrepare can serve an older target view from the exact retained source/LNV/tip identity; ordinary repair remains current-view only
-- without snapshots, retention floor is fixed at zero and all 1024 lifetime-capped log entries remain available for repair
+- without snapshots, retention floor is fixed at zero and all 1024 lifetime-capped log entries remain available for repair; a three-replica boundary test commits and recovers op 1024, then rejects op 1025 without mutation
 - active candidate fetch uses only its fixed candidate deadline instead of being preempted by the shorter recovered/view-change timeout
 - deterministic gate passed Debug and ReleaseFast, all 17 prior liveness seeds, and `1000 / 1000` mutated threaded seeds with zero failures
 

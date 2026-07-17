@@ -914,11 +914,6 @@ pub const Replica = struct {
         if (!self.entryFitsLog(prepare.entry)) return;
 
         if (prepare.op_number == self.op_number + 1) {
-            // Pipeline depth guard: reject prepare that would wrap past the
-            // leader-advertised retained floor. Preflight guarantees
-            // retention_floor <= op_number so this subtraction cannot underflow.
-            std.debug.assert(prepare.retention_floor <= prepare.op_number);
-            if (prepare.op_number - prepare.retention_floor >= LOG_SIZE_MAX) return;
             // Lifetime cap: never accept an op beyond LOG_SIZE_MAX without snapshots.
             if (prepare.op_number > LOG_SIZE_MAX) return;
 

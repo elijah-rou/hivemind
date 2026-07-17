@@ -1186,6 +1186,53 @@ test "no-snapshot retention keeps ops 1 through 14 and floor zero across crash" 
     while (op <= 14) : (op += 1) try std.testing.expect(tc.replicas[0].journalHas(op));
 }
 
+test "three replicas durably commit lifetime boundary and recover at tip 1024" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x1024B0AD);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var op: msg.OpNumber = 1;
+    while (op <= replica_mod.LOG_SIZE_MAX) : (op += 1) {
+        tc.request(0, .{ .noop = {} });
+        tc.tick();
+    }
+    tc.advance(20);
+
+    for (0..3) |replica_index| {
+        const replica = tc.replicas[replica_index];
+        try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), replica.op_number);
+        try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), replica.commit_min);
+        op = 1;
+        while (op <= replica_mod.LOG_SIZE_MAX) : (op += 1) {
+            try std.testing.expect(replica.journalHas(op));
+            try std.testing.expect(replica.isDurablePrepare(op));
+        }
+    }
+
+    var capture = ReplyCapture{};
+    tc.replicas[0].client_reply_ctx = &capture;
+    tc.replicas[0].client_reply_fn = ReplyCapture.reply;
+    const tip_checksum = tc.replicas[0].journalGet(replica_mod.LOG_SIZE_MAX).?.checksum;
+    tc.requestWithIdentity(0, 0x1025, 1, .{ .noop = {} });
+    tc.tick();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expect(capture.last_err == .log_full);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].op_number);
+    try std.testing.expectEqual(tip_checksum, tc.replicas[0].journalGet(replica_mod.LOG_SIZE_MAX).?.checksum);
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[0].commit_min);
+    try std.testing.expect(tc.replicas[0].isDurablePrepare(replica_mod.LOG_SIZE_MAX));
+    tc.advance(500);
+    for (0..3) |replica_index| {
+        try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[replica_index].op_number);
+        try std.testing.expectEqual(@as(msg.OpNumber, replica_mod.LOG_SIZE_MAX), tc.replicas[replica_index].commit_min);
+        try std.testing.expectEqual(tip_checksum, tc.replicas[replica_index].journalGet(replica_mod.LOG_SIZE_MAX).?.checksum);
+    }
+}
+
 test "journal retention: log_full before overwrite and restart reconstructs state" {
     const tc = try TestCluster.init(std.testing.allocator, 1, 0x7E01);
     defer tc.deinit();
