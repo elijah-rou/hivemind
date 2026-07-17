@@ -302,6 +302,7 @@ pub const PrepareOkMsg = struct {
     replica_id: u8 = 0,
     commit_min: OpNumber = 0,
     entry_checksum: u64 = 0,
+    commit_checksum: u64 = 0,
 };
 
 pub const CommitMsg = struct {
@@ -345,7 +346,9 @@ pub const SV_LOG_MAX: usize = 8;
 
 pub const StartViewMsg = struct {
     view_number: ViewNumber = 0,
+    selected_last_normal_view: ViewNumber = 0,
     op_number: OpNumber = 0,
+    tip_checksum: u64 = 0,
     commit_min: OpNumber = 0,
     retention_floor: OpNumber = 0,
     log_entries: [SV_LOG_MAX]LogEntry = [_]LogEntry{.{}} ** SV_LOG_MAX,
@@ -359,6 +362,7 @@ pub const RequestPrepareMsg = struct {
     selected_last_normal_view: ViewNumber = 0,
     selected_tip_op: OpNumber = 0,
     selected_tip_checksum: u64 = 0,
+    selected_commit_bound: OpNumber = 0,
 };
 
 pub const SendPrepareMsg = struct {
@@ -368,6 +372,7 @@ pub const SendPrepareMsg = struct {
     selected_last_normal_view: ViewNumber = 0,
     selected_tip_op: OpNumber = 0,
     selected_tip_checksum: u64 = 0,
+    selected_commit_bound: OpNumber = 0,
 };
 
 pub const RequestStatusMsg = struct {
@@ -378,6 +383,8 @@ pub const SendStatusMsg = struct {
     view_number: ViewNumber = 0,
     op_number: OpNumber = 0,
     commit_min: OpNumber = 0,
+    tip_checksum: u64 = 0,
+    commit_checksum: u64 = 0,
 };
 
 pub const Tag = enum(u8) {
@@ -1009,6 +1016,7 @@ test "source-bound repair round-trip" {
         .selected_last_normal_view = 8,
         .selected_tip_op = 24,
         .selected_tip_checksum = 0xCAFE,
+        .selected_commit_bound = 12,
     } };
     const len = serialize(message, &buf);
     const decoded = try deserialize(buf[0..len]);
@@ -1018,6 +1026,27 @@ test "source-bound repair round-trip" {
     try std.testing.expectEqual(@as(ViewNumber, 8), decoded.request_prepare.selected_last_normal_view);
     try std.testing.expectEqual(@as(OpNumber, 24), decoded.request_prepare.selected_tip_op);
     try std.testing.expectEqual(@as(u64, 0xCAFE), decoded.request_prepare.selected_tip_checksum);
+    try std.testing.expectEqual(@as(OpNumber, 12), decoded.request_prepare.selected_commit_bound);
+}
+
+test "StartView certificate round-trip" {
+    var buf: [1 + @sizeOf(StartViewMsg)]u8 = undefined;
+    const message = Message{ .start_view = .{
+        .view_number = 9,
+        .selected_last_normal_view = 7,
+        .op_number = 24,
+        .tip_checksum = 0xBEEF,
+        .commit_min = 12,
+        .retention_floor = 4,
+    } };
+    const len = serialize(message, &buf);
+    const decoded = try deserialize(buf[0..len]);
+    try std.testing.expectEqual(@as(ViewNumber, 9), decoded.start_view.view_number);
+    try std.testing.expectEqual(@as(ViewNumber, 7), decoded.start_view.selected_last_normal_view);
+    try std.testing.expectEqual(@as(OpNumber, 24), decoded.start_view.op_number);
+    try std.testing.expectEqual(@as(u64, 0xBEEF), decoded.start_view.tip_checksum);
+    try std.testing.expectEqual(@as(OpNumber, 12), decoded.start_view.commit_min);
+    try std.testing.expectEqual(@as(OpNumber, 4), decoded.start_view.retention_floor);
 }
 
 test "deserialize rejects unknown tag" {

@@ -60,7 +60,7 @@ const (
 	ClientTagClusterStateRequest byte   = 0x24
 	ClientTagClusterStateResp    byte   = 0x25
 	CmdCreateDeploy              byte   = 3
-	ProtocolVersion              uint16 = 3
+	ProtocolVersion              uint16 = 4
 	MaxFrameBytes                       = 64 * 1024
 	MaxRunPayload                       = 512
 	MaxRunResponseBody                  = 16*1024 - 9

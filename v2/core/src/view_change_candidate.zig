@@ -18,7 +18,7 @@ pub const ViewSelectionPhase = enum {
     persisting_start_view,
 };
 
-pub const PendingStartViewRole = enum { none, leader };
+pub const PendingStartViewRole = enum { none, leader, follower };
 
 /// Compact publication record. StartView is reconstructed from the installed log.
 pub const PendingStartView = struct {
@@ -30,6 +30,7 @@ pub const PendingStartView = struct {
     tip_checksum: u64 = 0,
     op_number: msg.OpNumber = 0,
     commit_min: msg.OpNumber = 0,
+    retention_floor: msg.OpNumber = 0,
     last_normal_view: msg.ViewNumber = 0,
 };
 
@@ -117,7 +118,6 @@ pub const ViewChangeCandidate = struct {
     pub fn validate(self: *const ViewChangeCandidate, committed_op: msg.OpNumber, committed_checksum: u64) !void {
         if (!self.complete()) return error.Incomplete;
         if (self.metadata.base_op != committed_op + 1) return error.InvalidCommittedOverlap;
-        if (self.metadata.commit_bound < committed_op) return error.InvalidCommitBound;
         if (self.metadata.commit_bound > self.metadata.tip_op) return error.InvalidCommitBound;
 
         var parent_checksum = if (committed_op == 0) @as(u64, 0) else committed_checksum;
@@ -227,6 +227,18 @@ test "candidate validates full exact parent chain and tip" {
     try candidate.add(first);
     try std.testing.expect(candidate.complete());
     try candidate.validate(1, 0xAA);
+}
+
+test "follower candidate permits leader commit below durable follower anchor" {
+    const first = testEntry(3, 0xAA, 3);
+    const second = testEntry(4, first.checksum, 4);
+    var metadata = testMetadata(3, 4, second.checksum);
+    metadata.commit_bound = 1;
+    var candidate = try ViewChangeCandidate.allocate(std.testing.allocator, metadata);
+    defer candidate.deinit();
+    try candidate.add(first);
+    try candidate.add(second);
+    try candidate.validate(2, 0xAA);
 }
 
 test "candidate detects missing parent and wrong tip" {

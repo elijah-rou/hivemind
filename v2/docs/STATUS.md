@@ -163,7 +163,7 @@ Client/Agent frames (plaintext): [4B LE len][1B flags=0x00][2B LE version][1B ta
 Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext][16B tag]
 Peer frames (plaintext):         [4B LE len][1B flags=0x00][1B from_id][VRR payload]
 Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(from_id+VRR)][16B tag]
-PROTOCOL_VERSION = 3 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
+PROTOCOL_VERSION = 4 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
 ```
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)

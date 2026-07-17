@@ -1295,7 +1295,9 @@ test "durable storage: StartView PrepareOk waits for barrier" {
 
     var sv = msg.StartViewMsg{
         .view_number = tc.replicas[0].view_number,
+        .selected_last_normal_view = tc.replicas[0].last_normal_view,
         .op_number = 1,
+        .tip_checksum = entry.checksum,
         .commit_min = 0,
         .retention_floor = 0,
         .log_entry_count = 1,
@@ -1303,10 +1305,13 @@ test "durable storage: StartView PrepareOk waits for barrier" {
     sv.log_entries[0] = entry;
 
     // Install via StartView without ticking (no durability barrier yet).
+    tc.replicas[1].status = .view_change;
     tc.deliver(1, 0, .{ .start_view = sv });
     const slot = replica_mod.journalSlot(1);
     try std.testing.expect(tc.replicas[1].journalHas(1));
-    try std.testing.expect(tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(tc.replicas[1].pending_start_view.active);
+    try std.testing.expect(tc.replicas[1].status == .view_change);
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
     try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
 
     // PrepareOk must not reach the leader until the follower flushes.
@@ -1317,6 +1322,218 @@ test "durable storage: StartView PrepareOk waits for barrier" {
     tc.deliverAll();
     try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
     try std.testing.expect(!tc.replicas[1].journal_dirty[slot]);
+}
+
+test "follower StartView durable watermark relation table installs only after barrier" {
+    const Case = struct { name: []const u8, follower_commit: u64, leader_commit: u64, tip: u64, accepted: bool };
+    const cases = [_]Case{
+        .{ .name = "Cf below Cl below S", .follower_commit = 0, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cf equals Cl", .follower_commit = 1, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cl below Cf below S", .follower_commit = 2, .leader_commit = 1, .tip = 3, .accepted = true },
+        .{ .name = "Cf equals S", .follower_commit = 2, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cf above S", .follower_commit = 3, .leader_commit = 1, .tip = 2, .accepted = false },
+    };
+
+    for (cases, 0..) |case, case_index| {
+        _ = case.name;
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A70 + case_index);
+        defer tc.deinit();
+        const follower = tc.replicas[1];
+        follower.status = .view_change;
+        follower.view_number = 3;
+        follower.last_normal_view = 2;
+
+        var entries: [3]msg.LogEntry = undefined;
+        var parent: u64 = 0;
+        for (&entries, 0..) |*entry, index| {
+            entry.* = .{
+                .view_number = 2,
+                .op_number = index + 1,
+                .command = .{ .noop = {} },
+                .client_id = 0x5000 + index,
+                .request_id = 0x6000 + index,
+                .parent_checksum = parent,
+            };
+            entry.checksum = entry.computeChecksum();
+            parent = entry.checksum;
+        }
+
+        var op: u64 = 1;
+        while (op <= case.follower_commit) : (op += 1) {
+            follower.journalPut(entries[op - 1]);
+            const slot = replica_mod.journalSlot(op);
+            follower.journal_dirty[slot] = false;
+            follower.durable_prepare_op[slot] = op;
+            follower.durable_prepare_checksum[slot] = entries[op - 1].checksum;
+        }
+        follower.op_number = case.follower_commit;
+        follower.commit_min = case.follower_commit;
+        follower.commit_max = case.follower_commit;
+        follower.durable_prepare_through = case.follower_commit;
+
+        var sv = msg.StartViewMsg{
+            .view_number = 3,
+            .selected_last_normal_view = 2,
+            .op_number = case.tip,
+            .tip_checksum = entries[case.tip - 1].checksum,
+            .commit_min = case.leader_commit,
+            .retention_floor = 0,
+        };
+        op = case.follower_commit + 1;
+        while (op <= case.tip) : (op += 1) {
+            sv.log_entries[sv.log_entry_count] = entries[op - 1];
+            sv.log_entry_count += 1;
+        }
+
+        follower.onMessage(0, .{ .start_view = sv });
+        if (!case.accepted) {
+            try std.testing.expect(!follower.pending_start_view.active);
+            try std.testing.expectEqual(case.follower_commit, follower.commit_min);
+            continue;
+        }
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(view_candidate.PendingStartViewRole.follower, follower.pending_start_view.role);
+        try std.testing.expectEqual(msg.Status.view_change, follower.status);
+        try std.testing.expectEqual(case.follower_commit, follower.commit_min);
+        follower.tick();
+        try std.testing.expectEqual(msg.Status.normal, follower.status);
+        try std.testing.expectEqual(case.tip, follower.op_number);
+        try std.testing.expectEqual(@max(case.follower_commit, case.leader_commit), follower.commit_min);
+        try std.testing.expectEqual(entries[case.tip - 1].checksum, follower.journalGet(case.tip).?.checksum);
+    }
+}
+
+test "follower fetches omitted StartView tail only from certificate-bound appended leader" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A71);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var entries: [3]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, index| {
+        entry.* = .{
+            .view_number = 2,
+            .op_number = index + 1,
+            .command = .{ .noop = {} },
+            .client_id = 0x7100 + index,
+            .request_id = 0x7200 + index,
+            .parent_checksum = parent,
+        };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+
+    const leader = tc.replicas[0];
+    leader.status = .normal;
+    leader.view_number = 3;
+    leader.last_normal_view = 3;
+    leader.selected_target_view = 3;
+    leader.selected_source = 0;
+    leader.selected_last_normal_view = 2;
+    leader.selected_tip_op = 2;
+    leader.selected_tip_checksum = entries[1].checksum;
+    leader.selected_commit_bound = 1;
+    for (entries) |entry| leader.journalPut(entry);
+    leader.op_number = 3;
+
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    const sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 2,
+        .tip_checksum = entries[1].checksum,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 0,
+    };
+    follower.onMessage(0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_view_selection);
+    try std.testing.expect(!follower.pending_start_view.active);
+
+    // Wrong source and wrong certificate cannot seed the candidate.
+    follower.onMessage(2, .{ .send_prepare = .{
+        .view_number = 3,
+        .entry = entries[0],
+        .selected_source = 0,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 2,
+        .selected_tip_checksum = entries[1].checksum,
+        .selected_commit_bound = 1,
+    } });
+    follower.onMessage(0, .{ .send_prepare = .{
+        .view_number = 3,
+        .entry = entries[0],
+        .selected_source = 0,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 2,
+        .selected_tip_checksum = entries[1].checksum,
+        .selected_commit_bound = 0,
+    } });
+    follower.onMessage(0, .{ .prepare = .{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .entry = entries[0],
+    } });
+    try std.testing.expectEqual(@as(usize, 0), follower.view_change_candidate.present_count);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expect(!follower.journalHas(1));
+
+    // The leader has appended op 3, but serves only the frozen selected prefix.
+    tc.deliverAll();
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(@as(msg.OpNumber, 3), leader.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), follower.pending_start_view.op_number);
+    follower.tick();
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(entries[1].checksum, follower.journalGet(2).?.checksum);
+    try std.testing.expect(!follower.journalHas(3));
+}
+
+test "follower StartView crash before barrier keeps old state and after barrier recovers candidate" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A72);
+    defer tc.deinit();
+    var entry = msg.LogEntry{
+        .view_number = 2,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 0x7300,
+        .request_id = 0x7400,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    follower.onMessage(0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_start_view.active);
+    tc.crashReplica(1);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[1].op_number);
+    try std.testing.expect(!tc.replicas[1].journalHas(1));
+
+    tc.replicas[1].status = .view_change;
+    tc.replicas[1].view_number = 3;
+    tc.replicas[1].onMessage(0, .{ .start_view = sv });
+    tc.replicas[1].tick();
+    try std.testing.expectEqual(msg.Status.normal, tc.replicas[1].status);
+    tc.crashReplica(1);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
+    try std.testing.expectEqual(entry.checksum, tc.replicas[1].journalGet(1).?.checksum);
 }
 
 test "durable storage: replaced op cannot re-ack on stale durable watermark" {
@@ -1363,7 +1580,9 @@ test "durable storage: replaced op cannot re-ack on stale durable watermark" {
 
     var sv = msg.StartViewMsg{
         .view_number = 3,
+        .selected_last_normal_view = 0,
         .op_number = 1,
+        .tip_checksum = replacement.checksum,
         .commit_min = 0,
         .retention_floor = 0,
         .log_entry_count = 1,
@@ -1466,7 +1685,9 @@ test "StartView rejects conflicting committed prefix" {
 
     var sv = msg.StartViewMsg{
         .view_number = 3,
+        .selected_last_normal_view = 0,
         .op_number = 1,
+        .tip_checksum = conflicting.checksum,
         .commit_min = 1,
         .retention_floor = 0,
         .log_entry_count = 1,
