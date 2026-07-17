@@ -22,6 +22,9 @@ const (
 	TagRunResponse          byte = 0x23
 	TagClusterStateRequest  byte = 0x24
 	TagClusterStateResponse byte = 0x25
+	TagLeaderProbeRequest   byte = 0x26
+	TagLeaderProbeResponse  byte = 0x27
+	leaderProbeResponseLen       = 12
 )
 
 // Command tags (consensus operations)
@@ -162,7 +165,7 @@ func (c *HivemindClient) dialLeader(spans *[]TimedSpan) (net.Conn, string, error
 			continue
 		}
 
-		// Read-only leader probe via cluster_state_request. Does NOT mutate state.
+		// Fixed-size read-only leader probe. Does not serialize cluster state.
 		probeStart := nowWallMS()
 		isLeader, err := probeIsLeader(conn, c.crypto)
 		probeEnd := nowWallMS()
@@ -178,6 +181,32 @@ func (c *HivemindClient) dialLeader(spans *[]TimedSpan) (net.Conn, string, error
 	}
 
 	return nil, "", fmt.Errorf("no leader found among %v", c.addrs)
+}
+
+func (c *HivemindClient) dialCachedLeader(spans *[]TimedSpan) (net.Conn, string, error) {
+	c.mu.Lock()
+	cached := c.leader
+	c.mu.Unlock()
+	if cached != "" {
+		conn, err := net.DialTimeout("tcp", cached, 2*time.Second)
+		if err == nil {
+			return conn, cached, nil
+		}
+		c.mu.Lock()
+		if c.leader == cached {
+			c.leader = ""
+		}
+		c.mu.Unlock()
+	}
+	return c.dialLeader(spans)
+}
+
+func (c *HivemindClient) invalidateLeader(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.leader == addr {
+		c.leader = ""
+	}
 }
 
 func (c *HivemindClient) reconnect(spans *[]TimedSpan) error {
@@ -238,7 +267,7 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	copy(payload[17:], cmdPayload)
 
 	connectStart := nowWallMS()
-	conn, leader, err := c.dialLeader(&timings.SpansRaw)
+	conn, leader, err := c.dialCachedLeader(&timings.SpansRaw)
 	connectEnd := nowWallMS()
 	timings.SpansRaw = append(timings.SpansRaw, TimedSpan{Phase: "command_connect", StartMS: connectStart, EndMS: connectEnd, Source: "api/client.go"})
 	if err != nil {
@@ -267,6 +296,9 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	}
 
 	result, err := parseResult(reply, reqID)
+	if err == nil && !result.OK && result.ErrCode == ErrCodeNotLeader {
+		c.invalidateLeader(leader)
+	}
 	return result, timings, err
 }
 
@@ -542,29 +574,51 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 	return writeAll(conn, inner)
 }
 
-// probeIsLeader sends a read-only cluster_state_request and returns whether
-// the peer self-identifies as the current VRR leader. No consensus, no state
-// mutation, no client_table entry — safe to call on every reconnect.
+type leaderProbeResponse struct {
+	Status     byte
+	IsLeader   bool
+	ReplicaID  byte
+	LeaderID   byte
+	ViewNumber uint64
+}
+
+func parseLeaderProbe(payload []byte) (leaderProbeResponse, error) {
+	if len(payload) != leaderProbeResponseLen {
+		return leaderProbeResponse{}, fmt.Errorf("leader probe response length %d, want %d", len(payload), leaderProbeResponseLen)
+	}
+	if payload[0] > 2 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid replica status %d", payload[0])
+	}
+	if payload[1] > 1 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid leader boolean %d", payload[1])
+	}
+	if payload[2] >= 11 || payload[3] >= 11 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid replica identity %d/%d", payload[2], payload[3])
+	}
+	return leaderProbeResponse{
+		Status: payload[0], IsLeader: payload[1] == 1,
+		ReplicaID: payload[2], LeaderID: payload[3],
+		ViewNumber: binary.LittleEndian.Uint64(payload[4:12]),
+	}, nil
+}
+
 func probeIsLeader(conn net.Conn, crypto *CryptoState) (bool, error) {
-	if err := writeFrameEncrypted(conn, TagClusterStateRequest, []byte{0x01}, crypto); err != nil {
+	if err := writeFrameEncrypted(conn, TagLeaderProbeRequest, nil, crypto); err != nil {
 		return false, err
 	}
-
-	buf := make([]byte, 131072)
-	frame, err := readFrameGeneric(conn, buf, 2*time.Second, crypto)
+	var buf [4 + 1 + CryptoNonceLen + 2 + 1 + leaderProbeResponseLen + CryptoTagLen]byte
+	frame, err := readFrameGeneric(conn, buf[:], 2*time.Second, crypto)
 	if err != nil {
 		return false, err
 	}
-	if len(frame) < 3 || frame[2] != TagClusterStateResponse {
-		return false, fmt.Errorf("unexpected probe tag: 0x%02x", frame[2])
+	if len(frame) != 3+leaderProbeResponseLen || frame[2] != TagLeaderProbeResponse {
+		return false, fmt.Errorf("invalid leader probe frame tag/length: tag=0x%02x length=%d", frame[2], len(frame))
 	}
-
-	// payload layout: query_type(1) + view(8) + commit_min(8) + op(8) + status(1) + is_leader(1)
-	payload := frame[3:]
-	if len(payload) < 27 {
-		return false, fmt.Errorf("probe reply too short: %d", len(payload))
+	probe, err := parseLeaderProbe(frame[3:])
+	if err != nil {
+		return false, err
 	}
-	return payload[26] == 1, nil
+	return probe.IsLeader && probe.Status == 0 && probe.ReplicaID == probe.LeaderID, nil
 }
 
 // readFrameGeneric reads exactly one frame and returns [version(2)][tag(1)][payload...].

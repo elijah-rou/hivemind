@@ -33,7 +33,7 @@ func startLeaderProbeServer(t *testing.T, frameLen int) (string, <-chan error) {
 			done <- fmt.Errorf("read probe: %w", err)
 			return
 		}
-		if len(request) != 4 || request[2] != ClientTagClusterStateRequest || request[3] != 0x01 {
+		if len(request) != 3 || request[2] != ClientTagLeaderProbeRequest {
 			done <- fmt.Errorf("unexpected probe request: %x", request)
 			return
 		}
@@ -52,8 +52,10 @@ func startLeaderProbeServer(t *testing.T, frameLen int) (string, <-chan error) {
 
 		inner := make([]byte, frameLen-1)
 		binary.LittleEndian.PutUint16(inner[:2], ProtocolVersion)
-		inner[2] = ClientTagClusterStateResp
-		inner[3+26] = 1
+		inner[2] = ClientTagLeaderProbeResponse
+		if len(inner) >= 3+LeaderProbeResponseBytes {
+			inner[4] = 1
+		}
 		if _, err := conn.Write(inner); err != nil {
 			done <- fmt.Errorf("write response body: %w", err)
 			return
@@ -64,8 +66,8 @@ func startLeaderProbeServer(t *testing.T, frameLen int) (string, <-chan error) {
 	return listener.Addr().String(), done
 }
 
-func TestFindLeaderAcceptsProbeResponseLargerThan256Bytes(t *testing.T) {
-	const frameLen = 300
+func TestFindLeaderAcceptsFixedProbeResponse(t *testing.T) {
+	const frameLen = 1 + 3 + LeaderProbeResponseBytes
 	addr, done := startLeaderProbeServer(t, frameLen)
 
 	conn := findLeader([]string{addr})
@@ -80,27 +82,12 @@ func TestFindLeaderAcceptsProbeResponseLargerThan256Bytes(t *testing.T) {
 	}
 }
 
-func TestFindLeaderAcceptsMaximumFrameBoundary(t *testing.T) {
-	addr, done := startLeaderProbeServer(t, MaxFrameBytes-4)
-
-	conn := findLeader([]string{addr})
-	if conn == nil {
-		t.Fatal("findLeader rejected valid maximum-sized frame")
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatalf("close leader connection: %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestFindLeaderRejectsFrameOverMaximum(t *testing.T) {
-	addr, done := startLeaderProbeServer(t, MaxFrameBytes-3)
+func TestFindLeaderRejectsNonFixedProbeResponse(t *testing.T) {
+	addr, done := startLeaderProbeServer(t, 1+3+LeaderProbeResponseBytes+1)
 
 	if conn := findLeader([]string{addr}); conn != nil {
 		conn.Close()
-		t.Fatal("findLeader accepted frame larger than MaxFrameBytes")
+		t.Fatal("findLeader accepted non-fixed leader response")
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -151,7 +138,7 @@ func TestBenchReceiversFailClosedOnReadDeadlineErrors(t *testing.T) {
 	}{
 		{name: "command", frame: benchFrame(ClientTagReply, make([]byte, 17)), call: func(c net.Conn) error { return readReply(c, make([]byte, 256), 0) }},
 		{name: "run", frame: benchFrame(ClientTagRunResponse, make([]byte, 13)), call: func(c net.Conn) error { return readRunResponse(c, make([]byte, 256), 0) }},
-		{name: "leader probe", frame: benchFrame(ClientTagClusterStateResp, make([]byte, 27)), call: func(c net.Conn) error { _, err := readLeaderProbe(c, make([]byte, 256)); return err }},
+		{name: "leader probe", frame: benchFrame(ClientTagLeaderProbeResponse, make([]byte, LeaderProbeResponseBytes)), call: func(c net.Conn) error { _, err := readLeaderProbe(c, make([]byte, 256)); return err }},
 	}
 	for _, tc := range cases {
 		for _, failure := range []string{"set", "clear"} {

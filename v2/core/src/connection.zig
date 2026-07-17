@@ -659,6 +659,8 @@ pub const ConnectionManager = struct {
                 self.handleRunRequest(client, payload);
             } else if (tag_byte == 0x24) { // ClientTag.cluster_state_request (read-only)
                 self.handleClusterStateRequest(client);
+            } else if (tag_byte == 0x26) { // ClientTag.leader_probe_request (fixed-size)
+                if (payload.len == msg.LEADER_PROBE_REQUEST_BYTES) self.handleLeaderProbe(client);
             }
         }
 
@@ -742,8 +744,24 @@ pub const ConnectionManager = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Cluster state query (read-only, no consensus)
+    // Read-only client queries
     // -----------------------------------------------------------------------
+
+    fn handleLeaderProbe(self: *ConnectionManager, client: *Conn) void {
+        const response = (msg.LeaderProbeResponse{
+            .status = self.replica.status,
+            .is_leader = self.replica.isLeader() and self.replica.status == .normal,
+            .replica_id = self.replica.replica_id,
+            .leader_id = self.replica.leader(),
+            .view_number = self.replica.view_number,
+        }).encode();
+        var inner: [3 + msg.LEADER_PROBE_RESPONSE_BYTES]u8 = undefined;
+        @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
+        inner[2] = @intFromEnum(msg.ClientTag.leader_probe_response);
+        @memcpy(inner[3..], &response);
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
+        self.sendFrame(client.fd, key, &inner) catch self.disconnectClient(client);
+    }
 
     fn handleClusterStateRequest(self: *ConnectionManager, client: *Conn) void {
         var buf = &self.state_response_buf;

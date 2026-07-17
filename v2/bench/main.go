@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -59,6 +60,9 @@ const (
 	ClientTagRunResponse         byte   = 0x23
 	ClientTagClusterStateRequest byte   = 0x24
 	ClientTagClusterStateResp    byte   = 0x25
+	ClientTagLeaderProbeRequest  byte   = 0x26
+	ClientTagLeaderProbeResponse byte   = 0x27
+	LeaderProbeResponseBytes            = 12
 	CmdCreateDeploy              byte   = 3
 	ProtocolVersion              uint16 = 5
 	MaxFrameBytes                       = 64 * 1024
@@ -69,6 +73,8 @@ const (
 	ResultErr    byte = 1
 	ErrNotLeader byte = 5
 )
+
+var errExplicitNotLeader = errors.New("reply error code 5: explicit not-leader response")
 
 func main() {
 	addrs := flag.String("addrs", "127.0.0.1:9001", "comma-separated client API addresses")
@@ -117,19 +123,21 @@ func main() {
 // =================================================================
 
 func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error {
+	totalStart := time.Now()
+	probeStart := totalStart
 	conn := findLeader(addrList)
 	if conn == nil {
 		return fmt.Errorf("no leader found")
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
+	probeDuration := time.Since(probeStart)
+	fmt.Printf("hivemind-bench: leader probe %s (included in total throughput duration)\n", probeDuration)
 
 	fmt.Printf("hivemind-bench: submitting %d deployments (%d replicas, %d GPUs each)\n",
 		count, replicas, gpuCount)
 
 	latencies := make([]time.Duration, 0, count)
 	recvBuf := make([]byte, 256)
-
-	totalStart := time.Now()
 
 	// Use timestamp-based clientID so repeated runs don't collide in the client table
 	benchClientID := uint64(time.Now().UnixNano())
@@ -140,15 +148,24 @@ func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error 
 
 		start := time.Now()
 
-		if err := sendCreateDeployment(conn, clientID, requestID, name, replicas, gpuCount); err != nil {
-			return fmt.Errorf("send failed at %d: %w", i, err)
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := sendCreateDeployment(conn, clientID, requestID, name, replicas, gpuCount); err != nil {
+				return fmt.Errorf("send failed at %d (outcome ambiguous; not retried): %w", i, err)
+			}
+			if err := readReply(conn, recvBuf, requestID); err != nil {
+				if errors.Is(err, errExplicitNotLeader) && attempt == 0 {
+					_ = conn.Close()
+					conn = findLeader(addrList)
+					if conn == nil {
+						return fmt.Errorf("leader changed at %d and reprobe failed", i)
+					}
+					continue
+				}
+				return fmt.Errorf("recv failed at %d (not retried unless explicitly not-leader): %w", i, err)
+			}
+			latencies = append(latencies, time.Since(start))
+			break
 		}
-
-		if err := readReply(conn, recvBuf, requestID); err != nil {
-			return fmt.Errorf("recv failed at %d: %w", i, err)
-		}
-
-		latencies = append(latencies, time.Since(start))
 	}
 
 	printResults("Deploy", count, time.Since(totalStart), latencies)
@@ -183,26 +200,23 @@ func runWorkloadBenchmarkWithFinder(addrList []string, count int, depName string
 	recvBuf := make([]byte, MaxFrameBytes)
 
 	totalStart := time.Now()
+	probeStart := totalStart
+	conn := find(addrList)
+	if conn == nil {
+		return fmt.Errorf("no leader found")
+	}
+	defer func() { _ = conn.Close() }()
+	probeDuration := time.Since(probeStart)
+	fmt.Printf("hivemind-bench: leader probe %s (included in total throughput duration)\n", probeDuration)
 
 	for i := 0; i < count; i++ {
-		// Reprobe the configured list before each sample so a changed leader is
-		// discovered without retrying an accepted request and risking duplicates.
-		conn := find(addrList)
-		if conn == nil {
-			return fmt.Errorf("no leader found at workload request %d", i)
-		}
 		requestID := uint64(i + 1)
 		start := time.Now()
 		if err := sendRunRequest(conn, requestID, depName, payload); err != nil {
-			_ = conn.Close()
-			return fmt.Errorf("send failed at %d: %w", i, err)
+			return fmt.Errorf("send failed at %d (outcome may be ambiguous; not retried): %w", i, err)
 		}
 		if err := readRunResponse(conn, recvBuf, requestID); err != nil {
-			_ = conn.Close()
-			return fmt.Errorf("recv failed at %d: %w", i, err)
-		}
-		if err := conn.Close(); err != nil {
-			return fmt.Errorf("close failed at %d: %w", i, err)
+			return fmt.Errorf("recv failed at %d (outcome ambiguous; not retried): %w", i, err)
 		}
 		latencies = append(latencies, time.Since(start))
 	}
@@ -395,8 +409,7 @@ func sendCreateDeployment(conn net.Conn, clientID, requestID uint64, name string
 }
 
 func sendLeaderProbe(conn net.Conn) error {
-	// Read-only cluster_state_request (matches api/client.go probeIsLeader).
-	return writeFrame(conn, ClientTagClusterStateRequest, []byte{0x01})
+	return writeFrame(conn, ClientTagLeaderProbeRequest, nil)
 }
 
 func readLeaderProbe(conn net.Conn, buf []byte) (bool, error) {
@@ -404,18 +417,14 @@ func readLeaderProbe(conn net.Conn, buf []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if len(frame) < 3 || frame[2] != ClientTagClusterStateResp {
-		if len(frame) < 3 {
-			return false, fmt.Errorf("short probe frame: %d bytes", len(frame))
-		}
-		return false, fmt.Errorf("unexpected probe tag: 0x%02x", frame[2])
+	if len(frame) != 3+LeaderProbeResponseBytes || frame[2] != ClientTagLeaderProbeResponse {
+		return false, fmt.Errorf("invalid leader probe tag/length: length=%d", len(frame))
 	}
 	payload := frame[3:]
-	// payload: query_type(1) + view(8) + commit_min(8) + op(8) + status(1) + is_leader(1)
-	if len(payload) < 27 {
-		return false, fmt.Errorf("probe reply too short: %d", len(payload))
+	if payload[0] > 2 || payload[1] > 1 || payload[2] >= 11 || payload[3] >= 11 {
+		return false, fmt.Errorf("malformed leader probe response")
 	}
-	return payload[26] == 1, nil
+	return payload[0] == 0 && payload[1] == 1 && payload[2] == payload[3], nil
 }
 
 // CommandResult mirrors the client API wire result for deploy replies.
@@ -504,7 +513,17 @@ func readReply(conn net.Conn, buf []byte, expectedRequestID uint64) error {
 		}
 		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
-	return expectSuccessResult(frame[3:], expectedRequestID)
+	result, err := parseResult(frame[3:], expectedRequestID)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		if result.ErrCode == ErrNotLeader {
+			return errExplicitNotLeader
+		}
+		return fmt.Errorf("reply error code %d", result.ErrCode)
+	}
+	return nil
 }
 
 func readFull(conn net.Conn, buf []byte) (int, error) {

@@ -11,15 +11,14 @@ import (
 )
 
 func buildClusterStateProbeFrame(isLeader bool) []byte {
-	payload := make([]byte, 27)
-	payload[0] = 0x01 // query_type
+	payload := make([]byte, leaderProbeResponseLen)
 	if isLeader {
-		payload[26] = 1
+		payload[1] = 1
 	}
 
 	inner := make([]byte, 3+len(payload))
 	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
-	inner[2] = TagClusterStateResponse
+	inner[2] = TagLeaderProbeResponse
 	copy(inner[3:], payload)
 
 	frame := make([]byte, 5+len(inner))
@@ -27,6 +26,27 @@ func buildClusterStateProbeFrame(isLeader bool) []byte {
 	frame[4] = 0x00
 	copy(frame[5:], inner)
 	return frame
+}
+
+func TestLeaderProbeGoldenAndMalformedBounds(t *testing.T) {
+	golden := []byte{0, 1, 2, 2, 8, 7, 6, 5, 4, 3, 2, 1}
+	probe, err := parseLeaderProbe(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.IsLeader || probe.ReplicaID != 2 || probe.LeaderID != 2 || probe.ViewNumber != 0x0102030405060708 {
+		t.Fatalf("unexpected probe: %+v", probe)
+	}
+	for _, malformed := range [][]byte{golden[:11], append(append([]byte(nil), golden...), 0)} {
+		if _, err := parseLeaderProbe(malformed); err == nil {
+			t.Fatalf("accepted malformed length %d", len(malformed))
+		}
+	}
+	badBool := append([]byte(nil), golden...)
+	badBool[1] = 2
+	if _, err := parseLeaderProbe(badBool); err == nil {
+		t.Fatal("accepted malformed boolean")
+	}
 }
 
 func TestParseResultRequiresExactVariantLengths(t *testing.T) {
@@ -363,7 +383,7 @@ func TestSendCommandTimedAllowsConcurrentConsensusCommands(t *testing.T) {
 			go func(conn net.Conn) {
 				buf := make([]byte, 1024)
 				frame, err := readFrameGeneric(conn, buf, time.Second, nil)
-				if err != nil || len(frame) < 3 || frame[2] != TagClusterStateRequest {
+				if err != nil || len(frame) < 3 || frame[2] != TagLeaderProbeRequest {
 					conn.Close()
 					return
 				}
@@ -649,7 +669,7 @@ func TestSendRunRequestDoesNotResendAfterServerAcceptsRequest(t *testing.T) {
 			}
 			buf := make([]byte, 1024)
 			frame, err := readFrameGeneric(conn, buf, time.Second, nil)
-			if err != nil || len(frame) < 3 || frame[2] != TagClusterStateRequest {
+			if err != nil || len(frame) < 3 || frame[2] != TagLeaderProbeRequest {
 				conn.Close()
 				return
 			}
@@ -793,7 +813,7 @@ func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T)
 		buf := make([]byte, 1024)
 		// Leader probe first (dialLeader / reconnect).
 		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
-		if err != nil || len(frame) < 3 || frame[2] != TagClusterStateRequest {
+		if err != nil || len(frame) < 3 || frame[2] != TagLeaderProbeRequest {
 			return
 		}
 		if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
@@ -822,5 +842,90 @@ func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T)
 		t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
 	} else if !bytes.Contains([]byte(err.Error()), []byte("request_id mismatch")) {
 		t.Fatalf("error = %v, want request_id mismatch", err)
+	}
+}
+
+func TestCommandBurstUsesFixedProbeOnceAndInvalidatesNotLeader(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	seen := make(chan byte, 8)
+	serverErr := make(chan error, 1)
+	go func() {
+		defer close(serverErr)
+		for connectionIndex := 0; connectionIndex < 4; connectionIndex++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			buf := make([]byte, 256)
+			frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+			if err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			seen <- frame[2]
+			if frame[2] == TagLeaderProbeRequest {
+				if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
+					conn.Close()
+					serverErr <- err
+					return
+				}
+				frame, err = readFrameGeneric(conn, buf, time.Second, nil)
+				if err != nil {
+					conn.Close()
+					serverErr <- err
+					return
+				}
+				seen <- frame[2]
+			}
+			requestID := binary.LittleEndian.Uint64(frame[11:19])
+			resultCode := byte(0)
+			if connectionIndex == 2 {
+				resultCode = ErrCodeNotLeader
+			}
+			payload := make([]byte, 10)
+			binary.LittleEndian.PutUint64(payload[:8], requestID)
+			payload[8] = 1
+			payload[9] = resultCode
+			if resultCode == 0 {
+				payload = make([]byte, 17)
+				binary.LittleEndian.PutUint64(payload[:8], requestID)
+			}
+			if _, err := conn.Write(buildTestFrame(t, 0, ProtocolVersion, TagReply, payload, nil)); err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	client := NewClient([]string{listener.Addr().String()}, nil)
+	for i := 0; i < 4; i++ {
+		result, err := client.SendCommand(CmdNoop, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 2 && (result.OK || result.ErrCode != ErrCodeNotLeader) {
+			t.Fatalf("expected explicit not-leader result: %+v", result)
+		}
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	close(seen)
+	var tags []byte
+	for tag := range seen {
+		tags = append(tags, tag)
+	}
+	want := []byte{TagLeaderProbeRequest, TagRequest, TagRequest, TagRequest, TagLeaderProbeRequest, TagRequest}
+	if !bytes.Equal(tags, want) {
+		t.Fatalf("wire tags = %x, want %x; mutation burst must not request cluster state", tags, want)
 	}
 }
