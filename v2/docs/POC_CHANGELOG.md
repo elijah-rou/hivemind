@@ -47,7 +47,7 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 ### 2026-07-16 — Bench replacement deadline and fixed-wire string boundaries
 
 What changed:
-- bench remote replacement uses one wall-clock deadline across bounded lock acquisition, systemctl state queries, stop/reset, transient start, stabilization, and diagnostics
+- bench remote replacement uses one wall-clock deadline across bounded lock acquisition, systemctl state queries, stop/reset, transient start, stabilization, and diagnostics; GNU timeout sends TERM to the command process group then KILLs TERM-ignoring descendants so they cannot retain the deploy lock
 - transient units must remain active with the same nonzero `MainPID` through stabilization before deploy success
 - Go API and client reject `/run` deployment names beyond 64 bytes or containing NUL before frame construction; mutation endpoints reject NUL in every JSON string copied into fixed-width wire fields
 

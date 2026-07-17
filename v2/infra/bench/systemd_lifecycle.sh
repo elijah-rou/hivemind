@@ -4,6 +4,8 @@
 hivemind_transaction_begin() {
     local timeout_sec="${HIVEMIND_SYSTEMD_TIMEOUT_SEC:-15}" now
     [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: invalid systemd timeout: $timeout_sec" >&2; return 1; }
+    command -v timeout >/dev/null 2>&1 || { echo "FAIL: GNU timeout(1) is required" >&2; return 1; }
+    timeout --version 2>/dev/null | grep -q 'GNU coreutils' || { echo "FAIL: GNU coreutils timeout(1) is required" >&2; return 1; }
     now="$(date +%s)" || { echo "FAIL: cannot read wall clock" >&2; return 1; }
     export HIVEMIND_TRANSACTION_DEADLINE_EPOCH=$((now + timeout_sec))
 }
@@ -30,7 +32,10 @@ hivemind_transaction_ensure() {
 hivemind_run_bounded() {
     local remaining
     remaining="$(hivemind_deadline_remaining)" || return 1
-    timeout "${remaining}s" "$@"
+    # No --foreground: GNU timeout owns a separate process group and signals
+    # every descendant. KILL guarantees TERM-ignoring children cannot retain
+    # inherited deployment-lock descriptors after the deadline.
+    timeout --signal=TERM --kill-after=1s "${remaining}s" "$@"
 }
 
 hivemind_unit_diagnostics() {

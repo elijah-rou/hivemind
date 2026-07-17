@@ -43,14 +43,42 @@ cat > "$TMP_DIR/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'journalctl %q ' "$@" >> "$CALLS"; echo >> "$CALLS"
 EOF
+cat > "$TMP_DIR/bin/stubborn-command" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+echo "$BASHPID" > "$STUBBORN_PARENT_PID"
+(
+  trap '' TERM
+  echo "$BASHPID" > "$STUBBORN_CHILD_PID"
+  while :; do sleep 1; done
+) &
+wait
+EOF
 chmod +x "$TMP_DIR/bin/"*
 export PATH="$TMP_DIR/bin:$PATH" CALLS="$TMP_DIR/calls" ACTIVE_CALLS="$TMP_DIR/active-calls"
+export STUBBORN_PARENT_PID="$TMP_DIR/stubborn-parent.pid" STUBBORN_CHILD_PID="$TMP_DIR/stubborn-child.pid"
 export HIVEMIND_SYSTEMD_TIMEOUT_SEC=2 HIVEMIND_SYSTEMD_STABILIZE_SEC=1
 # shellcheck disable=SC1090,SC1091
 source "$LIB"
 unit=hivemind-bench-node-2.service
 exe="$TMP_DIR/hivemind"
 printf '#!/bin/sh\n' > "$exe"; chmod +x "$exe"
+
+mkdir "$TMP_DIR/no-timeout" "$TMP_DIR/non-gnu"
+cat > "$TMP_DIR/non-gnu/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]] && { echo 'BusyBox timeout'; exit 0; }
+exec /usr/bin/timeout "$@"
+EOF
+chmod +x "$TMP_DIR/non-gnu/timeout"
+if PATH="$TMP_DIR/no-timeout" hivemind_transaction_begin >"$TMP_DIR/missing-timeout.out" 2>&1; then
+  echo 'missing timeout dependency unexpectedly passed' >&2; exit 1
+fi
+grep -q 'GNU timeout' "$TMP_DIR/missing-timeout.out"
+if PATH="$TMP_DIR/non-gnu:$PATH" hivemind_transaction_begin >"$TMP_DIR/non-gnu.out" 2>&1; then
+  echo 'non-GNU timeout dependency unexpectedly passed' >&2; exit 1
+fi
+grep -q 'GNU coreutils timeout' "$TMP_DIR/non-gnu.out"
 
 hivemind_transaction_begin
 SYSTEMD_SCENARIO=no-unit hivemind_unit_stop_verified "$unit"
@@ -124,6 +152,32 @@ flock -x 8
 if flock -x -w 1 9 9>"$held_lock"; then
   echo 'held lock unexpectedly acquired' >&2; exit 1
 fi
+
+# TERM-ignoring command groups are KILLed and cannot retain the deploy lock.
+stubborn_lock="$TMP_DIR/stubborn.lock"
+unset HIVEMIND_TRANSACTION_DEADLINE_EPOCH
+HIVEMIND_SYSTEMD_TIMEOUT_SEC=1 hivemind_transaction_begin
+start=$SECONDS
+(
+  exec 9>"$stubborn_lock"
+  flock -x 9
+  if hivemind_run_bounded stubborn-command; then
+    echo 'TERM-ignoring command unexpectedly passed' >&2
+    exit 1
+  fi
+) >"$TMP_DIR/stubborn.out" 2>&1
+(( SECONDS - start <= 3 )) || { echo 'forced termination exceeded bound' >&2; exit 1; }
+if ! flock -x -w 1 9 9>"$stubborn_lock"; then
+  echo 'terminated descendant retained deploy lock' >&2; exit 1
+fi
+for pid_file in "$STUBBORN_PARENT_PID" "$STUBBORN_CHILD_PID"; do
+  pid="$(cat "$pid_file")"
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "stubborn process survived forced termination: $pid" >&2; exit 1
+  fi
+done
+grep -q -- '--signal=TERM' "$CALLS"
+grep -q -- '--kill-after=1s' "$CALLS"
 
 # The deploy lock serializes concurrent replacement commands.
 events="$TMP_DIR/events" lock="$TMP_DIR/launch.lock"

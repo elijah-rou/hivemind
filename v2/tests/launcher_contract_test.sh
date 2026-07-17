@@ -55,6 +55,7 @@ SMOKE="$SCRIPT_DIR/smoke_test.sh"
 MULTI="$SCRIPT_DIR/multi_node_smoke_test.sh"
 COMPARE="$REPO_ROOT/bench/compare.sh"
 DEPLOY="$REPO_ROOT/infra/bench/deploy.sh"
+SYSTEMD_LIFECYCLE="$REPO_ROOT/infra/bench/systemd_lifecycle.sh"
 SERVICE="$REPO_ROOT/infra/poc/hivemind.service"
 BENCH_TF="$REPO_ROOT/infra/bench/main.tf"
 GPU_TEST="$REPO_ROOT/infra/gpu-test/run-tests.sh"
@@ -104,6 +105,9 @@ assert_contains "$DEPLOY" 'hivemind_transaction_begin'
 assert_contains "$DEPLOY" 'hivemind_deadline_remaining'
 assert_contains "$DEPLOY" 'hivemind_unit_stop_verified'
 assert_contains "$DEPLOY" 'hivemind_unit_start_verified'
+assert_file "$SYSTEMD_LIFECYCLE"
+assert_contains "$SYSTEMD_LIFECYCLE" 'timeout.*--signal=TERM.*--kill-after=1s'
+assert_lacks "$SYSTEMD_LIFECYCLE" 'timeout.*--foreground'
 assert_lacks "$DEPLOY" 'pid_lifecycle|nohup|kill[[:space:]]+-'
 # Terraform must be caller-CWD independent.
 assert_contains "$DEPLOY" '-chdir="\$SCRIPT_DIR"|-chdir=\$SCRIPT_DIR'
