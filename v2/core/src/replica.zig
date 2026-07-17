@@ -192,9 +192,9 @@ pub const WorkerSendFn = *const fn (ctx: *anyopaque, worker_idx: usize, data: []
 // ---------------------------------------------------------------------------
 
 pub const ReplicaConfig = struct {
-    // Test-only default bounds mechanical churn in direct unit constructors.
+    // Direct constructors default to a build-valid allocator to bound test churn.
     // Production and TestCluster owners inject their allocator explicitly.
-    allocator: std.mem.Allocator = std.testing.allocator,
+    allocator: std.mem.Allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator,
     replica_id: u8,
     replica_count: u8,
     io: Io,
@@ -748,7 +748,14 @@ pub const Replica = struct {
                 }
             },
             .view_change => {
-                if (self.pending_view_selection and self.isLeader()) self.advanceSelectedView();
+                if (self.pending_view_selection and self.isLeader()) {
+                    const deadline_tick = self.view_change_candidate.metadata.deadline_tick;
+                    if (deadline_tick > 0 and now_tick >= 0 and @as(u64, @intCast(now_tick)) >= deadline_tick) {
+                        self.abortSelectedView();
+                    } else {
+                        self.advanceSelectedView();
+                    }
+                }
                 const timeout = if (self.recovered_from_disk)
                     RECOVERED_VIEW_CHANGE_TIMEOUT
                 else
@@ -895,6 +902,7 @@ pub const Replica = struct {
 
         // If we see a Prepare from a higher view, we missed the view change.
         if (prepare.view_number > self.view_number) {
+            self.resetSelectedView();
             // A higher-view leader may only safely reuse our committed prefix.
             // Any locally-held uncommitted suffix could be divergent.
             self.truncateAbove(self.commit_min);
@@ -1037,6 +1045,7 @@ pub const Replica = struct {
         }
 
         if (commit_msg.view_number > self.view_number) {
+            self.resetSelectedView();
             // A higher-view leader may only safely reuse our committed prefix.
             // Any locally-held uncommitted suffix could be divergent — except a
             // verified advancing commit target, which must survive to be applied.
@@ -1117,7 +1126,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
-        self.pending_view_selection = false;
+        self.resetSelectedView();
 
         self.start_vc_count[self.replica_id] = true;
         self.start_vc_total = 1;
@@ -1142,7 +1151,7 @@ pub const Replica = struct {
             self.start_vc_total = 0;
             self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
             self.do_vc_total = 0;
-            self.pending_view_selection = false;
+            self.resetSelectedView();
             self.start_vc_count[self.replica_id] = true;
             self.start_vc_total = 1;
 
@@ -1189,6 +1198,21 @@ pub const Replica = struct {
 
         const new_leader: u8 = @intCast(self.view_number % self.replica_count);
         if (new_leader != self.replica_id) return;
+
+        if (self.pending_view_selection and dvc.replica_id == self.selected_source) {
+            const tip_checksum = dvcEntryChecksum(&dvc, dvc.op_number) orelse {
+                self.abortSelectedView();
+                return;
+            };
+            if (dvc.last_normal_view != self.selected_last_normal_view or
+                dvc.op_number != self.selected_tip_op or
+                tip_checksum != self.selected_tip_checksum or
+                !dvcOverlapEqual(&dvc, &self.do_vc_msgs[dvc.replica_id]))
+            {
+                self.abortSelectedView();
+                return;
+            }
+        }
 
         if (!self.do_vc_received[dvc.replica_id]) {
             self.do_vc_received[dvc.replica_id] = true;
@@ -1256,6 +1280,33 @@ pub const Replica = struct {
         self.selected_commit_bound = max_commit;
         self.selected_target_view = self.view_number;
         self.selected_next_op = self.commit_min + 1;
+
+        if (self.selected_tip_op > self.commit_min) {
+            const now_tick = io_mod.nowTick(self.io);
+            const now: u64 = @intCast(@max(0, now_tick));
+            const timeout: u64 = @intCast(VIEW_CHANGE_TIMEOUT * 2);
+            self.view_change_candidate = view_candidate.ViewChangeCandidate.allocate(self.allocator, .{
+                .source_replica = self.selected_source,
+                .target_view = self.selected_target_view,
+                .source_last_normal_view = self.selected_last_normal_view,
+                .base_op = self.commit_min + 1,
+                .tip_op = self.selected_tip_op,
+                .tip_checksum = self.selected_tip_checksum,
+                .commit_bound = self.selected_commit_bound,
+                .deadline_tick = now + timeout,
+            }) catch {
+                self.abortSelectedView();
+                return;
+            };
+
+            for (selected.log_entries[0..selected.log_entry_count]) |entry| {
+                if (entry.op_number < self.view_change_candidate.metadata.base_op) continue;
+                self.view_change_candidate.add(entry) catch {
+                    self.abortSelectedView();
+                    return;
+                };
+            }
+        }
         self.advanceSelectedView();
     }
 
@@ -1286,32 +1337,25 @@ pub const Replica = struct {
         return true;
     }
 
-    fn selectedDvcEntry(self: *const Replica, op: msg.OpNumber) ?msg.LogEntry {
-        const dvc = &self.do_vc_msgs[self.selected_source];
-        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
-            if (entry.op_number == op and entry.valid()) return entry;
-        }
-        return null;
+    fn resetSelectedView(self: *Replica) void {
+        self.view_change_candidate.reset();
+        self.pending_view_selection = false;
+        self.selected_next_op = 0;
     }
 
-    fn selectedParentChecksum(self: *const Replica, op: msg.OpNumber) ?u64 {
-        if (op == 1) return 0;
-        const parent = self.journalGet(op - 1) orelse return null;
-        return parent.checksum;
+    fn abortSelectedView(self: *Replica) void {
+        self.resetSelectedView();
+        if (self.status == .view_change) self.initiateViewChange();
     }
 
-    fn installSelectedEntry(self: *Replica, entry: msg.LogEntry) bool {
+    fn addSelectedEntry(self: *Replica, entry: msg.LogEntry) bool {
         if (!self.pending_view_selection) return false;
-        if (entry.op_number != self.selected_next_op) return false;
-        const parent_checksum = self.selectedParentChecksum(entry.op_number) orelse return false;
-        if (entry.parent_checksum != parent_checksum) return false;
-        if (self.journalGet(entry.op_number)) |existing| {
-            if (existing.checksum == entry.checksum) return true;
-            if (self.isDurablePrepare(entry.op_number)) return false;
-        }
-        self.journalPut(entry);
-        const installed = self.journalGet(entry.op_number) orelse return false;
-        return installed.checksum == entry.checksum;
+        if (self.view_change_candidate.phase == .idle) return false;
+        self.view_change_candidate.add(entry) catch {
+            self.abortSelectedView();
+            return false;
+        };
+        return true;
     }
 
     fn requestSelectedEntry(self: *Replica, op: msg.OpNumber) void {
@@ -1328,21 +1372,75 @@ pub const Replica = struct {
     fn advanceSelectedView(self: *Replica) void {
         if (!self.pending_view_selection) return;
         if (self.status != .view_change) return;
-        if (self.view_number != self.selected_target_view) return;
+        if (self.view_number != self.selected_target_view) {
+            self.resetSelectedView();
+            return;
+        }
 
-        while (self.selected_next_op <= self.selected_tip_op) {
-            const op = self.selected_next_op;
-            var entry = self.selectedDvcEntry(op);
-            if (entry == null and self.selected_source == self.replica_id) {
-                if (self.journalGet(op)) |local| entry = local.*;
+        if (self.selected_tip_op == self.commit_min) {
+            self.startViewCandidateReady();
+            return;
+        }
+        if (self.view_change_candidate.phase == .idle) {
+            self.abortSelectedView();
+            return;
+        }
+
+        if (self.selected_source == self.replica_id) {
+            var op = self.view_change_candidate.metadata.base_op;
+            while (op <= self.selected_tip_op) : (op += 1) {
+                const index: usize = @intCast(op - self.view_change_candidate.metadata.base_op);
+                if (self.view_change_candidate.present[index]) continue;
+                const entry = self.journalGet(op) orelse break;
+                if (!self.addSelectedEntry(entry.*)) return;
             }
-            const selected_entry = entry orelse {
-                self.requestSelectedEntry(op);
+        }
+
+        if (self.view_change_candidate.complete()) {
+            self.installCompletedCandidate();
+            return;
+        }
+
+        for (self.view_change_candidate.present, 0..) |present, index| {
+            if (present) continue;
+            self.selected_next_op = self.view_change_candidate.metadata.base_op + @as(msg.OpNumber, @intCast(index));
+            self.requestSelectedEntry(self.selected_next_op);
+            return;
+        }
+        unreachable;
+    }
+
+    fn installCompletedCandidate(self: *Replica) void {
+        if (!self.pending_view_selection) return;
+        if (!self.view_change_candidate.complete()) return;
+
+        const committed_checksum: u64 = if (self.commit_min == 0) 0 else blk: {
+            const committed = self.journalGet(self.commit_min) orelse {
+                self.abortSelectedView();
                 return;
             };
-            if (!self.installSelectedEntry(selected_entry)) return;
-            self.selected_next_op += 1;
+            break :blk committed.checksum;
+        };
+        self.view_change_candidate.validate(self.commit_min, committed_checksum) catch {
+            self.abortSelectedView();
+            return;
+        };
+
+        for (self.view_change_candidate.entries) |entry| {
+            if (self.journalGet(entry.op_number)) |existing| {
+                if (existing.checksum != entry.checksum and self.isDurablePrepare(entry.op_number)) {
+                    self.abortSelectedView();
+                    return;
+                }
+            }
         }
+
+        self.truncateAboveFromValidatedStartView(self.commit_min);
+        for (self.view_change_candidate.entries) |entry| {
+            self.journalPutFromValidatedStartView(entry);
+        }
+        self.selected_next_op = self.selected_tip_op + 1;
+        self.view_change_candidate.reset();
         self.startViewCandidateReady();
     }
 
@@ -1386,7 +1484,7 @@ pub const Replica = struct {
                 self.pending_prepare_broadcast[slot] = true;
             }
         }
-        self.pending_view_selection = false;
+        self.resetSelectedView();
         self.status = .normal;
         self.last_normal_view = self.view_number;
         const now_tick = io_mod.nowTick(self.io);
@@ -1958,8 +2056,7 @@ pub const Replica = struct {
             if (sp.selected_last_normal_view != self.selected_last_normal_view) return;
             if (sp.selected_tip_op != self.selected_tip_op) return;
             if (sp.selected_tip_checksum != self.selected_tip_checksum) return;
-            if (!self.installSelectedEntry(sp.entry)) return;
-            self.selected_next_op += 1;
+            if (!self.addSelectedEntry(sp.entry)) return;
             self.advanceSelectedView();
             return;
         }
@@ -2069,6 +2166,7 @@ pub const Replica = struct {
         // all incoming parent_checksum relationships) before mutation/ack.
         if (!startViewProspectiveChainValid(self, sv)) return;
 
+        self.resetSelectedView();
         self.view_number = sv.view_number;
         self.retention_floor = sv.retention_floor;
 

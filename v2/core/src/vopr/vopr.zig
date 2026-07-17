@@ -1810,6 +1810,36 @@ test "vopr: seed 6239 idle follower catch-up liveness regression" {
     try std.testing.expectEqual(@as(u64, 0), result.checker_summary.safety_violations);
 }
 
+test "vopr: seed 3844 leader candidate fetch liveness diagnostic" {
+    const result = try run(std.testing.allocator, .{
+        .seed = 3844,
+        .replica_count = 5,
+        .safety_ticks = 500,
+        .request_count = 20,
+        .partition_probability = Ratio.init(3, 100),
+        .heal_probability = Ratio.init(8, 100),
+        .crash_probability = Ratio.init(1, 100),
+        .pause_probability = Ratio.init(1, 100),
+        .asymmetric_partition_probability = Ratio.init(1, 100),
+        .drop_rate = Ratio.init(2, 100),
+        .replay_rate = Ratio.init(1, 100),
+        .path_max_capacity = 16,
+        .partition_stability = 20,
+        .heal_stability = 10,
+        .crash_stability = 30,
+        .pause_stability = 15,
+        .disk_read_fault_rate = Ratio.init(1, 1000),
+        .disk_write_fault_rate = Ratio.init(1, 1000),
+        .deployment_count = 3,
+        .worker_count = 4,
+        .agent_pod_crash_probability = Ratio.init(1, 100),
+        .liveness_ticks = 2000,
+    });
+
+    try std.testing.expectEqual(VoprResult.Outcome.passed, result.outcome);
+    try std.testing.expectEqual(@as(u64, 0), result.checker_summary.safety_violations);
+}
+
 test "vopr: seed 7957 prepare-rejoin safety regression" {
     const result = try run(std.testing.allocator, .{
         .seed = 7957,

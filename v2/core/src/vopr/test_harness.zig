@@ -1647,7 +1647,8 @@ test "one quorum-intersection durable prepare blocks conflicting selected source
     tc.deliver(0, 1, .{ .do_view_change = source });
 
     try std.testing.expectEqual(msg.Status.view_change, leader.status);
-    try std.testing.expect(leader.pending_view_selection);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
     try std.testing.expectEqual(prepared.checksum, leader.journalGet(1).?.checksum);
     try std.testing.expectEqual(prepared.checksum, leader.durable_prepare_checksum[slot]);
 }
@@ -1681,6 +1682,9 @@ test "incomplete selected suffix remains view_change and accepts only bound sour
     try std.testing.expectEqual(msg.Status.view_change, leader.status);
     try std.testing.expect(leader.pending_view_selection);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.selected_next_op);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expect(leader.journalGet(8) == null);
+    try std.testing.expectEqual(@as(usize, 8), leader.view_change_candidate.present_count);
 
     tc.deliver(0, 2, .{ .send_prepare = .{ .view_number = 3, .entry = entries[0], .selected_source = 1, .selected_last_normal_view = 2, .selected_tip_op = 10, .selected_tip_checksum = entries[9].checksum } });
     try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.selected_next_op);
@@ -1697,6 +1701,98 @@ test "incomplete selected suffix remains view_change and accepts only bound sour
     try std.testing.expectEqual(msg.Status.normal, leader.status);
     try std.testing.expect(!leader.pending_view_selection);
     try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+}
+
+test "selected source mutation aborts candidate without changing active journal" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC4AD);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [10]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
+    for (0..8) |i| source.log_entries[i] = entries[9 - i];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    try std.testing.expect(leader.pending_view_selection);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+
+    source.log_entries[0].client_id = 99;
+    source.log_entries[0].checksum = source.log_entries[0].computeChecksum();
+    tc.deliver(0, 1, .{ .do_view_change = source });
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expect(leader.journalGet(10) == null);
+}
+
+test "selected source crash times out candidate without changing active journal" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC2A5);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [10]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
+    for (0..8) |i| source.log_entries[i] = entries[9 - i];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    try std.testing.expect(leader.pending_view_selection);
+
+    tc.stopReplica(1);
+    tc.current_tick = @intCast(leader.view_change_candidate.metadata.deadline_tick);
+    leader.tick();
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+}
+
+test "candidate allocation failure advances view without active mutation" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA110C);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .log_entry_count = 1 };
+    source.log_entries[0] = entry;
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    leader.allocator = fixed.allocator();
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    leader.allocator = tc.allocator;
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expect(leader.journalGet(1) == null);
 }
 
 test "Replica candidate ownership survives crash reset and frees on teardown" {
