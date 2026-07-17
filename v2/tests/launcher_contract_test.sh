@@ -110,6 +110,7 @@ assert_contains "$SYSTEMD_LIFECYCLE" 'timeout.*--signal=TERM.*--kill-after=1s'
 assert_lacks "$SYSTEMD_LIFECYCLE" 'timeout.*--foreground'
 assert_lacks "$DEPLOY" 'pid_lifecycle|nohup|kill[[:space:]]+-'
 # Terraform must be caller-CWD independent.
+# shellcheck disable=SC2016 # This is an intentional literal regex contract.
 assert_contains "$DEPLOY" '-chdir="\$SCRIPT_DIR"|-chdir=\$SCRIPT_DIR'
 # Broad pkill must not appear in this launcher.
 assert_lacks "$DEPLOY" 'pkill[[:space:]]+-f[[:space:]]+hivemind'

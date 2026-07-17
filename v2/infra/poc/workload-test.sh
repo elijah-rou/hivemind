@@ -16,9 +16,10 @@ IMAGE_PULL_PASSWORD="${IMAGE_PULL_PASSWORD:-}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 CPU_NAME="poc-cpu-${RUN_ID}"
 GPU_NAME="poc-gpu-${RUN_ID}"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
 source "$SCRIPT_DIR/run_retry.sh"
 
 TMP_FILES=()

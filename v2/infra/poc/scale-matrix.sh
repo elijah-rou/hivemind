@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=http.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
 source "$SCRIPT_DIR/http.sh"
 
 # Hivemind scale benchmark matrix with phase timing.
@@ -17,7 +18,7 @@ SCALE_IMAGE="${SCALE_IMAGE:-docker.io/library/nginx:1.27-alpine}"
 OUT_DIR="${OUT_DIR:-artifacts/poc-final/06-benchmarks/hivemind-scale-matrix-$(date +%Y%m%d%H%M%S)}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 POLL_DELAY="${POLL_DELAY:-0.2}"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
 
 EVENTS_CSV="$OUT_DIR/latency-events.csv"
 EVENTS_JSONL="$OUT_DIR/latency-events.jsonl"

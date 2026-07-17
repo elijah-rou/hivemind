@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../infra/poc/http.sh
+# shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
 source "$ROOT_DIR/infra/poc/http.sh"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -113,7 +114,7 @@ if [[ -z "${CPU_IMAGE:-}" ]]; then
         echo "CPU_IMAGE is unset and no images-*.env artifact exists" >&2
         exit 1
     fi
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090 # The selected run artifact is intentionally sourced at runtime.
     source "$env_file"
 fi
 if [[ -z "${CPU_IMAGE:-}" ]]; then

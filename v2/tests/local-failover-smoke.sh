@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../infra/poc/http.sh
+# shellcheck disable=SC1091 # REPO_ROOT resolves to the known repository helper.
 source "$REPO_ROOT/infra/poc/http.sh"
 BUILD=false
 BASE_PORT="${BASE_PORT:-21000}"
@@ -89,7 +90,8 @@ peer_list() {
         if [[ "$i" == "$self" ]]; then
             continue
         fi
-        local entry="$i@127.0.0.1:$(peer_port "$i")"
+        local entry
+        entry="$i@127.0.0.1:$(peer_port "$i")"
         if [[ -z "$out" ]]; then
             out="$entry"
         else
@@ -102,7 +104,8 @@ peer_list() {
 client_addrs() {
     local out=""
     for i in $(seq 0 $((replica_count - 1))); do
-        local entry="127.0.0.1:$(client_port "$i")"
+        local entry
+        entry="127.0.0.1:$(client_port "$i")"
         if [[ -z "$out" ]]; then
             out="$entry"
         else
@@ -126,13 +129,13 @@ start_replica() {
         --peers "$(peer_list "$id")" \
         > "$LOG_DIR/replica-$id.log" 2>&1 &
     local pid=$!
-    REPLICA_PIDS[$id]="$pid"
+    REPLICA_PIDS[id]="$pid"
     PIDS+=("$pid")
     echo "    replica $id pid=$pid client=:$(client_port "$id") peer=:$(peer_port "$id")"
 }
 
 for i in $(seq 0 $((replica_count - 1))); do
-    DATA_DIRS[$i]="$(mktemp -d /tmp/hivemind-failover-data-$i.XXXXXX)"
+    DATA_DIRS[i]="$(mktemp -d "/tmp/hivemind-failover-data-$i.XXXXXX")"
 done
 
 cleanup_dead_pids() {

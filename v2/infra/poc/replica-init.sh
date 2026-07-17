@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2154 # Terraform template variables are assigned during rendering.
 set -euo pipefail
 
 # Hivemind replica cloud-init script
@@ -6,8 +7,8 @@ set -euo pipefail
 # Secret-bearing env files and the data dir must be owner-only.
 umask 077
 
-mkdir -m 700 -p /var/lib/hivemind
-mkdir -m 700 -p /etc/hivemind
+mkdir -p /var/lib/hivemind /etc/hivemind
+chmod 700 /var/lib/hivemind /etc/hivemind
 
 install -m 600 /dev/null /etc/hivemind/replica.env
 cat > /etc/hivemind/replica.env <<'ENVEOF'

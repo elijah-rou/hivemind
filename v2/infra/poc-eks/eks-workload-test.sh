@@ -17,7 +17,7 @@ CPU_IMAGE="${CPU_IMAGE:?set CPU_IMAGE}"
 GPU_IMAGE="${GPU_IMAGE:?set GPU_IMAGE}"
 NAMESPACE="${NAMESPACE:-hivemind-poc-baseline}"
 OUT_DIR="${OUT_DIR:-../../artifacts/poc-final/06-benchmarks}"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
 
 PF_CPU_PID=""
 PF_GPU_PID=""
@@ -259,7 +259,7 @@ done
 echo "Waiting for all 50 scheduled..."
 SCHED_OK=0
 for i in $(seq 1 50); do
-    kubectl rollout status deployment/sched-bench-$i -n "$NAMESPACE" --timeout=120s >/dev/null 2>&1 && SCHED_OK=$((SCHED_OK + 1))
+    kubectl rollout status "deployment/sched-bench-$i" -n "$NAMESPACE" --timeout=120s >/dev/null 2>&1 && SCHED_OK=$((SCHED_OK + 1))
 done
 SCHED_END="$(date +%s%N)"
 SCHED_MS="$(( (SCHED_END - SCHED_START) / 1000000 ))"

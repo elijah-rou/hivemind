@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2329 # Fixture callbacks are invoked indirectly by run_case and sourced helpers.
 # Deterministic offline fixtures for infra/bench SSM wait + deploy contract.
 # Uses a stub aws CLI; never touches live AWS.
 set -euo pipefail
@@ -145,7 +146,6 @@ FAKE_NOW=1000000
 export FAKE_NOW
 
 # Advance fake clock on sleep (waiter uses hivemind_ssm_now).
-# shellcheck disable=SC2329
 sleep() {
   local n="${1:-1}"
   FAKE_NOW=$((FAKE_NOW + n))
@@ -183,14 +183,12 @@ run_case() {
 }
 
 # Case helpers are invoked indirectly via run_case "$@".
-# shellcheck disable=SC2329
 case_pending_inprogress_success() {
   printf '%s\n' Pending InProgress Success > "$STUB_STATE/cmd-a.seq"
   SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
     hivemind_ssm_wait_invocation "us-east-1" "cmd-a" "i-aaa"
 }
 
-# shellcheck disable=SC2329
 case_failed() {
   printf '%s\n' Pending Failed > "$STUB_STATE/cmd-b.seq"
   if SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
@@ -201,7 +199,6 @@ case_failed() {
   grep -q 'terminal status=Failed' "$TMP_DIR/failed.err"
 }
 
-# shellcheck disable=SC2329
 case_timedout() {
   printf '%s\n' InProgress TimedOut > "$STUB_STATE/cmd-c.seq"
   if SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
@@ -212,7 +209,6 @@ case_timedout() {
   grep -q 'terminal status=TimedOut' "$TMP_DIR/timedout.err"
 }
 
-# shellcheck disable=SC2329
 case_cancelled() {
   printf '%s\n' Pending Cancelled > "$STUB_STATE/cmd-d.seq"
   if SSM_POLL_INTERVAL_SEC=1 SSM_POLL_TIMEOUT_SEC=10 \
@@ -223,7 +219,6 @@ case_cancelled() {
   grep -q 'terminal status=Cancelled' "$TMP_DIR/cancelled.err"
 }
 
-# shellcheck disable=SC2329
 case_eventual_visibility_then_success() {
   printf '%s\n' InvocationDoesNotExist InvocationDoesNotExist > "$STUB_STATE/cmd-visible.api_errors"
   printf '%s\n' Pending Success > "$STUB_STATE/cmd-visible.seq"
@@ -234,7 +229,6 @@ case_eventual_visibility_then_success() {
   (( status_calls == 4 ))
 }
 
-# shellcheck disable=SC2329
 case_persistent_eventual_visibility_timeout() {
   yes InvocationDoesNotExist | head -n 50 > "$STUB_STATE/cmd-not-visible.api_errors"
   printf '%s\n' Success > "$STUB_STATE/cmd-not-visible.seq"
@@ -259,7 +253,6 @@ case_persistent_eventual_visibility_timeout() {
   fi
 }
 
-# shellcheck disable=SC2329
 case_permanent_api_error_fails_fast() {
   printf '%s\n' Pending > "$STUB_STATE/cmd-e.seq"
   printf '%s\n' AccessDeniedException > "$STUB_STATE/cmd-e.fail_api"
@@ -276,7 +269,6 @@ case_permanent_api_error_fails_fast() {
   (( status_calls == 1 && FAKE_NOW == start_now ))
 }
 
-# shellcheck disable=SC2329
 case_bounded_timeout() {
   # Stay Pending forever within the stub sequence refill: keep rewriting Pending.
   # Use a short timeout and count Status polls via calls.log.
@@ -297,7 +289,6 @@ case_bounded_timeout() {
 }
 
 
-# shellcheck disable=SC2329
 case_timeout_diagnostics_no_deadline_overrun() {
   # After wall-clock timeout, diagnostics must not spend extra AWS budget past deadline,
   # but must still emit useful terminal identity/status lines.
@@ -339,7 +330,6 @@ case_timeout_diagnostics_no_deadline_overrun() {
   return 0
 }
 
-# shellcheck disable=SC2329
 case_per_node_command_ids() {
   printf '%s\n' Success > "$STUB_STATE/cmd-node0.seq"
   printf '%s\n' Pending Success > "$STUB_STATE/cmd-node1.seq"
@@ -354,7 +344,6 @@ case_per_node_command_ids() {
   grep -q -- '--command-id cmd-node1' "$STUB_STATE/calls.log"
 }
 
-# shellcheck disable=SC2329
 case_invalid_bounds() {
   if SSM_POLL_INTERVAL_SEC=0 SSM_POLL_TIMEOUT_SEC=10 \
     hivemind_ssm_wait_invocation "us-east-1" "cmd-x" "i-x" 2>"$TMP_DIR/bounds.err"; then
@@ -364,7 +353,6 @@ case_invalid_bounds() {
   grep -q 'SSM_POLL_INTERVAL_SEC' "$TMP_DIR/bounds.err"
 }
 
-# shellcheck disable=SC2329
 case_missing_timeout_fails_before_aws() {
   local empty_path="$TMP_DIR/no-timeout"
   mkdir -p "$empty_path"
@@ -381,7 +369,6 @@ case_missing_timeout_fails_before_aws() {
 }
 
 
-# shellcheck disable=SC2329
 case_deploy_dead_process_fail_closed() {
   touch "$STUB_STATE/dead_start"
   cid=$(aws ssm send-command --region us-east-1 --instance-ids i-dead \

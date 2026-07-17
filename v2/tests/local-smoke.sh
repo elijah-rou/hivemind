@@ -10,9 +10,9 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../infra/poc/run_retry.sh
+# shellcheck disable=SC1091 # REPO_ROOT resolves to the known repository helper.
 source "$REPO_ROOT/infra/poc/run_retry.sh"
 BUILD=false
-PIDS=""
 REPLICA_PID=""
 AGENT_PID=""
 API_PID=""

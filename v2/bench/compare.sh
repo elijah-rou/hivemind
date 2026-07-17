@@ -70,7 +70,8 @@ for i in 0 1 2; do
         peers+="${j}@127.0.0.1:$((BASE_REPLICA_PORT + j))"
     done
     dd="$BENCH_DATA/replica-$i"
-    mkdir -m 700 -p "$dd"
+    mkdir -p "$dd"
+    chmod 700 "$dd"
     "$REPLICA_BIN" \
         --node-id "$i" \
         --replica-count 3 \

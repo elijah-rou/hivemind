@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2154 # Terraform injects template variables before cloud-init execution.
 set -euo pipefail
 
 ${http_helper}
@@ -27,7 +28,7 @@ chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
 /etc/eks/bootstrap.sh --container-runtime containerd || true
 
 # --- 3. Write hivemind worker env ---
-mkdir -p /etc/hivemind
+install -d -m 700 /etc/hivemind
 
 cat > /etc/hivemind/worker.env <<'ENVEOF'
 HIVEMIND_REPLICA_ADDR=${replica_addr}

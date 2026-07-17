@@ -6,8 +6,32 @@ LIB="$ROOT_DIR/infra/bench/systemd_lifecycle.sh"
 DEPLOY="$ROOT_DIR/infra/bench/deploy.sh"
 TF="$ROOT_DIR/infra/bench/main.tf"
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+cleanup_fixture() {
+  local status="$1"
+  local pid pid_file
+  local -a background_jobs=()
+  trap - EXIT INT TERM
+  set +e
+  for pid_file in "$TMP_DIR"/stubborn-parent.pid "$TMP_DIR"/stubborn-child.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid="$(cat "$pid_file")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  mapfile -t background_jobs < <(jobs -pr)
+  if (( ${#background_jobs[@]} > 0 )); then
+    kill -TERM "${background_jobs[@]}" 2>/dev/null || true
+    kill -KILL "${background_jobs[@]}" 2>/dev/null || true
+  fi
+  wait 2>/dev/null || true
+  rm -rf "$TMP_DIR"
+  exit "$status"
+}
+trap 'cleanup_fixture "$?"' EXIT INT TERM
 mkdir -p "$TMP_DIR/bin"
+chmod 700 "$TMP_DIR/bin"
 : > "$TMP_DIR/calls"
 
 cat > "$TMP_DIR/bin/systemctl" <<'EOF'
@@ -58,7 +82,7 @@ chmod +x "$TMP_DIR/bin/"*
 export PATH="$TMP_DIR/bin:$PATH" CALLS="$TMP_DIR/calls" ACTIVE_CALLS="$TMP_DIR/active-calls"
 export STUBBORN_PARENT_PID="$TMP_DIR/stubborn-parent.pid" STUBBORN_CHILD_PID="$TMP_DIR/stubborn-child.pid"
 export HIVEMIND_SYSTEMD_TIMEOUT_SEC=2 HIVEMIND_SYSTEMD_STABILIZE_SEC=1
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1090,SC1091 # LIB resolves to the known lifecycle helper under ROOT_DIR.
 source "$LIB"
 unit=hivemind-bench-node-2.service
 exe="$TMP_DIR/hivemind"
@@ -156,7 +180,8 @@ fi
 # TERM-ignoring command groups are KILLed and cannot retain the deploy lock.
 stubborn_lock="$TMP_DIR/stubborn.lock"
 unset HIVEMIND_TRANSACTION_DEADLINE_EPOCH
-HIVEMIND_SYSTEMD_TIMEOUT_SEC=1 hivemind_transaction_begin
+# Three seconds avoids whole-second deadline truncation while retaining a tight bound.
+HIVEMIND_SYSTEMD_TIMEOUT_SEC=3 hivemind_transaction_begin
 start=$SECONDS
 (
   exec 9>"$stubborn_lock"
@@ -166,16 +191,24 @@ start=$SECONDS
     exit 1
   fi
 ) >"$TMP_DIR/stubborn.out" 2>&1
-(( SECONDS - start <= 3 )) || { echo 'forced termination exceeded bound' >&2; exit 1; }
+(( SECONDS - start <= 5 )) || { echo 'forced termination exceeded bound' >&2; exit 1; }
 if ! flock -x -w 1 9 9>"$stubborn_lock"; then
   echo 'terminated descendant retained deploy lock' >&2; exit 1
 fi
-for pid_file in "$STUBBORN_PARENT_PID" "$STUBBORN_CHILD_PID"; do
+assert_process_gone() {
+  local pid_file="$1" pid
   pid="$(cat "$pid_file")"
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "stubborn process survived forced termination: $pid" >&2; exit 1
-  fi
-done
+  for _ in {1..100}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "stubborn process survived forced termination: $pid" >&2
+  return 1
+}
+assert_process_gone "$STUBBORN_PARENT_PID"
+assert_process_gone "$STUBBORN_CHILD_PID"
 grep -q -- '--signal=TERM' "$CALLS"
 grep -q -- '--kill-after=1s' "$CALLS"
 

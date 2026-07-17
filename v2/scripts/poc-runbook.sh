@@ -21,6 +21,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../infra/poc/http.sh
+# shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
 source "$ROOT_DIR/infra/poc/http.sh"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
@@ -48,6 +49,7 @@ WORKER_GPU_PUBLIC_IP=""
 
 ARTIFACT_ROOT="$ROOT_DIR/artifacts/poc-final"
 mkdir -p "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
+chmod 700 "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
 LOG="$ARTIFACT_ROOT/00-runbook/runbook-$TAG.log"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -169,9 +171,9 @@ capture_ssh() {
     local safe_name="${name//[^A-Za-z0-9_.-]/_}"
     local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o BatchMode=yes -i "$SSH_KEY")
 
-    mkdir -p "$out_dir"
+    install -d -m 700 "$out_dir"
     echo "capture_remote_log host=$host name=$name"
-    ssh "${ssh_opts[@]}" "$user@$host" "$command" > "$out_dir/$safe_name.txt" 2>&1 || true
+    printf '%s\n' "$command" | ssh "${ssh_opts[@]}" "$user@$host" 'bash -s' > "$out_dir/$safe_name.txt" 2>&1 || true
 }
 
 capture_remote_logs() {
@@ -219,8 +221,10 @@ preload_image_to_worker() {
         local remote_tmp="/tmp/hivemind-${label}-${TAG}.tar"
         local remote_tmp_q
         remote_tmp_q="$(printf '%q' "$remote_tmp")"
-        docker image save "$image" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" \
-            "set -euo pipefail; trap 'rm -f $remote_tmp_q' EXIT; cat > $remote_tmp_q; sudo ctr -n hivemind images import $remote_tmp_q >/tmp/hivemind-${label}-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx $image_q >/dev/null"
+        local remote_command
+        remote_command="set -euo pipefail; trap 'rm -f $remote_tmp_q' EXIT; cat > $remote_tmp_q; sudo ctr -n hivemind images import $remote_tmp_q >/tmp/hivemind-${label}-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx $image_q >/dev/null"
+        # shellcheck disable=SC2029 # Command is intentionally assembled from shell-quoted local values; stdin carries the image tar.
+        docker image save "$image" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" "$remote_command"
     else
         local registry_host password password_q
         registry_host="${image%%/*}"
@@ -230,12 +234,13 @@ preload_image_to_worker() {
         fi
         password="$(aws ecr get-login-password --region "$AWS_REGION")"
         password_q="$(printf '%q' "$password")"
-        ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" \
-            "set -euo pipefail; sudo ctr -n hivemind images pull --user AWS:$password_q $image_q >/tmp/hivemind-${label}-image-pull.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx $image_q >/dev/null"
+        local remote_command
+        remote_command="set -euo pipefail; sudo ctr -n hivemind images pull --user AWS:$password_q $image_q >/tmp/hivemind-${label}-image-pull.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx $image_q >/dev/null"
+        printf '%s\n' "$remote_command" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" 'bash -s'
     fi
 
-    ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" \
-        "sudo ctr -n hivemind images ls -q | grep -Fx $image_q"
+    printf '%s\n' "sudo ctr -n hivemind images ls -q | grep -Fx $image_q" | \
+        ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" 'bash -s'
 }
 
 preload_worker_images() {

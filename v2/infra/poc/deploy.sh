@@ -7,7 +7,6 @@ set -euo pipefail
 # Usage: ./deploy.sh [--build] [--key <ssh-key>]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SSH_KEY="${SSH_KEY:-~/.ssh/id_ed25519}"
 REPLICA_SSH_USER="${REPLICA_SSH_USER:-ec2-user}"   # AL2023 default
 WORKER_SSH_USER="${WORKER_SSH_USER:-ubuntu}"       # hivemind-standalone AMI (Ubuntu)
@@ -21,7 +20,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i $SSH_KEY"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$SSH_KEY")
 
 # --- Build Linux binaries ---
 if [ "$BUILD" = true ]; then
@@ -33,8 +32,8 @@ fi
 echo "==> Reading Terraform outputs..."
 cd "$SCRIPT_DIR"
 
-REPLICA_IPS=($(terraform output -json replica_ips | jq -r '.[]'))
-REPLICA_PUBLIC_IPS=($(terraform output -json replica_public_ips | jq -r '.[]'))
+mapfile -t REPLICA_IPS < <(terraform output -json replica_ips | jq -r '.[]')
+mapfile -t REPLICA_PUBLIC_IPS < <(terraform output -json replica_public_ips | jq -r '.[]')
 AGENT_CPU_IP=$(terraform output -raw worker_cpu_ip)
 AGENT_GPU_IP=$(terraform output -raw worker_gpu_ip)
 
@@ -62,25 +61,27 @@ for i in $(seq 0 $((REPLICA_COUNT - 1))); do
     echo "==> Deploying replica $i to $PUBLIC_IP ($PRIVATE_IP)..."
 
     # Upload binaries
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind-linux" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind"
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind-api-linux" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind-api"
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind.service" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind.service"
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind-api.service" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind-api.service"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind-linux" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind-api-linux" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind-api"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind.service" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind.service"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind-api.service" "$REPLICA_SSH_USER@$PUBLIC_IP:/tmp/hivemind-api.service"
 
-    # Install and configure
-    ssh $SSH_OPTS "$REPLICA_SSH_USER@$PUBLIC_IP" bash <<REMOTE
+    # Install and configure. Values are explicit positional arguments so the
+    # quoted remote script cannot accidentally expand them on the deployer.
+    ssh "${SSH_OPTS[@]}" "$REPLICA_SSH_USER@$PUBLIC_IP" bash -s -- \
+        "$PEERS" "$i" "$REPLICA_COUNT" "$API_ADDRS" <<'REMOTE'
+        peers="$1"; node_id="$2"; replica_count="$3"; api_addrs="$4"
         sudo mv /tmp/hivemind /usr/local/bin/hivemind
         sudo mv /tmp/hivemind-api /usr/local/bin/hivemind-api
         sudo chmod +x /usr/local/bin/hivemind /usr/local/bin/hivemind-api
         sudo mv /tmp/hivemind.service /etc/systemd/system/hivemind.service
         sudo mv /tmp/hivemind-api.service /etc/systemd/system/hivemind-api.service
-        sudo mkdir -p /var/lib/hivemind /etc/hivemind
+        sudo install -d -m 700 /var/lib/hivemind /etc/hivemind
 
-        # Update env with real peer addresses
-        sudo sed -i "s|^HIVEMIND_PEERS=.*|HIVEMIND_PEERS=$PEERS|" /etc/hivemind/replica.env
-        sudo sed -i "s|^HIVEMIND_NODE_ID=.*|HIVEMIND_NODE_ID=$i|" /etc/hivemind/replica.env
-        sudo sed -i "s|^HIVEMIND_REPLICA_COUNT=.*|HIVEMIND_REPLICA_COUNT=$REPLICA_COUNT|" /etc/hivemind/replica.env
-        sudo sed -i "s|^HIVEMIND_API_ADDRS=.*|HIVEMIND_API_ADDRS=$API_ADDRS|" /etc/hivemind/api.env
+        sudo sed -i "s|^HIVEMIND_PEERS=.*|HIVEMIND_PEERS=$peers|" /etc/hivemind/replica.env
+        sudo sed -i "s|^HIVEMIND_NODE_ID=.*|HIVEMIND_NODE_ID=$node_id|" /etc/hivemind/replica.env
+        sudo sed -i "s|^HIVEMIND_REPLICA_COUNT=.*|HIVEMIND_REPLICA_COUNT=$replica_count|" /etc/hivemind/replica.env
+        sudo sed -i "s|^HIVEMIND_API_ADDRS=.*|HIVEMIND_API_ADDRS=$api_addrs|" /etc/hivemind/api.env
 
         sudo systemctl daemon-reload
         sudo systemctl enable hivemind hivemind-api
@@ -114,19 +115,19 @@ for AGENT_PAIR in "cpu:$AGENT_CPU_PUBLIC" "gpu:$AGENT_GPU_PUBLIC"; do
     fi
 
     echo "==> Deploying worker ($ROLE) to $PUBLIC_IP..."
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind-worker-linux" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/hivemind-worker"
-    scp $SSH_OPTS "$SCRIPT_DIR/hivemind-worker.service" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/hivemind-worker.service"
-    scp $SSH_OPTS "$SCRIPT_DIR/update-worker-env.sh" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/update-worker-env.sh"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind-worker-linux" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/hivemind-worker"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/hivemind-worker.service" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/hivemind-worker.service"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/update-worker-env.sh" "$WORKER_SSH_USER@$PUBLIC_IP:/tmp/update-worker-env.sh"
 
-    ssh $SSH_OPTS "$WORKER_SSH_USER@$PUBLIC_IP" bash <<REMOTE
+    ssh "${SSH_OPTS[@]}" "$WORKER_SSH_USER@$PUBLIC_IP" bash -s -- "$AGENT_REPLICA_ADDR" <<'REMOTE'
+        replica_addr="$1"
         sudo mv /tmp/hivemind-worker /usr/local/bin/hivemind-worker
         sudo chmod +x /usr/local/bin/hivemind-worker
         sudo mv /tmp/hivemind-worker.service /etc/systemd/system/hivemind-worker.service
-        sudo mkdir -p /etc/hivemind
+        sudo install -d -m 700 /etc/hivemind
 
-        # Preserve the Terraform-rendered PSK and only patch the replica address.
         sudo chmod +x /tmp/update-worker-env.sh
-        sudo /tmp/update-worker-env.sh /etc/hivemind/worker.env "$AGENT_REPLICA_ADDR"
+        sudo /tmp/update-worker-env.sh /etc/hivemind/worker.env "$replica_addr"
         rm -f /tmp/update-worker-env.sh
 
         sudo systemctl daemon-reload

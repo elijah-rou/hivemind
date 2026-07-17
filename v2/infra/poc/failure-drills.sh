@@ -15,13 +15,13 @@ API_URL="${1:?Usage: failure-drills.sh <api-url> --ssh-key <key> --replica-ips <
 shift
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
 source "$SCRIPT_DIR/run_retry.sh"
 
 SSH_KEY=""
 REPLICA_IPS_CSV=""
 CPU_WORKER_IP=""
 GPU_WORKER_IP=""
-GPU_TYPE="t4"
 CPU_IMAGE="${CPU_IMAGE:-docker.io/mendhak/http-https-echo:31}"
 REPLICA_SSH_USER="${REPLICA_SSH_USER:-ec2-user}"
 WORKER_SSH_USER="${WORKER_SSH_USER:-ubuntu}"
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         --replica-ips) REPLICA_IPS_CSV="$2"; shift 2 ;;
         --cpu-worker-ip) CPU_WORKER_IP="$2"; shift 2 ;;
         --gpu-worker-ip) GPU_WORKER_IP="$2"; shift 2 ;;
-        --gpu-type) GPU_TYPE="$2"; shift 2 ;;
+        --gpu-type) shift 2 ;; # Accepted for caller compatibility; this CPU drill does not use it.
         --cpu-image) CPU_IMAGE="$2"; shift 2 ;;
         *) echo "Unknown: $1"; exit 1 ;;
     esac
@@ -47,7 +47,7 @@ done
 [[ -z "$CPU_WORKER_IP" ]] && { echo "--cpu-worker-ip required"; exit 1; }
 
 IFS=',' read -ra REPLICA_IPS <<< "$REPLICA_IPS_CSV"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$SSH_KEY")
 LEADER_STOPPED_IP=""
@@ -114,7 +114,7 @@ wait_api() {
 capture_worker_runtime_diagnostics() {
     local label="$1"
     local diag_dir="$OUT_DIR/diagnostics-$label"
-    mkdir -p "$diag_dir"
+    install -d -m 700 "$diag_dir"
 
     echo "[Diagnostics] Capturing worker runtime state: $label -> $diag_dir"
     local workers=("cpu:$CPU_WORKER_IP")
@@ -157,7 +157,7 @@ REMOTE
 capture_replica_diagnostics() {
     local label="$1"
     local diag_dir="$OUT_DIR/diagnostics-$label"
-    mkdir -p "$diag_dir"
+    install -d -m 700 "$diag_dir"
 
     echo "[Diagnostics] Capturing replica state: $label -> $diag_dir"
     {

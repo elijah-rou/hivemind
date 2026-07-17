@@ -11,6 +11,7 @@ API_URL="${1:?Usage: ./smoke-test.sh <api-url> [--gpu-worker <ip>] [--ssh-key <p
 shift
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
 source "$SCRIPT_DIR/run_retry.sh"
 
 GPU_WORKER_IP="${GPU_WORKER_IP:-}"
@@ -152,7 +153,8 @@ remote_gpu_checks_enabled() {
 }
 
 remote_ssh() {
-    ssh "${SSH_OPTS[@]}" "$GPU_SSH_USER@$GPU_WORKER_IP" "$1"
+    local remote_command="$1"
+    printf '%s\n' "$remote_command" | ssh "${SSH_OPTS[@]}" "$GPU_SSH_USER@$GPU_WORKER_IP" 'bash -s'
 }
 
 echo "=== Hivemind POC Smoke Test ==="
