@@ -47,8 +47,9 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 ### 2026-07-17 — Ownership-scoped bench artifacts and retry cleanup
 
 What changed:
-- bench deploy artifacts now use an AWS-account-scoped 128-bit random run identity and immutable SHA-256 object keys
-- bucket ownership is established fail-closed before an exit trap is installed; all exits remove only the owned run prefix and bucket unless `HIVEMIND_KEEP_ARTIFACTS=1`
+- bench deploy artifacts now use an internally generated AWS-account-scoped 128-bit random run identity and immutable SHA-256 object keys; callers cannot supply a reusable production identity
+- bucket ownership is established through an atomic conditional marker claim before the exit trap is installed; cleanup revalidates that exact claim, so us-east-1 already-owned success and same-token races cannot delete a prior bucket
+- artifact AWS calls use GNU `timeout` to TERM and then KILL the complete process group on a bounded deadline; all exits remove only the owned run prefix and bucket unless `HIVEMIND_KEEP_ARTIFACTS=1`
 - creation/upload failures are fatal and remote nodes receive the exact immutable object URIs
 - `/run` retry workspaces are cleaned on every post-creation return; requested response artifact copy/read failures cannot report success
 - active status now records protocol version 5 and one fresh local verification result

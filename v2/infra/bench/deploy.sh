@@ -54,7 +54,7 @@ hivemind_deploy_cleanup() {
 hivemind_artifact_prepare "$REGION"
 trap hivemind_deploy_cleanup EXIT
 
-RUN_TOKEN="$HIVEMIND_ARTIFACT_ACCOUNT-$HIVEMIND_ARTIFACT_TOKEN"
+RUN_ID="$HIVEMIND_ARTIFACT_ACCOUNT-$HIVEMIND_ARTIFACT_TOKEN"
 hivemind_artifact_upload "$BINARY" hivemind
 HIVEMIND_BINARY_URI="$HIVEMIND_ARTIFACT_URI"
 HIVEMIND_BENCH_URI=""
@@ -80,7 +80,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
 
   echo "starting node $i on $id (${PRIVATE_IPS[$i]})"
 
-  run_dir="/tmp/hivemind-runs/$RUN_TOKEN"
+  run_dir="/tmp/hivemind-runs/$RUN_ID"
   run_binary="$run_dir/hivemind"
   unit="hivemind-bench-node-$i.service"
   remote_script=$(cat <<EOF
