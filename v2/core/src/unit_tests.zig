@@ -7,6 +7,7 @@ comptime {
     _ = @import("state_machine.zig");
     _ = @import("scheduler.zig");
     _ = @import("replica.zig");
+    _ = @import("view_change_candidate.zig");
     _ = @import("disk.zig");
     _ = @import("vopr/simulated_net.zig");
     _ = @import("vopr/simulated_io.zig");
