@@ -94,7 +94,7 @@ struct WirePodStatusEvent {
 // len = 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const FRAME_FLAGS_LEN: usize = 1;
 const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
 const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;

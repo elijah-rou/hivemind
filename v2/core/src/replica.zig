@@ -89,7 +89,7 @@ pub fn peerMessageSemanticsValid(message: msg.Message) bool {
     return switch (message) {
         .prepare => |m| prepareSemanticsValid(m),
         // A late ack may report a commit watermark above the acked op.
-        .prepare_ok => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.commit_min <= LOG_SIZE_MAX,
+        .prepare_ok => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.commit_min <= LOG_SIZE_MAX and m.entry_checksum != 0,
         .commit => |m| commitSemanticsValid(m),
         .do_view_change => |m| blk: {
             if (m.commit_min > m.op_number or m.op_number > LOG_SIZE_MAX) break :blk false;
@@ -830,13 +830,21 @@ pub const Replica = struct {
         // Unsigned underflow of (op_number - retention_floor) is possible otherwise.
         if (!prepareSemanticsValid(prepare)) return;
 
+        // One leader cannot propose two identities for the same (view, op).
+        // Reject before heartbeat, retention, status, or journal mutation.
+        if (prepare.view_number == self.view_number) {
+            if (self.journalGet(prepare.op_number)) |existing| {
+                if (existing.checksum != prepare.entry.checksum) return;
+            }
+        }
+
         // If we see a Prepare from a higher view, we missed the view change.
         if (prepare.view_number > self.view_number) {
             // A higher-view leader may only safely reuse our committed prefix.
             // Any locally-held uncommitted suffix could be divergent.
             self.truncateAbove(self.commit_min);
             self.view_number = prepare.view_number;
-            self.op_number = self.commit_min;
+            self.op_number = @max(self.logHighOp(), self.commit_min);
             self.commit_max = self.commit_min;
         }
 
@@ -848,7 +856,7 @@ pub const Replica = struct {
             // Preserving entries above our own commit_min can let a stale value
             // get committed under the new view before the leader repairs us.
             self.truncateAbove(self.commit_min);
-            self.op_number = self.commit_min;
+            self.op_number = @max(self.logHighOp(), self.commit_min);
             self.commit_max = self.commit_min;
             self.status = .normal;
             self.last_normal_view = self.view_number;
@@ -902,6 +910,7 @@ pub const Replica = struct {
                             .op_number = prepare.op_number,
                             .replica_id = self.replica_id,
                             .commit_min = self.commit_min,
+                            .entry_checksum = existing.checksum,
                         } });
                     } else {
                         self.pending_prepare_ok[slot] = true;
@@ -927,9 +936,11 @@ pub const Replica = struct {
         if (!self.isLeader()) return;
         if (ok.view_number != self.view_number) return;
         if (ok.replica_id != from) return;
+        if (!peerOpInRetainedLog(ok.op_number)) return;
+        const current_entry = self.journalGet(ok.op_number) orelse return;
+        if (ok.entry_checksum != current_entry.checksum) return;
         // commit_min is the sender watermark and may exceed the acked op
         // (late PrepareOk after the follower has already committed further).
-        if (!peerOpInRetainedLog(ok.op_number)) return;
         if (!peerCommitInRetainedLog(ok.commit_min)) return;
 
         self.noteReplicaCommitMin(from, ok.commit_min);
@@ -976,7 +987,7 @@ pub const Replica = struct {
             // verified advancing commit target, which must survive to be applied.
             self.truncateAbove(self.commit_min);
             self.view_number = commit_msg.view_number;
-            self.op_number = self.commit_min;
+            self.op_number = @max(self.logHighOp(), self.commit_min);
             self.commit_max = self.commit_min;
             if (preserved_target) |entry| {
                 self.journalPut(entry);
@@ -991,7 +1002,7 @@ pub const Replica = struct {
             // Rejoining via Commit must discard any uncommitted local suffix.
             // Otherwise a stale tail can become locally committed before repair.
             self.truncateAbove(self.commit_min);
-            self.op_number = self.commit_min;
+            self.op_number = @max(self.logHighOp(), self.commit_min);
             self.commit_max = self.commit_min;
             if (preserved_target) |entry| {
                 self.journalPut(entry);
@@ -1326,7 +1337,7 @@ pub const Replica = struct {
         // Committed entries (op_number <= commit_min) are preserved by truncateAbove.
         // op_number must be >= commit_min to maintain the invariant.
         self.truncateAbove(highest_kept);
-        self.op_number = @max(repair_target, self.commit_min);
+        self.op_number = @max(@max(repair_target, self.logHighOp()), self.commit_min);
 
         if (max_commit > self.commit_min) {
             self.commitUpTo(max_commit);
@@ -2021,12 +2032,12 @@ pub const Replica = struct {
         // preserved or acknowledged, otherwise a follower can help commit a
         // value the new leader did not choose. Gaps from the bounded StartView
         // tail are repaired through the explicit transfer path below.
-        self.truncateAbove(self.commit_min);
+        self.truncateAboveFromValidatedStartView(self.commit_min);
         self.op_number = @max(self.logHighOp(), self.commit_min);
 
         for (sv.log_entries[0..sv.log_entry_count]) |entry| {
             if (!entry.valid()) continue;
-            self.journalPut(entry);
+            self.journalPutFromValidatedStartView(entry);
         }
 
         self.op_number = @max(@max(sv.op_number, self.logHighOp()), self.commit_min);
@@ -2426,6 +2437,7 @@ pub const Replica = struct {
                     .op_number = op,
                     .replica_id = self.replica_id,
                     .commit_min = self.commit_min,
+                    .entry_checksum = self.journal[slot].checksum,
                 } });
                 self.pending_prepare_ok[slot] = false;
             }
@@ -2476,29 +2488,30 @@ pub const Replica = struct {
     }
 
     pub fn journalPut(self: *Replica, entry: msg.LogEntry) void {
-        // Peer-validated paths must already enforce these bounds; soft-drop
-        // here so a missed check cannot assert/trap on adversarial input.
+        self.journalPutInternal(entry, false);
+    }
+
+    fn journalPutFromValidatedStartView(self: *Replica, entry: msg.LogEntry) void {
+        self.journalPutInternal(entry, true);
+    }
+
+    fn journalPutInternal(self: *Replica, entry: msg.LogEntry, validated_start_view: bool) void {
         if (entry.op_number == 0 or entry.op_number > LOG_SIZE_MAX) return;
         const slot = journalSlot(entry.op_number);
         if (self.journal_occupied[slot] and
             (self.journal[slot].op_number != entry.op_number or
                 self.journal[slot].checksum != entry.checksum))
         {
-            // Reject stale overwrites (older op landing on a slot already
-            // holding a newer one). Different-op replacement is forbidden
-            // until snapshots exist.
-            if (entry.op_number != self.journal[slot].op_number) {
-                return;
-            }
-            if (entry.op_number < self.journal[slot].op_number) return;
-            // Committed prefix is immutable: same-op/different-checksum at or
-            // below commit_min is adversarial or corrupt input — reject without
-            // panicking. Uncommitted suffix replacement remains allowed.
-            if (entry.op_number <= self.commit_min) {
-                return;
-            }
+            if (entry.op_number != self.journal[slot].op_number) return;
+            if (entry.op_number <= self.commit_min) return;
+            // Durable prepared evidence is immutable during normal traffic and
+            // repair. Only the separately preflighted StartView install path may
+            // replace it in a later view.
+            if (self.isDurablePrepare(entry.op_number) and !validated_start_view) return;
             self.prepare_ok_counts[slot] = 0;
             self.prepare_ok_from[slot] = 0;
+            self.durable_prepare_op[slot] = 0;
+            self.durable_prepare_checksum[slot] = 0;
         }
         self.journal[slot] = entry;
         self.journal_occupied[slot] = true;
@@ -2506,16 +2519,24 @@ pub const Replica = struct {
     }
 
     fn truncateAbove(self: *Replica, limit: msg.OpNumber) void {
+        self.truncateAboveInternal(limit, false);
+    }
+
+    fn truncateAboveFromValidatedStartView(self: *Replica, limit: msg.OpNumber) void {
+        self.truncateAboveInternal(limit, true);
+    }
+
+    fn truncateAboveInternal(self: *Replica, limit: msg.OpNumber, validated_start_view: bool) void {
         for (0..LOG_SIZE_MAX) |i| {
             if (!self.journal_occupied[i]) continue;
-            if (self.journal[i].op_number > limit and self.journal[i].op_number > self.commit_min) {
-                self.journal_occupied[i] = false;
-                self.prepare_ok_counts[i] = 0;
-                self.prepare_ok_from[i] = 0;
-                self.durable_prepare_op[i] = 0;
-                self.durable_prepare_checksum[i] = 0;
-                self.journal_dirty[i] = true;
-            }
+            if (self.journal[i].op_number <= limit or self.journal[i].op_number <= self.commit_min) continue;
+            if (self.isDurablePrepare(self.journal[i].op_number) and !validated_start_view) continue;
+            self.journal_occupied[i] = false;
+            self.prepare_ok_counts[i] = 0;
+            self.prepare_ok_from[i] = 0;
+            self.durable_prepare_op[i] = 0;
+            self.durable_prepare_checksum[i] = 0;
+            self.journal_dirty[i] = true;
         }
     }
 
@@ -3414,7 +3435,6 @@ test "committed batch bind dispatches all bound pods to worker" {
     try std.testing.expectEqual(sm.pods[2].id, capture.records[2].pod_id);
 }
 
-
 test "onMessage drops out-of-range from" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(7001);
@@ -4046,6 +4066,69 @@ test "onCommit advancing requires nonzero checksum and exact local match" {
     try std.testing.expectEqual(msg.Status.normal, replica.status);
     try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+}
+
+test "PrepareOk binds votes to exact entry identity and sender" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xACCE55);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+
+    var entry_a = msg.LogEntry{ .view_number = 0, .op_number = 1, .command = .{ .noop = {} }, .client_id = 1, .request_id = 1 };
+    entry_a.checksum = entry_a.computeChecksum();
+    var entry_b = entry_a;
+    entry_b.client_id = 2;
+    entry_b.request_id = 2;
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    leader.journalPut(entry_b);
+    leader.op_number = 1;
+    const slot = journalSlot(1);
+    leader.prepare_ok_counts[slot] = 1;
+    leader.prepare_ok_from[slot] = 1;
+
+    try std.testing.expect(!peerMessageSemanticsValid(.{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = 0 } }));
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 1, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 1), leader.prepare_ok_counts[slot]);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_a.checksum } });
+    try std.testing.expectEqual(@as(u8, 1), leader.prepare_ok_counts[slot]);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.commit_min);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.commit_min);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+    leader.onMessage(2, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+}
+
+test "same-view conflicting Prepare preserves durable prepared identity" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD0AB1E);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+
+    var entry_a = msg.LogEntry{ .view_number = 0, .op_number = 1, .command = .{ .noop = {} }, .client_id = 1, .request_id = 1 };
+    entry_a.checksum = entry_a.computeChecksum();
+    var entry_b = entry_a;
+    entry_b.client_id = 2;
+    entry_b.request_id = 2;
+    entry_b.checksum = entry_b.computeChecksum();
+    follower.journalPut(entry_a);
+    follower.op_number = 1;
+    const slot = journalSlot(1);
+    follower.durable_prepare_op[slot] = 1;
+    follower.durable_prepare_checksum[slot] = entry_a.checksum;
+
+    follower.onMessage(0, .{ .prepare = .{ .view_number = 0, .op_number = 1, .entry = entry_b } });
+    try std.testing.expectEqual(entry_a.checksum, follower.journalGet(1).?.checksum);
+    try std.testing.expectEqual(entry_a.checksum, follower.durable_prepare_checksum[slot]);
+
+    follower.journalPut(entry_b);
+    try std.testing.expectEqual(entry_a.checksum, follower.journalGet(1).?.checksum);
+    try std.testing.expectEqual(entry_a.checksum, follower.durable_prepare_checksum[slot]);
 }
 
 test "sendCommitHeartbeat never emits zero checksum for advancing target" {

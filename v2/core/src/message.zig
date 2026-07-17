@@ -301,6 +301,7 @@ pub const PrepareOkMsg = struct {
     op_number: OpNumber = 0,
     replica_id: u8 = 0,
     commit_min: OpNumber = 0,
+    entry_checksum: u64 = 0,
 };
 
 pub const CommitMsg = struct {
@@ -980,6 +981,7 @@ test "serialize/deserialize round-trip" {
         .op_number = 42,
         .replica_id = 2,
         .commit_min = 11,
+        .entry_checksum = 0xCAFE,
     } };
     const len = serialize(msg, &buf);
     const decoded = try deserialize(buf[0..len]);
@@ -987,6 +989,7 @@ test "serialize/deserialize round-trip" {
     try std.testing.expectEqual(decoded.prepare_ok.op_number, 42);
     try std.testing.expectEqual(decoded.prepare_ok.replica_id, 2);
     try std.testing.expectEqual(decoded.prepare_ok.commit_min, 11);
+    try std.testing.expectEqual(decoded.prepare_ok.entry_checksum, 0xCAFE);
 }
 
 test "deserialize rejects unknown tag" {
@@ -1160,6 +1163,14 @@ test "deserialize rejects trailing payload bytes" {
 
 test "deserialize rejects truncated prepare_ok" {
     var buf: [1 + @sizeOf(PrepareOkMsg) - 1]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = @intFromEnum(Tag.prepare_ok);
+    try std.testing.expectError(error.InvalidMessageSize, deserialize(&buf));
+}
+
+test "deserialize rejects protocol-v1 PrepareOk without checksum" {
+    const protocol_v1_size = @sizeOf(PrepareOkMsg) - @sizeOf(u64);
+    var buf: [1 + protocol_v1_size]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.prepare_ok);
     try std.testing.expectError(error.InvalidMessageSize, deserialize(&buf));

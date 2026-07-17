@@ -458,7 +458,7 @@ func (c *HivemindClient) Leader() string {
 
 // Wire helpers
 
-const ProtocolVersion uint16 = 1
+const ProtocolVersion uint16 = 2
 const frameWriteTimeout = 2 * time.Second
 
 type frameWriteError struct {

@@ -44,6 +44,18 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Phase 1 durable prepare identity binding
+
+What changed:
+- peer protocol version 2 adds `entry_checksum` to PrepareOk; v1 mixed peers/workers fail closed at frame version validation
+- followers publish PrepareOk only after the exact current journal identity crosses the durability barrier, while leaders count only matching sender/view/op/checksum votes and deduplicate sender identity
+- same-view conflicting Prepare is rejected before state mutation; durable prepared identities resist normal journal replacement/truncation, with replacement isolated to the fully preflighted later StartView install path
+
+Why it matters:
+- delayed votes for one entry cannot be relabeled as quorum evidence for another entry at the same operation
+
+Current acceptance progress: unchanged. This is unpublished phase 1 only; DVC source selection, bounded full-suffix repair, and pending durable StartView publication remain phase 2 blockers. No full-sweep safety claim is made.
+
 ### 2026-07-16 — Bench replacement deadline and fixed-wire string boundaries
 
 What changed:
