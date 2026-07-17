@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-16 — Ambiguous run outcomes, bounded peer handshakes, and StartPod parsing closed
+
+What changed:
+- `/run` status `5` is now the cross-language `outcome_ambiguous` result for any worker write attempt or disconnect that may follow acceptance; status `4` remains response-too-large only
+- the Go gateway emits stable machine-readable `outcome_ambiguous` and pre-send `unavailable` errors; operator workflow retries only `unavailable` and `queue_full`, never ambiguous or generic failures
+- peer TCP connect is nonblocking with bounded connect/identity deadlines; configured targets remain separate from validated identities, silent sockets expire, and validated bindings are never evicted
+- Rust StartPod parsing requires every declared env record, validates the optional registry-auth trailer exactly, and rejects truncation, overflow, and trailing bytes
+
+Why it matters:
+- prevents automated duplicate workload execution, bounds black-hole/silent peer resource use without suppressing liveness retries, and closes fail-open StartPod env/secret parsing
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. retain application-level idempotency keys and authenticated per-peer identity as future protocol work
+2. rerun independent safety review after the deterministic and local failover gates
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
 ### 2026-07-16 — `/run` ambiguous outcomes and worker response ownership hardened
 
 What changed:

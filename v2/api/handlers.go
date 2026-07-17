@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -178,7 +179,19 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 
 		resp, err := client.SendRunRequest(name, body)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
+			switch {
+			case errors.Is(err, ErrRunOutcomeAmbiguous):
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error":  "outcome_ambiguous",
+					"status": RunStatusOutcomeAmbiguous,
+				})
+			case errors.Is(err, ErrRunUnavailable):
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"error": "unavailable",
+				})
+			default:
+				writeErr(w, http.StatusBadGateway, err.Error())
+			}
 			return
 		}
 
@@ -216,6 +229,8 @@ func runStatusToHTTP(status byte) (int, string) {
 		return http.StatusBadRequest, "invalid_payload"
 	case RunStatusResponseTooLarge:
 		return http.StatusBadGateway, "response_too_large"
+	case RunStatusOutcomeAmbiguous:
+		return http.StatusBadGateway, "outcome_ambiguous"
 	default:
 		return http.StatusBadGateway, "worker_error"
 	}

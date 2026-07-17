@@ -1121,10 +1121,12 @@ fn test_scheduler_under_network_partition() {
 
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
-Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid. Status `4` means the selected worker became unavailable during dispatch; the request is not automatically requeued because a partial write cannot prove non-execution.
+Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid. Status `4` is reserved for an explicit worker response-too-large result. Status `5` is `outcome_ambiguous`: the worker may have accepted the request before a write failure or disconnect, so clients and operator automation must not replay it. Failure to obtain a leader connection before sending any request bytes is reported separately as `unavailable` and is safe to retry.
+
+The HTTP `/run` error body uses stable `error` values. In particular, ambiguous outcomes return `{"error":"outcome_ambiguous","status":5}` and safe pre-send failures return `{"error":"unavailable"}`. Operator retries are limited to the explicit safe values `unavailable` and `queue_full`.
 
 ## Peer identity limitation
 
-Peer sockets bind an initially unbound slot to a configured replica ID only after a valid frame. Once bound, application frames cannot replace that identity. For each configured pair, only the lower replica ID initiates TCP and the higher ID accepts inbound, preventing reciprocal startup deadlock.
+Configured peer targets and validated socket identities are separate. Outbound TCP connect is nonblocking and bounded by a 2,000-tick completion deadline; successful TCP alone does not create an established peer binding. Both outbound and accepted sockets must carry a valid identity-consistent VRR frame within a further 2,000 ticks or they expire and the configured target remains retryable. Once validated, application frames cannot replace or evict that binding. For each configured pair, only the lower replica ID initiates TCP and the higher ID accepts inbound.
 
 This initial binding is unauthenticated unless the shared encryption key is configured, and a shared key still does not provide unique per-peer identity. Authenticated per-peer TLS/mTLS handshakes remain required. Mixed-version rolling upgrades are unsupported; stop and upgrade the full cluster together.

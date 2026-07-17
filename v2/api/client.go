@@ -274,7 +274,8 @@ const (
 	RunStatusNotFound         byte = 1 // deployment not found
 	RunStatusQueueFull        byte = 2
 	RunStatusInvalidPayload   byte = 3 // declared length mismatch / over MAX_PAYLOAD
-	RunStatusResponseTooLarge byte = 4
+	RunStatusResponseTooLarge byte = 4 // explicit worker response overflow only
+	RunStatusOutcomeAmbiguous byte = 5 // worker may have accepted the request before disconnect
 )
 
 // MaxRunPayload is the shared run-request body bound (matches core request_queue.MAX_PAYLOAD).
@@ -287,6 +288,9 @@ const MaxRunResponseBody = 16*1024 - 9
 // could not prove whether the worker executed it. Callers must not retry unless
 // the workload operation is independently idempotent.
 var ErrRunOutcomeAmbiguous = errors.New("run outcome ambiguous")
+
+// ErrRunUnavailable means no request bytes were sent. Retrying is safe.
+var ErrRunUnavailable = errors.New("run unavailable before send")
 
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
@@ -323,7 +327,10 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 		}
 	}
 	if c.conn == nil {
-		return nil, connectErr
+		if connectErr == nil {
+			connectErr = errors.New("no leader connection")
+		}
+		return nil, fmt.Errorf("%w: %v", ErrRunUnavailable, connectErr)
 	}
 
 	// Calling writeFrameEncrypted may partially write before returning an error.
@@ -348,6 +355,9 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 	if resp.RequestID != reqID {
 		c.closeLocked()
 		return nil, fmt.Errorf("%w: run response request_id mismatch: got %d want %d", ErrRunOutcomeAmbiguous, resp.RequestID, reqID)
+	}
+	if resp.Status == RunStatusOutcomeAmbiguous {
+		return resp, ErrRunOutcomeAmbiguous
 	}
 	return resp, nil
 }

@@ -437,12 +437,21 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             pos += 64;
             let env_count = payload[pos] as usize;
             pos += 1;
-            let mut env_vars = Vec::with_capacity(env_count);
             const ENV_ENTRY_SIZE: usize = 64 + 256 + 1; // name + value + is_secret
+            let env_bytes = env_count.checked_mul(ENV_ENTRY_SIZE).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "StartPod env length overflow")
+            })?;
+            let env_end = pos.checked_add(env_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "StartPod env length overflow")
+            })?;
+            if env_end > payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StartPod env entries truncated",
+                ));
+            }
+            let mut env_vars = Vec::with_capacity(env_count);
             for _ in 0..env_count {
-                if pos + ENV_ENTRY_SIZE > payload.len() {
-                    break;
-                }
                 let name = fixed_to_string(&payload[pos..pos + 64]);
                 pos += 64;
                 let value = fixed_to_string(&payload[pos..pos + 256]);
@@ -461,15 +470,16 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             let mut image_pull_password = String::new();
             let mut image_pull_password_is_secret = false;
 
-            if pos < payload.len() && payload[pos] == 0x01 {
-                pos += 1;
-                const REGISTRY_AUTH_TAIL: usize = 128 + 64 + 256 + 1;
-                if pos + REGISTRY_AUTH_TAIL > payload.len() {
+            const REGISTRY_AUTH_TRAILER_SIZE: usize = 1 + 128 + 64 + 256 + 1;
+            let remaining = payload.len() - pos;
+            if remaining != 0 {
+                if remaining != REGISTRY_AUTH_TRAILER_SIZE || payload[pos] != 0x01 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "StartPod registry auth truncated",
+                        "StartPod registry auth trailer invalid",
                     ));
                 }
+                pos += 1;
                 image_pull_registry = fixed_to_string(&payload[pos..pos + 128]);
                 pos += 128;
                 image_pull_username = fixed_to_string(&payload[pos..pos + 64]);
@@ -477,6 +487,13 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
                 image_pull_password = fixed_to_string(&payload[pos..pos + 256]);
                 pos += 256;
                 image_pull_password_is_secret = payload[pos] != 0;
+                pos += 1;
+            }
+            if pos != payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StartPod payload has trailing bytes",
+                ));
             }
 
             Ok(ControlMessage::StartPod(StartPodCmd {
@@ -987,23 +1004,49 @@ mod tests {
             "",
             "",
             "",
-            &[],
+            &[("TOKEN".into(), "doppler-token".into(), true)],
         );
-        append_start_pod_registry_trailer(&mut payload, "registry.io", "alice", "s3cr3t", false);
-        assert_eq!(payload.len(), 797 + 450);
+        append_start_pod_registry_trailer(&mut payload, "registry.io", "alice", "s3cr3t", true);
+        assert_eq!(payload.len(), 797 + 321 + 450);
 
         let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
         match msg {
             ControlMessage::StartPod(cmd) => {
                 assert_eq!(cmd.pod_id, 7);
                 assert_eq!(cmd.deployment_id, 200);
+                assert_eq!(cmd.env_vars.len(), 1);
+                assert!(cmd.env_vars[0].is_secret_ref);
                 assert_eq!(cmd.image_pull_registry, "registry.io");
                 assert_eq!(cmd.image_pull_username, "alice");
                 assert_eq!(cmd.image_pull_password, "s3cr3t");
-                assert!(!cmd.image_pull_password_is_secret);
+                assert!(cmd.image_pull_password_is_secret);
             }
             _ => panic!("expected StartPod"),
         }
+    }
+
+    #[test]
+    fn decode_start_pod_rejects_missing_env_secret_trailer_and_trailing_bytes() {
+        let mut missing_env =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        missing_env[796] = 1;
+        assert!(decode_control_message(MSG_START_POD, &missing_env).is_err());
+
+        let mut missing_secret_flag =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        append_start_pod_registry_trailer(
+            &mut missing_secret_flag,
+            "registry",
+            "user",
+            "secret",
+            true,
+        );
+        missing_secret_flag.pop();
+        assert!(decode_control_message(MSG_START_POD, &missing_secret_flag).is_err());
+
+        let mut trailing = build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        trailing.push(0xff);
+        assert!(decode_control_message(MSG_START_POD, &trailing).is_err());
     }
 
     #[test]

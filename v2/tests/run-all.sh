@@ -76,6 +76,10 @@ run_phase "GPU-test cleanup trap fixture" \
 run_phase "Active docs layout path contract" \
     bash -c "'$SCRIPT_DIR/docs_layout_paths_test.sh'"
 
+# --- Phase 4g: Operator /run retry safety fixtures ---
+run_phase "Operator workflow retry fixtures" \
+    bash -c "'$SCRIPT_DIR/operator_workflow_retry_test.sh'"
+
 # --- Phase 5: Containerd integration (Docker/OrbStack) ---
 if [ "$SKIP_CONTAINERD" = false ]; then
     if command -v docker &>/dev/null; then

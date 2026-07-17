@@ -403,6 +403,10 @@ func TestParseRunResponseExactLengthContract(t *testing.T) {
 			raw:  buildRunResponseRaw(7, RunStatusNotFound, nil, false),
 		},
 		{
+			name: "ambiguous gateway error without length",
+			raw:  buildRunResponseRaw(7, RunStatusOutcomeAmbiguous, nil, false),
+		},
+		{
 			name:    "missing response length",
 			raw:     []byte{7, 0, 0, 0, 0, 0, 0, 0, RunStatusOK},
 			wantErr: "missing length",
@@ -525,6 +529,52 @@ func TestSendRunRequestDoesNotResendAfterServerAcceptsRequest(t *testing.T) {
 	close(requests)
 	if got := len(requests); got != 1 {
 		t.Fatalf("server received %d run requests, want exactly 1", got)
+	}
+}
+
+func TestSendRunRequestParsesExplicitAmbiguousStatusAsSentinel(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		if _, err := readFrameGeneric(conn, buf, time.Second, nil); err != nil {
+			return
+		}
+		if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
+			return
+		}
+		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil || len(frame) < 11 || frame[2] != TagRunRequest {
+			return
+		}
+		requestID := binary.LittleEndian.Uint64(frame[3:11])
+		raw := buildRunResponseRaw(requestID, RunStatusOutcomeAmbiguous, nil, false)
+		inner := make([]byte, 3+len(raw))
+		binary.LittleEndian.PutUint16(inner[:2], ProtocolVersion)
+		inner[2] = TagRunResponse
+		copy(inner[3:], raw)
+		out := make([]byte, 5+len(inner))
+		binary.LittleEndian.PutUint32(out[:4], uint32(1+len(inner)))
+		copy(out[5:], inner)
+		_, _ = conn.Write(out)
+	}()
+
+	client := NewClient([]string{listener.Addr().String()}, nil)
+	resp, err := client.SendRunRequest("dep", []byte("request"))
+	if !errors.Is(err, ErrRunOutcomeAmbiguous) {
+		t.Fatalf("error = %v, want ErrRunOutcomeAmbiguous", err)
+	}
+	if resp == nil || resp.Status != RunStatusOutcomeAmbiguous {
+		t.Fatalf("response = %+v, want explicit ambiguous status", resp)
 	}
 }
 

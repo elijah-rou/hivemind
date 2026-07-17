@@ -12,7 +12,11 @@ const MAX_CLIENTS: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Worker frame payload is bounded at 16 KiB; run metadata consumes 9 bytes.
 pub const MAX_RUN_RESPONSE_BODY: usize = 16 * 1024 - 9;
+const RUN_STATUS_OUTCOME_AMBIGUOUS: u8 = 5;
 const MAX_PEER_CONNECTIONS: usize = @as(usize, msg.REPLICA_COUNT_MAX) * 2;
+const PEER_CONNECT_TIMEOUT_TICKS: u64 = 2_000;
+const PEER_IDENTITY_TIMEOUT_TICKS: u64 = 2_000;
+const PEER_RETRY_INTERVAL_TICKS: u64 = 2_000;
 
 // Wire protocol version. Included in every client and agent frame.
 // Frame format: [4B LE len][2B LE version][1B tag][payload...]
@@ -38,6 +42,10 @@ const Conn = struct {
     frame_pos: usize = 0,
     connected: bool = false,
     peer_direction: PeerDirection = .inbound,
+    connect_pending: bool = false,
+    peer_deadline_tick: u64 = 0,
+    configured_peer_id: u8 = 0,
+    configured_peer_id_known: bool = false,
 
     // For workers: the agent index in the replica's agent table
     worker_idx: usize = 0,
@@ -172,6 +180,7 @@ pub const ConnectionManager = struct {
         self.acceptWorkers();
         self.acceptClients();
         self.acceptPeers();
+        self.completePeerConnections(self.poll_count);
         self.readWorkers();
         self.readClients();
         self.readPeers();
@@ -526,7 +535,7 @@ pub const ConnectionManager = struct {
         var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
         const released_count = self.request_queue.releaseWorker(worker_idx, &released);
         for (released[0..released_count]) |request| {
-            self.sendRunErrorToClientId(request.client_id, request.client_request_id, 4);
+            self.sendRunErrorToClientId(request.client_id, request.client_request_id, RUN_STATUS_OUTCOME_AMBIGUOUS);
         }
     }
 
@@ -952,6 +961,7 @@ pub const ConnectionManager = struct {
                 .frame_pos = 0,
                 .connected = true,
                 .peer_id_known = false,
+                .peer_deadline_tick = self.poll_count +| PEER_IDENTITY_TIMEOUT_TICKS,
             };
         }
     }
@@ -959,7 +969,7 @@ pub const ConnectionManager = struct {
     fn readPeers(self: *ConnectionManager) void {
         for (0..self.peer_count) |peer_idx| {
             const peer = &self.peers[peer_idx];
-            if (!peer.connected) continue;
+            if (!peer.connected or peer.connect_pending) continue;
             readConn(peer) catch {
                 disconnectPeer(peer);
                 continue;
@@ -1029,8 +1039,13 @@ pub const ConnectionManager = struct {
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.peer_key else null;
 
         for (self.peers[0..self.peer_count]) |*peer| {
-            if (!peer.connected) continue;
-            if (peer.peer_id_known and peer.worker_idx == to) {
+            if (!peer.connected or peer.connect_pending) continue;
+            const validated_match = peer.peer_id_known and peer.worker_idx == to;
+            const configured_match = !peer.peer_id_known and
+                peer.peer_direction == .outbound and
+                peer.configured_peer_id_known and
+                peer.configured_peer_id == to;
+            if (validated_match or configured_match) {
                 self.sendFrame(peer.fd, key, inner) catch {
                     disconnectPeer(peer);
                 };
@@ -1075,7 +1090,7 @@ pub const ConnectionManager = struct {
         }
     }
 
-    fn hasPeerConnection(self: *ConnectionManager, peer_id: u8) bool {
+    fn hasPeerConnection(self: *const ConnectionManager, peer_id: u8) bool {
         for (self.peers[0..self.peer_count]) |*peer| {
             if (peer.connected and peer.peer_id_known and peer.worker_idx == peer_id) return true;
         }
@@ -1090,33 +1105,31 @@ pub const ConnectionManager = struct {
 
         // Bound socket identity is immutable: reject spoof/rebind attempts.
         if (peer.peer_id_known) return peer.worker_idx == from_id;
+        if (peer.configured_peer_id_known and peer.configured_peer_id != from_id) {
+            disconnectPeer(peer);
+            return false;
+        }
+
+        const preferred_direction: PeerDirection = if (self.replica_id < from_id) .outbound else .inbound;
+        if (peer.peer_direction != preferred_direction) {
+            disconnectPeer(peer);
+            return false;
+        }
 
         for (0..self.peer_count) |other_idx| {
             if (other_idx == peer_idx) continue;
             const other = &self.peers[other_idx];
-            if (!other.connected) continue;
-            if (!other.peer_id_known) continue;
+            if (!other.connected or !other.peer_id_known) continue;
             if (other.worker_idx != from_id) continue;
 
-            const preferred_direction: PeerDirection = if (self.replica_id < from_id) .outbound else .inbound;
-            if (peer.peer_direction != preferred_direction) {
-                disconnectPeer(peer);
-                return false;
-            }
-            if (other.peer_direction == preferred_direction) {
-                disconnectPeer(peer);
-                return false;
-            }
-
-            // The candidate frame passed framing, encryption, deserialization,
-            // identity, and semantic validation. Replace only now, retaining the
-            // established socket until the winner is ready to bind.
-            disconnectPeer(other);
-            break;
+            // A validated binding is never evicted by a later candidate.
+            disconnectPeer(peer);
+            return false;
         }
 
         peer.worker_idx = from_id;
         peer.peer_id_known = true;
+        peer.peer_deadline_tick = 0;
         return true;
     }
 
@@ -1124,37 +1137,81 @@ pub const ConnectionManager = struct {
     pub fn retryPeerConnections(self: *ConnectionManager, now_tick: u64) void {
         if (self.peer_target_count == 0) return;
 
-        // Retry every 2 seconds
-        if (now_tick > 0 and now_tick - self.last_retry_tick < 2000) return;
+        self.completePeerConnections(now_tick);
+
+        if (now_tick > 0 and now_tick - self.last_retry_tick < PEER_RETRY_INTERVAL_TICKS) return;
         self.last_retry_tick = now_tick;
 
         for (self.peer_targets[0..self.peer_target_count]) |target| {
-            if (!self.shouldInitiatePeerConnection(target.peer_id)) continue;
-            if (!self.hasPeerConnection(target.peer_id)) {
+            if (self.peerNeedsRetry(target.peer_id)) {
                 self.connectToPeerInner(target.peer_id, target.host, target.port);
             }
+        }
+    }
+
+    fn hasPeerCandidate(self: *const ConnectionManager, peer_id: u8) bool {
+        for (self.peers[0..self.peer_count]) |peer| {
+            if (!peer.connected or peer.peer_id_known) continue;
+            if (peer.configured_peer_id_known and peer.configured_peer_id == peer_id) return true;
+        }
+        return false;
+    }
+
+    fn peerNeedsRetry(self: *const ConnectionManager, peer_id: u8) bool {
+        return self.shouldInitiatePeerConnection(peer_id) and
+            !self.hasPeerConnection(peer_id) and
+            !self.hasPeerCandidate(peer_id);
+    }
+
+    fn completePeerConnections(self: *ConnectionManager, now_tick: u64) void {
+        for (self.peers[0..self.peer_count]) |*peer| {
+            if (!peer.connected or peer.peer_id_known) continue;
+            if (now_tick >= peer.peer_deadline_tick) {
+                disconnectPeer(peer);
+                continue;
+            }
+            if (!peer.connect_pending) continue;
+
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = peer.fd,
+                .events = std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&poll_fds, 0) catch {
+                disconnectPeer(peer);
+                continue;
+            };
+            if (ready == 0) continue;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.posix.socklen_t = @sizeOf(c_int);
+            if (std.c.getsockopt(peer.fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&socket_error), &socket_error_len) != 0 or socket_error != 0) {
+                disconnectPeer(peer);
+                continue;
+            }
+            peer.connect_pending = false;
+            peer.peer_deadline_tick = now_tick +| PEER_IDENTITY_TIMEOUT_TICKS;
+            std.debug.print("hivemind core: peer {d} TCP connected, awaiting identity\n", .{peer.configured_peer_id});
         }
     }
 
     fn connectToPeerInner(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
         const fd = libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         if (fd < 0) return;
+        setNonBlocking(fd);
 
-        // Blocking connect: completes in <1ms on LAN/localhost.
-        // Non-blocking connect returns EINPROGRESS, causing the first write
-        // to fail and permanently kill the peer connection.
         var addr: std.posix.sockaddr.in = .{
             .port = std.mem.nativeToBig(u16, port),
             .addr = host,
         };
         const rc = std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-        if (rc != 0) {
-            _ = libc.close(fd);
-            return;
-        }
-        std.debug.print("hivemind core: peer {d} connected\n", .{peer_id});
-
-        setNonBlocking(fd);
+        const pending = if (rc == 0) false else switch (std.posix.errno(rc)) {
+            .INPROGRESS => true,
+            else => {
+                _ = libc.close(fd);
+                return;
+            },
+        };
 
         const slot = self.acquirePeerSlot() orelse {
             _ = libc.close(fd);
@@ -1165,9 +1222,15 @@ pub const ConnectionManager = struct {
             .frame_pos = 0,
             .connected = true,
             .peer_direction = .outbound,
-            .worker_idx = peer_id,
-            .peer_id_known = true,
+            .connect_pending = pending,
+            .peer_deadline_tick = self.poll_count +| PEER_CONNECT_TIMEOUT_TICKS,
+            .configured_peer_id = peer_id,
+            .configured_peer_id_known = true,
+            .peer_id_known = false,
         };
+        if (!pending) {
+            self.peers[slot].peer_deadline_tick = self.poll_count +| PEER_IDENTITY_TIMEOUT_TICKS;
+        }
     }
 
     // -- Helpers --
@@ -1441,6 +1504,10 @@ fn disconnectPeer(peer: *Conn) void {
     peer.fd = -1;
     peer.connected = false;
     peer.frame_pos = 0;
+    peer.connect_pending = false;
+    peer.peer_deadline_tick = 0;
+    peer.configured_peer_id = 0;
+    peer.configured_peer_id_known = false;
     peer.worker_idx = 0;
     peer.peer_id_known = false;
 }
@@ -1699,6 +1766,74 @@ test "connectToPeer ignores self target" {
 
     try std.testing.expectEqual(@as(usize, 0), cm.peer_target_count);
     try std.testing.expectEqual(@as(usize, 0), cm.peer_count);
+}
+
+test "pending peer connect and silent endpoint expire then become retryable" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 0;
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+
+    var black_hole_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &black_hole_fds));
+    defer _ = libc.close(black_hole_fds[1]);
+    cm.peers[0] = .{
+        .fd = black_hole_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .connect_pending = true,
+        .peer_deadline_tick = PEER_CONNECT_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+    try std.testing.expect(!cm.peerNeedsRetry(1));
+    cm.completePeerConnections(PEER_CONNECT_TIMEOUT_TICKS);
+    try std.testing.expect(!cm.peers[0].connected);
+    try std.testing.expect(cm.peerNeedsRetry(1));
+
+    var silent_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &silent_fds));
+    defer _ = libc.close(silent_fds[1]);
+    cm.peers[0] = .{
+        .fd = silent_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+    try std.testing.expect(!cm.hasPeerConnection(1));
+    try std.testing.expect(!cm.peerNeedsRetry(1));
+    cm.completePeerConnections(PEER_IDENTITY_TIMEOUT_TICKS);
+    try std.testing.expect(!cm.peers[0].connected);
+    try std.testing.expect(cm.peerNeedsRetry(1));
+}
+
+test "valid peer handshake separates configured target from validated identity" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 0;
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .fd = fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+
+    try std.testing.expect(!cm.hasPeerConnection(1));
+    try std.testing.expect(cm.identifyPeerConnection(0, 1));
+    try std.testing.expect(cm.hasPeerConnection(1));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expectEqual(@as(u64, 0), cm.peers[0].peer_deadline_tick);
 }
 
 fn buildTestProtocolFrame(flags: u8, version: u16, state: ?*const enc.EncryptionState) ![]u8 {
@@ -2191,7 +2326,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
 
-    // Immediate write failure after dequeue: correlation is released and client gets unavailable.
+    // A write attempt may have been accepted before failure, so replay is unsafe.
     cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
     cm.dispatchRun();
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
@@ -2199,7 +2334,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     var client_buf: [128]u8 = undefined;
     var n = try std.posix.read(client_fds[1], &client_buf);
     try std.testing.expect(n >= 17);
-    try std.testing.expectEqual(@as(u8, 4), client_buf[16]);
+    try std.testing.expectEqual(RUN_STATUS_OUTCOME_AMBIGUOUS, client_buf[16]);
 
     // Accepted dispatch followed by disconnect releases its owned correlation.
     var worker_fds: [2]c_int = undefined;
@@ -2214,7 +2349,7 @@ test "dispatchRun preserves queued work without worker and fails accepted work o
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
     n = try std.posix.read(client_fds[1], &client_buf);
     try std.testing.expect(n >= 17);
-    try std.testing.expectEqual(@as(u8, 4), client_buf[16]);
+    try std.testing.expectEqual(RUN_STATUS_OUTCOME_AMBIGUOUS, client_buf[16]);
 
     // A replacement connection reuses the released slot and completes normally.
     var success_worker_fds: [2]c_int = undefined;
@@ -2315,7 +2450,7 @@ test "identifyPeerConnection rejects rebind to different replica id" {
     try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
 }
 
-test "identifyPeerConnection deterministically converges reciprocal sockets" {
+test "identifyPeerConnection enforces direction without evicting established sockets" {
     var lower_outbound_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lower_outbound_fds));
     defer _ = libc.close(lower_outbound_fds[1]);
@@ -2362,24 +2497,23 @@ test "identifyPeerConnection deterministically converges reciprocal sockets" {
     higher.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
     higher.peer_count = 2;
     higher.peers[0] = .{
-        .fd = higher_outbound_fds[0],
+        .fd = higher_inbound_fds[0],
         .connected = true,
         .worker_idx = 1,
         .peer_id_known = true,
-        .peer_direction = .outbound,
-    };
-    higher.peers[1] = .{
-        .fd = higher_inbound_fds[0],
-        .connected = true,
         .peer_direction = .inbound,
     };
+    higher.peers[1] = .{
+        .fd = higher_outbound_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+    };
 
-    try std.testing.expect(higher.identifyPeerConnection(1, 1));
-    try std.testing.expect(!higher.peers[0].connected);
-    try std.testing.expectEqual(@as(c_int, -1), higher.peers[0].fd);
-    try std.testing.expect(higher.peers[1].connected);
-    try std.testing.expect(higher.peers[1].peer_id_known);
-    try std.testing.expectEqual(@as(usize, 1), higher.peers[1].worker_idx);
+    try std.testing.expect(!higher.identifyPeerConnection(1, 1));
+    try std.testing.expect(higher.peers[0].connected);
+    try std.testing.expectEqual(higher_inbound_fds[0], higher.peers[0].fd);
+    try std.testing.expect(!higher.peers[1].connected);
+    try std.testing.expectEqual(@as(c_int, -1), higher.peers[1].fd);
 }
 
 test "identifyPeerConnection preserves established duplicate peer socket" {
@@ -2393,6 +2527,7 @@ test "identifyPeerConnection preserves established duplicate peer socket" {
 
     const cm = try std.testing.allocator.create(ConnectionManager);
     defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 5;
     cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
     cm.peer_count = 2;
     cm.peers[0] = .{
@@ -2473,11 +2608,11 @@ test "simultaneous reciprocal sockets converge and carry bidirectional VRR traff
     ConnectionManager.setNonBlocking(socket_b[1]);
 
     lower.peer_count = 2;
-    lower.peers[0] = .{ .fd = socket_a[0], .connected = true, .peer_direction = .outbound, .worker_idx = 1, .peer_id_known = true };
-    lower.peers[1] = .{ .fd = socket_b[1], .connected = true, .peer_direction = .inbound };
+    lower.peers[0] = .{ .fd = socket_a[0], .connected = true, .peer_direction = .outbound, .configured_peer_id = 1, .configured_peer_id_known = true, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+    lower.peers[1] = .{ .fd = socket_b[1], .connected = true, .peer_direction = .inbound, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
     higher.peer_count = 2;
-    higher.peers[0] = .{ .fd = socket_b[0], .connected = true, .peer_direction = .outbound, .worker_idx = 0, .peer_id_known = true };
-    higher.peers[1] = .{ .fd = socket_a[1], .connected = true, .peer_direction = .inbound };
+    higher.peers[0] = .{ .fd = socket_b[0], .connected = true, .peer_direction = .outbound, .configured_peer_id = 0, .configured_peer_id_known = true, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+    higher.peers[1] = .{ .fd = socket_a[1], .connected = true, .peer_direction = .inbound, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
 
     // Both replicas send before either polls, reproducing symmetric startup.
     sendTestPeerMessage(lower, 1, .{ .start_view_change = .{ .view_number = 1, .replica_id = 0 } });
