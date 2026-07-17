@@ -315,6 +315,7 @@ const (
 	RunStatusForwardingFailed   RunStatus = 6
 	RunStatusNoRunningPod       RunStatus = 7
 	RunStatusUnavailable        RunStatus = 8
+	RunStatusNotLeader          RunStatus = 9
 )
 
 func (s RunStatus) String() string {
@@ -337,6 +338,8 @@ func (s RunStatus) String() string {
 		return "no_running_pod"
 	case RunStatusUnavailable:
 		return "unavailable"
+	case RunStatusNotLeader:
+		return "not_leader"
 	default:
 		return "unknown"
 	}
@@ -404,37 +407,46 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 		return nil, fmt.Errorf("%w: %v", ErrRunUnavailable, connectErr)
 	}
 
-	// Calling writeFrameEncrypted may partially write before returning an error.
-	// From this boundary onward, resending could execute the request twice.
-	if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
-		c.closeLocked()
-		var writeErr *frameWriteError
-		if errors.As(err, &writeErr) && writeErr.attempted {
-			return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+	for attempt := 0; attempt < 2; attempt++ {
+		// Calling writeFrameEncrypted may partially write before returning an error.
+		// Only explicit not_leader is guaranteed unexecuted and therefore retryable.
+		if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
+			c.closeLocked()
+			var writeErr *frameWriteError
+			if errors.As(err, &writeErr) && writeErr.attempted {
+				return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+			}
+			return nil, fmt.Errorf("%w: send failed before write: %v", ErrRunUnavailable, err)
 		}
-		return nil, fmt.Errorf("%w: send failed before write: %v", ErrRunUnavailable, err)
-	}
 
-	buf := make([]byte, 65536)
-	raw, err := readRunResponseEncrypted(c.conn, buf, c.crypto)
-	if err != nil {
-		c.closeLocked()
-		return nil, fmt.Errorf("%w: recv failed: %w", ErrRunOutcomeAmbiguous, err)
+		buf := make([]byte, 65536)
+		raw, err := readRunResponseEncrypted(c.conn, buf, c.crypto)
+		if err != nil {
+			c.closeLocked()
+			return nil, fmt.Errorf("%w: recv failed: %w", ErrRunOutcomeAmbiguous, err)
+		}
+		resp, err := parseRunResponse(raw)
+		if err != nil {
+			c.closeLocked()
+			return nil, fmt.Errorf("%w: invalid response: %w", ErrRunOutcomeAmbiguous, err)
+		}
+		if resp.RequestID != reqID {
+			c.closeLocked()
+			return nil, fmt.Errorf("%w: run response request_id mismatch: got %d want %d", ErrRunOutcomeAmbiguous, resp.RequestID, reqID)
+		}
+		if resp.Status == RunStatusNotLeader && attempt == 0 {
+			c.closeLocked()
+			if err := c.reconnect(nil); err != nil {
+				return nil, fmt.Errorf("%w: leader reprobe: %v", ErrRunUnavailable, err)
+			}
+			continue
+		}
+		if resp.Status == RunStatusOutcomeAmbiguous {
+			return resp, ErrRunOutcomeAmbiguous
+		}
+		return resp, nil
 	}
-
-	resp, err := parseRunResponse(raw)
-	if err != nil {
-		c.closeLocked()
-		return nil, fmt.Errorf("%w: invalid response: %w", ErrRunOutcomeAmbiguous, err)
-	}
-	if resp.RequestID != reqID {
-		c.closeLocked()
-		return nil, fmt.Errorf("%w: run response request_id mismatch: got %d want %d", ErrRunOutcomeAmbiguous, resp.RequestID, reqID)
-	}
-	if resp.Status == RunStatusOutcomeAmbiguous {
-		return resp, ErrRunOutcomeAmbiguous
-	}
-	return resp, nil
+	panic("bounded run retry exhausted")
 }
 
 // parseRunResponse decodes a run_response payload: [request_id(8)][status(1)][len(4)?][data?].
@@ -448,7 +460,7 @@ func parseRunResponse(raw []byte) (*RunResponse, error) {
 		RequestID: binary.LittleEndian.Uint64(raw[0:8]),
 		Status:    RunStatus(raw[8]),
 	}
-	if resp.Status > RunStatusUnavailable {
+	if resp.Status > RunStatusNotLeader {
 		return nil, fmt.Errorf("unknown run status: %d", resp.Status)
 	}
 	if len(raw) == 9 {

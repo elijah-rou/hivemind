@@ -199,7 +199,7 @@ pub const ConnectionManager = struct {
     /// Poll all connections: accept new, read messages, dispatch.
     pub fn poll(self: *ConnectionManager) void {
         self.poll_count += 1;
-        _ = self.request_queue.expireAbandoned(self.poll_count);
+        self.disconnectExpiredAbandonedWorkers();
         self.acceptWorkers();
         self.acceptClients();
         self.acceptPeers();
@@ -211,6 +211,19 @@ pub const ConnectionManager = struct {
     }
 
     // -- Worker connections --
+
+    fn disconnectExpiredAbandonedWorkers(self: *ConnectionManager) void {
+        var expired_workers: [rq.MAX_IN_FLIGHT]usize = undefined;
+        const count = self.request_queue.expiredAbandonedWorkers(self.poll_count, &expired_workers);
+        for (expired_workers[0..count]) |worker_idx| {
+            if (worker_idx < self.worker_count and self.workers[worker_idx].connected) {
+                self.disconnectWorker(&self.workers[worker_idx]);
+            } else {
+                var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
+                _ = self.request_queue.releaseWorker(worker_idx, &released);
+            }
+        }
+    }
 
     fn acceptWorkers(self: *ConnectionManager) void {
         while (true) {
@@ -395,6 +408,10 @@ pub const ConnectionManager = struct {
         const body = payload[76..];
         if (declared_len > rq.MAX_PAYLOAD or body.len != @as(usize, declared_len)) {
             self.sendRunError(client, request_id, .invalid_payload);
+            return;
+        }
+        if (!self.acceptsWorkerTraffic()) {
+            self.sendRunError(client, request_id, .not_leader);
             return;
         }
         const req_payload = body;
@@ -2184,12 +2201,23 @@ test "consensus reply write failure cleans client-owned run state and permits sl
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
     cm.client_count = 1;
+    cm.worker_count = 2;
+    var worker_zero: [2]c_int = undefined;
+    var worker_one: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_zero));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_one));
+    defer _ = libc.close(worker_zero[1]);
+    defer _ = libc.close(worker_one[0]);
+    defer _ = libc.close(worker_one[1]);
+    cm.workers[0] = .{ .fd = worker_zero[0], .connected = true, .worker_idx = 0 };
+    cm.workers[1] = .{ .fd = worker_one[0], .connected = true, .worker_idx = 1 };
     var failed_client_pipe: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_client_pipe));
     defer _ = libc.close(failed_client_pipe[1]);
     cm.clients[0] = .{ .fd = failed_client_pipe[0], .connected = true, .client_id = 72 };
     try std.testing.expect(cm.request_queue.enqueue(1, 20, 72, "queued"));
     _ = cm.request_queue.trackInFlightForWorker(21, 72, 0).?;
+    const unrelated = cm.request_queue.trackInFlightForWorker(22, 99, 1).?;
 
     cm.sendClientReply(&cm.clients[0], 22, .{ .ok = .{ .entity_id = 9 } });
 
@@ -2197,11 +2225,13 @@ test "consensus reply write failure cleans client-owned run state and permits sl
     try std.testing.expect(!cm.clients[0].connected);
     try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
-    // The already-sent request remains worker-owned so its late response can
-    // be consumed without punishing a healthy worker. Bounded expiry frees it.
+    try std.testing.expectEqual(@as(usize, 2), cm.request_queue.activeInFlightCount());
+    cm.poll_count += rq.ABANDONED_TTL_TICKS;
+    cm.disconnectExpiredAbandonedWorkers();
+    try std.testing.expect(!cm.workers[0].connected);
+    try std.testing.expect(cm.workers[1].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
-    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.expireAbandoned(cm.poll_count + rq.ABANDONED_TTL_TICKS));
-    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(@as(u128, 99), cm.request_queue.resolveResponseForWorker(unrelated, 1).?.client_id);
 
     var replacement_client: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &replacement_client));
@@ -3117,6 +3147,17 @@ test "handleRunRequest enforces exact declared payload length" {
             try std.testing.expectEqual(tc.expect_status.?, err_buf[16]);
         }
     }
+
+    replica.status = .view_change;
+    const follower_payload = buildClientRunRequestPayload(9999, "echo", 1, "x");
+    defer allocator.free(follower_payload);
+    const depth_before = cm.request_queue.totalDepth();
+    cm.handleRunRequest(&cm.clients[0], follower_payload);
+    try std.testing.expectEqual(depth_before, cm.request_queue.totalDepth());
+    var follower_error: [64]u8 = undefined;
+    const follower_n = try std.posix.read(fds[1], &follower_error);
+    try std.testing.expect(follower_n >= 17);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.not_leader), follower_error[16]);
 }
 
 test "fixed worker payload parsers reject trailing bytes and accept exact frames" {

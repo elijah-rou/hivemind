@@ -251,7 +251,7 @@ func TestRunStatusWireGolden(t *testing.T) {
 	want := []string{
 		"ok", "deployment_not_found", "queue_full", "invalid_payload",
 		"response_too_large", "outcome_ambiguous", "forwarding_failed",
-		"no_running_pod", "unavailable",
+		"no_running_pod", "unavailable", "not_leader",
 	}
 	for wire, name := range want {
 		if got := runStatusName(RunStatus(wire)); got != name {

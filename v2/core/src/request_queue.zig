@@ -5,6 +5,9 @@ pub const MAX_PAYLOAD: usize = 512;
 pub const MAX_QUEUE_DEPTH: usize = 64;
 pub const MAX_QUEUES: usize = 16;
 pub const MAX_IN_FLIGHT: usize = 1024;
+/// Production loop tick is fixed at 1ms. Worker hard /run deadline is 25s;
+/// retain ownership for an additional 5s before terminating that worker session.
+pub const WORKER_RUN_DEADLINE_TICKS: u64 = 25_000;
 pub const ABANDONED_TTL_TICKS: u64 = 30_000;
 
 /// Cross-language /run outcome contract. Values are stable wire bytes.
@@ -18,11 +21,13 @@ pub const RunStatus = enum(u8) {
     forwarding_failed = 6,
     no_running_pod = 7,
     unavailable = 8,
+    not_leader = 9,
 };
 
 comptime {
     std.debug.assert(@intFromEnum(RunStatus.ok) == 0);
-    std.debug.assert(@intFromEnum(RunStatus.unavailable) == 8);
+    std.debug.assert(@intFromEnum(RunStatus.not_leader) == 9);
+    std.debug.assert(ABANDONED_TTL_TICKS > WORKER_RUN_DEADLINE_TICKS);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,16 +258,23 @@ pub const RequestQueue = struct {
         }
     }
 
-    pub fn expireAbandoned(self: *RequestQueue, now_tick: u64) usize {
-        var expired: usize = 0;
-        for (&self.in_flight) |*entry| {
+    /// Report unique worker sessions whose abandoned ownership expired.
+    /// Callers must terminate each session before releasing its correlations.
+    pub fn expiredAbandonedWorkers(self: *const RequestQueue, now_tick: u64, workers: *[MAX_IN_FLIGHT]usize) usize {
+        var count: usize = 0;
+        for (self.in_flight) |entry| {
             if (!entry.active or !entry.abandoned) continue;
             if (now_tick < entry.expires_at_tick) continue;
-            entry.* = .{};
-            self.resolve_total += 1;
-            expired += 1;
+            var duplicate = false;
+            for (workers[0..count]) |worker_idx| {
+                if (worker_idx == entry.worker_idx) duplicate = true;
+            }
+            if (duplicate) continue;
+            std.debug.assert(count < workers.len);
+            workers[count] = entry.worker_idx;
+            count += 1;
         }
-        return expired;
+        return count;
     }
 
     /// Total queued requests across all deployments.
@@ -373,6 +385,7 @@ test "run status wire golden" {
         .forwarding_failed,
         .no_running_pod,
         .unavailable,
+        .not_leader,
     };
     for (statuses, 0..) |status, wire| {
         try std.testing.expectEqual(@as(u8, @intCast(wire)), @intFromEnum(status));
@@ -517,8 +530,12 @@ test "request queue: abandoned saturation expires and reuses every slot" {
     try std.testing.expectEqual(MAX_IN_FLIGHT, rq.activeInFlightCount());
     try std.testing.expectEqual(MAX_IN_FLIGHT, rq.abandonedInFlightCount());
     try std.testing.expect(rq.trackInFlight(9999, 1) == null);
-    try std.testing.expectEqual(@as(usize, 0), rq.expireAbandoned(100 + ABANDONED_TTL_TICKS - 1));
-    try std.testing.expectEqual(MAX_IN_FLIGHT, rq.expireAbandoned(100 + ABANDONED_TTL_TICKS));
+    var expired_workers: [MAX_IN_FLIGHT]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 0), rq.expiredAbandonedWorkers(100 + ABANDONED_TTL_TICKS - 1, &expired_workers));
+    try std.testing.expectEqual(@as(usize, 2), rq.expiredAbandonedWorkers(100 + ABANDONED_TTL_TICKS, &expired_workers));
+    var released: [MAX_IN_FLIGHT]ResolvedRequest = undefined;
+    _ = rq.releaseWorker(expired_workers[0], &released);
+    _ = rq.releaseWorker(expired_workers[1], &released);
     try std.testing.expectEqual(@as(usize, 0), rq.activeInFlightCount());
     for (0..MAX_IN_FLIGHT) |i| try std.testing.expect(rq.trackInFlight(@intCast(i), 1) != null);
 }

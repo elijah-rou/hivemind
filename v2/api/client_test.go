@@ -745,11 +745,73 @@ func TestSendRunRequestParsesExplicitAmbiguousStatusAsSentinel(t *testing.T) {
 	}
 }
 
+func TestSendRunRequestRetriesOnlyExplicitNotLeaderAfterReprobe(t *testing.T) {
+	first, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	serve := func(listener net.Listener, status RunStatus, body []byte) {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 65536)
+		if _, err = readFrameGeneric(conn, buf, time.Second, nil); err != nil {
+			return
+		}
+		_, _ = conn.Write(buildClusterStateProbeFrame(true))
+		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil || len(frame) < 11 {
+			return
+		}
+		requestID := binary.LittleEndian.Uint64(frame[3:11])
+		raw := buildRunResponseRaw(requestID, status, body, false)
+		_, _ = conn.Write(buildTestFrame(t, 0, ProtocolVersion, TagRunResponse, raw, nil))
+	}
+	go func() {
+		conn, err := first.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 65536)
+		if _, err = readFrameGeneric(conn, buf, time.Second, nil); err != nil {
+			return
+		}
+		_, _ = conn.Write(buildClusterStateProbeFrame(true))
+		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil || len(frame) < 11 {
+			return
+		}
+		_ = first.Close()
+		requestID := binary.LittleEndian.Uint64(frame[3:11])
+		raw := buildRunResponseRaw(requestID, RunStatusNotLeader, nil, false)
+		_, _ = conn.Write(buildTestFrame(t, 0, ProtocolVersion, TagRunResponse, raw, nil))
+	}()
+	go serve(second, RunStatusOK, []byte("ok"))
+
+	client := NewClient([]string{first.Addr().String(), second.Addr().String()}, nil)
+	response, err := client.SendRunRequest("dep", []byte("request"))
+	if err != nil {
+		t.Fatalf("run retry: %v", err)
+	}
+	if response.Status != RunStatusOK || string(response.Body) != "ok" {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
 func TestRunStatusWireGolden(t *testing.T) {
 	want := []string{
 		"ok", "deployment_not_found", "queue_full", "invalid_payload",
 		"response_too_large", "outcome_ambiguous", "forwarding_failed",
-		"no_running_pod", "unavailable",
+		"no_running_pod", "unavailable", "not_leader",
 	}
 	for wire, name := range want {
 		status := RunStatus(wire)

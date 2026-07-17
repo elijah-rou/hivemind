@@ -26,6 +26,7 @@ const (
 	RunStatusForwardingFailed   RunStatus = 6
 	RunStatusNoRunningPod       RunStatus = 7
 	RunStatusUnavailable        RunStatus = 8
+	RunStatusNotLeader          RunStatus = 9
 )
 
 func runStatusName(status RunStatus) string {
@@ -48,6 +49,8 @@ func runStatusName(status RunStatus) string {
 		return "no_running_pod"
 	case RunStatusUnavailable:
 		return "unavailable"
+	case RunStatusNotLeader:
+		return "not_leader"
 	default:
 		return "unknown"
 	}
@@ -481,7 +484,7 @@ func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
 		return fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
 	}
 	status := RunStatus(raw[8])
-	if status > RunStatusUnavailable {
+	if status > RunStatusNotLeader {
 		return fmt.Errorf("unknown run status %d", status)
 	}
 	if status != RunStatusOK {

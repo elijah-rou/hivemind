@@ -5,6 +5,7 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::protocol::MAX_RUN_RESPONSE_BODY;
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
 
 const BASE_PORT: u16 = 15000;
@@ -192,26 +193,53 @@ pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
 
 /// Send an HTTP POST to a process "container" and return the response body.
 pub fn forward_run(port: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
+    forward_run_with_deadline(port, payload, Duration::from_secs(25))
+}
+
+fn forward_run_with_deadline(
+    port: u16,
+    payload: &[u8],
+    hard_deadline: Duration,
+) -> Result<Vec<u8>, String> {
+    assert!(!hard_deadline.is_zero(), "run deadline must be positive");
     let url = format!("http://127.0.0.1:{port}/inference");
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
+        .timeout(hard_deadline)
+        .timeout_connect(Duration::from_secs(5).min(hard_deadline))
         .build();
     let response = agent
         .post(&url)
         .set("Connection", "close")
         .send_bytes(payload);
 
-    let mut reader: Box<dyn Read + Send + Sync + 'static> = match response {
-        Ok(resp) => resp.into_reader(),
-        Err(ureq::Error::Status(_, resp)) => resp.into_reader(),
+    let response = match response {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(_, resp)) => resp,
         Err(ureq::Error::Transport(err)) => return Err(format!("request: {err}")),
     };
+    if let Some(content_length) = response.header("Content-Length") {
+        let declared = content_length
+            .parse::<usize>()
+            .map_err(|_| "invalid Content-Length".to_string())?;
+        if declared > MAX_RUN_RESPONSE_BODY {
+            return Err(format!(
+                "response body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
+            ));
+        }
+    }
 
-    let mut body = Vec::new();
+    let mut reader = response
+        .into_reader()
+        .take((MAX_RUN_RESPONSE_BODY + 1) as u64);
+    let mut body = Vec::with_capacity(MAX_RUN_RESPONSE_BODY.min(4096));
     reader
         .read_to_end(&mut body)
         .map_err(|e| format!("read body: {e}"))?;
+    if body.len() > MAX_RUN_RESPONSE_BODY {
+        return Err(format!(
+            "response body exceeds {MAX_RUN_RESPONSE_BODY} bytes"
+        ));
+    }
     Ok(body)
 }
 
@@ -256,5 +284,69 @@ mod tests {
         );
 
         server.join().unwrap();
+    }
+
+    fn serve_response(response: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        port
+    }
+
+    #[test]
+    fn forward_run_accepts_exact_maximum_body() {
+        let body = vec![b'x'; MAX_RUN_RESPONSE_BODY];
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        assert_eq!(
+            forward_run(serve_response(response), b"x").unwrap().len(),
+            MAX_RUN_RESPONSE_BODY
+        );
+    }
+
+    #[test]
+    fn forward_run_rejects_oversized_declared_and_chunked_bodies() {
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RUN_RESPONSE_BODY + 1
+        )
+        .into_bytes();
+        assert!(forward_run(serve_response(declared), b"x")
+            .unwrap_err()
+            .contains("exceeds"));
+
+        let body = vec![b'y'; MAX_RUN_RESPONSE_BODY + 1];
+        let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        chunked.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        chunked.extend_from_slice(&body);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert!(forward_run(serve_response(chunked), b"x")
+            .unwrap_err()
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn forward_run_total_deadline_stops_trickle_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for _ in 0..20 {
+                let _ = stream.write_all(b"1\r\nx\r\n");
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        assert!(forward_run_with_deadline(port, b"x", Duration::from_millis(80)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }

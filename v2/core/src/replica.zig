@@ -1390,29 +1390,31 @@ pub const Replica = struct {
             } });
             return;
         }
-        for (0..self.replica_count) |source_index| {
-            // Local exact entries are consumed directly by advanceSelectedView;
-            // production peer transports intentionally have no self socket.
-            if (source_index == self.replica_id) continue;
-            if (!self.do_vc_received[source_index]) continue;
-            const source_bit = @as(u16, 1) << @intCast(source_index);
-            if (self.selected_sources_attempted & source_bit != 0) continue;
-            const source_dvc = &self.do_vc_msgs[source_index];
-            if (!msg.bitsetGet(&source_dvc.present_bitset, @intCast(op % LOG_SIZE_MAX))) continue;
+        // DVC retention hints are advisory ordering only. If every hinted
+        // source fails exact identity, boundedly try all configured peers.
+        for (0..2) |pass| {
+            for (0..self.replica_count) |source_index| {
+                if (source_index == self.replica_id) continue;
+                const source_bit = @as(u16, 1) << @intCast(source_index);
+                if (self.selected_sources_attempted & source_bit != 0) continue;
+                const hinted = self.do_vc_received[source_index] and
+                    msg.bitsetGet(&self.do_vc_msgs[source_index].present_bitset, @intCast(op % LOG_SIZE_MAX));
+                if ((pass == 0) != hinted) continue;
 
-            self.selected_sources_attempted |= source_bit;
-            self.selected_sources_requested |= source_bit;
-            self.sendTo(@intCast(source_index), .{ .request_prepare = .{
-                .view_number = self.selected_target_view,
-                .op_number = op,
-                .selected_source = self.selected_source,
-                .selected_last_normal_view = self.selected_last_normal_view,
-                .selected_tip_op = self.selected_tip_op,
-                .selected_tip_checksum = self.selected_tip_checksum,
-                .selected_commit_bound = self.selected_commit_bound,
-                .expected_entry_checksum = expected_checksum,
-            } });
-            return;
+                self.selected_sources_attempted |= source_bit;
+                self.selected_sources_requested |= source_bit;
+                self.sendTo(@intCast(source_index), .{ .request_prepare = .{
+                    .view_number = self.selected_target_view,
+                    .op_number = op,
+                    .selected_source = self.selected_source,
+                    .selected_last_normal_view = self.selected_last_normal_view,
+                    .selected_tip_op = self.selected_tip_op,
+                    .selected_tip_checksum = self.selected_tip_checksum,
+                    .selected_commit_bound = self.selected_commit_bound,
+                    .expected_entry_checksum = expected_checksum,
+                } });
+                return;
+            }
         }
     }
 

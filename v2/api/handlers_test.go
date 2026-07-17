@@ -22,6 +22,7 @@ func TestRunStatusesMapToStableMachineReadableErrors(t *testing.T) {
 		{status: RunStatusForwardingFailed, wantHTTP: http.StatusBadGateway, wantReason: "forwarding_failed"},
 		{status: RunStatusNoRunningPod, wantHTTP: http.StatusServiceUnavailable, wantReason: "no_running_pod"},
 		{status: RunStatusUnavailable, wantHTTP: http.StatusServiceUnavailable, wantReason: "unavailable"},
+		{status: RunStatusNotLeader, wantHTTP: http.StatusServiceUnavailable, wantReason: "not_leader"},
 	}
 	for _, tc := range cases {
 		status, reason := runStatusToHTTP(tc.status)

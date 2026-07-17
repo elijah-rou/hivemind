@@ -279,7 +279,7 @@ func runStatusToHTTP(status RunStatus) (int, string) {
 		return http.StatusBadRequest, status.String()
 	case RunStatusResponseTooLarge, RunStatusOutcomeAmbiguous, RunStatusForwardingFailed:
 		return http.StatusBadGateway, status.String()
-	case RunStatusNoRunningPod, RunStatusUnavailable:
+	case RunStatusNoRunningPod, RunStatusUnavailable, RunStatusNotLeader:
 		return http.StatusServiceUnavailable, status.String()
 	default:
 		return http.StatusBadGateway, "unknown_status"
