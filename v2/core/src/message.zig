@@ -379,6 +379,10 @@ pub const RequestStatusMsg = struct {
     view_number: ViewNumber = 0,
 };
 
+pub const RequestStartViewMsg = struct {
+    view_number: ViewNumber = 0,
+};
+
 pub const SendStatusMsg = struct {
     view_number: ViewNumber = 0,
     op_number: OpNumber = 0,
@@ -400,6 +404,7 @@ pub const Tag = enum(u8) {
     send_prepare,
     request_status,
     send_status,
+    request_start_view,
 };
 
 pub const Message = union(Tag) {
@@ -415,6 +420,7 @@ pub const Message = union(Tag) {
     send_prepare: SendPrepareMsg,
     request_status: RequestStatusMsg,
     send_status: SendStatusMsg,
+    request_start_view: RequestStartViewMsg,
 };
 
 // ---------------------------------------------------------------------------
@@ -889,6 +895,7 @@ pub fn deserialize(buf: []const u8) !Message {
         .send_prepare => .{ .send_prepare = try decodeExact(SendPrepareMsg, data) },
         .request_status => .{ .request_status = try decodeExact(RequestStatusMsg, data) },
         .send_status => .{ .send_status = try decodeExact(SendStatusMsg, data) },
+        .request_start_view => .{ .request_start_view = try decodeExact(RequestStartViewMsg, data) },
     };
     try validateDecodedMessage(decoded);
     return decoded;
@@ -944,6 +951,7 @@ fn validateDecodedMessage(decoded: Message) !void {
         .request_prepare,
         .request_status,
         .send_status,
+        .request_start_view,
         => {},
     }
 }
@@ -1027,6 +1035,14 @@ test "source-bound repair round-trip" {
     try std.testing.expectEqual(@as(OpNumber, 24), decoded.request_prepare.selected_tip_op);
     try std.testing.expectEqual(@as(u64, 0xCAFE), decoded.request_prepare.selected_tip_checksum);
     try std.testing.expectEqual(@as(OpNumber, 12), decoded.request_prepare.selected_commit_bound);
+}
+
+test "RequestStartView round-trip" {
+    var buf: [1 + @sizeOf(RequestStartViewMsg)]u8 = undefined;
+    const message = Message{ .request_start_view = .{ .view_number = 17 } };
+    const len = serialize(message, &buf);
+    const decoded = try deserialize(buf[0..len]);
+    try std.testing.expectEqual(@as(ViewNumber, 17), decoded.request_start_view.view_number);
 }
 
 test "StartView certificate round-trip" {

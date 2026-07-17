@@ -116,6 +116,7 @@ pub fn peerMessageSemanticsValid(message: msg.Message) bool {
         .reply,
         .start_view_change,
         .request_status,
+        .request_start_view,
         => true,
     };
 }
@@ -799,6 +800,7 @@ pub const Replica = struct {
             .send_prepare => |m| self.onSendPrepare(from, m),
             .request_status => |m| self.onRequestStatus(from, m),
             .send_status => |m| self.onSendStatus(from, m),
+            .request_start_view => |m| self.onRequestStartView(from, m),
             .reply => {},
         }
     }
@@ -908,31 +910,20 @@ pub const Replica = struct {
             }
         }
 
-        // If we see a Prepare from a higher view, we missed the view change.
+        // Prepare proves only that a leader is active. StartView is the sole
+        // adoption record for a new view and its selected suffix.
         if (prepare.view_number > self.view_number) {
-            self.resetSelectedView();
-            // A higher-view leader may only safely reuse our committed prefix.
-            // Any locally-held uncommitted suffix could be divergent.
-            self.truncateAbove(self.commit_min);
-            self.view_number = prepare.view_number;
-            self.op_number = @max(self.logHighOp(), self.commit_min);
-            self.commit_max = self.commit_min;
+            self.awaitStartView(prepare.view_number);
+            self.requestStartView(prepare.view_number);
+            return;
         }
 
         if (prepare.view_number != self.view_number) return;
-        if (self.isLeader()) return;
-
         if (self.status == .view_change) {
-            // Rejoining via Prepare must discard any uncommitted local suffix.
-            // Preserving entries above our own commit_min can let a stale value
-            // get committed under the new view before the leader repairs us.
-            self.truncateAbove(self.commit_min);
-            self.op_number = @max(self.logHighOp(), self.commit_min);
-            self.commit_max = self.commit_min;
-            self.status = .normal;
-            self.last_normal_view = self.view_number;
-            self.recovered_from_disk = false;
+            self.requestStartView(prepare.view_number);
+            return;
         }
+        if (self.isLeader()) return;
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, prepare.commit_min);
@@ -1047,49 +1038,29 @@ pub const Replica = struct {
 
         const target = @max(commit_msg.commit_min, commit_msg.commit_max);
         const advancing = target > self.commit_min;
-        var preserved_target: ?msg.LogEntry = null;
-        if (advancing) {
-            // Advancing Commit must carry a nonzero checksum that exactly matches
-            // the local target when present. Invalid messages leave state unchanged.
-            if (commit_msg.commit_checksum == 0) return;
-            if (self.journalGet(target)) |target_entry| {
-                if (target_entry.checksum != commit_msg.commit_checksum) return;
-                preserved_target = target_entry.*;
-            }
-        }
+        if (advancing and commit_msg.commit_checksum == 0) return;
 
+        // Commit cannot substitute for the StartView certificate that selected
+        // this view's suffix. A conflicting local speculative target is exactly
+        // why the follower must request the leader's adoption record.
         if (commit_msg.view_number > self.view_number) {
-            self.resetSelectedView();
-            // A higher-view leader may only safely reuse our committed prefix.
-            // Any locally-held uncommitted suffix could be divergent — except a
-            // verified advancing commit target, which must survive to be applied.
-            self.truncateAbove(self.commit_min);
-            self.view_number = commit_msg.view_number;
-            self.op_number = @max(self.logHighOp(), self.commit_min);
-            self.commit_max = self.commit_min;
-            if (preserved_target) |entry| {
-                self.journalPut(entry);
-                self.op_number = @max(self.op_number, entry.op_number);
-            }
+            self.awaitStartView(commit_msg.view_number);
+            self.requestStartView(commit_msg.view_number);
+            return;
         }
 
         if (commit_msg.view_number != self.view_number) return;
-        if (self.isLeader()) return;
-
-        if (self.status == .view_change) {
-            // Rejoining via Commit must discard any uncommitted local suffix.
-            // Otherwise a stale tail can become locally committed before repair.
-            self.truncateAbove(self.commit_min);
-            self.op_number = @max(self.logHighOp(), self.commit_min);
-            self.commit_max = self.commit_min;
-            if (preserved_target) |entry| {
-                self.journalPut(entry);
-                self.op_number = @max(self.op_number, entry.op_number);
+        if (advancing) {
+            // Within an adopted view, advancement remains identity-bound.
+            if (self.journalGet(target)) |target_entry| {
+                if (target_entry.checksum != commit_msg.commit_checksum) return;
             }
-            self.status = .normal;
-            self.last_normal_view = self.view_number;
-            self.recovered_from_disk = false;
         }
+        if (self.status == .view_change) {
+            self.requestStartView(commit_msg.view_number);
+            return;
+        }
+        if (self.isLeader()) return;
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, commit_msg.commit_min);
@@ -1125,6 +1096,26 @@ pub const Replica = struct {
 
     fn initiateViewChange(self: *Replica) void {
         self.initiateViewChangeTo(self.view_number + 1);
+    }
+
+    fn awaitStartView(self: *Replica, new_view: msg.ViewNumber) void {
+        std.debug.assert(new_view > self.view_number);
+        std.debug.assert(!self.pending_start_view.active);
+
+        self.status = .view_change;
+        self.view_number = new_view;
+        self.repair_pending = false;
+        self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
+        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.repair_status_count = 0;
+        self.transfer_pending = false;
+        self.transfer_target_op = 0;
+        self.last_leader_activity = io_mod.nowTick(self.io);
+        self.start_vc_count = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.start_vc_total = 0;
+        self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.do_vc_total = 0;
+        self.resetSelectedView();
     }
 
     fn initiateViewChangeTo(self: *Replica, new_view: msg.ViewNumber) void {
@@ -1250,13 +1241,21 @@ pub const Replica = struct {
             return;
         }
 
-        var selected_index: ?usize = null;
-        var selected_tip_checksum: u64 = 0;
         var max_commit: msg.OpNumber = 0;
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
+            max_commit = @max(max_commit, self.do_vc_msgs[i].commit_min);
+        }
+
+        var selected_index: ?usize = null;
+        var selected_tip_checksum: u64 = 0;
+        for (0..self.replica_count) |i| {
+            if (!self.do_vc_received[i]) continue;
             const candidate = &self.do_vc_msgs[i];
-            max_commit = @max(max_commit, candidate.commit_min);
+            // Once any quorum member exposes a commit watermark, speculative
+            // suffixes from replicas below that watermark cannot outrank it by
+            // carrying a later last_normal_view.
+            if (candidate.commit_min != max_commit) continue;
             const candidate_tip_checksum = dvcEntryChecksum(candidate, candidate.op_number) orelse return;
 
             if (selected_index) |current_index| {
@@ -1500,6 +1499,10 @@ pub const Replica = struct {
             }
         }
 
+        // Volatile journal and metadata must name the same selected tip even if
+        // a subsequent slot, metadata, or sync operation fails.
+        self.op_number = self.selected_tip_op;
+
         self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
@@ -1528,6 +1531,7 @@ pub const Replica = struct {
         std.debug.assert(pending.role != .none);
         std.debug.assert(self.status == .view_change);
         std.debug.assert(self.logHighOp() == pending.op_number);
+        std.debug.assert(self.op_number == pending.op_number);
         std.debug.assert(pending.commit_min >= self.commit_min);
         std.debug.assert(pending.commit_min <= pending.op_number);
         if (pending.op_number > 0) {
@@ -2003,6 +2007,21 @@ pub const Replica = struct {
         }
 
         self.transfer_pending = false;
+    }
+
+    fn requestStartView(self: *Replica, view_number: msg.ViewNumber) void {
+        std.debug.assert(self.status == .view_change);
+        std.debug.assert(self.view_number == view_number);
+        self.sendTo(self.leaderForView(view_number), .{ .request_start_view = .{
+            .view_number = view_number,
+        } });
+    }
+
+    fn onRequestStartView(self: *Replica, from: u8, request: msg.RequestStartViewMsg) void {
+        if (self.status != .normal) return;
+        if (!self.isLeader()) return;
+        if (request.view_number != self.view_number) return;
+        self.sendTo(from, .{ .start_view = self.buildStartView() });
     }
 
     fn onRequestStatus(self: *Replica, from: u8, rs: msg.RequestStatusMsg) void {
@@ -4388,7 +4407,8 @@ test "onCommit advancing requires nonzero checksum and exact local match" {
     try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
     try std.testing.expectEqual(sm_seed_before, sm.seed);
 
-    // Advancing with nonzero but mismatched checksum must leave all state unchanged.
+    // A nonzero higher-view checksum that conflicts with speculative local A
+    // enters view change so StartView can install the leader's committed B.
     replica.onMessage(2, .{ .commit = .{
         .view_number = 2,
         .commit_min = 1,
@@ -4398,7 +4418,7 @@ test "onCommit advancing requires nonzero checksum and exact local match" {
         .commit_checksum = journal_checksum_before ^ 1,
     } });
     try std.testing.expectEqual(msg.Status.view_change, replica.status);
-    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
     try std.testing.expect(replica.journalHas(1));
@@ -4406,8 +4426,8 @@ test "onCommit advancing requires nonzero checksum and exact local match" {
     try std.testing.expectEqual(sm_seed_before, sm.seed);
     try std.testing.expect(!replica.transfer_pending);
 
-    // Matching nonzero checksum advances and may rejoin from view_change,
-    // preserving the verified target across higher-view truncate.
+    // A valid higher-view Commit is not an adoption record. It can move the
+    // follower into view change, but cannot promote or commit its local suffix.
     replica.onMessage(2, .{ .commit = .{
         .view_number = 2,
         .commit_min = 1,
@@ -4416,9 +4436,80 @@ test "onCommit advancing requires nonzero checksum and exact local match" {
         .retention_floor = 0,
         .commit_checksum = journal_checksum_before,
     } });
-    try std.testing.expectEqual(msg.Status.normal, replica.status);
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
     try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
-    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+}
+
+test "higher-view Prepare retains suffix and requests StartView adoption" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0x57A27);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+
+    const leader = tc.replicas[2];
+    const follower = tc.replicas[1];
+    var committed = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 7, .request_id = 1 };
+    committed.checksum = committed.computeChecksum();
+    var speculative = msg.LogEntry{ .view_number = 0, .op_number = 2, .client_id = 7, .request_id = 2, .parent_checksum = committed.checksum };
+    speculative.checksum = speculative.computeChecksum();
+    var proposed = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 8, .request_id = 2, .parent_checksum = committed.checksum };
+    proposed.checksum = proposed.computeChecksum();
+
+    follower.journalPut(committed);
+    follower.journalPut(speculative);
+    follower.op_number = 2;
+    follower.commit_min = 1;
+    follower.commit_max = 1;
+    follower.durable_prepare_op[journalSlot(1)] = 1;
+    follower.durable_prepare_checksum[journalSlot(1)] = committed.checksum;
+
+    leader.status = .normal;
+    leader.view_number = 2;
+    leader.last_normal_view = 2;
+    leader.journalPut(committed);
+    leader.op_number = 1;
+    leader.commit_min = 1;
+    leader.commit_max = 1;
+    leader.selected_source = 2;
+    leader.selected_last_normal_view = 0;
+    leader.selected_tip_op = 1;
+    leader.selected_tip_checksum = committed.checksum;
+    leader.selected_commit_bound = 1;
+    leader.durable_prepare_op[journalSlot(1)] = 1;
+    leader.durable_prepare_checksum[journalSlot(1)] = committed.checksum;
+
+    const request_tag = @intFromEnum(msg.Tag.request_start_view);
+    const before = tc.network.stats.sent[request_tag];
+    tc.deliver(1, 2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 2,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .entry = proposed,
+    } });
+
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), follower.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), follower.op_number);
+    try std.testing.expectEqual(speculative.checksum, follower.journalGet(2).?.checksum);
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[request_tag]);
+
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const start_view_before = tc.network.stats.sent[start_view_tag];
+    leader.onMessage(1, .{ .request_start_view = .{ .view_number = 2 } });
+    try std.testing.expectEqual(start_view_before + 1, tc.network.stats.sent[start_view_tag]);
+    follower.onMessage(2, .{ .start_view = leader.buildStartView() });
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+    follower.tick();
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), follower.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+    try std.testing.expect(!follower.journalHas(2));
 }
 
 test "PrepareOk binds votes to exact entry identity and sender" {

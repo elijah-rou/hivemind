@@ -1403,6 +1403,51 @@ test "follower StartView durable watermark relation table installs only after ba
     }
 }
 
+test "follower StartView slot metadata and sync failures preserve volatile coherence" {
+    inline for (.{ "slot", "metadata", "sync" }, 0..) |fault_kind, case_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0x5AF0 + case_index);
+        defer tc.deinit();
+        const follower = tc.replicas[1];
+        follower.status = .view_change;
+        follower.view_number = 3;
+
+        var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 4, .request_id = 1 };
+        entry.checksum = entry.computeChecksum();
+        var sv = msg.StartViewMsg{
+            .view_number = 3,
+            .selected_last_normal_view = 2,
+            .op_number = 1,
+            .tip_checksum = entry.checksum,
+            .commit_min = 0,
+            .log_entry_count = 1,
+        };
+        sv.log_entries[0] = entry;
+        follower.onMessage(0, .{ .start_view = sv });
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+        try std.testing.expectEqual(follower.op_number, follower.pending_start_view.op_number);
+
+        if (std.mem.eql(u8, fault_kind, "slot")) {
+            tc.disks[1].fail_next_write = true;
+        } else if (std.mem.eql(u8, fault_kind, "metadata")) {
+            for (0..replica_mod.LOG_SIZE_MAX) |slot| follower.journal_dirty[slot] = false;
+            tc.disks[1].fail_next_write = true;
+        } else {
+            tc.disks[1].fail_next_sync = true;
+        }
+
+        const prepare_ok_tag = @intFromEnum(msg.Tag.prepare_ok);
+        const before = tc.network.stats.sent[prepare_ok_tag];
+        follower.tick();
+        try std.testing.expect(follower.storage_failed);
+        try std.testing.expectEqual(msg.Status.view_change, follower.status);
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+        try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
+        try std.testing.expectEqual(before, tc.network.stats.sent[prepare_ok_tag]);
+    }
+}
+
 test "follower fetches omitted StartView tail only from certificate-bound appended leader" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A71);
     defer tc.deinit();
@@ -1865,7 +1910,8 @@ test "view change selects one source chain instead of mixing per-op candidates" 
     try std.testing.expectEqual(start_view_before, tc.network.stats.sent[start_view_tag]);
     try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
     tc.requestWithIdentity(0, 99, 99, .{ .noop = {} });
-    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.op_number);
+    try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
     try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
     try std.testing.expectEqual(a1.checksum, leader.journalGet(1).?.checksum);
     try std.testing.expectEqual(a2.checksum, leader.journalGet(2).?.checksum);
@@ -1878,22 +1924,27 @@ test "view change selects one source chain instead of mixing per-op candidates" 
     try std.testing.expectEqual(start_view_before + 2, tc.network.stats.sent[start_view_tag]);
 }
 
-test "leader StartView write and sync failures publish nothing" {
-    inline for (.{ "write", "sync" }) |fault_kind| {
-        const tc = try TestCluster.init(std.testing.allocator, 3, if (std.mem.eql(u8, fault_kind, "write")) 0xD001 else 0xD002);
+test "leader StartView slot metadata and sync failures preserve volatile coherence" {
+    inline for (.{ "slot", "metadata", "sync" }, 0..) |fault_kind, case_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0xD001 + case_index);
         defer tc.deinit();
         const leader = tc.replicas[0];
         _ = stageTwoEntryLeaderStartView(tc);
         const start_view_tag = @intFromEnum(msg.Tag.start_view);
         const before = tc.network.stats.sent[start_view_tag];
-        if (std.mem.eql(u8, fault_kind, "write")) {
+        if (std.mem.eql(u8, fault_kind, "slot")) {
+            tc.disks[0].fail_next_write = true;
+        } else if (std.mem.eql(u8, fault_kind, "metadata")) {
+            for (0..replica_mod.LOG_SIZE_MAX) |slot| leader.journal_dirty[slot] = false;
             tc.disks[0].fail_next_write = true;
         } else {
             tc.disks[0].fail_next_sync = true;
         }
 
+        try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
         leader.tick();
         try std.testing.expect(leader.storage_failed);
+        try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
         try std.testing.expectEqual(msg.Status.view_change, leader.status);
         try std.testing.expect(leader.pending_start_view.active);
         try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
@@ -1947,6 +1998,8 @@ test "leader StartView crash before sync recovers old state and after sync recov
     defer pre.deinit();
     _ = stageTwoEntryLeaderStartView(pre);
     try std.testing.expect(pre.replicas[0].pending_start_view.active);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), pre.replicas[0].op_number);
+    try std.testing.expectEqual(pre.replicas[0].op_number, pre.replicas[0].pending_start_view.op_number);
     pre.crashReplica(0);
     try std.testing.expectEqual(@as(msg.OpNumber, 0), pre.replicas[0].op_number);
     try std.testing.expect(pre.replicas[0].journalGet(1) == null);
@@ -1959,6 +2012,34 @@ test "leader StartView crash before sync recovers old state and after sync recov
     post.crashReplica(0);
     try std.testing.expectEqual(@as(msg.OpNumber, 2), post.replicas[0].op_number);
     try std.testing.expectEqual(entries[1].checksum, post.replicas[0].journalGet(2).?.checksum);
+}
+
+test "committed suffix outranks later-view speculative suffix" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB17);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var speculative_a = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    speculative_a.checksum = speculative_a.computeChecksum();
+    var committed_b = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
+    committed_b.checksum = committed_b.computeChecksum();
+    try std.testing.expect(speculative_a.checksum != committed_b.checksum);
+
+    var a = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .commit_min = 0, .log_entry_count = 1 };
+    a.log_entries[0] = speculative_a;
+    var b = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+    b.log_entries[0] = committed_b;
+
+    tc.deliver(0, 1, .{ .do_view_change = a });
+    tc.deliver(0, 2, .{ .do_view_change = b });
+
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(@as(u8, 2), leader.pending_start_view.source_replica);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.pending_start_view.commit_min);
+    try std.testing.expectEqual(committed_b.checksum, leader.journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.op_number);
 }
 
 test "one quorum-intersection durable prepare blocks conflicting selected source" {
