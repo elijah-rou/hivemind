@@ -22,8 +22,15 @@ if [[ "${2:-}" == -json ]]; then
   case "$name:$DEPLOY_OUTPUT_SCENARIO" in
     replica_ips:empty) printf '[]\n' ;;
     replica_public_ips:mismatch) printf '["198.51.100.10"]\n' ;;
-    replica_ips:*|replica_ips:valid) printf '["10.0.0.10","10.0.0.11"]\n' ;;
-    replica_public_ips:*|replica_public_ips:valid) printf '["198.51.100.10","198.51.100.11"]\n' ;;
+    replica_ips:empty-element) printf '["","10.0.0.11"]\n' ;;
+    replica_public_ips:host-token) printf '["worker.example","198.51.100.11"]\n' ;;
+    replica_ips:out-of-range) printf '["256.0.0.1","10.0.0.11"]\n' ;;
+    replica_public_ips:option-injection) printf '["-oProxyCommand=bad","198.51.100.11"]\n' ;;
+    replica_ips:whitespace-token) printf '["10.0.0.10 bad","10.0.0.11"]\n' ;;
+    replica_ips:valid-bound) printf '["0.0.0.0","255.255.255.255"]\n' ;;
+    replica_public_ips:valid-bound) printf '["255.255.255.255","0.0.0.0"]\n' ;;
+    replica_ips:*) printf '["10.0.0.10","10.0.0.11"]\n' ;;
+    replica_public_ips:*) printf '["198.51.100.10","198.51.100.11"]\n' ;;
     *) exit 2 ;;
   esac
   exit 0
@@ -32,11 +39,20 @@ fi
 if [[ "$DEPLOY_OUTPUT_SCENARIO" == "raw-failure-$3" ]]; then
   exit 1
 fi
-case "$3" in
-  worker_cpu_ip) printf '10.0.1.10' ;;
-  worker_gpu_ip) printf '10.0.1.11' ;;
-  worker_cpu_public_ip) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.20' ;;
-  worker_gpu_public_ip) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.21' ;;
+case "$3:$DEPLOY_OUTPUT_SCENARIO" in
+  worker_cpu_ip:worker-private-empty) ;;
+  worker_cpu_ip:worker-private-malformed) printf '10.0.1.10 bad' ;;
+  worker_gpu_ip:worker-private-out-of-range) printf '10.0.1.999' ;;
+  worker_cpu_public_ip:worker-public-malformed) printf 'public.example' ;;
+  worker_gpu_public_ip:worker-public-option) printf -- '-oProxyCommand=bad' ;;
+  worker_cpu_ip:valid-bound) printf '0.0.0.0' ;;
+  worker_gpu_ip:valid-bound) printf '255.255.255.255' ;;
+  worker_cpu_public_ip:valid-bound) printf '0.0.0.0' ;;
+  worker_gpu_public_ip:valid-bound) printf '255.255.255.255' ;;
+  worker_cpu_ip:*) printf '10.0.1.10' ;;
+  worker_gpu_ip:*) printf '10.0.1.11' ;;
+  worker_cpu_public_ip:*) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.20' ;;
+  worker_gpu_public_ip:*) [[ "$DEPLOY_OUTPUT_SCENARIO" == empty-public ]] || printf '198.51.100.21' ;;
   *) exit 2 ;;
 esac
 EOF
@@ -91,6 +107,20 @@ run_failure raw-failure-worker_cpu_ip
 run_failure raw-failure-worker_gpu_ip
 run_failure raw-failure-worker_cpu_public_ip
 run_failure raw-failure-worker_gpu_public_ip
+run_failure empty-element
+run_failure host-token
+run_failure out-of-range
+run_failure option-injection
+run_failure whitespace-token
+run_failure worker-private-empty
+run_failure worker-private-malformed
+run_failure worker-private-out-of-range
+run_failure worker-public-malformed
+run_failure worker-public-option
+
+: > "$DEPLOY_MUTATIONS"
+DEPLOY_OUTPUT_SCENARIO=valid-bound bash "$DEPLOY" >"$TMP_DIR/valid-bound.out" 2>&1
+[[ -s "$DEPLOY_MUTATIONS" ]]
 
 : > "$DEPLOY_MUTATIONS"
 DEPLOY_OUTPUT_SCENARIO=empty-public bash "$DEPLOY" >"$TMP_DIR/empty-public.out" 2>&1

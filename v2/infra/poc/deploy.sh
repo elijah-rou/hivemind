@@ -24,12 +24,24 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Connect
 
 capture_terraform_string_array() {
     local output_name="$1" output_file="$2"
-    if ! terraform output -json "$output_name" | jq -r \
-        'if type != "array" then error("expected array") elif any(.[]; type != "string") then error("expected string elements") else .[] end' \
+    if ! terraform output -json "$output_name" | jq -j \
+        'if type != "array" then error("expected array") elif any(.[]; type != "string") then error("expected string elements") else (.[] | ., "\u0000") end' \
         > "$output_file"; then
         echo "FAIL: invalid Terraform output: $output_name" >&2
         return 1
     fi
+}
+
+valid_ipv4() {
+    local address="$1" octet
+    local -a octets=()
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$address"
+    (( ${#octets[@]} == 4 )) || return 1
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
 }
 
 # --- Build Linux binaries ---
@@ -48,8 +60,8 @@ capture_terraform_string_array replica_ips "$terraform_output_dir/replica_ips"
 capture_terraform_string_array replica_public_ips "$terraform_output_dir/replica_public_ips"
 declare -a REPLICA_IPS=()
 declare -a REPLICA_PUBLIC_IPS=()
-mapfile -t REPLICA_IPS < "$terraform_output_dir/replica_ips"
-mapfile -t REPLICA_PUBLIC_IPS < "$terraform_output_dir/replica_public_ips"
+mapfile -d '' -t REPLICA_IPS < "$terraform_output_dir/replica_ips"
+mapfile -d '' -t REPLICA_PUBLIC_IPS < "$terraform_output_dir/replica_public_ips"
 rm -rf "$terraform_output_dir"
 trap - EXIT
 if (( ${#REPLICA_IPS[@]} == 0 )); then
@@ -80,10 +92,30 @@ if ! AGENT_GPU_PUBLIC="$(terraform output -raw worker_gpu_public_ip)"; then
     echo "FAIL: unable to read Terraform output: worker_gpu_public_ip" >&2
     exit 1
 fi
-if [[ -z "$AGENT_CPU_IP" || -z "$AGENT_GPU_IP" ]]; then
-    echo "FAIL: required worker private IP Terraform output is empty" >&2
-    exit 1
-fi
+for address in "${REPLICA_IPS[@]}"; do
+    if ! valid_ipv4 "$address"; then
+        echo "FAIL: invalid replica private IPv4 address: $address" >&2
+        exit 1
+    fi
+done
+for address in "${REPLICA_PUBLIC_IPS[@]}"; do
+    if ! valid_ipv4 "$address"; then
+        echo "FAIL: invalid replica public IPv4 address: $address" >&2
+        exit 1
+    fi
+done
+for address in "$AGENT_CPU_IP" "$AGENT_GPU_IP"; do
+    if ! valid_ipv4 "$address"; then
+        echo "FAIL: invalid required worker private IPv4 address: $address" >&2
+        exit 1
+    fi
+done
+for address in "$AGENT_CPU_PUBLIC" "$AGENT_GPU_PUBLIC"; do
+    if [[ -n "$address" ]] && ! valid_ipv4 "$address"; then
+        echo "FAIL: invalid optional worker public IPv4 address: $address" >&2
+        exit 1
+    fi
+done
 
 REPLICA_COUNT=${#REPLICA_IPS[@]}
 echo "    Replicas: ${REPLICA_IPS[*]}"
