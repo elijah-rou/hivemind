@@ -270,7 +270,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
 - Zig: `330 / 330` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
-- Rust: `153` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Rust: `159` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
@@ -299,7 +299,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Partition blocks queued traffic in both directions; ratio-based drop, one-shot replay, and per-path capacity apply symmetrically. Accepted worker messages and encoded payload bytes contribute to network accounting.
 - Runner convergence requires control-plane-observed registration from every worker and a terminal status for every generated start command; permanent total loss fails liveness. Network and per-tick I/O staging paths retain at most 256 messages per worker, optionally reduced by configured path capacity; control-plane schedule and recorder growth is fail-loud bounded.
 - Named worker scenarios `liveness_probe_two_failures_then_success_resets_counter` and `liveness_probe_three_failures_transition_pod_to_failed` consume bounded scripted runtime outcomes and prove liveness hysteresis, retained runtime/resource ownership after a failed stop, replacement GPU denial, and final `Failed` publication only after verified removal.
-- Named scenarios `mismatched_nonzero_gpu_type_is_rejected_without_accounting_change` and `deterministic_run_outcomes_preserve_identity_bounds_and_accounting` reject mismatched nonzero GPU types and cover `/run` success, response overflow, forwarding failure, timeout, crash/no-running-pod, and partition-healed delivery through the bidirectional simulated network. They assert statuses 0, 4, 6, and 7, exact request identity, bounded bodies, and stable request-path resource accounting.
+- Named scenarios `mismatched_nonzero_gpu_type_is_rejected_without_accounting_change` and `deterministic_run_outcomes_preserve_identity_bounds_and_accounting` reject mismatched nonzero GPU types and cover `/run` success, the exact response boundary, boundary-plus-one wire overflow, scripted forwarding/timeout errors, crash-tick forwarding failure, reconciled no-running-pod, and partition-healed delivery through the bidirectional simulated network. They assert statuses 0, 4, 6, and 7, exact request identity, exactly one ordinary response, bounded wire-semantic bodies, and stable nonzero GPU/CPU/memory accounting until the deliberate crash. Matching running pods are selected by lowest pod ID. The scripted timeout proves status mapping, not virtual deadline progression.
 - Simulation does not prove kernel TCP buffering, partial-frame loss, half-close behavior, reconnect timing, real process scheduling, containerd task-network-namespace behavior, GPU/CDI, or cloud behavior.
 
 ## Codebase Size

@@ -213,12 +213,16 @@ impl Worker {
 
     fn handle_run_request(&self, io: &mut dyn Io, runtime: &dyn Runtime, cmd: RunRequestCmd) {
         // Find a running pod for this deployment.
-        let pod = self.pods.values().find(|p| {
-            p.deployment_id == cmd.deployment_id
-                && p.state == TrackedPodState::Running
-                && p.port > 0
-                && p.handle.is_some()
-        });
+        let pod = self
+            .pods
+            .values()
+            .filter(|pod| {
+                pod.deployment_id == cmd.deployment_id
+                    && pod.state == TrackedPodState::Running
+                    && pod.port > 0
+                    && pod.handle.is_some()
+            })
+            .min_by_key(|pod| pod.pod_id);
 
         match pod {
             Some(pod) => {
@@ -1492,6 +1496,64 @@ mod tests {
             }
             other => panic!("unexpected worker message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_request_selects_lowest_running_pod_id() {
+        let mut worker = Worker::new("node-run-order".into(), GpuType::None, 0, 4000, 8192);
+        let runtime = ForwardingRuntime::new();
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+
+        for pod_id in (1..=32).rev() {
+            worker.pods.insert(
+                pod_id,
+                TrackedPod {
+                    pod_id,
+                    deployment_id: 55,
+                    image: "demo".into(),
+                    entrypoint: String::new(),
+                    state: TrackedPodState::Running,
+                    handle: Some(PodHandle {
+                        pod_id,
+                        container_id: format!("cap-{pod_id}"),
+                    }),
+                    state_changed_at: 0,
+                    gpu_count: 0,
+                    cpu_millicores: 1,
+                    memory_megabytes: 1,
+                    grace_period_ms: 0,
+                    port: 8080,
+                    liveness_path: String::new(),
+                    readiness_path: String::new(),
+                    probe_interval_ms: 10000,
+                    last_probe_tick: 0,
+                    consecutive_failures: 0,
+                    env_vars: Vec::new(),
+                    juicefs_path: String::new(),
+                    image_pull_auth: None,
+                    lifecycle_failures: 0,
+                    lifecycle_retry_after_tick: 0,
+                },
+            );
+        }
+
+        worker.handle_run_request(
+            &mut io,
+            &runtime,
+            RunRequestCmd {
+                request_id: 6,
+                deployment_id: 55,
+                payload: b"ordered".to_vec(),
+            },
+        );
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "cap-1");
     }
 
     #[test]

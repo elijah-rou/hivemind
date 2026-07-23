@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use crate::prng::{Prng, Ratio};
+use crate::protocol::MAX_RUN_RESPONSE_BODY;
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
 
 const PROBE_SCRIPT_MAX: usize = 64;
@@ -17,7 +18,8 @@ pub enum ProbeOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     Echo,
-    ResponseTooLarge,
+    ExactResponseBoundary,
+    ResponseBoundaryOverflow,
     ForwardingFailure,
     Timeout,
 }
@@ -302,9 +304,8 @@ impl Runtime for SimulatedRuntime {
         };
         match outcome {
             RunOutcome::Echo => Ok(payload.to_vec()),
-            RunOutcome::ResponseTooLarge => {
-                Err(RuntimeError::ResponseTooLarge("simulated overflow".into()))
-            }
+            RunOutcome::ExactResponseBoundary => Ok(vec![0x5a; MAX_RUN_RESPONSE_BODY]),
+            RunOutcome::ResponseBoundaryOverflow => Ok(vec![0x6b; MAX_RUN_RESPONSE_BODY + 1]),
             RunOutcome::ForwardingFailure => Err(RuntimeError::Internal(
                 "simulated forwarding failure".into(),
             )),

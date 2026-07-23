@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 
 use crate::message::{ControlMessage, WorkerMessage};
 use crate::prng::{Prng, Ratio};
-use crate::protocol::{encode_agent_message, MAX_FRAME_PAYLOAD};
+use crate::protocol::{
+    encode_agent_message, MAX_FRAME_PAYLOAD, MAX_RUN_RESPONSE_BODY, RUN_STATUS_RESPONSE_TOO_LARGE,
+};
 
 const QUEUE_CAPACITY: usize = 256;
 
@@ -129,6 +131,16 @@ impl SimulatedNetwork {
         let mut payload = [0u8; MAX_FRAME_PAYLOAD];
         let (_, payload_len) = encode_agent_message(&msg, &mut payload)
             .expect("worker simulation must emit encodable messages");
+        let msg = match msg {
+            WorkerMessage::RunResponse(mut response)
+                if response.payload.len() > MAX_RUN_RESPONSE_BODY =>
+            {
+                response.status = RUN_STATUS_RESPONSE_TOO_LARGE;
+                response.payload.clear();
+                WorkerMessage::RunResponse(response)
+            }
+            other => other,
+        };
         let delay = self.min_delay + self.prng.bounded(self.max_delay - self.min_delay + 1);
         queue.push_back(PendingAgent {
             msg,
@@ -253,6 +265,7 @@ impl SimulatedNetwork {
 mod tests {
     use super::*;
     use crate::message::*;
+    use crate::protocol::{MAX_RUN_RESPONSE_BODY, RUN_STATUS_RESPONSE_TOO_LARGE};
     use crate::types::GpuType;
 
     fn test_start_cmd(pod_id: u64) -> ControlMessage {
@@ -338,6 +351,34 @@ mod tests {
         assert_eq!(net.stats.control_sent, 1);
         assert_eq!(net.stats.worker_sent, 1);
         assert!(net.stats.worker_bytes > 0);
+    }
+
+    #[test]
+    fn outbound_run_response_matches_wire_overflow_semantics() {
+        let mut net = SimulatedNetwork::new(1, 0xB4_10);
+        net.min_delay = 1;
+        net.max_delay = 1;
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 44,
+                status: 0,
+                payload: vec![0x5a; MAX_RUN_RESPONSE_BODY + 1],
+            }),
+            0,
+        );
+
+        let delivered = net
+            .pop_outbound(0, 1)
+            .expect("encoded run response must be delivered");
+        match delivered {
+            WorkerMessage::RunResponse(response) => {
+                assert_eq!(response.request_id, 44);
+                assert_eq!(response.status, RUN_STATUS_RESPONSE_TOO_LARGE);
+                assert!(response.payload.is_empty());
+            }
+            other => panic!("unexpected worker message: {other:?}"),
+        }
     }
 
     #[test]

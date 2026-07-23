@@ -44,6 +44,26 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane B4 review remediation
+
+What changed:
+- `/run` simulation now keeps a matching nonzero H100 allocation across every request and refunds it only after the deliberate runtime crash
+- simulated runtime responses exercise the exact body boundary and boundary-plus-one overflow; outbound simulation canonicalizes the queued object to the encoded status-4 empty-body wire result
+- ordinary requests and healed delivery require exactly one matching response, while crash-tick coverage distinguishes forwarding failure before reconciliation from no-running-pod afterward
+- workers select the lowest pod ID when multiple running pods match one deployment
+- timeout wording now states the tested contract precisely: scripted error-to-status mapping, not virtual deadline progression
+
+Why it matters:
+- closes false-positive coverage where GPU accounting stayed zero and the recorder could observe a different response than the wire encoder
+- removes randomized `HashMap` routing from per-pod outcomes and records the crash ordering explicitly
+
+Evidence and limits:
+- RED: `outbound_run_response_matches_wire_overflow_semantics` observed status `0` instead of `4`; `run_request_selects_lowest_running_pod_id` selected pod `8` instead of pod `1`
+- GREEN: `cargo test --all-targets` passed `159` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `17.0s`
+- no real TCP, process forwarding, containerd, GPU/CDI, or cloud boundary ran; duplicate delivery/idempotency and virtual run-deadline simulation remain outside B4
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status was not revalidated
+
 ### 2026-07-23 — Lane B4 GPU admission and deterministic `/run` outcomes
 
 What changed:
