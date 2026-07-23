@@ -334,6 +334,17 @@ pub const RequestQueue = struct {
         return self.occupied_count - self.active_count;
     }
 
+    /// Deterministic harness inspection only. Production dispatch uses the
+    /// O(1) per-worker ownership table directly and never scans it.
+    pub fn busyWorkerCountForTesting(self: *const RequestQueue) usize {
+        var count: usize = 0;
+        for (self.worker_owned_count) |owned| {
+            std.debug.assert(owned <= 1);
+            count += owned;
+        }
+        return count;
+    }
+
     pub fn reset(self: *RequestQueue) void {
         self.* = RequestQueue.init();
     }

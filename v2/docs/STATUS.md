@@ -1,6 +1,6 @@
 # Hivemind Status Report
 
-*Last updated: 2026-07-17*
+*Last updated: 2026-07-23*
 
 
 ## Current Presentation Gate (2026-05-05)
@@ -284,9 +284,12 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
 - Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
+- Seeded ConnectionManager socketpair/fake-clock transition coverage: leader probe, fragmented client frame, client and three worker connections, dispatch, client abandonment, foreign worker response isolation, tombstone expiry, worker disconnect, leader change, and slot reconnect; every transition checks RequestQueue accounting plus exact queue/occupied/client-active/worker-busy/live-connection/counter values
+- Connection metrics count currently connected sockets rather than high-water allocated slots; the deterministic harness proves final agent/client gauges `1`/`2` and queue/in-flight/enqueued/dispatched/resolved values `0`/`0`/`1`/`1`/`1`
 - Cross-region gossip propagation
 - Gossip under network partitions
 - Deterministic federated locality selector proof inputs (`same-locality-best`, `same-locality-failover`, `cross-locality-fallback`, `residency-restricted`)
+- Connection harness limit: AF_UNIX socketpairs exercise kernel stream buffering and partial inbound client frames with a deterministic logical poll clock, but do not model real TCP connect/listen timing, packet loss, encryption fragmentation, short nonblocking writes, or process scheduling
 
 ## Codebase Size
 

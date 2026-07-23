@@ -199,6 +199,91 @@ pub const ConnectionManager = struct {
         if (self.peer_listen_fd >= 0) _ = libc.close(self.peer_listen_fd);
     }
 
+    /// Initialize without listeners for deterministic socketpair tests.
+    pub fn initForTesting(self: *ConnectionManager, replica: *replica_mod.Replica) void {
+        initTestConnectionManager(self, replica);
+    }
+
+    pub fn deinitForTesting(self: *ConnectionManager) void {
+        for (&self.workers) |*worker| self.disconnectWorker(worker);
+        for (&self.clients) |*client| self.disconnectClient(client);
+        for (&self.peers) |*peer| disconnectPeer(peer);
+    }
+
+    pub fn attachClientForTesting(self: *ConnectionManager, fd: c_int, client_id: u128) !usize {
+        std.debug.assert(fd >= 0);
+        try setNonBlocking(fd);
+        for (0..self.client_count) |index| {
+            if (self.clients[index].connected or self.clients[index].fd >= 0) continue;
+            self.clients[index] = .{ .fd = fd, .connected = true, .client_id = client_id };
+            return index;
+        }
+        if (self.client_count >= MAX_CLIENTS) return error.NoClientSlots;
+        const index = self.client_count;
+        self.client_count += 1;
+        self.clients[index] = .{ .fd = fd, .connected = true, .client_id = client_id };
+        return index;
+    }
+
+    pub fn attachWorkerForTesting(self: *ConnectionManager, fd: c_int) !usize {
+        std.debug.assert(fd >= 0);
+        try setNonBlocking(fd);
+        for (0..self.worker_count) |index| {
+            if (self.workers[index].connected or self.workers[index].fd >= 0) continue;
+            self.workers[index] = .{ .fd = fd, .connected = true, .worker_idx = index };
+            return index;
+        }
+        if (self.worker_count >= MAX_WORKERS) return error.NoWorkerSlots;
+        const index = self.worker_count;
+        self.worker_count += 1;
+        self.workers[index] = .{ .fd = fd, .connected = true, .worker_idx = index };
+        return index;
+    }
+
+    pub fn readClientsForTesting(self: *ConnectionManager) void {
+        self.readClients();
+    }
+
+    pub fn readWorkersForTesting(self: *ConnectionManager) void {
+        self.readWorkers();
+    }
+
+    pub fn disconnectClientForTesting(self: *ConnectionManager, client_index: usize) void {
+        std.debug.assert(client_index < self.client_count);
+        self.disconnectClient(&self.clients[client_index]);
+    }
+
+    pub fn disconnectWorkerForTesting(self: *ConnectionManager, worker_index: usize) void {
+        std.debug.assert(worker_index < self.worker_count);
+        self.disconnectWorker(&self.workers[worker_index]);
+    }
+
+    pub fn expireAbandonedForTesting(self: *ConnectionManager) void {
+        self.disconnectExpiredAbandonedWorkers();
+    }
+
+    pub fn connectedWorkerCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.workers[0..self.worker_count]) |worker| count += @intFromBool(worker.connected);
+        return count;
+    }
+
+    pub fn connectedClientCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.clients[0..self.client_count]) |client| count += @intFromBool(client.connected);
+        return count;
+    }
+
+    pub fn connectedPeerCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.peers[0..self.peer_count]) |peer| count += @intFromBool(peer.connected);
+        return count;
+    }
+
+    pub fn setNonBlockingForTesting(fd: c_int) !void {
+        try setNonBlocking(fd);
+    }
+
     /// Poll all connections: accept new, read messages, dispatch.
     pub fn poll(self: *ConnectionManager) void {
         self.poll_count += 1;

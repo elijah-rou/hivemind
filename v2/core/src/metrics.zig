@@ -36,6 +36,7 @@ const InitSyscalls = struct {
 };
 
 const BUF_SIZE = 65536;
+pub const BUF_SIZE_FOR_TESTING = BUF_SIZE;
 const REQUEST_SIZE_MAX = 1024;
 const RESPONSE_SIZE_MAX = BUF_SIZE + 256;
 const CLIENT_COUNT_MAX = 8;
@@ -324,9 +325,9 @@ pub const MetricsServer = struct {
         if (self.connection_mgr) |cm| {
             pos += write(buf, pos, "# HELP hivemind_connections Connected sockets by type\n");
             pos += write(buf, pos, "# TYPE hivemind_connections gauge\n");
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"agents\"}} {d}\n", .{cm.worker_count});
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"clients\"}} {d}\n", .{cm.client_count});
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"peers\"}} {d}\n", .{cm.peer_count});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"agents\"}} {d}\n", .{cm.connectedWorkerCount()});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"clients\"}} {d}\n", .{cm.connectedClientCount()});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"peers\"}} {d}\n", .{cm.connectedPeerCount()});
             var identified_peers: usize = 0;
             for (cm.peers[0..cm.peer_count]) |peer| {
                 if (peer.connected and peer.peer_id_known) identified_peers += 1;
@@ -417,6 +418,10 @@ pub const MetricsServer = struct {
         }
 
         return pos;
+    }
+
+    pub fn formatMetricsForTesting(self: *MetricsServer, buf: *[BUF_SIZE]u8) usize {
+        return self.formatMetrics(buf);
     }
 
     const CapacitySummary = struct {

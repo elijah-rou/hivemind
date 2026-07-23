@@ -44,6 +44,24 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane A4 deterministic ConnectionManager transitions
+
+What changed:
+- added a seeded, bounded AF_UNIX socketpair harness using the simulated replica clock and ConnectionManager logical poll clock
+- the fixed transition sequence covers a fragmented leader probe, client and three worker connections, a fragmented run request, dispatch, client abandonment, a foreign worker response, tombstone expiry, an explicit remaining-worker disconnect, leader change, and worker/client slot reconnect
+- every transition calls `RequestQueue.assertAccountingInvariants()` and asserts exact queue depth, occupied correlations, client-active correlations, busy workers, live client/worker connections, and enqueue/dispatch/resolve counters
+- final Prometheus assertions prove live connection gauges and queue counters exactly; connection gauges now count connected sockets rather than allocated-slot high-water marks
+
+Why it matters:
+- exercises the leader-local `/run` correlation and abandonment lifecycle through real stream framing instead of only RequestQueue calls
+- proves a foreign response cannot consume another worker's tombstone and that expiry releases ownership before slot reuse
+
+Evidence and limits:
+- focused deterministic seed `0xA4C011EC7100` passes in the core test suite
+- partial inbound framing is covered before the probe header completes, immediately before the run frame completes, and immediately before a foreign worker response completes
+- socketpairs exercise kernel stream buffering, not real TCP connect/listen timing; packet loss, encrypted-frame fragmentation, forced short writes, and process scheduling remain outside this harness
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
 ### 2026-07-23 — Lane A3 durability-cut review remediation
 
 What changed:
