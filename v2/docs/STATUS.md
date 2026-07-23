@@ -269,7 +269,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
-- Zig: `329 / 329` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
+- Zig: `330 / 330` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
 - Rust: `128` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
@@ -280,7 +280,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 **VOPR simulation coverage:**
 - VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state
-- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled); explicit coalesced barrier causes let deterministic cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication, with consumed scheduled cuts emitted once in JSONL traces
+- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled); explicit coalesced barrier causes let deterministic cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication, with consumed scheduled cuts emitted once in JSONL traces after safety- and liveness-phase ticks
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
 - Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps

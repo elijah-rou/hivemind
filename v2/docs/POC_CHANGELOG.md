@@ -57,7 +57,7 @@ Why it matters:
 - proves a foreign response cannot consume another worker's tombstone and that expiry releases ownership before slot reuse
 
 Evidence and limits:
-- focused deterministic seed `0xA4C011EC7100` passes as part of `329 / 329` core tests in Debug and ReleaseFast
+- focused deterministic seed `0xA4C011EC7100` passes as part of `330 / 330` core tests in Debug and ReleaseFast
 - partial inbound framing is covered before the probe header completes, immediately before the run frame completes, and immediately before a foreign worker response completes
 - socketpairs exercise kernel stream buffering, not real TCP connect/listen timing; packet loss, encrypted-frame fragmentation, forced short writes, and process scheduling remain outside this harness
 - POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
@@ -66,7 +66,7 @@ Evidence and limits:
 
 What changed:
 - normal group-commit barriers now retain explicit pending Prepare and Commit causes, so a combined follower Prepare+Commit barrier can consume either selected cut and unrelated idle metadata flushes cannot consume Commit cuts
-- traced VOPR runs can schedule deterministic message or barrier cuts and emit exactly one identified JSONL event when each cut is consumed
+- traced VOPR runs can schedule deterministic message or barrier cuts and emit exactly one identified JSONL event when each cut is consumed, including cuts first consumed during the healed liveness phase
 - the four-boundary cut tables now assert relevant Prepare, PrepareOk, SendStatus, StartView, and client publication counters plus complete recovered metadata and entry identity
 - the five-replica repair scenario enforces the candidate deadline in simulated milliseconds and crash-recovers the complete repaired chain; random sync-fault coverage stages both slot and metadata state before proving whole-operation failure and retry
 

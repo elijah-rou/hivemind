@@ -371,6 +371,95 @@ test "traced scheduled barrier cut emits one identified event" {
     try std.testing.expectEqual(@as(usize, 1), cut_events);
 }
 
+test "traced scheduled cuts consumed during liveness emit identified events" {
+    const collector = try std.testing.allocator.create(TraceCollector);
+    collector.initInPlace(3);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    const drop = ScheduledDropNext{
+        .id = 0xA3D012,
+        .from = 0,
+        .to = 1,
+        .tag = .prepare,
+    };
+    const cut = replica_mod.BarrierCut{
+        .id = 0xA3C012,
+        .kind = .prepare,
+        .point = .before_sync,
+    };
+    _ = try run_traced_collected(std.testing.allocator, .{
+        .seed = 0xA3C012,
+        .replica_count = 3,
+        .safety_ticks = 0,
+        .request_count = 0,
+        .liveness_ticks = 200,
+        .partition_probability = Ratio.zero(),
+        .heal_probability = Ratio.zero(),
+        .deployment_count = 1,
+        .scheduled_drop_next = drop,
+        .scheduled_barrier_cut = .{ .replica = 2, .cut = cut },
+    }, collector);
+
+    var drop_events: usize = 0;
+    var cut_events: usize = 0;
+    for (collector.events[0..collector.count]) |event| {
+        switch (event.kind) {
+            .drop_next => |observed| {
+                drop_events += 1;
+                try std.testing.expectEqual(drop.id, observed.id);
+                try std.testing.expectEqual(drop.from, observed.from);
+                try std.testing.expectEqual(drop.to, observed.to);
+                try std.testing.expectEqual(@intFromEnum(drop.tag), observed.tag);
+            },
+            .barrier_cut => |observed| {
+                cut_events += 1;
+                try std.testing.expectEqual(@as(u8, 2), observed.replica);
+                try std.testing.expectEqual(cut.id, observed.id);
+                try std.testing.expectEqual(cut.kind, observed.kind);
+                try std.testing.expectEqual(cut.point, observed.point);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), drop_events);
+    try std.testing.expectEqual(@as(usize, 1), cut_events);
+}
+
+fn observeScheduledCuts(
+    tc: *const TestCluster,
+    config: VoprConfig,
+    collector: ?*TraceCollector,
+    tick: u64,
+    observed_drop_next_count: *u64,
+    observed_barrier_cut_count: *[msg.REPLICA_COUNT_MAX]u64,
+) void {
+    const c = collector orelse return;
+
+    if (tc.network.drop_next_count > observed_drop_next_count.*) {
+        std.debug.assert(tc.network.drop_next_count == observed_drop_next_count.* + 1);
+        const scheduled = config.scheduled_drop_next orelse unreachable;
+        std.debug.assert(tc.network.last_drop_next_id == scheduled.id);
+        std.debug.assert(tc.network.last_drop_next_from == scheduled.from);
+        std.debug.assert(tc.network.last_drop_next_to == scheduled.to);
+        std.debug.assert(tc.network.last_drop_next_tag == @intFromEnum(scheduled.tag));
+        c.addDropNext(tick, tc.network.drop_next_count, scheduled.id, scheduled.from, scheduled.to, @intFromEnum(scheduled.tag));
+        observed_drop_next_count.* = tc.network.drop_next_count;
+    }
+
+    for (0..config.replica_count) |i| {
+        if (tc.replicas[i].barrier_cut_count <= observed_barrier_cut_count[i]) continue;
+        std.debug.assert(tc.replicas[i].barrier_cut_count == observed_barrier_cut_count[i] + 1);
+        const scheduled = config.scheduled_barrier_cut orelse unreachable;
+        std.debug.assert(scheduled.replica == i);
+        std.debug.assert(tc.replicas[i].last_barrier_cut_id == scheduled.cut.id);
+        c.addBarrierCut(tick, @intCast(i), scheduled.cut);
+        observed_barrier_cut_count[i] = tc.replicas[i].barrier_cut_count;
+    }
+}
+
 fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, collector: ?*TraceCollector) !VoprResult {
     var prng = Prng.init(config.seed +% 0xF00D);
 
@@ -525,22 +614,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         }
 
         tc.tick();
-        if (collector) |c| {
-            if (tc.network.drop_next_count > observed_drop_next_count) {
-                std.debug.assert(tc.network.drop_next_count == observed_drop_next_count + 1);
-                c.addDropNext(tick_count, tc.network.drop_next_count, tc.network.last_drop_next_id, tc.network.last_drop_next_from, tc.network.last_drop_next_to, tc.network.last_drop_next_tag);
-                observed_drop_next_count = tc.network.drop_next_count;
-            }
-            for (0..config.replica_count) |i| {
-                if (tc.replicas[i].barrier_cut_count <= observed_barrier_cut_count[i]) continue;
-                std.debug.assert(tc.replicas[i].barrier_cut_count == observed_barrier_cut_count[i] + 1);
-                const scheduled = config.scheduled_barrier_cut orelse unreachable;
-                std.debug.assert(scheduled.replica == i);
-                std.debug.assert(tc.replicas[i].last_barrier_cut_id == scheduled.cut.id);
-                c.addBarrierCut(tick_count, @intCast(i), scheduled.cut);
-                observed_barrier_cut_count[i] = tc.replicas[i].barrier_cut_count;
-            }
-        }
+        observeScheduledCuts(tc, config, collector, tick_count, &observed_drop_next_count, &observed_barrier_cut_count);
         tc.restartStorageFailed();
         tc.tickWorkers();
 
@@ -588,6 +662,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
 
     while (tick_count < config.liveness_ticks) : (tick_count += 1) {
         tc.tick();
+        observeScheduledCuts(tc, config, collector, config.safety_ticks + tick_count, &observed_drop_next_count, &observed_barrier_cut_count);
         tc.restartStorageFailed();
         tc.tickWorkers();
         phase2_ticks = tick_count + 1;
