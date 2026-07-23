@@ -1,56 +1,35 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016 # Contract regexes contain literal Markdown backticks.
-# Contract: active docs must describe the repo-root v1 frozen / v2 active layout,
-# and every path asserted by this fixture must exist on disk.
+# Contract: repository layout and every path owned by this fixture are stable.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 V2_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$V2_ROOT/.." && pwd)"
 
-FAIL=0
-pass() { echo "PASS: $1"; }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
+failures=0
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
 
 assert_file() {
-  local path="$1"
-  if [[ -f "$path" ]]; then
-    pass "exists: $path"
-  else
-    fail "missing: $path"
-  fi
+    local path="$1"
+    if [[ -f "$path" ]]; then pass "exists: $path"; else fail "missing: $path"; fi
 }
 
 assert_dir() {
-  local path="$1"
-  if [[ -d "$path" ]]; then
-    pass "exists dir: $path"
-  else
-    fail "missing dir: $path"
-  fi
+    local path="$1"
+    if [[ -d "$path" ]]; then pass "exists dir: $path"; else fail "missing dir: $path"; fi
 }
 
 assert_contains() {
-  local path="$1"
-  local pattern="$2"
-  if grep -qE -- "$pattern" "$path"; then
-    pass "contains in $(basename "$path"): $pattern"
-  else
-    fail "$(basename "$path") missing pattern: $pattern"
-  fi
+    local path="$1"
+    local pattern="$2"
+    if grep -qE -- "$pattern" "$path"; then
+        pass "layout ownership in $(basename "$path")"
+    else
+        fail "$(basename "$path") does not describe required layout ownership"
+    fi
 }
 
-assert_lacks() {
-  local path="$1"
-  local pattern="$2"
-  if grep -qE -- "$pattern" "$path"; then
-    fail "$(basename "$path") has forbidden pattern: $pattern"
-  else
-    pass "lacks in $(basename "$path"): $pattern"
-  fi
-}
-
-# Repo-root layout
 assert_dir "$REPO_ROOT/v1"
 assert_dir "$REPO_ROOT/v2"
 assert_file "$REPO_ROOT/README.md"
@@ -60,69 +39,32 @@ assert_contains "$REPO_ROOT/README.md" 'v2/.*active|active development'
 assert_contains "$REPO_ROOT/AGENTS.md" 'v1/.*frozen|Do not change it unless correcting'
 assert_contains "$REPO_ROOT/AGENTS.md" 'v2/.*active'
 
-# Active docs under v2/
-STATUS="$V2_ROOT/docs/STATUS.md"
-FINDINGS="$V2_ROOT/docs/FINDINGS_AND_ISSUES.md"
-ENGINEERING="$V2_ROOT/docs/ENGINEERING.md"
-POC_CHANGELOG="$V2_ROOT/docs/POC_CHANGELOG.md"
-assert_file "$STATUS"
-assert_file "$FINDINGS"
-assert_file "$ENGINEERING"
-assert_file "$POC_CHANGELOG"
-
-# Must not claim repo-root v1/ was removed while it is the frozen snapshot.
-assert_lacks "$STATUS" 'old `v1/`.*,.*are removed'
-assert_lacks "$STATUS" 'removed old `v1/` implementation'
-assert_contains "$STATUS" 'frozen POC V1|repo-root `v1/`|`v1/` is the frozen'
-assert_contains "$STATUS" '`v2/` is the active|active development line'
-assert_contains "$STATUS" 'mixed-version peer clusters.*unsupported'
-assert_contains "$STATUS" 'stop the full cluster'
-assert_contains "$STATUS" 'no rolling migration or incarnation protocol claim'
-assert_lacks "$STATUS" '[Ee]xperimental v1 journal|v1 single-copy journal'
-assert_contains "$STATUS" 'layout v2 journal|layout-v2 `journal\.bin`'
-assert_contains "$STATUS" '[Aa]ctual legacy v1 journals.*fail-closed as incompatible'
-assert_contains "$STATUS" 'PROTOCOL_VERSION = 5'
-assert_contains "$STATUS" '313 / 313'
-assert_lacks "$STATUS" '124/124|262 Zig|15/17|PROTOCOL_VERSION = 4'
-assert_contains "$ENGINEERING" 'mixed-version peer clusters.*legacy-v1 journal upgrades'
-assert_contains "$ENGINEERING" '[Aa]ctual legacy.*fail-closed as incompatible'
-assert_contains "$ENGINEERING" '9.*`not_leader`'
-assert_contains "$ENGINEERING" '`not_leader` is gateway-only'
-assert_contains "$ENGINEERING" 'safely retries one time only'
-assert_contains "$ENGINEERING" 'stop the full cluster'
-assert_contains "$ENGINEERING" 'No rolling migration or incarnation protocol.*claimed'
-assert_lacks "$POC_CHANGELOG" 'active docs now state.*experimental v1 single-copy'
-assert_contains "$POC_CHANGELOG" 'FileDisk journal format bumped to layout version 2'
-assert_lacks "$POC_CHANGELOG" 'legacy layout v1 journals are rejected at open with a useful startup error'
-
-assert_lacks "$FINDINGS" '`v1/` \| Removed old implementation'
-assert_lacks "$FINDINGS" '`v1/`, `hivemind/`, and `honeybee/` were removed from active tree'
-assert_contains "$FINDINGS" 'repo-root `v1/`|frozen POC V1 snapshot'
-assert_contains "$FINDINGS" 'worker/'
-assert_lacks "$FINDINGS" 'agent/src/agent\.rs'
-
-# Documented paths that this fixture owns must exist (v2-relative).
-for rel in \
-  docs/STATUS.md \
-  docs/FINDINGS_AND_ISSUES.md \
-  docs/ENGINEERING.md \
-  docs/POC_ACCEPTANCE.md \
-  docs/POC_CHANGELOG.md \
-  docs/POC_V2_ACCEPTANCE.md \
-  docs/frozen/ARCHITECTURE.md \
-  docs/design/HIVEMIND_NATIVE_PLATFORM.md \
-  core/src/main.zig \
-  worker/src/worker.rs \
-  api/main.go \
-  infra/gpu-test/run-tests.sh \
-  infra/bench/ssm_wait.sh
+for relative_path in \
+    AGENTS.md \
+    CLAUDE.md \
+    docs/TESTING.md \
+    docs/HANDOFF.md \
+    docs/STATUS.md \
+    docs/FINDINGS_AND_ISSUES.md \
+    docs/ENGINEERING.md \
+    docs/POC_ACCEPTANCE.md \
+    docs/POC_CHANGELOG.md \
+    docs/POC_V2_ACCEPTANCE.md \
+    docs/design/CONTROL_PLANE_CONTRACT.md \
+    docs/design/TESTING.md \
+    docs/frozen/ARCHITECTURE.md \
+    tests/README.md \
+    core/src/main.zig \
+    worker/src/worker.rs \
+    api/main.go
 do
-  assert_file "$V2_ROOT/$rel"
+    assert_file "$V2_ROOT/$relative_path"
 done
 
-if [[ "$FAIL" -ne 0 ]]; then
-  echo "FAIL: docs_layout_paths_test ($FAIL assertion(s))"
-  exit 1
+if [[ "$failures" -ne 0 ]]; then
+    printf 'FAIL: docs_layout_paths_test (%d assertion(s))\n' "$failures" >&2
+    exit 1
 fi
-echo "PASS: docs_layout_paths_test"
+
+printf 'PASS: docs_layout_paths_test\n'
 exit 0

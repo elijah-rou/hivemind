@@ -1,71 +1,33 @@
-# Hivemind Local Agent Rules
+# Hivemind v2 contributor rules
 
-Read this file before implementation work in this repo.
+Read this file before implementation work. Read [docs/TESTING.md](docs/TESTING.md) before changing control-plane, worker, wire, E2E, or infrastructure behavior. Script operation belongs in [tests/README.md](tests/README.md); handoffs use [docs/HANDOFF.md](docs/HANDOFF.md).
 
-## Mandatory simulation rule
+## Simulation-first
 
-This repo is **simulation-first**.
+Simulation is mandatory, not optional polish.
 
-If a change affects the Hivemind cluster / control plane and is representable in simulation, it **must** be covered in the Zig VOPR simulation or related deterministic cluster tests.
+- Control-plane, replica, scheduler, gossip, recovery, liveness, and failover behavior representable in simulation requires a named Zig `core/src/vopr/` scenario.
+- Worker lifecycle, runtime, registration, heartbeat, pod state, forwarding, and failure behavior representable in simulation requires a named Rust `worker/src/sim/` scenario.
+- Every behavior change names its deterministic scenario, not merely a test file.
+- Real-infrastructure glue still requires the nearest deterministic coverage and an explicit reason the remaining boundary cannot be simulated.
 
-If a change affects the Rust agent and is representable in simulation, it **must** be covered in the agent's deterministic simulation/runtime tests.
+For E2E-relevant changes, state which real boundary is covered: process, socket, filesystem, kernel/containerd, GPU, or cloud. Local process evidence is not containerd or live evidence.
 
-Do not treat simulation as optional polish. It is part of the implementation.
+## Wire and evidence
 
-## Required mapping
+Wire changes update Zig, Rust, Go API, and Go bench consumers together, plus the shared fixture corpus when available. Until that corpus exists, record it as unavailable rather than implying a shared contract gate ran.
 
-- **Control plane / replica / scheduler / gossip / recovery / liveness / failover** changes → add or extend **`core/src/vopr/`** coverage when applicable.
-- **Agent lifecycle / runtime / registration / heartbeats / pod state / request forwarding / failures** changes → add or extend **`worker/src/sim/`** coverage when applicable.
-- **Pure wire format changes** → add cross-language/unit coverage on both sides and simulation coverage if behavior changes at runtime.
-- **Real infra-only glue** that cannot be simulated → still add the nearest deterministic unit/integration test possible and document why simulation is not applicable.
+Record every skipped capability explicitly. This includes `--skip-containerd`, Docker-missing containerd auto-skip, `--skip-smoke`, and unavailable live execution. A skip is not a pass.
 
-## Default workflow
+POC handoffs must include a fresh live-resource inventory and current `up`, `destroyed`, or `mixed` state. If inventory was not checked, mark current state blocked and keep any last-known state explicitly historical.
 
-1. Read `docs/STATUS.md`, `docs/FINDINGS_AND_ISSUES.md`, `docs/ENGINEERING.md`.
-2. For POC-facing work, also read `docs/POC_ACCEPTANCE.md` and `docs/POC_CHANGELOG.md`.
-3. Identify whether the change belongs to:
-   - Hivemind cluster simulation
-   - Worker simulation
-   - both
-4. Add failing deterministic test/sim coverage first where practical.
-5. Implement.
-6. Re-run relevant Zig/Rust/Go tests.
-7. Update docs when behavior, scope, or POC readiness changed.
-8. If the work affects the POC, update `docs/POC_CHANGELOG.md` in the same change.
+## Workflow
 
-## POC rule
+1. Read `docs/STATUS.md`, `docs/FINDINGS_AND_ISSUES.md`, and `docs/ENGINEERING.md`.
+2. Identify control-plane, worker, wire, and real-boundary coverage.
+3. Add failing deterministic coverage first where practical; implement; run focused then broader gates.
+4. Update documentation when behavior, evidence, scope, or POC readiness changes.
+5. For POC-facing work, update `docs/POC_CHANGELOG.md` with date, what/why, concrete acceptance progress, next actions, blockers, explicit skips, and live state.
+6. Complete `docs/HANDOFF.md` without mutable totals, temporary paths, or commit hashes in this rules file.
 
-Goal is a **real workload POC**, not a production launch. But any claim that the system "works" should be backed by deterministic simulation when the behavior is simulatable.
-
-## POC progress tracking
-
-When work changes the POC plan, acceptance status, infra readiness, locality/routing design, or evidence state, update `docs/POC_CHANGELOG.md`.
-
-Each meaningful entry should record at least:
-
-- date
-- what changed
-- why it matters for the POC
-- current acceptance progress using concrete counts, not hand-wavy percentages
-  - preferred: completed acceptance sections / total sections
-  - optional: completed execution steps / total execution steps
-- next 1-3 concrete steps
-- current blocker(s) or unknowns
-- live infra status (`up`, `destroyed`, or `mixed`)
-
-Do not invent fake certainty. If progress cannot be quantified cleanly, state why.
-
-## Current priority
-
-Prefer work that moves the project toward a real workload POC **and** can be validated in simulation:
-
-1. reconnect / stale-node handling
-2. containerd run/probe/request path correctness
-3. `/run` response contract cleanup
-4. auth / TLS slices that can be exercised deterministically
-5. richer app spec model
-
-## Notes
-
-- Repo has `CLAUDE.md`; this file is the repo-local equivalent for implementation discipline.
-- If a proposed change cannot be reflected in simulation, say so explicitly before coding.
+`v1/` at repository root is frozen. Active work belongs under `v2/`.
