@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::message::{ControlMessage, WorkerMessage};
-use crate::prng::Prng;
+use crate::prng::{Prng, Ratio};
+use crate::protocol::{encode_agent_message, MAX_FRAME_PAYLOAD};
 
 const QUEUE_CAPACITY: usize = 256;
 
@@ -41,10 +42,10 @@ pub struct SimulatedNetwork {
     prng: Prng,
     pub min_delay: u64,
     pub max_delay: u64,
-    pub drop_rate_percent: u8,
+    pub drop_rate: Ratio,
 
     // Packet replay: probability of re-queueing a delivered message
-    pub replay_percent: u8,
+    pub replay_rate: Ratio,
 
     // Path clogging: max in-flight per worker (0=unlimited)
     pub path_max_capacity: usize,
@@ -79,8 +80,8 @@ impl SimulatedNetwork {
             prng: Prng::init(seed.wrapping_add(0xBEEF)),
             min_delay: 1,
             max_delay: 5,
-            drop_rate_percent: 0,
-            replay_percent: 0,
+            drop_rate: Ratio::zero(),
+            replay_rate: Ratio::zero(),
             path_max_capacity: 0,
             partition_stable_until,
             heal_stable_until: 0,
@@ -91,60 +92,103 @@ impl SimulatedNetwork {
     }
 
     pub fn send_to_agent(&mut self, agent_id: usize, msg: ControlMessage, current_tick: u64) {
-        if self.partitioned[agent_id] {
-            return;
-        }
-        if self.drop_rate_percent > 0 && self.prng.chance(self.drop_rate_percent) {
+        assert!(agent_id < self.inbound.len());
+        assert!(self.min_delay <= self.max_delay);
+        if self.prng.chance_ratio(self.drop_rate) {
             return;
         }
 
-        // Path clogging
-        if self.path_max_capacity > 0 {
-            let queue = &self.inbound[agent_id];
-            if queue.len() >= self.path_max_capacity {
-                return;
-            }
+        let queue = &mut self.inbound[agent_id];
+        if queue.len() >= Self::queue_capacity(self.path_max_capacity) {
+            return;
         }
 
         let delay = self.min_delay + self.prng.bounded(self.max_delay - self.min_delay + 1);
-        let queue = &mut self.inbound[agent_id];
-        if queue.len() < QUEUE_CAPACITY {
-            queue.push_back(PendingControl {
-                msg,
-                deliver_at_tick: current_tick + delay,
-            });
-            self.stats.control_sent += 1;
-        }
+        queue.push_back(PendingControl {
+            msg,
+            deliver_at_tick: current_tick + delay,
+        });
+        self.stats.control_sent += 1;
     }
 
     pub fn send_from_agent(&mut self, agent_id: usize, msg: WorkerMessage, current_tick: u64) {
-        if self.partitioned[agent_id] {
-            return;
-        }
-        if self.drop_rate_percent > 0 && self.prng.chance(self.drop_rate_percent) {
+        assert!(agent_id < self.outbound.len());
+        assert!(self.min_delay <= self.max_delay);
+        if self.prng.chance_ratio(self.drop_rate) {
             return;
         }
 
-        let delay = self.min_delay + self.prng.bounded(self.max_delay - self.min_delay + 1);
         let queue = &mut self.outbound[agent_id];
-        if queue.len() < QUEUE_CAPACITY {
-            queue.push_back(PendingAgent {
-                msg,
-                deliver_at_tick: current_tick + delay,
-            });
+        if queue.len() >= Self::queue_capacity(self.path_max_capacity) {
+            return;
         }
+
+        let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+        let (_, payload_len) = encode_agent_message(&msg, &mut payload)
+            .expect("worker simulation must emit encodable messages");
+        let delay = self.min_delay + self.prng.bounded(self.max_delay - self.min_delay + 1);
+        queue.push_back(PendingAgent {
+            msg,
+            deliver_at_tick: current_tick + delay,
+        });
+        self.stats.worker_sent += 1;
+        self.stats.worker_bytes += payload_len as u64;
     }
 
     pub fn pop_inbound(&mut self, agent_id: usize, now: u64) -> Option<ControlMessage> {
+        assert!(agent_id < self.inbound.len());
+        if self.partitioned[agent_id] {
+            return None;
+        }
+
         let queue = &mut self.inbound[agent_id];
-        let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
-        Some(queue.remove(pos).unwrap().msg)
+        let pos = queue
+            .iter()
+            .position(|message| message.deliver_at_tick <= now)?;
+        let pending = queue
+            .remove(pos)
+            .expect("located inbound message must exist");
+        if self.prng.chance_ratio(self.replay_rate)
+            && queue.len() < Self::queue_capacity(self.path_max_capacity)
+        {
+            queue.push_back(PendingControl {
+                msg: pending.msg.clone(),
+                deliver_at_tick: now + self.min_delay.max(1),
+            });
+        }
+        Some(pending.msg)
     }
 
     pub fn pop_outbound(&mut self, agent_id: usize, now: u64) -> Option<WorkerMessage> {
+        assert!(agent_id < self.outbound.len());
+        if self.partitioned[agent_id] {
+            return None;
+        }
+
         let queue = &mut self.outbound[agent_id];
-        let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
-        Some(queue.remove(pos).unwrap().msg)
+        let pos = queue
+            .iter()
+            .position(|message| message.deliver_at_tick <= now)?;
+        let pending = queue
+            .remove(pos)
+            .expect("located outbound message must exist");
+        if self.prng.chance_ratio(self.replay_rate)
+            && queue.len() < Self::queue_capacity(self.path_max_capacity)
+        {
+            queue.push_back(PendingAgent {
+                msg: pending.msg.clone(),
+                deliver_at_tick: now + self.min_delay.max(1),
+            });
+        }
+        Some(pending.msg)
+    }
+
+    fn queue_capacity(path_max_capacity: usize) -> usize {
+        if path_max_capacity == 0 {
+            QUEUE_CAPACITY
+        } else {
+            path_max_capacity.min(QUEUE_CAPACITY)
+        }
     }
 
     pub fn partition_agent(&mut self, agent_id: usize, current_tick: u64) {
@@ -213,6 +257,14 @@ mod tests {
         })
     }
 
+    fn test_heartbeat(tick: u64) -> WorkerMessage {
+        WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+            tick,
+            active_pods: 0,
+            gpu_free: 1,
+        })
+    }
+
     #[test]
     fn message_delayed_delivery() {
         let mut net = SimulatedNetwork::new(1, 42);
@@ -227,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_drops_messages() {
+    fn partitioned_blocks_delivery() {
         let mut net = SimulatedNetwork::new(1, 42);
         net.partition_agent(0, 0);
 
@@ -246,5 +298,62 @@ mod tests {
 
         net.send_to_agent(0, test_start_cmd(1), 10);
         assert!(net.pop_inbound(0, 11).is_some());
+    }
+
+    #[test]
+    fn partition_holds_both_directions_until_healing() {
+        let mut net = SimulatedNetwork::new(1, 0xB1_10);
+        net.min_delay = 1;
+        net.max_delay = 1;
+        net.partition_agent(0, 0);
+        net.send_to_agent(0, test_start_cmd(1), 0);
+        net.send_from_agent(0, test_heartbeat(0), 0);
+
+        assert!(net.pop_inbound(0, 10).is_none());
+        assert!(net.pop_outbound(0, 10).is_none());
+
+        net.heal_all(10);
+        assert!(net.pop_inbound(0, 10).is_some());
+        assert!(net.pop_outbound(0, 10).is_some());
+        assert_eq!(net.stats.control_sent, 1);
+        assert_eq!(net.stats.worker_sent, 1);
+        assert!(net.stats.worker_bytes > 0);
+    }
+
+    #[test]
+    fn drop_replay_and_capacity_apply_to_both_directions() {
+        let mut dropped = SimulatedNetwork::new(1, 0xB1_11);
+        dropped.drop_rate = Ratio::new(1, 1);
+        dropped.send_to_agent(0, test_start_cmd(1), 0);
+        dropped.send_from_agent(0, test_heartbeat(0), 0);
+        assert!(dropped.pop_inbound(0, 100).is_none());
+        assert!(dropped.pop_outbound(0, 100).is_none());
+        assert_eq!(dropped.total_messages(), 0);
+
+        let mut replayed = SimulatedNetwork::new(1, 0xB1_12);
+        replayed.min_delay = 1;
+        replayed.max_delay = 1;
+        replayed.replay_rate = Ratio::new(1, 1);
+        replayed.send_to_agent(0, test_start_cmd(1), 0);
+        replayed.send_from_agent(0, test_heartbeat(0), 0);
+        assert!(replayed.pop_inbound(0, 1).is_some());
+        assert!(replayed.pop_outbound(0, 1).is_some());
+        assert!(replayed.pop_inbound(0, 2).is_some());
+        assert!(replayed.pop_outbound(0, 2).is_some());
+
+        let mut clogged = SimulatedNetwork::new(1, 0xB1_13);
+        clogged.min_delay = 1;
+        clogged.max_delay = 1;
+        clogged.path_max_capacity = 1;
+        clogged.send_to_agent(0, test_start_cmd(1), 0);
+        clogged.send_to_agent(0, test_start_cmd(2), 0);
+        clogged.send_from_agent(0, test_heartbeat(1), 0);
+        clogged.send_from_agent(0, test_heartbeat(2), 0);
+        assert_eq!(clogged.stats.control_sent, 1);
+        assert_eq!(clogged.stats.worker_sent, 1);
+        assert!(clogged.pop_inbound(0, 1).is_some());
+        assert!(clogged.pop_outbound(0, 1).is_some());
+        assert!(clogged.pop_inbound(0, 1).is_none());
+        assert!(clogged.pop_outbound(0, 1).is_none());
     }
 }

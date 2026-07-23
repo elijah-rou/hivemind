@@ -270,7 +270,8 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
 - Zig: `330 / 330` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
-- Rust: `128` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Rust: `135` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
 - Local smoke within run-all: `16 passed, 0 failed`.
@@ -290,6 +291,13 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Gossip under network partitions
 - Deterministic federated locality selector proof inputs (`same-locality-best`, `same-locality-failover`, `cross-locality-fallback`, `residency-restricted`)
 - Connection harness limit: AF_UNIX socketpairs exercise kernel stream buffering and partial inbound client frames with a deterministic logical poll clock, but do not model real TCP connect/listen timing, packet loss, encryption fragmentation, short nonblocking writes, or process scheduling
+
+**Worker simulation coverage:**
+- Worker output is enqueued through `SimulatedNetwork::send_from_agent` and delivered to `ControlPlaneStub` only by `pop_outbound` at the beginning of a later deterministic tick; direct worker-to-recorder delivery is removed.
+- Named seeds `0xB101` through `0xB104` partition before registration, heartbeat delivery, pod status, and run response. The recorder remains unchanged while partitioned, then receives each queued message after healing.
+- Partition blocks queued traffic in both directions; ratio-based drop and replay plus per-path capacity apply symmetrically. Accepted worker messages and encoded payload bytes contribute to network accounting.
+- A newly established partition invokes `Worker::on_connection_lost`, forcing re-registration semantics. Network paths retain at most 256 messages per worker, optionally reduced by configured path capacity; the control-plane schedule and recorder are fail-loud bounded.
+- Simulation does not prove kernel TCP buffering, half-close behavior, reconnect timing, real process scheduling, containerd, GPU/CDI, or cloud behavior. Partitioned messages are retained in bounded simulator queues until healing, which models delayed delivery rather than the loss characteristics of every real TCP/session failure.
 
 ## Codebase Size
 

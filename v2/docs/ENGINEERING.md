@@ -110,14 +110,16 @@ The [fuzz runner](../core/src/fuzz.zig) supplies sequential, random, and replay 
 | Component | Current role | Current limitation |
 |---|---|---|
 | [`Worker`](../worker/src/worker.rs) | Production worker state machine exercised through injected I/O and runtime interfaces | Simulation cannot attest host or cloud integration |
-| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Dynamic queues are bounded by runner workload rather than compile-time capacity |
-| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate control-plane-to-worker and worker-to-control-plane queues, delays, partition fields, drop/replay fields, and path capacity | The simulator does not currently deliver worker output through the outbound queue |
+| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Per-tick staging is drained by the simulator; it is not a real socket buffer |
+| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate bounded control-plane-to-worker and worker-to-control-plane queues, delays, partitions, ratio drop/replay, and path capacity | Models messages, not kernel TCP/session behavior |
 | [`SimulatedRuntime`](../worker/src/sim/runtime.rs) | Pull/create/start/forward/stop/status/remove and spontaneous crash model | No real process namespace, containerd, cgroup, mount, CDI, or GPU behavior |
-| [`ControlPlaneStub`](../worker/src/sim/control_plane.rs) | Seeded command schedule and received-message recorder | Not a Zig replica or real protocol endpoint |
+| [`ControlPlaneStub`](../worker/src/sim/control_plane.rs) | Bounded seeded command schedule and received-message recorder | Not a Zig replica or real protocol endpoint |
 | [`WorkerChecker`](../worker/src/sim/checker.rs) | GPU/CPU/memory accounting, legal pod transitions, heartbeat liveness | No cross-language protocol oracle |
-| [`runner.rs`](../worker/src/sim/runner.rs) | Seeded safety/liveness phases and fault scheduling | Pause partitions instead of freezing execution; configured ratio drop/replay values are not applied |
+| [`runner.rs`](../worker/src/sim/runner.rs) | Seeded safety/liveness phases and configured bidirectional network/runtime faults | Pause partitions instead of freezing worker execution |
 
-**Current limitation:** the network is structurally bidirectional, but [`WorkerSimulator::tick`](../worker/src/sim/simulator.rs) records worker output in the control-plane stub before enqueueing it and never drains `pop_outbound` into that stub. Worker-to-control-plane partition, drop, delay, replay, capacity, and healed delivery are therefore not proven. The runner also leaves legacy drop/replay percentages at zero instead of applying `SimConfig` ratios. Evidence must name the exact scenario and must not claim bidirectional fault coverage.
+Worker output enters `send_from_agent` after a worker tick and can reach the recorder only through `pop_outbound` at the beginning of a later tick. Partition, ratio drop/replay, delay, and path capacity apply to both directions; accepted worker message counts and encoded payload bytes are tracked. A new partition invokes `Worker::on_connection_lost`, and deterministic registration, heartbeat, pod-status, and run-response cases prove no recorder delivery before healing.
+
+**Current limitation:** partitions retain accepted messages in bounded simulator queues until healing, so this is a deterministic delayed-delivery model rather than a complete model of kernel TCP buffers, half-close, reconnect timing, or which bytes survive a real session failure. Pause still partitions rather than freezing worker execution. Evidence must not generalize these scenarios to process, containerd, GPU, or cloud behavior.
 
 ### Current, implemented: local real-process boundaries
 

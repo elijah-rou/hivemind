@@ -85,8 +85,8 @@ pub fn run(config: &SimConfig) -> SimResult {
     let mut sim = WorkerSimulator::new(config.agent_count, config.seed);
 
     // Configure network
-    sim.network.drop_rate_percent = 0; // legacy, unused with ratio
-    sim.network.replay_percent = 0;
+    sim.network.drop_rate = config.drop_rate;
+    sim.network.replay_rate = config.replay_rate;
     sim.network.path_max_capacity = config.path_max_capacity;
     sim.network.partition_stability = config.partition_stability;
     sim.network.heal_stability = config.heal_stability;
@@ -255,6 +255,28 @@ mod tests {
         let result = run(&config);
         assert_eq!(result.outcome, Outcome::Passed);
         assert_eq!(result.safety_violations, 0);
+    }
+
+    #[test]
+    fn sim_config_applies_bidirectional_drop_rate() {
+        let result = run(&SimConfig {
+            seed: 0xB1_20,
+            agent_count: 1,
+            safety_ticks: 10,
+            liveness_ticks: 1,
+            pod_count: 1,
+            partition_probability: Ratio::zero(),
+            heal_probability: Ratio::zero(),
+            pause_probability: Ratio::zero(),
+            image_pull_failure_rate: Ratio::zero(),
+            container_crash_rate: Ratio::zero(),
+            gpu_failure_rate: Ratio::zero(),
+            drop_rate: Ratio::new(1, 1),
+            ..Default::default()
+        });
+
+        assert_eq!(result.outcome, Outcome::Passed);
+        assert_eq!(result.messages_sent, 0);
     }
 
     #[test]

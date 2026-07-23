@@ -69,36 +69,37 @@ impl WorkerSimulator {
     pub fn tick(&mut self) {
         self.current_tick += 1;
 
-        // A. Control plane generates commands for this tick
-        let commands = self.control_plane.commands_for_tick(self.current_tick);
-        for (agent_id, cmd) in commands {
-            self.network.send_to_agent(agent_id, cmd, self.current_tick);
+        // A. Deliver worker messages enqueued on an earlier tick.
+        for i in 0..self.agent_count {
+            while let Some(message) = self.network.pop_outbound(i, self.current_tick) {
+                self.control_plane
+                    .on_agent_message(self.current_tick, i, message);
+            }
         }
 
-        // B. For each agent: deliver messages, tick, collect outbound
+        // B. Control plane generates commands for this tick.
+        let commands = self.control_plane.commands_for_tick(self.current_tick);
+        for (agent_id, command) in commands {
+            self.network
+                .send_to_agent(agent_id, command, self.current_tick);
+        }
+
+        // C. Deliver control messages, tick each worker, then enqueue its output.
         for i in 0..self.agent_count {
-            // Deliver ready inbound messages to SimulatedIo
             self.sim_ios[i].current_tick = self.current_tick;
-            while let Some(msg) = self.network.pop_inbound(i, self.current_tick) {
-                self.sim_ios[i].inbound.push_back(msg);
+            while let Some(message) = self.network.pop_inbound(i, self.current_tick) {
+                self.sim_ios[i].inbound.push_back(message);
             }
 
-            // Runtime fault injection
             self.sim_runtimes[i].maybe_crash_pods();
-
-            // Tick the agent
             self.workers[i].tick(&mut self.sim_ios[i], &self.sim_runtimes[i]);
 
-            // Drain outbound messages
-            let outbound: Vec<_> = self.sim_ios[i].outbound.drain(..).collect();
-            for msg in outbound {
-                self.control_plane
-                    .on_agent_message(self.current_tick, i, msg.clone());
-                self.network.send_from_agent(i, msg, self.current_tick);
+            for message in self.sim_ios[i].outbound.drain(..) {
+                self.network.send_from_agent(i, message, self.current_tick);
             }
         }
 
-        // C. Invariant checking
+        // D. Invariant checking
         for i in 0..self.agent_count {
             let partitioned = self.network.is_partitioned(i);
             self.checker
@@ -113,7 +114,12 @@ impl WorkerSimulator {
     }
 
     pub fn partition_agent(&mut self, agent_id: usize) {
+        assert!(agent_id < self.agent_count);
+        let was_partitioned = self.network.is_partitioned(agent_id);
         self.network.partition_agent(agent_id, self.current_tick);
+        if !was_partitioned && self.network.is_partitioned(agent_id) {
+            self.workers[agent_id].on_connection_lost();
+        }
     }
 
     pub fn heal_all(&mut self) {
@@ -131,6 +137,158 @@ mod tests {
     use crate::message::*;
     use crate::types::GpuType;
     use crate::worker::TrackedPodState;
+
+    fn received_count(sim: &WorkerSimulator, predicate: impl Fn(&WorkerMessage) -> bool) -> usize {
+        sim.control_plane
+            .received_messages()
+            .iter()
+            .filter(|(_, agent_id, message)| *agent_id == 0 && predicate(message))
+            .count()
+    }
+
+    #[test]
+    fn outbound_partition_before_registration_delays_delivery_until_healing() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_01);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.partition_agent(0);
+
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::NodeRegister(_)
+            )),
+            0,
+            "partitioned registration must not bypass the simulated network"
+        );
+
+        sim.heal_all();
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::NodeRegister(_)
+            )),
+            1,
+            "queued registration must reach the control plane after healing"
+        );
+    }
+
+    #[test]
+    fn outbound_partition_before_heartbeat_delays_delivery_until_healing() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_02);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.run(101);
+        let before = received_count(&sim, |message| {
+            matches!(message, WorkerMessage::NodeHeartbeat(_))
+        });
+
+        sim.partition_agent(0);
+        assert!(
+            !sim.workers[0].is_registered(),
+            "partition must model session loss through Worker::on_connection_lost"
+        );
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::NodeHeartbeat(_)
+            )),
+            before,
+            "partitioned heartbeat must not bypass the simulated network"
+        );
+
+        sim.heal_all();
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::NodeHeartbeat(_)
+            )),
+            before + 1,
+            "queued heartbeat must reach the control plane after healing"
+        );
+    }
+
+    #[test]
+    fn outbound_partition_before_pod_status_delays_delivery_until_healing() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_03);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.run(2);
+        let before = received_count(&sim, |message| {
+            matches!(message, WorkerMessage::PodStatusEvent(_))
+        });
+        sim.sim_ios[0].inbound.push_back(start_cmd(700, 7_000));
+
+        sim.partition_agent(0);
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::PodStatusEvent(_)
+            )),
+            before,
+            "partitioned pod status must not bypass the simulated network"
+        );
+
+        sim.heal_all();
+        sim.tick();
+        assert!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::PodStatusEvent(_)
+            )) > before,
+            "queued pod status must reach the control plane after healing"
+        );
+    }
+
+    #[test]
+    fn outbound_partition_before_run_response_delays_delivery_until_healing() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_04);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.sim_ios[0].inbound.push_back(start_cmd(800, 8_000));
+        sim.run(3);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&800].state,
+            TrackedPodState::Running
+        );
+        let before = received_count(&sim, |message| {
+            matches!(message, WorkerMessage::RunResponse(_))
+        });
+        sim.sim_ios[0]
+            .inbound
+            .push_back(ControlMessage::RunRequest(RunRequestCmd {
+                request_id: 81,
+                deployment_id: 8_000,
+                payload: b"partitioned-response".to_vec(),
+            }));
+
+        sim.partition_agent(0);
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::RunResponse(_)
+            )),
+            before,
+            "partitioned run response must not bypass the simulated network"
+        );
+
+        sim.heal_all();
+        sim.tick();
+        assert_eq!(
+            received_count(&sim, |message| matches!(
+                message,
+                WorkerMessage::RunResponse(_)
+            )),
+            before + 1,
+            "queued run response must reach the control plane after healing"
+        );
+    }
 
     #[test]
     fn single_agent_registers_and_heartbeats() {
@@ -339,7 +497,7 @@ mod tests {
         );
 
         sim.workers[0].on_connection_lost();
-        sim.tick();
+        sim.run(2);
 
         let register_count = sim
             .control_plane

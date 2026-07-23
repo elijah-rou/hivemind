@@ -2,6 +2,9 @@ use crate::message::*;
 use crate::prng::Prng;
 use crate::types::GpuType;
 
+const SCHEDULE_CAPACITY: usize = 4_096;
+const RECEIVED_CAPACITY: usize = 16_384;
+
 pub struct ControlPlaneStub {
     prng: Prng,
     scheduled: Vec<(u64, usize, ControlMessage)>,
@@ -14,14 +17,18 @@ impl ControlPlaneStub {
     pub fn new(seed: u64) -> Self {
         Self {
             prng: Prng::init(seed.wrapping_add(0xF00D)),
-            scheduled: Vec::new(),
+            scheduled: Vec::with_capacity(SCHEDULE_CAPACITY),
             schedule_index: 0,
-            received: Vec::new(),
+            received: Vec::with_capacity(RECEIVED_CAPACITY),
             next_pod_id: 1,
         }
     }
 
     pub fn generate_workload(&mut self, agent_count: usize, pod_count: u32, over_ticks: u64) {
+        assert!(agent_count > 0);
+        assert!(over_ticks >= 2);
+        assert!(self.scheduled.len() <= SCHEDULE_CAPACITY);
+        assert!((pod_count as usize).saturating_mul(2) <= SCHEDULE_CAPACITY - self.scheduled.len());
         for _ in 0..pod_count {
             let agent_id = self.prng.bounded(agent_count as u64) as usize;
             let start_tick = self.prng.bounded(over_ticks / 2);
@@ -83,6 +90,7 @@ impl ControlPlaneStub {
     }
 
     pub fn on_agent_message(&mut self, tick: u64, agent_id: usize, msg: WorkerMessage) {
+        assert!(self.received.len() < RECEIVED_CAPACITY);
         self.received.push((tick, agent_id, msg));
     }
 

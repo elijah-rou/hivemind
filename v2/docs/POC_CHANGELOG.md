@@ -44,6 +44,26 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane B1 bidirectional worker simulation networking
+
+What changed:
+- worker registration, heartbeat, pod status, and run responses now enter the bounded worker-to-control-plane network queue and reach the recorder only through `pop_outbound` at the start of a later deterministic tick
+- partitions block queued delivery in both directions until healing; configured ratio drop, replay, and path capacity now apply to both directions
+- accepted worker messages and encoded payload bytes are counted; network queues remain capped at 256 messages per worker and control-plane schedule/recorder growth is fail-loud bounded
+- a newly established simulated partition calls `Worker::on_connection_lost`, so the worker follows production re-registration behavior
+- delayed stop commands exposed valid ImagePulling/Creating-to-Stopped observations, which the simulation transition checker now accepts
+
+Why it matters:
+- removes the direct worker-output shortcut that previously made worker-side partition, delay, drop, replay, and capacity claims invalid
+- named deterministic seeds `0xB101`, `0xB102`, `0xB103`, and `0xB104` prove registration, heartbeat, pod status, and run response do not reach the control-plane recorder during a partition and arrive only after healing
+
+Evidence and limits:
+- RED: `cargo test outbound_partition_before_ -- --nocapture` failed all four named cases because the recorder received each worker message immediately
+- GREEN: `cargo test --lib sim::` passed `32 / 32`; `cargo test --all-targets` passed `135` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `19.6s`; mutation includes bounded drop, replay, and path-capacity configurations
+- no containerd, GPU/CDI, real TCP, real process, or live/cloud boundary ran; the simulator retains partitioned messages in bounded queues until healing and does not reproduce every real TCP/session loss mode
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
 ### 2026-07-23 — Lane A4 deterministic ConnectionManager transitions
 
 What changed:

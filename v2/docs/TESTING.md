@@ -54,7 +54,7 @@ done
 
 VOPR models bounded replica state machines, virtual ticks, a simulated network, simulated disk operations, crashes/restarts, durable publication cut points, and safety/liveness oracles. It provides deterministic seed replay and a failure corpus. It cannot prove kernel TCP behavior, process scheduling, real filesystem ordering, torn writes, power loss, containerd namespaces/cgroups, systemd, GPU/CDI, or cloud-provider behavior.
 
-The worker simulator models the worker state machine, simulated I/O, control-plane stub, simulated runtime, deterministic scheduling, and checker-visible resource/state transitions. Some outbound delivery and runtime fault behaviors remain incomplete; evidence must name the scenario actually exercised. It cannot prove real process signals, host networking/filesystems, `ctr`/containerd behavior, GPU visibility, mounts, or cloud services.
+The worker simulator models the worker state machine, simulated I/O, a bounded control-plane stub, simulated runtime, deterministic scheduling, checker-visible resource/state transitions, and bounded bidirectional message delivery. Worker output traverses the simulated network in a later tick; partition, ratio drop/replay, delay, and path capacity apply in both directions. Runtime fault behaviors remain scenario-specific, and evidence must name the scenario actually exercised. It cannot prove real process signals, host networking/filesystems, `ctr`/containerd behavior, GPU visibility, mounts, or cloud services.
 
 Real-process tests are required when behavior crosses sockets, process lifecycle, retained filesystem state, or OS deadlines. Privileged containerd evidence is required for namespaces, cgroups, task adoption, and the real runtime. GPU, private registry, JuiceFS, S3/SSM/systemd, Terraform apply, and provider cleanup require separately authorized live evidence.
 
@@ -71,10 +71,10 @@ A future required-capability mode must fail nonzero when its capability is absen
 
 | Fault | Current deterministic coverage | Observable assertion | Real-boundary gap |
 |---|---|---|---|
-| Network partition | Zig VOPR; worker simulation has partial network modeling | Isolated traffic does not cross the partition; healing preserves safety | Kernel TCP and process reconnect timing |
+| Network partition | Zig VOPR; worker simulation covers bounded bidirectional queued delivery and worker session loss | Isolated traffic does not cross the partition; healing preserves safety | Kernel TCP buffering, byte loss, half-close, and process reconnect timing |
 | True pause/resume | Zig VOPR | Paused replicas do not tick, sync, publish, or receive; state is retained | OS suspension and clock behavior |
 | Crash/restart | Zig VOPR and worker simulation scenarios | Volatile state is lost as modeled; durable/resource invariants survive | Real process, filesystem, containerd restart |
-| Delay/drop/replay/capacity | Zig simulated network; worker coverage is scenario-dependent | Bounded delivery semantics and convergence/accounting | Socket buffers and kernel scheduling |
+| Delay/drop/replay/capacity | Zig simulated network; worker simulation applies each fault in both directions | Bounded delivery semantics and worker message/byte accounting | Socket buffers and kernel scheduling |
 | Disk read/write/sync failure | Zig simulated disk | Fail-closed transitions and durable-prefix invariants | Torn writes, reordering, power loss |
 | Durability barrier cuts | Zig VOPR around Prepare, Commit, and StartView publication | Unpublished state cannot become committed; recovery remains canonical | Real drive/cache behavior |
 | Client/worker disconnect, abandonment, late/foreign response | Zig unit/deterministic connection scenarios | Queue/correlation accounting and identity remain bounded | Real socket half-close and scheduling |
