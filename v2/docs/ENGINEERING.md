@@ -110,16 +110,18 @@ The [fuzz runner](../core/src/fuzz.zig) supplies sequential, random, and replay 
 | Component | Current role | Current limitation |
 |---|---|---|
 | [`Worker`](../worker/src/worker.rs) | Production worker state machine exercised through injected I/O and runtime interfaces | Simulation cannot attest host or cloud integration |
-| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Per-tick staging is drained by the simulator; it is not a real socket buffer |
-| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate bounded control-plane-to-worker and worker-to-control-plane queues, delays, partitions, ratio drop/replay, and path capacity | Models messages, not kernel TCP/session behavior |
+| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Per-tick inbound and outbound staging is fail-loud bounded at 256 messages; it is not a real socket buffer |
+| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate bounded control-plane-to-worker and worker-to-control-plane queues, delays, partitions, one-shot ratio replay, ratio drop, and path capacity | Models messages, not kernel TCP/session behavior |
 | [`SimulatedRuntime`](../worker/src/sim/runtime.rs) | Pull/create/start/forward/stop/status/remove and spontaneous crash model | No real process namespace, containerd, cgroup, mount, CDI, or GPU behavior |
 | [`ControlPlaneStub`](../worker/src/sim/control_plane.rs) | Bounded seeded command schedule and received-message recorder | Not a Zig replica or real protocol endpoint |
 | [`WorkerChecker`](../worker/src/sim/checker.rs) | GPU/CPU/memory accounting, legal pod transitions, heartbeat liveness | No cross-language protocol oracle |
 | [`runner.rs`](../worker/src/sim/runner.rs) | Seeded safety/liveness phases and configured bidirectional network/runtime faults | Pause partitions instead of freezing worker execution |
 
-Worker output enters `send_from_agent` after a worker tick and can reach the recorder only through `pop_outbound` at the beginning of a later tick. Partition, ratio drop/replay, delay, and path capacity apply to both directions; accepted worker message counts and encoded payload bytes are tracked. A new partition invokes `Worker::on_connection_lost`, and deterministic registration, heartbeat, pod-status, and run-response cases prove no recorder delivery before healing.
+Worker output enters `send_from_agent` after a worker tick and can reach the recorder only through `pop_outbound` at the beginning of a later tick. Partition, ratio drop/replay, delay, and path capacity apply to both directions; accepted worker message counts and encoded payload bytes are tracked. Delayed partitions retain the current session and queued traffic. Explicit session loss instead discards both old-session queues, invokes `Worker::on_connection_lost`, and requires re-registration before later new-session traffic. Deterministic registration, heartbeat, exact pod-status sequence, run-response, one-shot replay, and session-loss cases assert identities, ordering, counts, and no extra delivery.
 
-**Current limitation:** partitions retain accepted messages in bounded simulator queues until healing, so this is a deterministic delayed-delivery model rather than a complete model of kernel TCP buffers, half-close, reconnect timing, or which bytes survive a real session failure. Pause still partitions rather than freezing worker execution. Evidence must not generalize these scenarios to process, containerd, GPU, or cloud behavior.
+Runner convergence requires a control-plane-observed registration from every worker and a control-plane-observed terminal status for every generated start command. The healed liveness phase retries unresolved registration and start commands through the same faulted network; permanent total loss therefore fails liveness rather than passing with an empty worker state.
+
+**Current limitation:** delayed partitions are a bounded queued-delivery model, while explicit session loss drops whole queued messages. Neither is a complete model of kernel TCP buffers, partial-frame loss, half-close, or reconnect timing. Pause still partitions rather than freezing worker execution. Evidence must not generalize these scenarios to process, containerd, GPU, or cloud behavior.
 
 ### Current, implemented: local real-process boundaries
 

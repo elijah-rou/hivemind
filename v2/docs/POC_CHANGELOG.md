@@ -44,13 +44,33 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane B1 liveness and session-epoch review remediation
+
+What changed:
+- worker-runner convergence now requires a control-plane-observed registration from every worker and a terminal pod status for every generated start command; unresolved registration and start commands retry through the configured network during the healed liveness phase
+- permanent 100% message loss now returns `LivenessFailure` instead of passing with no worker/control-plane traffic
+- delayed partitions no longer imply a connection reset; explicit session loss discards both old-session queues, calls `Worker::on_connection_lost`, and proves re-registration arrives before exact new-session heartbeat, pod-status, and run-response traffic
+- ratio replay is one-shot per accepted message, and registration, heartbeat, pod status, run response, replay, and session-loss tests assert exact identities, ordering, counts, and no extra delivery
+- per-worker simulated I/O inbound and outbound staging is fail-loud bounded at 256 messages
+
+Why it matters:
+- prevents worker fuzz runs from reporting convergence when all control-plane commands disappeared
+- prevents stale old-session frames from appearing after simulated reconnect, while preserving delayed partition coverage as a distinct network behavior
+
+Evidence and limits:
+- RED: the 100% drop case returned `Passed`; 100% replay continued indefinitely; outbound staging accepted a 257th message; and a delayed partition marked the worker disconnected
+- GREEN: focused simulation passed `35 / 35`; `cargo test --all-targets` passed `139` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `16.4s`
+- no real TCP, process, containerd, GPU/CDI, or cloud boundary ran; message-level session invalidation does not model partial frames or kernel socket state
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
 ### 2026-07-23 — Lane B1 bidirectional worker simulation networking
 
 What changed:
 - worker registration, heartbeat, pod status, and run responses now enter the bounded worker-to-control-plane network queue and reach the recorder only through `pop_outbound` at the start of a later deterministic tick
 - partitions block queued delivery in both directions until healing; configured ratio drop, replay, and path capacity now apply to both directions
 - accepted worker messages and encoded payload bytes are counted; network queues remain capped at 256 messages per worker and control-plane schedule/recorder growth is fail-loud bounded
-- a newly established simulated partition calls `Worker::on_connection_lost`, so the worker follows production re-registration behavior
+- superseded by the review remediation above: delayed partition and explicit session loss are now separate, and only session loss calls `Worker::on_connection_lost`
 - delayed stop commands exposed valid ImagePulling/Creating-to-Stopped observations, which the simulation transition checker now accepts
 
 Why it matters:

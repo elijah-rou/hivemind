@@ -160,14 +160,30 @@ pub fn run(config: &SimConfig) -> SimResult {
 
     // -- Phase 2: Liveness --
 
-    sim.heal_all();
+    sim.force_heal_all();
     for i in 0..config.agent_count {
         sim.set_runtime_faults(i, FaultConfig::default());
+        sim.lose_agent_session(i);
     }
 
     let mut phase2_ticks: u64 = 0;
 
     for tick in 0..config.liveness_ticks {
+        for agent_id in 0..config.agent_count {
+            let registered = sim.control_plane.received_messages().iter().any(
+                |(_, received_agent_id, message)| {
+                    *received_agent_id == agent_id
+                        && matches!(message, crate::message::WorkerMessage::NodeRegister(_))
+                },
+            );
+            if !registered {
+                sim.retry_agent_registration(agent_id);
+            }
+        }
+        for (agent_id, command) in sim.control_plane.unresolved_start_recovery_commands() {
+            sim.network
+                .send_to_agent(agent_id, command, sim.current_tick);
+        }
         sim.tick();
         phase2_ticks = tick + 1;
 
@@ -197,6 +213,49 @@ pub fn run(config: &SimConfig) -> SimResult {
         }
     }
 
+    let unresolved: Vec<_> = sim
+        .control_plane
+        .unresolved_start_recovery_commands()
+        .into_iter()
+        .filter_map(|(agent_id, command)| match command {
+            crate::message::ControlMessage::StartPod(start) => Some((agent_id, start.pod_id)),
+            _ => None,
+        })
+        .collect();
+    let nonterminal: Vec<_> = sim
+        .workers
+        .iter()
+        .enumerate()
+        .flat_map(|(agent_id, worker)| {
+            worker
+                .tracked_pods()
+                .iter()
+                .filter_map(move |(pod_id, pod)| match pod.state {
+                    TrackedPodState::Running
+                    | TrackedPodState::Stopped { .. }
+                    | TrackedPodState::Failed { .. } => None,
+                    _ => Some((agent_id, *pod_id, pod.state.clone())),
+                })
+        })
+        .collect();
+    let unresolved_statuses: Vec<_> = sim
+        .control_plane
+        .received_messages()
+        .iter()
+        .filter_map(|(_, agent_id, message)| match message {
+            crate::message::WorkerMessage::PodStatusEvent(event)
+                if unresolved.iter().any(|(_, pod_id)| *pod_id == event.pod_id) =>
+            {
+                Some((*agent_id, event.pod_id, event.status.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "worker simulation liveness failure: seed={} unresolved={unresolved:?} unresolved_statuses={unresolved_statuses:?} nonterminal={nonterminal:?}",
+        config.seed
+    );
+
     let msgs = sim.network.stats.control_sent + sim.network.stats.worker_sent;
     SimResult {
         seed: config.seed,
@@ -210,8 +269,37 @@ pub fn run(config: &SimConfig) -> SimResult {
 }
 
 fn check_convergence(sim: &WorkerSimulator) -> bool {
-    for wk in &sim.workers {
-        for pod in wk.tracked_pods().values() {
+    let received = sim.control_plane.received_messages();
+    for agent_id in 0..sim.workers.len() {
+        if !received.iter().any(|(_, received_agent_id, message)| {
+            *received_agent_id == agent_id
+                && matches!(message, crate::message::WorkerMessage::NodeRegister(_))
+        }) {
+            return false;
+        }
+    }
+
+    for &(agent_id, pod_id) in sim.control_plane.expected_starts() {
+        if !received.iter().any(|(_, received_agent_id, message)| {
+            *received_agent_id == agent_id
+                && matches!(
+                    message,
+                    crate::message::WorkerMessage::PodStatusEvent(event)
+                        if event.pod_id == pod_id
+                            && matches!(
+                                event.status,
+                                crate::message::PodStatusReport::Running
+                                    | crate::message::PodStatusReport::Stopped { .. }
+                                    | crate::message::PodStatusReport::Failed { .. }
+                            )
+                )
+        }) {
+            return false;
+        }
+    }
+
+    for worker in &sim.workers {
+        for pod in worker.tracked_pods().values() {
             match pod.state {
                 TrackedPodState::Running
                 | TrackedPodState::Stopped { .. }
@@ -258,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn sim_config_applies_bidirectional_drop_rate() {
+    fn sim_total_message_loss_fails_liveness() {
         let result = run(&SimConfig {
             seed: 0xB1_20,
             agent_count: 1,
@@ -275,7 +363,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(result.outcome, Outcome::Passed);
+        assert_eq!(result.outcome, Outcome::LivenessFailure);
         assert_eq!(result.messages_sent, 0);
     }
 
@@ -297,6 +385,17 @@ mod tests {
             "safety violations with seed {}: {:?}",
             config.seed, result
         );
+    }
+
+    #[test]
+    fn liveness_phase_force_heals_recent_stable_partition() {
+        let result = run(&SimConfig {
+            seed: 901,
+            partition_probability: Ratio::new(10, 100),
+            heal_probability: Ratio::new(5, 100),
+            ..Default::default()
+        });
+        assert_eq!(result.outcome, Outcome::Passed, "seed 901: {result:?}");
     }
 
     #[test]

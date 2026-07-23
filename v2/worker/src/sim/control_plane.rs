@@ -10,6 +10,7 @@ pub struct ControlPlaneStub {
     scheduled: Vec<(u64, usize, ControlMessage)>,
     schedule_index: usize,
     received: Vec<(u64, usize, WorkerMessage)>,
+    expected_starts: Vec<(usize, u64)>,
     next_pod_id: u64,
 }
 
@@ -20,6 +21,7 @@ impl ControlPlaneStub {
             scheduled: Vec::with_capacity(SCHEDULE_CAPACITY),
             schedule_index: 0,
             received: Vec::with_capacity(RECEIVED_CAPACITY),
+            expected_starts: Vec::with_capacity(SCHEDULE_CAPACITY / 2),
             next_pod_id: 1,
         }
     }
@@ -28,12 +30,15 @@ impl ControlPlaneStub {
         assert!(agent_count > 0);
         assert!(over_ticks >= 2);
         assert!(self.scheduled.len() <= SCHEDULE_CAPACITY);
+        assert!(self.expected_starts.len() <= SCHEDULE_CAPACITY / 2);
         assert!((pod_count as usize).saturating_mul(2) <= SCHEDULE_CAPACITY - self.scheduled.len());
+        assert!(pod_count as usize <= SCHEDULE_CAPACITY / 2 - self.expected_starts.len());
         for _ in 0..pod_count {
             let agent_id = self.prng.bounded(agent_count as u64) as usize;
             let start_tick = self.prng.bounded(over_ticks / 2);
             let pod_id = self.next_pod_id;
             self.next_pod_id += 1;
+            self.expected_starts.push((agent_id, pod_id));
 
             let gpu_count = (self.prng.bounded(3) + 1) as u8;
 
@@ -96,5 +101,52 @@ impl ControlPlaneStub {
 
     pub fn received_messages(&self) -> &[(u64, usize, WorkerMessage)] {
         &self.received
+    }
+
+    pub fn expected_starts(&self) -> &[(usize, u64)] {
+        &self.expected_starts
+    }
+
+    pub fn unresolved_start_recovery_commands(&self) -> Vec<(usize, ControlMessage)> {
+        self.expected_starts
+            .iter()
+            .filter(|(agent_id, pod_id)| {
+                !self.received.iter().any(|(_, received_agent_id, message)| {
+                    received_agent_id == agent_id
+                        && matches!(
+                            message,
+                            WorkerMessage::PodStatusEvent(event)
+                                if event.pod_id == *pod_id
+                                    && matches!(
+                                        &event.status,
+                                        PodStatusReport::Running
+                                            | PodStatusReport::Stopped { .. }
+                                            | PodStatusReport::Failed { .. }
+                                    )
+                        )
+                })
+            })
+            .flat_map(|(agent_id, pod_id)| {
+                let start = self
+                    .scheduled
+                    .iter()
+                    .find_map(|(_, scheduled_agent_id, command)| match command {
+                        ControlMessage::StartPod(start)
+                            if scheduled_agent_id == agent_id && start.pod_id == *pod_id =>
+                        {
+                            Some(command.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("expected start command must remain in the bounded schedule");
+                [
+                    (*agent_id, start),
+                    (
+                        *agent_id,
+                        ControlMessage::ProbePod(ProbePodCmd { pod_id: *pod_id }),
+                    ),
+                ]
+            })
+            .collect()
     }
 }

@@ -9,11 +9,13 @@ const QUEUE_CAPACITY: usize = 256;
 struct PendingControl {
     msg: ControlMessage,
     deliver_at_tick: u64,
+    replayed: bool,
 }
 
 struct PendingAgent {
     msg: WorkerMessage,
     deliver_at_tick: u64,
+    replayed: bool,
 }
 
 /// Message accounting
@@ -107,6 +109,7 @@ impl SimulatedNetwork {
         queue.push_back(PendingControl {
             msg,
             deliver_at_tick: current_tick + delay,
+            replayed: false,
         });
         self.stats.control_sent += 1;
     }
@@ -130,6 +133,7 @@ impl SimulatedNetwork {
         queue.push_back(PendingAgent {
             msg,
             deliver_at_tick: current_tick + delay,
+            replayed: false,
         });
         self.stats.worker_sent += 1;
         self.stats.worker_bytes += payload_len as u64;
@@ -148,12 +152,14 @@ impl SimulatedNetwork {
         let pending = queue
             .remove(pos)
             .expect("located inbound message must exist");
-        if self.prng.chance_ratio(self.replay_rate)
+        if !pending.replayed
+            && self.prng.chance_ratio(self.replay_rate)
             && queue.len() < Self::queue_capacity(self.path_max_capacity)
         {
             queue.push_back(PendingControl {
                 msg: pending.msg.clone(),
                 deliver_at_tick: now + self.min_delay.max(1),
+                replayed: true,
             });
         }
         Some(pending.msg)
@@ -172,12 +178,14 @@ impl SimulatedNetwork {
         let pending = queue
             .remove(pos)
             .expect("located outbound message must exist");
-        if self.prng.chance_ratio(self.replay_rate)
+        if !pending.replayed
+            && self.prng.chance_ratio(self.replay_rate)
             && queue.len() < Self::queue_capacity(self.path_max_capacity)
         {
             queue.push_back(PendingAgent {
                 msg: pending.msg.clone(),
                 deliver_at_tick: now + self.min_delay.max(1),
+                replayed: true,
             });
         }
         Some(pending.msg)
@@ -200,7 +208,15 @@ impl SimulatedNetwork {
     }
 
     pub fn is_partitioned(&self, agent_id: usize) -> bool {
+        assert!(agent_id < self.partitioned.len());
         self.partitioned[agent_id]
+    }
+
+    pub fn discard_session_queues(&mut self, agent_id: usize) {
+        assert!(agent_id < self.inbound.len());
+        assert!(agent_id < self.outbound.len());
+        self.inbound[agent_id].clear();
+        self.outbound[agent_id].clear();
     }
 
     pub fn heal_all(&mut self, current_tick: u64) {
@@ -210,8 +226,12 @@ impl SimulatedNetwork {
                 return;
             }
         }
-        for p in self.partitioned.iter_mut() {
-            *p = false;
+        self.force_heal_all(current_tick);
+    }
+
+    pub fn force_heal_all(&mut self, current_tick: u64) {
+        for partitioned in &mut self.partitioned {
+            *partitioned = false;
         }
         self.heal_stable_until = current_tick + self.heal_stability;
     }
@@ -340,6 +360,8 @@ mod tests {
         assert!(replayed.pop_outbound(0, 1).is_some());
         assert!(replayed.pop_inbound(0, 2).is_some());
         assert!(replayed.pop_outbound(0, 2).is_some());
+        assert!(replayed.pop_inbound(0, 3).is_none());
+        assert!(replayed.pop_outbound(0, 3).is_none());
 
         let mut clogged = SimulatedNetwork::new(1, 0xB1_13);
         clogged.min_delay = 1;

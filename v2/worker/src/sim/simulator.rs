@@ -88,13 +88,13 @@ impl WorkerSimulator {
         for i in 0..self.agent_count {
             self.sim_ios[i].current_tick = self.current_tick;
             while let Some(message) = self.network.pop_inbound(i, self.current_tick) {
-                self.sim_ios[i].inbound.push_back(message);
+                self.sim_ios[i].push_inbound(message);
             }
 
             self.sim_runtimes[i].maybe_crash_pods();
             self.workers[i].tick(&mut self.sim_ios[i], &self.sim_runtimes[i]);
 
-            for message in self.sim_ios[i].outbound.drain(..) {
+            for message in self.sim_ios[i].drain_outbound() {
                 self.network.send_from_agent(i, message, self.current_tick);
             }
         }
@@ -115,15 +115,26 @@ impl WorkerSimulator {
 
     pub fn partition_agent(&mut self, agent_id: usize) {
         assert!(agent_id < self.agent_count);
-        let was_partitioned = self.network.is_partitioned(agent_id);
         self.network.partition_agent(agent_id, self.current_tick);
-        if !was_partitioned && self.network.is_partitioned(agent_id) {
-            self.workers[agent_id].on_connection_lost();
-        }
+    }
+
+    pub fn lose_agent_session(&mut self, agent_id: usize) {
+        assert!(agent_id < self.agent_count);
+        self.network.discard_session_queues(agent_id);
+        self.workers[agent_id].on_connection_lost();
+    }
+
+    pub fn retry_agent_registration(&mut self, agent_id: usize) {
+        assert!(agent_id < self.agent_count);
+        self.workers[agent_id].on_connection_lost();
     }
 
     pub fn heal_all(&mut self) {
         self.network.heal_all(self.current_tick);
+    }
+
+    pub fn force_heal_all(&mut self) {
+        self.network.force_heal_all(self.current_tick);
     }
 
     pub fn set_runtime_faults(&mut self, agent_id: usize, config: FaultConfig) {
@@ -146,6 +157,21 @@ mod tests {
             .count()
     }
 
+    fn received_pod_statuses(sim: &WorkerSimulator, pod_id: u64) -> Vec<PodStatusReport> {
+        sim.control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::PodStatusEvent(event)
+                    if *agent_id == 0 && event.pod_id == pod_id =>
+                {
+                    Some(event.status.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn outbound_partition_before_registration_delays_delivery_until_healing() {
         let mut sim = WorkerSimulator::new(1, 0xB1_01);
@@ -164,15 +190,18 @@ mod tests {
         );
 
         sim.heal_all();
-        sim.tick();
-        assert_eq!(
-            received_count(&sim, |message| matches!(
-                message,
-                WorkerMessage::NodeRegister(_)
-            )),
-            1,
-            "queued registration must reach the control plane after healing"
-        );
+        sim.run(2);
+        let registrations: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::NodeRegister(register) if *agent_id == 0 => Some(register),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].node_name, "sim-node-0");
     }
 
     #[test]
@@ -187,8 +216,8 @@ mod tests {
 
         sim.partition_agent(0);
         assert!(
-            !sim.workers[0].is_registered(),
-            "partition must model session loss through Worker::on_connection_lost"
+            sim.workers[0].is_registered(),
+            "a delayed network partition must not imply session loss"
         );
         sim.tick();
         assert_eq!(
@@ -201,14 +230,20 @@ mod tests {
         );
 
         sim.heal_all();
-        sim.tick();
+        sim.run(2);
+        let heartbeats: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::NodeHeartbeat(heartbeat) if *agent_id == 0 => Some(heartbeat),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heartbeats.len(), before + 1);
         assert_eq!(
-            received_count(&sim, |message| matches!(
-                message,
-                WorkerMessage::NodeHeartbeat(_)
-            )),
-            before + 1,
-            "queued heartbeat must reach the control plane after healing"
+            heartbeats.last().expect("heartbeat must be delivered").tick,
+            101
         );
     }
 
@@ -221,7 +256,7 @@ mod tests {
         let before = received_count(&sim, |message| {
             matches!(message, WorkerMessage::PodStatusEvent(_))
         });
-        sim.sim_ios[0].inbound.push_back(start_cmd(700, 7_000));
+        sim.sim_ios[0].push_inbound(start_cmd(700, 7_000));
 
         sim.partition_agent(0);
         sim.tick();
@@ -235,14 +270,112 @@ mod tests {
         );
 
         sim.heal_all();
-        sim.tick();
-        assert!(
+        sim.run(3);
+        assert_eq!(
+            received_pod_statuses(&sim, 700),
+            vec![
+                PodStatusReport::ImagePulling,
+                PodStatusReport::Creating,
+                PodStatusReport::Running,
+            ],
+            "healing must deliver the exact pod status identity and sequence once"
+        );
+        assert_eq!(
             received_count(&sim, |message| matches!(
                 message,
                 WorkerMessage::PodStatusEvent(_)
-            )) > before,
-            "queued pod status must reach the control plane after healing"
+            )),
+            before + 3
         );
+    }
+
+    #[test]
+    fn session_loss_discards_old_epoch_and_reregisters_before_new_traffic() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_05);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.run(2);
+        let received_before_loss = sim.control_plane.received_messages().len();
+
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+                tick: 20,
+                active_pods: 1,
+                gpu_free: 7,
+            }),
+            sim.current_tick,
+        );
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                pod_id: 70,
+                status: PodStatusReport::Running,
+            }),
+            sim.current_tick,
+        );
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 80,
+                status: 0,
+                payload: b"old-session".to_vec(),
+            }),
+            sim.current_tick,
+        );
+        sim.lose_agent_session(0);
+        assert!(!sim.workers[0].is_registered());
+        sim.run(2);
+
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+                tick: 40,
+                active_pods: 0,
+                gpu_free: 8,
+            }),
+            sim.current_tick,
+        );
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                pod_id: 71,
+                status: PodStatusReport::Stopped { exit_code: 0 },
+            }),
+            sim.current_tick,
+        );
+        sim.network.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 81,
+                status: 0,
+                payload: b"new-session".to_vec(),
+            }),
+            sim.current_tick,
+        );
+        sim.tick();
+
+        let after_loss = &sim.control_plane.received_messages()[received_before_loss..];
+        assert_eq!(after_loss.len(), 4);
+        assert!(matches!(
+            after_loss[0],
+            (_, 0, WorkerMessage::NodeRegister(_))
+        ));
+        assert!(matches!(
+            &after_loss[1].2,
+            WorkerMessage::NodeHeartbeat(heartbeat) if heartbeat.tick == 40
+        ));
+        assert!(matches!(
+            &after_loss[2].2,
+            WorkerMessage::PodStatusEvent(event)
+                if event.pod_id == 71
+                    && event.status == PodStatusReport::Stopped { exit_code: 0 }
+        ));
+        assert!(matches!(
+            &after_loss[3].2,
+            WorkerMessage::RunResponse(response)
+                if response.request_id == 81 && response.payload == b"new-session"
+        ));
     }
 
     #[test]
@@ -250,7 +383,7 @@ mod tests {
         let mut sim = WorkerSimulator::new(1, 0xB1_04);
         sim.network.min_delay = 1;
         sim.network.max_delay = 1;
-        sim.sim_ios[0].inbound.push_back(start_cmd(800, 8_000));
+        sim.sim_ios[0].push_inbound(start_cmd(800, 8_000));
         sim.run(3);
         assert_eq!(
             sim.workers[0].tracked_pods()[&800].state,
@@ -259,13 +392,11 @@ mod tests {
         let before = received_count(&sim, |message| {
             matches!(message, WorkerMessage::RunResponse(_))
         });
-        sim.sim_ios[0]
-            .inbound
-            .push_back(ControlMessage::RunRequest(RunRequestCmd {
-                request_id: 81,
-                deployment_id: 8_000,
-                payload: b"partitioned-response".to_vec(),
-            }));
+        sim.sim_ios[0].push_inbound(ControlMessage::RunRequest(RunRequestCmd {
+            request_id: 81,
+            deployment_id: 8_000,
+            payload: b"partitioned-response".to_vec(),
+        }));
 
         sim.partition_agent(0);
         sim.tick();
@@ -279,15 +410,21 @@ mod tests {
         );
 
         sim.heal_all();
-        sim.tick();
-        assert_eq!(
-            received_count(&sim, |message| matches!(
-                message,
-                WorkerMessage::RunResponse(_)
-            )),
-            before + 1,
-            "queued run response must reach the control plane after healing"
-        );
+        sim.run(2);
+        let responses: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::RunResponse(response) if *agent_id == 0 => Some(response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), before + 1);
+        let response = responses.last().expect("run response must be delivered");
+        assert_eq!(response.request_id, 81);
+        assert_eq!(response.status, 0);
+        assert_eq!(response.payload, b"partitioned-response");
     }
 
     #[test]
