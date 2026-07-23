@@ -470,10 +470,35 @@ impl Runtime for ContainerdRuntime {
     }
 
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
-        let _ = self.run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id]);
-        thread::sleep(Duration::from_millis(grace_period_ms));
-        let _ = self.run_ctr(&["tasks", "kill", "--signal", "9", &handle.container_id]);
-        Ok(())
+        let terminate_error = self
+            .run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id])
+            .err();
+        if grace_period_ms > 0 {
+            thread::sleep(Duration::from_millis(grace_period_ms));
+        }
+
+        if matches!(self.pod_status(handle), Ok(PodStatus::Stopped { .. })) {
+            return Ok(());
+        }
+
+        let kill_error = self
+            .run_ctr(&["tasks", "kill", "--signal", "9", &handle.container_id])
+            .err();
+        match self.pod_status(handle) {
+            Ok(PodStatus::Stopped { .. }) => Ok(()),
+            Ok(status) => Err(RuntimeError::ContainerStop(format!(
+                "{} remains {status:?} after TERM/KILL; TERM={}; KILL={}",
+                handle.container_id,
+                terminate_error.as_deref().unwrap_or("ok"),
+                kill_error.as_deref().unwrap_or("ok")
+            ))),
+            Err(status_error) => Err(RuntimeError::ContainerStop(format!(
+                "{} terminal status unverified after TERM/KILL: {status_error}; TERM={}; KILL={}",
+                handle.container_id,
+                terminate_error.as_deref().unwrap_or("ok"),
+                kill_error.as_deref().unwrap_or("ok")
+            ))),
+        }
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {

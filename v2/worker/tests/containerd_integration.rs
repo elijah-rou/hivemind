@@ -78,6 +78,10 @@ mod tests {
         );
 
         rt.stop_pod(&handle, 1000).expect("stop");
+        assert!(matches!(
+            rt.pod_status(&handle).expect("status after stop"),
+            PodStatus::Stopped { .. }
+        ));
         rt.remove_pod(&handle).expect("remove");
     }
 

@@ -143,10 +143,26 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 
     fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
-        if let Some(mut proc) = self.processes.lock().unwrap().remove(&handle.container_id) {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
+        let mut processes = self.processes.lock().unwrap();
+        let proc = processes
+            .get_mut(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+        match proc.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(RuntimeError::ContainerStop(format!(
+                    "{} status before kill: {error}",
+                    handle.container_id
+                )))
+            }
         }
+        proc.child.kill().map_err(|error| {
+            RuntimeError::ContainerStop(format!("{} kill: {error}", handle.container_id))
+        })?;
+        proc.child.wait().map_err(|error| {
+            RuntimeError::ContainerStop(format!("{} wait: {error}", handle.container_id))
+        })?;
         Ok(())
     }
 
@@ -166,7 +182,13 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
-        self.stop_pod(handle, 0)
+        self.stop_pod(handle, 0)?;
+        let removed = self.processes.lock().unwrap().remove(&handle.container_id);
+        assert!(
+            removed.is_some(),
+            "stopped process must remain owned until removal"
+        );
+        Ok(())
     }
 }
 
@@ -252,6 +274,37 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn stopped_process_remains_queryable_until_remove() {
+        let runtime = ProcessRuntime::with_base_port(24_000);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 77,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 0,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+
+        runtime.stop_pod(&handle, 0).unwrap();
+        assert!(matches!(
+            runtime.pod_status(&handle),
+            Ok(PodStatus::Stopped { .. })
+        ));
+        runtime.remove_pod(&handle).unwrap();
+        assert!(matches!(
+            runtime.pod_status(&handle),
+            Err(RuntimeError::ContainerNotFound(_))
+        ));
+    }
 
     #[test]
     fn forward_run_reads_content_length_without_waiting_for_eof() {

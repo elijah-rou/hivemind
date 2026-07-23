@@ -369,6 +369,8 @@ fn run_worker_loop(
 
     if SHUTDOWN.load(Ordering::SeqCst) {
         eprintln!("worker: shutting down gracefully...");
-        node_worker.shutdown(rio, rt);
+        while !node_worker.shutdown(rio, rt) {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }
