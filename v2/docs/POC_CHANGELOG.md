@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane B4 GPU admission and deterministic `/run` outcomes
+
+What changed:
+- worker admission rejects every nonzero GPU request whose requested type differs from the registered worker GPU type before reserving GPU, CPU, or memory
+- the simulated runtime provides bounded per-pod `/run` outcome scripts and an explicit deterministic crash operation
+- named worker scenarios cover success, response overflow, forwarding failure, timeout, crash/no-running-pod, and response delivery after a B1 outbound partition heals
+- the scenarios assert exact request IDs, only existing statuses `0`, `4`, `6`, and `7`, the shared response-body bound, and unchanged resource accounting around every request
+
+Why it matters:
+- prevents a scheduler or protocol mismatch from placing a GPU workload onto the wrong accelerator type even when the worker has enough GPU count
+- turns the worker `/run` status and failure contract into replayable deterministic evidence without bypassing the bidirectional simulated network
+
+Evidence and limits:
+- RED: `cargo test start_pod_rejects_nonzero_gpu_request_with_mismatched_type -- --nocapture` failed because a mismatched nonzero GPU request was inserted and allocated
+- GREEN: focused GPU-admission and `/run` scenarios passed; `cargo test --all-targets` passed `157` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `17.2s`
+- no real TCP, process forwarding, containerd, GPU/CDI, or cloud boundary ran; GPU hardware identity and runtime timeout behavior still require their respective real-boundary gates
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status was not revalidated
+
 ### 2026-07-23 — Lane B1 liveness and session-epoch review remediation
 
 What changed:

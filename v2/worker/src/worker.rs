@@ -276,6 +276,14 @@ impl Worker {
             None,
         );
 
+        if cmd.gpu_count > 0 && cmd.gpu_type != self.gpu_type {
+            self.reject_start(
+                io,
+                cmd.pod_id,
+                "requested GPU type does not match worker GPU type",
+            );
+            return;
+        }
         if self.gpu_allocated.saturating_add(cmd.gpu_count) > self.gpu_total {
             self.reject_start(io, cmd.pod_id, "insufficient GPU capacity");
             return;
@@ -2576,6 +2584,38 @@ mod tests {
                 status: PodStatusReport::Failed { .. }
             })
         )));
+    }
+
+    #[test]
+    fn start_pod_rejects_nonzero_gpu_request_with_mismatched_type() {
+        for (worker_gpu_type, requested_gpu_type) in [
+            (GpuType::H100Sxm, GpuType::T4),
+            (GpuType::T4, GpuType::H100Sxm),
+        ] {
+            let mut worker = Worker::new("node-gpu-type".into(), worker_gpu_type, 8, 4000, 8192);
+            let mut io = TestIo {
+                sent: Vec::new(),
+                inbox: VecDeque::new(),
+                tick: 0,
+            };
+            let mut command = test_start_cmd(1, 500, 512);
+            command.gpu_count = 1;
+            command.gpu_type = requested_gpu_type;
+
+            worker.handle_start_pod(&mut io, command, 0);
+
+            assert!(worker.tracked_pods().is_empty());
+            assert_eq!(worker.gpu_allocated(), 0);
+            assert_eq!(worker.cpu_allocated_millicores(), 0);
+            assert_eq!(worker.memory_allocated_megabytes(), 0);
+            assert!(io.sent.iter().any(|message| matches!(
+                message,
+                WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                    pod_id: 1,
+                    status: PodStatusReport::Failed { reason },
+                }) if reason == "requested GPU type does not match worker GPU type"
+            )));
+        }
     }
 
     #[test]

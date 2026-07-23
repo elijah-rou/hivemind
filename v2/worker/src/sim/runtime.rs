@@ -5,12 +5,21 @@ use crate::prng::{Prng, Ratio};
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
 
 const PROBE_SCRIPT_MAX: usize = 64;
+const RUN_SCRIPT_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     Healthy,
     Unhealthy,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Echo,
+    ResponseTooLarge,
+    ForwardingFailure,
+    Timeout,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +50,7 @@ struct Inner {
     start_attempts: HashMap<u64, u64>,
     stop_attempts: HashMap<u64, u64>,
     probe_outcomes: HashMap<u64, VecDeque<ProbeOutcome>>,
+    run_outcomes: HashMap<u64, VecDeque<RunOutcome>>,
     crash_round: u64,
 }
 
@@ -63,6 +73,7 @@ impl SimulatedRuntime {
                 start_attempts: HashMap::new(),
                 stop_attempts: HashMap::new(),
                 probe_outcomes: HashMap::new(),
+                run_outcomes: HashMap::new(),
                 crash_round: 0,
             }),
         }
@@ -84,6 +95,35 @@ impl SimulatedRuntime {
             previous.is_none(),
             "probe script may only be set once per pod"
         );
+    }
+
+    pub fn script_run_outcomes(&self, pod_id: u64, outcomes: &[RunOutcome]) {
+        assert!(!outcomes.is_empty(), "run script must not be empty");
+        assert!(
+            outcomes.len() <= RUN_SCRIPT_MAX,
+            "run script exceeds bounded capacity"
+        );
+        let previous = self
+            .inner
+            .lock()
+            .unwrap()
+            .run_outcomes
+            .insert(pod_id, outcomes.iter().copied().collect());
+        assert!(
+            previous.is_none(),
+            "run script may only be set once per pod"
+        );
+    }
+
+    pub fn crash_pod(&self, pod_id: u64, exit_code: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        let container_id = format!("sim-pod-{pod_id}");
+        let status = inner
+            .pods
+            .get_mut(&container_id)
+            .expect("scripted crash requires an existing pod");
+        assert_eq!(*status, PodStatus::Running);
+        *status = PodStatus::Stopped { exit_code };
     }
 
     /// Simulate spontaneous container crashes. Called by the simulator each tick.
@@ -244,13 +284,33 @@ impl Runtime for SimulatedRuntime {
         _port: u16,
         payload: &[u8],
     ) -> Result<Vec<u8>, RuntimeError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         match inner.pods.get(&handle.container_id) {
-            Some(PodStatus::Running) => Ok(payload.to_vec()),
-            Some(_) => Err(RuntimeError::ContainerStart(
-                "simulated pod not running".into(),
+            Some(PodStatus::Running) => {}
+            Some(_) => {
+                return Err(RuntimeError::ContainerStart(
+                    "simulated pod not running".into(),
+                ));
+            }
+            None => return Err(RuntimeError::ContainerNotFound(handle.container_id.clone())),
+        }
+        let outcome = match inner.run_outcomes.get_mut(&handle.pod_id) {
+            Some(script) => script
+                .pop_front()
+                .ok_or_else(|| RuntimeError::Internal("scripted run outcomes exhausted".into()))?,
+            None => RunOutcome::Echo,
+        };
+        match outcome {
+            RunOutcome::Echo => Ok(payload.to_vec()),
+            RunOutcome::ResponseTooLarge => {
+                Err(RuntimeError::ResponseTooLarge("simulated overflow".into()))
+            }
+            RunOutcome::ForwardingFailure => Err(RuntimeError::Internal(
+                "simulated forwarding failure".into(),
             )),
-            None => Err(RuntimeError::ContainerNotFound(handle.container_id.clone())),
+            RunOutcome::Timeout => Err(RuntimeError::Internal(
+                "simulated forwarding timeout".into(),
+            )),
         }
     }
 
