@@ -2151,12 +2151,66 @@ fn stageTwoEntryLeaderStartView(tc: *TestCluster) [2]msg.LogEntry {
     return entries;
 }
 
+test "combined follower Prepare and Commit barrier consumes Commit cut" {
+    const points = [_]replica_mod.BarrierCutPoint{ .before_slot_write, .before_metadata_write, .before_sync, .before_publication };
+    for (points, 0..) |point, point_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0xBA21C0 + point_index);
+        defer tc.deinit();
+        const follower = tc.replicas[1];
+
+        var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 7, .request_id = 9 };
+        entry.checksum = entry.computeChecksum();
+        tc.deliver(1, 0, .{ .prepare = .{
+            .view_number = 0,
+            .op_number = 1,
+            .commit_min = 0,
+            .retention_floor = 0,
+            .entry = entry,
+        } });
+        tc.deliver(1, 0, .{ .commit = .{
+            .view_number = 0,
+            .commit_min = 1,
+            .commit_max = 1,
+            .op_number = 1,
+            .retention_floor = 0,
+            .commit_checksum = entry.checksum,
+        } });
+        try std.testing.expect(follower.journal_dirty[replica_mod.journalSlot(1)]);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.commit_min);
+
+        const cut_id: u64 = 0xC01117 + point_index;
+        follower.armBarrierCut(.{ .id = cut_id, .kind = .commit, .point = point });
+        const prepare_ok_before = tc.network.stats.sent[@intFromEnum(msg.Tag.prepare_ok)];
+        follower.tick();
+
+        try std.testing.expect(follower.storage_failed);
+        try std.testing.expectEqual(@as(u64, 1), follower.barrier_cut_count);
+        try std.testing.expectEqual(cut_id, follower.last_barrier_cut_id);
+        try std.testing.expectEqual(prepare_ok_before, tc.network.stats.sent[@intFromEnum(msg.Tag.prepare_ok)]);
+
+        tc.crashReplica(1);
+        const recovered = tc.replicas[1];
+        const durable_new = point == .before_publication;
+        try std.testing.expectEqual(@as(msg.ViewNumber, 0), recovered.view_number);
+        try std.testing.expectEqual(@as(msg.ViewNumber, 0), recovered.last_normal_view);
+        try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), recovered.op_number);
+        try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), recovered.commit_min);
+        try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), recovered.commit_max);
+        if (durable_new) {
+            try std.testing.expectEqual(entry.checksum, recovered.journalGet(1).?.checksum);
+        } else {
+            try std.testing.expect(recovered.journalGet(1) == null);
+        }
+    }
+}
+
 test "Prepare and Commit barrier cut table recovers old or durable state" {
     const points = [_]replica_mod.BarrierCutPoint{ .before_slot_write, .before_metadata_write, .before_sync, .before_publication };
     const kinds = [_]replica_mod.BarrierKind{ .prepare, .commit };
     for (kinds, 0..) |kind, kind_index| {
         for (points, 0..) |point, point_index| {
-            const tc = try TestCluster.init(std.testing.allocator, 1, 0xBA2200 + kind_index * 16 + point_index);
+            const replica_count: u8 = if (kind == .prepare) 3 else 1;
+            const tc = try TestCluster.init(std.testing.allocator, replica_count, 0xBA2200 + kind_index * 16 + point_index);
             defer tc.deinit();
             var capture = ReplyCapture{};
             const replica = tc.replicas[0];
@@ -2164,6 +2218,7 @@ test "Prepare and Commit barrier cut table recovers old or durable state" {
             replica.client_reply_fn = ReplyCapture.reply;
             const cut_id: u64 = 100 + kind_index * 16 + point_index;
             replica.armBarrierCut(.{ .id = cut_id, .kind = kind, .point = point });
+            const prepare_before = tc.network.stats.sent[@intFromEnum(msg.Tag.prepare)];
 
             tc.requestWithIdentity(0, 9, 1, .{ .noop = {} });
             replica.tick();
@@ -2171,16 +2226,29 @@ test "Prepare and Commit barrier cut table recovers old or durable state" {
             try std.testing.expectEqual(@as(u64, 1), replica.barrier_cut_count);
             try std.testing.expectEqual(cut_id, replica.last_barrier_cut_id);
             try std.testing.expectEqual(@as(usize, 0), capture.count);
+            try std.testing.expectEqual(prepare_before, tc.network.stats.sent[@intFromEnum(msg.Tag.prepare)]);
 
             tc.crashReplica(0);
-            try std.testing.expectEqual(cut_id, tc.replicas[0].last_barrier_cut_id);
+            const recovered = tc.replicas[0];
+            try std.testing.expectEqual(cut_id, recovered.last_barrier_cut_id);
             const durable_new = point == .before_publication;
-            if (kind == .prepare) {
-                try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), tc.replicas[0].op_number);
-                try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[0].commit_min);
+            const expected_op: msg.OpNumber = if (kind == .prepare)
+                (if (durable_new) 1 else 0)
+            else
+                1;
+            const expected_commit: msg.OpNumber = if (kind == .commit and durable_new) 1 else 0;
+            try std.testing.expectEqual(@as(msg.ViewNumber, 0), recovered.view_number);
+            try std.testing.expectEqual(@as(msg.ViewNumber, 0), recovered.last_normal_view);
+            try std.testing.expectEqual(expected_op, recovered.op_number);
+            try std.testing.expectEqual(expected_commit, recovered.commit_min);
+            try std.testing.expectEqual(expected_commit, recovered.commit_max);
+            if (expected_op == 1) {
+                const recovered_entry = recovered.journalGet(1).?;
+                try std.testing.expectEqual(@as(u128, 9), recovered_entry.client_id);
+                try std.testing.expectEqual(@as(msg.RequestId, 1), recovered_entry.request_id);
+                try std.testing.expectEqual(@as(u64, 0), recovered_entry.parent_checksum);
             } else {
-                try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].op_number);
-                try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), tc.replicas[0].commit_min);
+                try std.testing.expect(recovered.journalGet(1) == null);
             }
         }
     }
@@ -2216,20 +2284,37 @@ test "leader and follower StartView barrier cut table recovers old or durable se
             try std.testing.expect(replica.pending_start_view.active);
             const cut_id: u64 = 200 + kind_index * 16 + point_index;
             replica.armBarrierCut(.{ .id = cut_id, .kind = kind, .point = point });
+            const expected_view = replica.pending_start_view.target_view;
+            const expected_last_normal_view = replica.pending_start_view.last_normal_view;
+            const expected_commit = replica.pending_start_view.commit_min;
             const start_view_before = tc.network.stats.sent[@intFromEnum(msg.Tag.start_view)];
+            const send_status_before = tc.network.stats.sent[@intFromEnum(msg.Tag.send_status)];
+            const prepare_ok_before = tc.network.stats.sent[@intFromEnum(msg.Tag.prepare_ok)];
 
             replica.tick();
             try std.testing.expect(replica.storage_failed);
             try std.testing.expect(replica.pending_start_view.active);
             try std.testing.expectEqual(msg.Status.view_change, replica.status);
             try std.testing.expectEqual(start_view_before, tc.network.stats.sent[@intFromEnum(msg.Tag.start_view)]);
+            try std.testing.expectEqual(send_status_before, tc.network.stats.sent[@intFromEnum(msg.Tag.send_status)]);
+            try std.testing.expectEqual(prepare_ok_before, tc.network.stats.sent[@intFromEnum(msg.Tag.prepare_ok)]);
             try std.testing.expectEqual(cut_id, replica.last_barrier_cut_id);
 
             tc.crashReplica(@intCast(replica_index));
-            try std.testing.expectEqual(cut_id, tc.replicas[replica_index].last_barrier_cut_id);
-            const durable_op: msg.OpNumber = if (point == .before_publication) expected_op else 0;
-            try std.testing.expectEqual(durable_op, tc.replicas[replica_index].op_number);
-            if (durable_op > 0) try std.testing.expectEqual(expected_tip, tc.replicas[replica_index].journalGet(durable_op).?.checksum);
+            const recovered = tc.replicas[replica_index];
+            try std.testing.expectEqual(cut_id, recovered.last_barrier_cut_id);
+            const durable_new = point == .before_publication;
+            try std.testing.expectEqual(@as(msg.ViewNumber, if (durable_new) expected_view else 0), recovered.view_number);
+            try std.testing.expectEqual(@as(msg.ViewNumber, if (durable_new) expected_last_normal_view else 0), recovered.last_normal_view);
+            try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) expected_op else 0), recovered.op_number);
+            try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) expected_commit else 0), recovered.commit_min);
+            try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) expected_commit else 0), recovered.commit_max);
+            if (durable_new) {
+                try std.testing.expectEqual(expected_op, recovered.op_number);
+                try std.testing.expectEqual(expected_tip, recovered.journalGet(expected_op).?.checksum);
+            } else {
+                try std.testing.expect(recovered.journalGet(1) == null);
+            }
         }
     }
 }
@@ -2579,14 +2664,25 @@ test "five-replica gapped selection repairs through dropped false hint and unhin
     } }, &wire);
     tc.network.enqueueSend(2, 0, wire[0..wire_len]);
 
-    const deadline = leader.view_change_candidate.metadata.deadline_tick;
+    const deadline_ms = leader.view_change_candidate.metadata.deadline_tick;
     const syncs_before = tc.disks[0].syncs;
-    while (leader.status != .normal and @as(u64, @intCast(tc.current_tick)) < deadline) tc.tick();
+    while (leader.status != .normal and @as(u64, @intCast(tc.current_tick * 10)) < deadline_ms) tc.tick();
     try std.testing.expectEqual(msg.Status.normal, leader.status);
-    try std.testing.expect(@as(u64, @intCast(tc.current_tick)) < deadline);
+    try std.testing.expect(@as(u64, @intCast(tc.current_tick * 10)) < deadline_ms);
     try std.testing.expect(tc.disks[0].syncs > syncs_before);
     try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
     try std.testing.expectEqual(@as(msg.OpNumber, 10), tc.disks[0].readMetadata().?.op_number);
+
+    tc.crashReplica(0);
+    const recovered = tc.replicas[0];
+    try std.testing.expectEqual(@as(msg.OpNumber, 10), recovered.op_number);
+    var recovered_parent: u64 = 0;
+    for (entries, 1..) |expected, op| {
+        const actual = recovered.journalGet(op).?;
+        try std.testing.expectEqual(expected.checksum, actual.checksum);
+        try std.testing.expectEqual(recovered_parent, actual.parent_checksum);
+        recovered_parent = actual.checksum;
+    }
 }
 
 test "selected source mutation aborts candidate without changing active journal" {

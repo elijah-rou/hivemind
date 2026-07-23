@@ -17,6 +17,7 @@ pub const EventKind = union(enum) {
     pause: struct { replica: u8, duration: u16 },
     unpause: struct { replica: u8 },
     drop_next: struct { count: u64, id: u64, from: u8, to: u8, tag: u8 },
+    barrier_cut: struct { replica: u8, id: u64, kind: replica_mod.BarrierKind, point: replica_mod.BarrierCutPoint },
     request: struct { leader: u8, request_num: u32 },
     state: [8]ReplicaSnapshot,
     violation: struct { message_buf: [256]u8, message_len: usize, replica: u8 },
@@ -94,7 +95,19 @@ pub const TraceCollector = struct {
     }
 
     pub fn addDropNext(self: *TraceCollector, tick: u64, count: u64, id: u64, from: u8, to: u8, tag: u8) void {
+        std.debug.assert(count > 0);
+        std.debug.assert(id > 0);
         self.push(.{ .tick = tick, .kind = .{ .drop_next = .{ .count = count, .id = id, .from = from, .to = to, .tag = tag } } });
+    }
+
+    pub fn addBarrierCut(self: *TraceCollector, tick: u64, replica: u8, cut: replica_mod.BarrierCut) void {
+        std.debug.assert(cut.id > 0);
+        self.push(.{ .tick = tick, .kind = .{ .barrier_cut = .{
+            .replica = replica,
+            .id = cut.id,
+            .kind = cut.kind,
+            .point = cut.point,
+        } } });
     }
 
     pub fn addRequest(self: *TraceCollector, tick: u64, leader: u8, request_num: u32) void {
@@ -199,6 +212,7 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
         .pause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"pause\",\"replica\":{d},\"duration\":{d}}}\n", .{ event.tick, e.replica, e.duration }) catch null,
         .unpause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"unpause\",\"replica\":{d}}}\n", .{ event.tick, e.replica }) catch null,
         .drop_next => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"drop_next\",\"count\":{d},\"id\":{d},\"from\":{d},\"to\":{d},\"tag\":{d}}}\n", .{ event.tick, e.count, e.id, e.from, e.to, e.tag }) catch null,
+        .barrier_cut => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"barrier_cut\",\"replica\":{d},\"id\":{d},\"kind\":\"{s}\",\"point\":\"{s}\"}}\n", .{ event.tick, e.replica, e.id, @tagName(e.kind), @tagName(e.point) }) catch null,
         .request => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"request\",\"leader\":{d},\"num\":{d}}}\n", .{ event.tick, e.leader, e.request_num }) catch null,
         .state => |snaps| blk: {
             var pos: usize = 0;

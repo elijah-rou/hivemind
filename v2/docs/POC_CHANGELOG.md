@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane A3 durability-cut review remediation
+
+What changed:
+- normal group-commit barriers now retain explicit pending Prepare and Commit causes, so a combined follower Prepare+Commit barrier can consume either selected cut and unrelated idle metadata flushes cannot consume Commit cuts
+- traced VOPR runs can schedule deterministic message or barrier cuts and emit exactly one identified JSONL event when each cut is consumed
+- the four-boundary cut tables now assert relevant Prepare, PrepareOk, SendStatus, StartView, and client publication counters plus complete recovered metadata and entry identity
+- the five-replica repair scenario enforces the candidate deadline in simulated milliseconds and crash-recovers the complete repaired chain; random sync-fault coverage stages both slot and metadata state before proving whole-operation failure and retry
+
+Why it matters:
+- closes review gaps where Commit coverage could be skipped by coalescing, candidate liveness used mismatched units, trace output reported zero-ID snapshots, and recovery assertions did not prove repaired ancestors were durable
+
+Progress:
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- faults still model whole-operation failure and process cuts, not torn sectors, filesystem reordering, or power-loss corruption
+- snapshots and operation beyond the 1024-entry lifetime cap remain unsupported
+
 ### 2026-07-17 — Deterministic VOPR message and durability cuts
 
 What changed:

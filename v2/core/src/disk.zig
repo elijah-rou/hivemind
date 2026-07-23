@@ -959,12 +959,25 @@ test "FileDisk: creation-crash partial journal fails closed" {
     try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
 }
 
-test "durable storage: sync_fault_rate fails before publication" {
+test "durable storage: sync_fault_rate fails whole staged set before publication" {
     var sim = SimulatedDisk.init();
+    var entry = msg.LogEntry{ .view_number = 3, .op_number = 1, .client_id = 5, .request_id = 7 };
+    entry.checksum = entry.computeChecksum();
+    const metadata = Metadata{ .view_number = 3, .last_normal_view = 2, .op_number = 1, .commit_min = 1, .commit_max = 1 };
+    try sim.writeSlot(1, &entry);
+    try sim.writeMetadata(metadata);
+
     sim.sync_fault_rate = prng_mod.Ratio.init(1, 1);
     try std.testing.expectError(error.SyncFailed, sim.sync());
     try std.testing.expectEqual(@as(u64, 1), sim.sync_faults);
     try std.testing.expectEqual(@as(u64, 0), sim.syncs);
+    try std.testing.expect(sim.readSlot(1) == null);
+    try std.testing.expect(sim.readMetadata() == null);
+
+    sim.sync_fault_rate = prng_mod.Ratio.zero();
+    try sim.sync();
+    try std.testing.expectEqual(entry.checksum, sim.readSlot(1).?.checksum);
+    try std.testing.expect(sim.metadataEquals(metadata));
 }
 
 test "durable storage: write_fault_rate applies to metadata writes" {
