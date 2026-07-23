@@ -2873,8 +2873,12 @@ test "peer envelope socketpair rejects before identity binding and VRR dispatch"
         .{ .name = "current v6 deterministic encrypted", .version = PROTOCOL_VERSION, .encrypt = true, .key_configured = true, .accepted = true },
     };
 
-    var accepted_mutation_seen = false;
     for (cases, 0..) |case, case_index| {
+        replica.status = .normal;
+        replica.view_number = 0;
+        replica.start_vc_count = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        replica.start_vc_total = 0;
+
         var sockets: [2]c_int = undefined;
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets));
         try ConnectionManager.setNonBlocking(sockets[0]);
@@ -2915,7 +2919,7 @@ test "peer envelope socketpair rejects before identity binding and VRR dispatch"
         try std.testing.expectEqual(@as(u8, 1), cm.peers[0].configured_peer_id);
         try std.testing.expectEqual(case.accepted, cm.peers[0].peer_id_known);
         if (case.accepted) {
-            accepted_mutation_seen = accepted_mutation_seen or replica.start_vc_total > dispatch_before;
+            try std.testing.expect(replica.start_vc_total > dispatch_before);
             try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
         } else {
             try std.testing.expectEqual(PEER_IDENTITY_TIMEOUT_TICKS, cm.peers[0].peer_deadline_tick);
@@ -2923,7 +2927,6 @@ test "peer envelope socketpair rejects before identity binding and VRR dispatch"
         }
         disconnectPeer(&cm.peers[0]);
     }
-    try std.testing.expect(accepted_mutation_seen);
 }
 
 test "simultaneous reciprocal sockets converge and carry bidirectional VRR traffic" {
@@ -3002,13 +3005,17 @@ test "simultaneous reciprocal sockets converge and carry bidirectional VRR traff
     try std.testing.expect(higher.hasPeerConnection(0));
 }
 
-test "peer frame buffer fits largest VRR view-change frame" {
-    const largest_plain_payload = 2 + 1 + @sizeOf(msg.DoViewChangeMsg); // version + from_id + serialized VRR message
-    const largest_plain_frame = 5 + largest_plain_payload; // len + flags + payload
-    const largest_encrypted_frame = 5 + enc.NONCE_LEN + largest_plain_payload + enc.TAG_LEN;
+test "peer frame buffer fits largest serialized VRR view-change frame" {
+    var serialized: [MAX_FRAME_BYTES]u8 = undefined;
+    const serialized_len = msg.serialize(.{ .do_view_change = .{} }, &serialized);
+    try std.testing.expectEqual(1 + @sizeOf(msg.DoViewChangeMsg), serialized_len);
 
-    try std.testing.expect(largest_plain_frame <= MAX_FRAME_BYTES);
-    try std.testing.expect(largest_encrypted_frame <= MAX_FRAME_BYTES);
+    const peer_body_len = 2 + 1 + serialized_len; // version + from_id + tagged VRR message
+    const plaintext_frame_len = 5 + peer_body_len; // len + flags + body
+    const encrypted_frame_len = 5 + enc.NONCE_LEN + peer_body_len + enc.TAG_LEN;
+
+    try std.testing.expect(plaintext_frame_len <= MAX_FRAME_BYTES);
+    try std.testing.expect(encrypted_frame_len <= MAX_FRAME_BYTES);
 }
 
 test "shiftBuffer saturates when consumed exceeds current position" {

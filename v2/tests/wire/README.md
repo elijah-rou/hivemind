@@ -91,7 +91,7 @@ Every applicable decoder must fail closed for:
 - plaintext when a key is required and encrypted frames when no key is configured;
 - altered nonce, AAD, ciphertext, or authentication tag;
 - old protocol versions and future protocol versions;
-- all current-version peer tests once peer frames become versioned.
+- current-version peer envelopes, including rejection before identity binding or VRR dispatch.
 
 Old/future-version failures occur before identity binding, dispatch, state mutation, or request execution. Malformed inputs must not be “normalized” into valid values. Corpus cases should distinguish incomplete streaming input from a complete invalid frame where that distinction is observable.
 
