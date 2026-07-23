@@ -155,10 +155,12 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
 
 ```
 Client/Agent frames (plaintext): [4B LE len][1B flags=0x00][2B LE version][1B tag][payload...]
-Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext][16B tag]
-Peer frames (plaintext):         [4B LE len][1B flags=0x00][1B from_id][VRR payload]
-Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(from_id+VRR)][16B tag]
-PROTOCOL_VERSION = 5 (2 bytes = 65535 possible versions; earlier mixed peers/workers fail closed)
+Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext(version+tag+payload)][16B tag]
+Peer frames (plaintext):         [4B LE len][1B flags=0x00][2B LE version][1B from_id][VRR payload]
+Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(version+from_id+VRR)][16B tag]
+PROTOCOL_VERSION = 6 (mismatch fails before peer identity binding, connection-state decisions, or VRR dispatch)
+
+Mixed-version rolling upgrades are unsupported. Stop every replica, worker, API gateway, and bench client, replace all components, then restart. This compatibility gate does not authenticate peers; without TLS/mTLS, reachable senders can still claim a configured peer identity.
 ```
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)
@@ -171,7 +173,7 @@ PROTOCOL_VERSION = 5 (2 bytes = 65535 possible versions; earlier mixed peers/wor
 - LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=1024 so dedup spans the full retained journal
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
-- Full view change protocol: StartViewChange → DoViewChange → StartView. Protocol v5 requires StartView for view adoption; higher-view Prepare/Commit traffic requests the current leader's StartView instead of promoting a follower directly.
+- Full view change protocol: StartViewChange → DoViewChange → StartView. Protocol v6 requires StartView for view adoption; higher-view Prepare/Commit traffic requests the current leader's StartView instead of promoting a follower directly.
 - A DVC quorum selects its source across every valid DVC by highest `(last_normal_view, op_number)`, independently computes the maximum exposed commit watermark as the adoption bound, and requires the selected tip to cover that bound. Equal-rank sources must agree on tip and overlap identities. A fully validated selected chain may replace conflicting durable prepares only above the local committed prefix; conflicts at or below `commit_min` remain fail-closed.
 - Log repair via RequestPrepare/SendPrepare; selection-bound repair can fetch a retained source chain for an older target view while exact LNV/tip/source bindings still match. Ordinary repair remains exact-current-view only. An active candidate is governed only by its fixed candidate deadline, so the shorter recovered/view-change timeout cannot preempt bounded suffix fetch.
 - Field-by-field outer serialization; nested Command/Result use a fixed tag-first wire codec (validate tags before union materialization)
@@ -269,8 +271,8 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
-- Zig: `330 / 330` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
-- Rust: `159` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Zig: `331 / 331` unit/simulation tests pass in Debug and ReleaseFast, including the protocol-v6 peer-envelope socketpair scenario.
+- Rust: `165` library, `3` fuzz-harness utility, `5` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
@@ -286,6 +288,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
 - Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
 - Seeded ConnectionManager socketpair/fake-clock transition coverage: leader probe, fragmented client frame, client and three worker connections, dispatch, client abandonment, foreign worker response isolation, tombstone expiry, worker disconnect, leader change, and slot reconnect; every transition checks RequestQueue accounting plus exact queue/occupied/client-active/worker-busy/live-connection/counter values
+- Named peer-envelope socketpair coverage checks protocol-v6 plaintext and fixed-nonce encrypted frames, current-1, malformed, and plaintext-on-keyed-connection rejection; rejected frames remain unbound and cannot reach replica VRR counters
 - Connection metrics count currently connected sockets rather than high-water allocated slots; the deterministic harness checks exact agent/client/peer gauges and queue/in-flight/lifetime counters at queued, dispatched, abandoned/client-disconnected, and final states
 - Cross-region gossip propagation
 - Gossip under network partitions

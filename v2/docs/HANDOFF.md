@@ -172,5 +172,5 @@ The values below show a complete record shape. Placeholders are intentional and 
 - Simulator/model limitations: no torn-write, filesystem-reordering, power-loss, kernel, GPU, or cloud proof
 - Real-process/runtime limitations: local process runtime does not attest containerd; standalone failover has no worker/data plane
 - Live-only unknowns: current AWS, ECR, GPU/CDI, JuiceFS, S3/SSM/systemd state and cleanup are unverified
-- Compatibility/upgrade limitations: peer frames remain unversioned; mixed-version rolling upgrades are unsupported
+- Compatibility/upgrade limitations: all TCP envelopes require protocol version 6; mixed-version rolling upgrades are unsupported and require a stop-the-world replacement
 ```

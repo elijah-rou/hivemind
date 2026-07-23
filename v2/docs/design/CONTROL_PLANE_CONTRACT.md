@@ -115,9 +115,9 @@ Current `state_machine.zig` has nodes, deployments, pods with basic lifecycle. N
 
 These are materialized views built from consensus mutations. Every replica computes them identically.
 
-## Client and Agent Frame Validation
+## TCP Frame Validation
 
-Client and agent streams use one frame contract in Zig core, Go API, and Rust worker:
+Client, agent, and replica peer streams use one outer frame contract:
 
 - Outer layout is `[4B little-endian length][1B flags][body]`; length includes flags and body, not the four-byte length field.
 - Flags are exactly `0x00` for plaintext or `0x01` for XChaCha20-Poly1305. Other values are invalid.
@@ -128,4 +128,6 @@ Client and agent streams use one frame contract in Zig core, Go API, and Rust wo
 
 Receiver limits remain explicit per connection role: Zig connection staging is 64 KiB, Rust agent payloads are at most 16 KiB, and Go callers supply a bounded receive buffer sized for the expected response. A declaration may exactly fill its receiver's bound; larger declarations are rejected before body read/allocation.
 
-Peer VRR frames share the exact flags, encryption-mode, and declaration-bound rules, but retain their existing unversioned body (`from_id` plus VRR payload). They do not use the client/agent version-and-tag body.
+Peer VRR bodies are `[2B little-endian protocol_version][1B from_id][VRR payload]` in plaintext, or encryption of that same complete body. The receiver validates `protocol_version` before reading or binding `from_id`, changing peer connection state, or deserializing and dispatching the VRR payload. Version 6 does not support mixed-version peers.
+
+Version validation is not peer authentication. Without an authenticated transport such as mTLS, a network participant that can reach the peer listener may still claim a configured sender identity; optional shared-key frame encryption does not provide distinct per-peer identity.

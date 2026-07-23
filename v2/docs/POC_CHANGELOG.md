@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane C1 protocol-v6 peer envelope
+
+What changed:
+- the replica peer body is now `[2B little-endian version][1B sender identity][VRR payload]` in plaintext, or encryption of that same complete body
+- peer version mismatch is consumed and rejected before sender identity binding, connection replacement/disconnect decisions, VRR deserialization, or replica dispatch
+- the global client, worker, API, bench, and peer protocol version moved atomically from 5 to 6
+- named deterministic AF_UNIX socketpair coverage exercises current-v6 plaintext, current-1, malformed, plaintext-on-keyed-connection, and fixed-nonce encrypted envelopes
+
+Why it matters:
+- mixed-version peers can no longer bind a socket identity or mutate replica state before incompatibility is detected
+- all TCP roles now share one explicit global compatibility epoch
+
+Evidence and limits:
+- RED: the focused peer-envelope socketpair test found current-version frames could not bind because the peer body had no version field
+- GREEN: focused peer tests and Zig Debug/ReleaseFast pass; Rust formatting/all-targets and Go API/bench formatting/race/build gates pass; the documentation layout test, shell syntax, and protocol-constant equality check pass
+- upgrades remain stop-the-world: stop replicas, workers, API gateways, and bench clients, replace every component, then restart; there is no rolling mixed-version support
+- version validation is not authentication; peer identity remains unauthenticated without TLS/mTLS, and no shared cross-language byte corpus exists until C2
+- no live, cloud, containerd, GPU/CDI, or external TCP environment ran
+
 ### 2026-07-23 — Lane B final safety remediation
 
 What changed:

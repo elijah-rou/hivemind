@@ -251,10 +251,10 @@ artifacts ----------> local files + ownership-scoped S3 + SSM output
 | Rust worker | Versioned envelope; [`protocol.rs`](../worker/src/protocol.rs) owns the current constant and codecs | Rust-local generated vectors | Same global client/worker version |
 | Go API | Versioned envelope; [`api/client.go`](../api/client.go) owns the current constant and codecs | Go API-local tests | Same global client/worker version |
 | Go bench | Versioned envelope; [`bench/main.go`](../bench/main.go) owns the current constant and codecs | Go bench-local tests | Same global client/worker version |
-| Zig replica peers | Length plus sender identity and serialized VRR message in [`replica.zig`](../core/src/replica.zig); no peer-envelope version | No shared fixture | A versioned peer envelope requires a future atomic global bump |
+| Zig replica peers | Versioned body plus sender identity and serialized VRR message in [`replica.zig`](../core/src/replica.zig) | Zig socketpair tests; no shared fixture | Reject mismatch before sender binding, socket replacement/disconnect decisions, or VRR dispatch |
 | Shared corpus/gate | None currently | Planned in [wire fixture contract](../tests/wire/README.md) | Fixture, consumers, gate, version, and docs land together |
 
-Protocol version 5 currently applies to client and worker envelopes. Replica peer frames are unversioned, and no shared normative cross-language corpus exists. A future peer envelope and shared corpus must land atomically across Zig, Rust, Go API, and Go bench. Do not reserve a proposed future number as current merely because it appears in planning history. Mixed-version rolling upgrades are unsupported: stop the entire cluster, upgrade every component, then restart it.
+Protocol version 6 applies to client, worker, API, bench, and replica peer envelopes. Peer plaintext bodies are `[2B little-endian version][1B sender identity][VRR payload]`; encrypted bodies protect that same complete body. No shared normative cross-language corpus exists yet. Mixed-version rolling upgrades are unsupported: stop every replica, worker, API gateway, and bench client, replace every component, then restart the cluster. The version gate is compatibility validation, not authentication: peer identity remains unauthenticated unless the deployment separately supplies an authenticated transport such as mTLS.
 
 ---
 

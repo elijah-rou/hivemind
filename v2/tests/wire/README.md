@@ -1,6 +1,6 @@
 # Shared wire fixture contract
 
-> **Current limitation:** Hivemind currently uses protocol version 5 for client and worker envelopes, while replica peer frames are unversioned. Zig, Rust, Go API, and Go bench have language-local protocol tests, but no shared normative fixture corpus or shared contract gate exists. Everything below marked planned is not runnable today.
+> **Current limitation:** Hivemind uses protocol version 6 for client, worker, API, bench, and replica peer envelopes. Zig socketpair tests cover peer version rejection, but all languages still have only language-local protocol tests; no shared normative fixture corpus or shared contract gate exists. Everything below marked planned is not runnable today.
 
 The behavioral protocol remains defined by [the control-plane contract](../../docs/design/CONTROL_PLANE_CONTRACT.md). Current constants and codecs remain source-owned by [`core/src/connection.zig`](../../core/src/connection.zig), [`worker/src/protocol.rs`](../../worker/src/protocol.rs), [`api/client.go`](../../api/client.go), and [`bench/main.go`](../../bench/main.go).
 
@@ -16,7 +16,7 @@ There are no normative shared fixtures today. Existing “golden” values in la
 
 ## Planned, not implemented: corpus schema
 
-The eventual JSON corpus must be bounded and schema-validated. Planning history suggested a version-named JSON file, but no `contract-v6.json` is created or current here, and version 6 is not reserved. Each record needs these fields:
+The eventual JSON corpus must be bounded and schema-validated. The planned `contract-v6.json` does not exist yet; protocol version 6 is current but does not have a shared normative corpus. Each record needs these fields:
 
 ```text
 corpus_version
@@ -53,7 +53,7 @@ Schema rules:
 - `consumer_set` explicitly names every applicable consumer. A vector cannot silently be skipped by an applicable implementation.
 - Expected failures use stable error classes such as `unknown_flags`, `short_frame`, `length_mismatch`, `oversize`, `unsupported_version`, `unknown_tag`, `invalid_status`, or `authentication_failed`, not language-specific error strings.
 - Boundary vectors include empty payloads and exact active maxima where the message permits them. Follow source links above for mutable limits.
-- Peer vectors cannot be normative until a peer-envelope version is implemented. Current peer framing is unversioned.
+- Peer vectors must include the version before sender identity and prove old-version rejection occurs before identity binding or VRR dispatch.
 
 ## Deterministic encryption policy
 
@@ -77,7 +77,7 @@ Normative encrypted vectors may use fixed keys and nonces only to make exact byt
 | Request data plane | run request and run response with empty, typical, and exact-boundary bodies |
 | Leader discovery | leader probe request and response/reply framing used by API and bench clients |
 | Run statuses | legal bytes `0` through `9`, with names and origin restrictions from [ENGINEERING.md](../../docs/ENGINEERING.md) |
-| Peer traffic | representative peer envelope and VRR messages only after a peer-envelope version exists |
+| Peer traffic | representative version-6 peer envelopes, VRR messages, current-1 rejection, malformed input, plaintext, and deterministic encrypted examples |
 | Encryption | byte-identical plaintext/encrypted examples plus deterministic authentication failures |
 
 The legal run-status inventory is `ok` (0), `deployment_not_found` (1), `queue_full` (2), `invalid_payload` (3), `response_too_large` (4), `outcome_ambiguous` (5), `forwarding_failed` (6), `no_running_pod` (7), `unavailable` (8), and gateway-only `not_leader` (9). A worker-originated status 9 is invalid and must disconnect/reject that worker rather than becoming a normal response.
@@ -99,7 +99,7 @@ Old/future-version failures occur before identity binding, dispatch, state mutat
 
 | Consumer | Current state | Planned normative obligation |
 |---|---|---|
-| Zig core | Self-generated client/worker frame tests in [`connection.zig`](../../core/src/connection.zig); peer serialization in [`replica.zig`](../../core/src/replica.zig) | Load applicable shared vectors, decode them, re-encode successful cases byte-identically, and reject every negative case |
+| Zig core | Self-generated client/worker frame tests plus peer-envelope socketpair tests in [`connection.zig`](../../core/src/connection.zig); peer serialization in [`replica.zig`](../../core/src/replica.zig) | Load applicable shared vectors, decode them, re-encode successful cases byte-identically, and reject every negative case |
 | Rust worker | Self-generated frame/payload tests in [`protocol.rs`](../../worker/src/protocol.rs) | Same for worker directions and shared envelope cases |
 | Go API | Self-generated client tests in [`client_test.go`](../../api/client_test.go) | Same for API client, leader, reply, and run-response cases |
 | Go bench | Self-generated tests under [`bench/`](../../bench/) | Same for probe, reply, and request cases |

@@ -3222,12 +3222,13 @@ pub const Replica = struct {
 
     fn sendTo(self: *Replica, to: u8, message: msg.Message) void {
         if (self.storage_failed) return;
-        // Frame format: [4-byte LE len][1-byte from_id][VRR message bytes]
-        const vrr_len = msg.serialize(message, self.send_buf[5..]);
-        const frame_len: u32 = @intCast(1 + vrr_len);
+        // Frame format: [4-byte LE len][2-byte version][1-byte from_id][VRR message bytes]
+        const vrr_len = msg.serialize(message, self.send_buf[7..]);
+        const frame_len: u32 = @intCast(2 + 1 + vrr_len);
         @memcpy(self.send_buf[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, frame_len)));
-        self.send_buf[4] = self.replica_id;
-        const total = 5 + vrr_len;
+        std.mem.writeInt(u16, self.send_buf[4..6], msg.PROTOCOL_VERSION, .little);
+        self.send_buf[6] = self.replica_id;
+        const total = 7 + vrr_len;
 
         // Production: send via callback
         if (self.peer_send_fn) |cb| {
@@ -4938,8 +4939,10 @@ test "sendCommitHeartbeat never emits zero checksum for advancing target" {
         fn send(ctx: *anyopaque, to: u8, data: []const u8) void {
             _ = to;
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (data.len < 5) return;
-            const message = msg.deserialize(data[5..]) catch return;
+            if (data.len < 7) return;
+            const version = std.mem.readInt(u16, data[4..6], .little);
+            if (version != msg.PROTOCOL_VERSION) return;
+            const message = msg.deserialize(data[7..]) catch return;
             switch (message) {
                 .commit => |c| {
                     self.checksum = c.commit_checksum;
