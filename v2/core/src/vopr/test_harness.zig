@@ -23,6 +23,7 @@ pub const TestCluster = struct {
     replicas: [msg.REPLICA_COUNT_MAX]*replica_mod.Replica,
     disks: [msg.REPLICA_COUNT_MAX]SimulatedDisk,
     replica_running: [msg.REPLICA_COUNT_MAX]bool,
+    replica_paused: [msg.REPLICA_COUNT_MAX]bool,
     checker: StateChecker,
     replica_count: u8,
 
@@ -37,6 +38,7 @@ pub const TestCluster = struct {
         tc.current_tick = 0;
         tc.replica_count = replica_count;
         tc.replica_running = [_]bool{false} ** msg.REPLICA_COUNT_MAX;
+        tc.replica_paused = [_]bool{false} ** msg.REPLICA_COUNT_MAX;
         tc.checker = StateChecker.init(replica_count);
         tc.sim_agents = undefined;
         tc.sim_worker_count = 0;
@@ -48,7 +50,7 @@ pub const TestCluster = struct {
             const id: u8 = @intCast(i);
             tc.sim_ios[i] = SimulatedIo.init(&tc.prng, &tc.current_tick, tc.network, id);
             tc.state_machines[i] = try allocator.create(StateMachine);
-            tc.state_machines[i].initInPlace(seed +% i);
+            tc.state_machines[i].initInPlace(seed);
             tc.disks[i] = SimulatedDisk.init();
             tc.replicas[i] = try allocator.create(replica_mod.Replica);
             tc.replicas[i].initInPlace(.{
@@ -79,7 +81,7 @@ pub const TestCluster = struct {
         self.current_tick += 1;
         self.deliverAll();
         for (0..self.replica_count) |i| {
-            if (!self.replica_running[i]) continue;
+            if (!self.replica_running[i] or self.replica_paused[i]) continue;
             self.replicas[i].tick();
         }
         // Run state checker after every tick
@@ -92,6 +94,7 @@ pub const TestCluster = struct {
     /// Restart replicas that fail-stopped on storage (systemd Restart=always).
     pub fn restartStorageFailed(self: *TestCluster) void {
         for (0..self.replica_count) |i| {
+            if (self.replica_paused[i]) continue;
             if (self.replicas[i].storage_failed) {
                 self.crashReplica(@intCast(i));
             }
@@ -110,11 +113,10 @@ pub const TestCluster = struct {
         while (delivered < 256) {
             var any = false;
             for (0..self.replica_count) |i| {
-                if (!self.replica_running[i]) continue;
-                const io = self.sim_ios[i].io();
-                var bufs = [_][]u8{&buf};
-                const n = io.vtable.netRead(io.userdata, @intCast(i), &bufs) catch continue;
-                if (n <= 1) continue;
+                if (!self.replica_running[i] or self.replica_paused[i]) continue;
+                const received = self.network.queues[i].popReadyExcluding(self.current_tick, buf[1..], &self.replica_paused) orelse continue;
+                buf[0] = received.from;
+                const n = received.len + 1;
                 const from = buf[0];
                 const message = msg.deserialize(buf[1..n]) catch continue;
                 self.replicas[i].onMessage(from, message);
@@ -127,6 +129,8 @@ pub const TestCluster = struct {
 
     /// Directly deliver a message to a specific replica (bypasses network).
     pub fn deliver(self: *TestCluster, to: u8, from: u8, message: msg.Message) void {
+        if (to >= self.replica_count or from >= self.replica_count) return;
+        if (self.replica_paused[to] or self.replica_paused[from]) return;
         self.replicas[to].onMessage(from, message);
     }
 
@@ -138,7 +142,7 @@ pub const TestCluster = struct {
         request_id: msg.RequestId,
         command: msg.Command,
     ) void {
-        if (to >= self.replica_count or !self.replica_running[to]) return;
+        if (to >= self.replica_count or !self.replica_running[to] or self.replica_paused[to]) return;
         self.replicas[to].onMessage(to, .{ .request = .{
             .client_id = client_id,
             .request_id = request_id,
@@ -150,7 +154,7 @@ pub const TestCluster = struct {
     /// Respects network partitions: if the target is fully partitioned
     /// (cannot reach any other replica), the request is dropped.
     pub fn request(self: *TestCluster, to: u8, command: msg.Command) void {
-        if (to >= self.replica_count or !self.replica_running[to]) return;
+        if (to >= self.replica_count or !self.replica_running[to] or self.replica_paused[to]) return;
         var reachable = self.replica_count <= 1;
         if (!reachable) {
             for (0..self.replica_count) |i| {
@@ -178,11 +182,22 @@ pub const TestCluster = struct {
         self.network.healAll();
     }
 
+    pub fn pauseReplica(self: *TestCluster, id: u8) void {
+        if (id >= self.replica_count or !self.replica_running[id]) return;
+        self.replica_paused[id] = true;
+    }
+
+    pub fn resumeReplica(self: *TestCluster, id: u8) void {
+        if (id >= self.replica_count or !self.replica_running[id]) return;
+        self.replica_paused[id] = false;
+    }
+
     /// Simulate process stop: replica no longer ticks or receives messages.
     /// Disk survives; queued inbound messages are dropped like closed TCP sockets.
     pub fn stopReplica(self: *TestCluster, id: u8) void {
         if (id >= self.replica_count) return;
         self.replica_running[id] = false;
+        self.replica_paused[id] = false;
         for (0..self.replica_count) |i| {
             self.network.partitioned[id][@intCast(i)] = true;
             self.network.partitioned[@intCast(i)][id] = true;
@@ -207,6 +222,7 @@ pub const TestCluster = struct {
     /// then recover from durable disk state.
     pub fn crashReplica(self: *TestCluster, id: u8) void {
         const i: usize = id;
+        self.replica_paused[i] = false;
 
         self.disks[i].crash();
         self.state_machines[i].initInPlace(self.state_machines[i].seed);
@@ -411,7 +427,7 @@ pub const TestCluster = struct {
         return self.replicas[i].op_number;
     }
     pub fn isLeader(self: *const TestCluster, i: u8) bool {
-        return self.replicas[i].isLeader();
+        return self.replica_running[i] and !self.replica_paused[i] and self.replicas[i].status == .normal and self.replicas[i].isLeader();
     }
     pub fn nodes(self: *const TestCluster, i: u8) usize {
         return self.state_machines[i].node_count;
@@ -752,6 +768,47 @@ pub const FederatedGossipHarness = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
+test "strict convergence rejects divergent active replica state" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0A7E2);
+    defer tc.deinit();
+    try std.testing.expect(tc.checkConvergence() == null);
+
+    tc.replicas[1].op_number = 1;
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.replicas[1].op_number = 0;
+
+    var first = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    first.checksum = first.computeChecksum();
+    var second = msg.LogEntry{ .view_number = 0, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = first.checksum };
+    second.checksum = second.computeChecksum();
+    for (0..3) |i| {
+        tc.replicas[i].journalPut(first);
+        tc.replicas[i].journalPut(second);
+        tc.replicas[i].op_number = 2;
+    }
+    try std.testing.expect(tc.checkConvergence() == null);
+
+    var divergent_tip = second;
+    divergent_tip.client_id = 2;
+    divergent_tip.checksum = divergent_tip.computeChecksum();
+    const tip_slot = replica_mod.journalSlot(2);
+    tc.replicas[1].journal[tip_slot] = divergent_tip;
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.replicas[1].journal[tip_slot] = second;
+
+    const first_slot = replica_mod.journalSlot(1);
+    tc.replicas[1].journal_occupied[first_slot] = false;
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.replicas[1].journal_occupied[first_slot] = true;
+
+    _ = tc.state_machines[1].prng.next();
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.state_machines[1].prng = tc.state_machines[0].prng;
+
+    tc.replicas[1].storage_failed = true;
+    try std.testing.expect(tc.checkConvergence() != null);
+}
+
 test "recoverFromDisk: discards orphan journal entries above recovered op_number" {
     // Scenario: pre-crash, journal entries for ops 1..5 were written to disk
     // but the metadata flush only committed up to op=3. After crash, recovery
@@ -1006,6 +1063,109 @@ const ReplyCapture = struct {
         }
     }
 };
+
+test "paused replica freezes queued inbound and outbound delivery" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A000);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var wire: [net_mod.MESSAGE_SIZE_MAX]u8 = undefined;
+    var len = msg.serialize(.{ .prepare = .{
+        .view_number = 0,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } }, &wire);
+    tc.network.enqueueSend(0, 1, wire[0..len]);
+    len = msg.serialize(.{ .start_view_change = .{ .view_number = 3, .replica_id = 1 } }, &wire);
+    tc.network.enqueueSend(1, 0, wire[0..len]);
+
+    tc.pauseReplica(1);
+    tc.tick();
+    try std.testing.expectEqual(@as(usize, 1), tc.network.queues[0].count);
+    try std.testing.expectEqual(@as(usize, 1), tc.network.queues[1].count);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[0].view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[1].op_number);
+
+    tc.resumeReplica(1);
+    tc.deliverAll();
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), tc.replicas[0].view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
+}
+
+test "paused follower defers pending Prepare barrier and acknowledgement" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A001);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 0,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.advance(100);
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.journal_dirty[slot]);
+    try std.testing.expect(!follower.pending_prepare_ok[slot]);
+}
+
+test "paused follower defers pending StartView barrier and publication" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A002);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+    tc.deliver(1, 0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_start_view.active);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.current_tick = @intCast(follower.view_change_candidate.metadata.deadline_tick + 1);
+    tc.tick();
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
+}
 
 test "durable storage: follower slot-write failure emits no PrepareOk" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0xD001);
@@ -2311,8 +2471,11 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     wrong_identity.client_id +%= 1;
     wrong_identity.checksum = wrong_identity.computeChecksum();
     tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3, .entry = wrong_identity, .selected_source = 1,
-        .selected_last_normal_view = 2, .selected_tip_op = 10,
+        .view_number = 3,
+        .entry = wrong_identity,
+        .selected_source = 1,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[1].checksum,
     } });
@@ -2324,8 +2487,11 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     tc.tick();
     tc.tick();
     tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3, .entry = entries[1], .selected_source = 1,
-        .selected_last_normal_view = 2, .selected_tip_op = 10,
+        .view_number = 3,
+        .entry = entries[1],
+        .selected_source = 1,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[1].checksum,
     } });
@@ -2336,8 +2502,11 @@ test "incomplete selected suffix repairs backward by exact content identity" {
     wrong_parent.client_id +%= 1;
     wrong_parent.checksum = wrong_parent.computeChecksum();
     tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3, .entry = wrong_parent, .selected_source = 1,
-        .selected_last_normal_view = 2, .selected_tip_op = 10,
+        .view_number = 3,
+        .entry = wrong_parent,
+        .selected_source = 1,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[0].checksum,
     } });
@@ -2347,8 +2516,11 @@ test "incomplete selected suffix repairs backward by exact content identity" {
 
     const syncs_before = tc.disks[0].syncs;
     tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3, .entry = entries[0], .selected_source = 1,
-        .selected_last_normal_view = 2, .selected_tip_op = 10,
+        .view_number = 3,
+        .entry = entries[0],
+        .selected_source = 1,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[0].checksum,
     } });

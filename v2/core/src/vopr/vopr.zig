@@ -76,6 +76,7 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
     tc.network.partitioned = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.REPLICA_COUNT_MAX]bool);
 
     for (0..config.replica_count) |i| {
+        tc.resumeReplica(@intCast(i));
         // Clear transient disk faults first. Production/systemd restart does not
         // wipe durable state; only an explicit operator action would. Retrying
         // recovery with faults disabled models the healed network phase.
@@ -172,14 +173,14 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
             if (pause_until[target] <= now) {
                 const pause_duration = config.pause_stability + @as(u16, @intCast(prng.bounded(50)));
                 pause_until[target] = now + @as(i64, pause_duration);
-                tc.partition(target);
+                tc.pauseReplica(target);
             }
         }
         // Resume paused replicas
         for (0..config.replica_count) |i| {
             if (pause_until[i] > 0 and now >= pause_until[i]) {
                 pause_until[i] = 0;
-                tc.network.healOne(@intCast(i));
+                tc.resumeReplica(@intCast(i));
             }
         }
 
@@ -403,16 +404,18 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
             if (pause_until[target] <= now) {
                 const pause_duration = config.pause_stability + @as(u16, @intCast(prng.bounded(50)));
                 pause_until[target] = now + @as(i64, pause_duration);
-                tc.partition(target);
+                tc.pauseReplica(target);
                 trace("T={d:>4} PAUSE replica={d} for {d} ticks\n", .{ tick_count, target, pause_duration });
+                if (collector) |c| c.push(.{ .tick = tick_count, .kind = .{ .pause = .{ .replica = target, .duration = pause_duration } } });
             }
         }
         // Resume paused replicas
         for (0..config.replica_count) |i| {
             if (pause_until[i] > 0 and now >= pause_until[i]) {
                 pause_until[i] = 0;
-                tc.network.healOne(@intCast(i));
+                tc.resumeReplica(@intCast(i));
                 trace("T={d:>4} RESUME replica={d}\n", .{ tick_count, i });
+                if (collector) |c| c.push(.{ .tick = tick_count, .kind = .{ .unpause = .{ .replica = @intCast(i) } } });
             }
         }
 
@@ -449,7 +452,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         // Periodic state dump (every 50 ticks)
         if (tick_count % 50 == 0) {
             traceClusterState(tc, tick_count);
-            if (collector) |c| c.addState(tick_count, &tc.replicas, tc.replica_count);
+            if (collector) |c| c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
         }
 
         // Check for new violations
@@ -458,7 +461,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
             traceClusterState(tc, tick_count);
             traceJournalState(tc);
             if (collector) |c| {
-                c.addState(tick_count, &tc.replicas, tc.replica_count);
+                c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
                 c.addViolation(tick_count, 0, "safety violation detected");
                 for (0..tc.replica_count) |i| {
                     c.addJournal(tick_count, @intCast(i), tc.replicas[i]);

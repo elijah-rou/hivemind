@@ -30,6 +30,7 @@ pub const ReplicaSnapshot = struct {
     op: u64 = 0,
     commit: u64 = 0,
     is_leader: bool = false,
+    paused: bool = false,
     active: bool = false,
 };
 
@@ -93,7 +94,7 @@ pub const TraceCollector = struct {
         self.push(.{ .tick = tick, .kind = .{ .request = .{ .leader = leader, .request_num = request_num } } });
     }
 
-    pub fn addState(self: *TraceCollector, tick: u64, replicas: []const *replica_mod.Replica, count: u8) void {
+    pub fn addState(self: *TraceCollector, tick: u64, replicas: []const *replica_mod.Replica, paused: []const bool, count: u8) void {
         var snap: [8]ReplicaSnapshot = std.mem.zeroes([8]ReplicaSnapshot);
         for (0..count) |i| {
             const r = replicas[i];
@@ -104,6 +105,7 @@ pub const TraceCollector = struct {
                 .op = r.op_number,
                 .commit = r.commit_min,
                 .is_leader = r.isLeader() and r.status == .normal,
+                .paused = i < paused.len and paused[i],
                 .active = true,
             };
         }
@@ -168,6 +170,14 @@ test "multi-MiB trace collector supports explicit heap lifetime" {
     try std.testing.expectEqual(@as(usize, 1), collector.count);
 }
 
+test "state trace exposes paused replicas" {
+    var snapshots = std.mem.zeroes([8]ReplicaSnapshot);
+    snapshots[0] = .{ .id = 0, .active = true, .paused = true };
+    var buf: [2048]u8 = undefined;
+    const line = formatEvent(&buf, .{ .tick = 7, .kind = .{ .state = snapshots } }).?;
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"paused\":true") != null);
+}
+
 fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
     return switch (event.kind) {
         .init => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"init\",\"replicas\":{d},\"seed\":{d}}}\n", .{ event.tick, e.replicas, e.seed }) catch null,
@@ -187,11 +197,19 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
             var first = true;
             for (&snaps) |*s| {
                 if (!s.active) continue;
-                if (!first) { buf[pos] = ','; pos += 1; }
+                if (!first) {
+                    buf[pos] = ',';
+                    pos += 1;
+                }
                 first = false;
-                const status_str: []const u8 = switch (s.status) { 0 => "N", 1 => "V", 2 => "R", else => "?" };
-                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{}}}", .{
-                    s.id, status_str, s.view, s.op, s.commit, s.is_leader,
+                const status_str: []const u8 = switch (s.status) {
+                    0 => "N",
+                    1 => "V",
+                    2 => "R",
+                    else => "?",
+                };
+                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{},\"paused\":{}}}", .{
+                    s.id, status_str, s.view, s.op, s.commit, s.is_leader, s.paused,
                 }) catch break :blk null;
                 pos += entry.len;
             }

@@ -13,6 +13,7 @@ comptime {
     _ = @import("vopr/simulated_io.zig");
     _ = @import("vopr/checker.zig");
     _ = @import("vopr/test_harness.zig");
+    _ = @import("vopr/trace.zig");
     _ = @import("vopr/vopr.zig");
     _ = @import("request_queue.zig");
     _ = @import("gossip.zig");

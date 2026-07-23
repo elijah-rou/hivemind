@@ -279,11 +279,11 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Acceptance counts remain `6 / 8` POC v1 sections and `16 / 16` warm-cache execution items. Historical live-infra state is unchanged by this verification.
 
 **VOPR simulation coverage:**
-- VRR consensus under faults (partitions, crashes, restarts)
+- VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state
 - Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled)
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection)
-- Checker compares full entry checksums; commit regression and history capacity are violations
+- Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
 - Cross-region gossip propagation
 - Gossip under network partitions
 - Deterministic federated locality selector proof inputs (`same-locality-best`, `same-locality-failover`, `cross-locality-fallback`, `residency-restricted`)

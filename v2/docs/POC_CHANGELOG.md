@@ -44,6 +44,27 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-17 — Strict VOPR convergence and true process pause
+
+What changed:
+- VOPR convergence now requires equal active op/tip/log high, contiguous retained journal occupancy, tip checksum, storage health, and bounded deterministic committed state-machine digest in addition to normal status, view, and commit watermark
+- the committed digest walks only bounded state-machine capacities, includes future deterministic PRNG state, and excludes deployment-local request timestamps
+- simulated pause is distinct from partition and crash: paused replicas preserve memory/disk but perform no inbound or outbound delivery, replica tick, durability barrier, or disk progress until resumed
+- JSONL state traces expose paused state, and pause/resume events remain explicit
+
+Why it matters:
+- the liveness gate can no longer declare convergence when active suffixes, state-machine output, retained occupancy, or storage state diverge
+- pause faults now model a stopped process rather than only a disconnected process that continues timers and disk publication
+
+Progress:
+- focused strict-convergence and pending Prepare/StartView pause tests pass
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- committed digest intentionally excludes local timestamps and transient transport/timer state
+- torn-write and power-loss durability remain outside the simulation contract
+
 ### 2026-07-17 — Ownership-scoped bench artifacts and retry cleanup
 
 What changed:

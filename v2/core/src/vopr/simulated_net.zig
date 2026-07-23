@@ -40,19 +40,23 @@ pub const MessageQueue = struct {
     }
 
     pub fn popReady(self: *MessageQueue, now: i64, buf: []u8) ?RecvResult {
+        return self.popReadyExcluding(now, buf, &[_]bool{});
+    }
+
+    pub fn popReadyExcluding(self: *MessageQueue, now: i64, buf: []u8, excluded_from: []const bool) ?RecvResult {
         for (self.items[0..self.count], 0..) |*item, i| {
-            if (item.deliver_at_tick <= now) {
-                const result = RecvResult{
-                    .from = item.from,
-                    .len = item.len,
-                };
-                @memcpy(buf[0..item.len], item.data[0..item.len]);
-                if (i < self.count - 1) {
-                    self.items[i] = self.items[self.count - 1];
-                }
-                self.count -= 1;
-                return result;
+            if (item.deliver_at_tick > now) continue;
+            if (item.from < excluded_from.len and excluded_from[item.from]) continue;
+            const result = RecvResult{
+                .from = item.from,
+                .len = item.len,
+            };
+            @memcpy(buf[0..item.len], item.data[0..item.len]);
+            if (i < self.count - 1) {
+                self.items[i] = self.items[self.count - 1];
             }
+            self.count -= 1;
+            return result;
         }
         return null;
     }

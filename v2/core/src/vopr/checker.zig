@@ -160,12 +160,11 @@ pub const StateChecker = struct {
                 self.recordViolation(
                     "CONSENSUS VIOLATION: replica {d} committed op {d} with different entry (checksum {d} vs {d}, client {d} vs {d}, req {d} vs {d}, view {d}, committed_by 0b{b:0>3})",
                     .{
-                        replica_id,          op,
-                        entry.checksum,      record.checksum,
-                        entry.client_id,     record.client_id,
-                        entry.request_id,    record.request_id,
-                        entry.view_number,
-                        record.committed_by,
+                        replica_id,        op,
+                        entry.checksum,    record.checksum,
+                        entry.client_id,   record.client_id,
+                        entry.request_id,  record.request_id,
+                        entry.view_number, record.committed_by,
                     },
                 );
                 return;
@@ -253,24 +252,35 @@ pub const StateChecker = struct {
     ) ?[]const u8 {
         if (count == 0) return "no replicas";
 
-        const target_commit = replicas[0].commit_min;
-        for (1..count) |i| {
-            if (replicas[i].commit_min != target_commit) {
-                return "commit_min mismatch across replicas";
-            }
+        const target = replicas[0];
+        if (target.status != .normal) return "replica not in normal status";
+        if (target.storage_failed) return "replica storage failed";
+        if (target.op_number < target.commit_min) return "op_number below commit_min";
+        if (target.logHighOp() != target.op_number) return "active log high mismatch";
+        var op: msg.OpNumber = 1;
+        while (op <= target.op_number) : (op += 1) {
+            if (!target.journalHas(op)) return "active journal gap";
         }
+        const target_tip_checksum = if (target.op_number == 0) 0 else target.journalGet(target.op_number).?.checksum;
+        const target_state_digest = target.state_machine.committedDigest();
 
-        for (0..count) |i| {
-            if (replicas[i].status != .normal) {
-                return "replica not in normal status";
-            }
-        }
-
-        const target_view = replicas[0].view_number;
         for (1..count) |i| {
-            if (replicas[i].view_number != target_view) {
-                return "view_number mismatch across replicas";
+            const replica = replicas[i];
+            if (replica.status != .normal) return "replica not in normal status";
+            if (replica.view_number != target.view_number) return "view_number mismatch across replicas";
+            if (replica.commit_min != target.commit_min) return "commit_min mismatch across replicas";
+            if (replica.storage_failed != target.storage_failed) return "storage state mismatch across replicas";
+            if (replica.op_number != target.op_number) return "op_number mismatch across replicas";
+            if (replica.op_number < replica.commit_min) return "op_number below commit_min";
+            if (replica.logHighOp() != replica.op_number) return "active log high mismatch";
+
+            op = 1;
+            while (op <= replica.op_number) : (op += 1) {
+                if (!replica.journalHas(op)) return "active journal gap";
             }
+            const tip_checksum = if (replica.op_number == 0) 0 else replica.journalGet(replica.op_number).?.checksum;
+            if (tip_checksum != target_tip_checksum) return "active tip checksum mismatch across replicas";
+            if (replica.state_machine.committedDigest() != target_state_digest) return "committed state digest mismatch across replicas";
         }
 
         return null;
