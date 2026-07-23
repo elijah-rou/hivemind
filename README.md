@@ -4,17 +4,7 @@ Deterministic workload orchestration for serverless AI/ML inference.
 
 ## Versions
 
-- [`v1/`](v1/) is the final POC V1 snapshot. It preserves the implementation, simulations, infrastructure tooling, and evidence at the V1 boundary.
-- [`v2/`](v2/) is the current implementation and the active development line.
+- [`v1/`](v1/) is the frozen final POC v1 snapshot. Its implementation, simulations, infrastructure tooling, and evidence remain historical.
+- [`v2/`](v2/) is the active development line. Start with its [project guide](v2/README.md).
 
-Both snapshots are self-contained. Run commands from the version directory you intend to use.
-
-## Build V2
-
-```bash
-cd v2/core && zig build
-cd ../worker && cargo build
-cd ../api && go build ./...
-```
-
-V1 uses the same component layout under `v1/`.
+Each snapshot is self-contained. Run commands from the version directory you intend to use. Current guidance and acceptance status live under `v2/`; historical v1 material does not attest v2.
