@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::protocol::MAX_RUN_RESPONSE_BODY;
-use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
+use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE_MS};
 
 const BASE_PORT: u16 = 15000;
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
@@ -152,7 +152,9 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         probe_http(port, path).map_err(RuntimeError::Internal)
     }
 
-    fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
+    fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
+        const TERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
         let mut processes = self.processes.lock().unwrap();
         let proc = processes
             .get_mut(&handle.container_id)
@@ -162,13 +164,45 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
             Ok(None) => {}
             Err(error) => {
                 return Err(RuntimeError::ContainerStop(format!(
-                    "{} status before kill: {error}",
+                    "{} status before TERM: {error}",
                     handle.container_id
                 )))
             }
         }
+
+        let pid = i32::try_from(proc.child.id()).map_err(|error| {
+            RuntimeError::ContainerStop(format!("{} pid conversion: {error}", handle.container_id))
+        })?;
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            return Err(RuntimeError::ContainerStop(format!(
+                "{} TERM: {}",
+                handle.container_id,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let grace = Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS));
+        let deadline = Instant::now() + grace;
+        loop {
+            match proc.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(
+                        TERM_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(RuntimeError::ContainerStop(format!(
+                        "{} status after TERM: {error}",
+                        handle.container_id
+                    )))
+                }
+            }
+        }
+
         proc.child.kill().map_err(|error| {
-            RuntimeError::ContainerStop(format!("{} kill: {error}", handle.container_id))
+            RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
         })?;
         proc.child.wait().map_err(|error| {
             RuntimeError::ContainerStop(format!("{} wait: {error}", handle.container_id))
@@ -380,6 +414,40 @@ mod tests {
         runtime.start_pod(&handle).unwrap();
 
         assert!(runtime.probe_pod(&handle, 1, "/health").unwrap());
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn stop_honors_graceful_sigterm_before_sigkill() {
+        let runtime = ProcessRuntime::with_base_port(24_250);
+        let container_id = "proc-grace".to_string();
+        let child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal,sys,time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)",
+            ])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            container_id.clone(),
+            RunningProcess {
+                child,
+                port: 24_250,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let handle = PodHandle {
+            pod_id: 79,
+            container_id,
+        };
+
+        runtime.stop_pod(&handle, 500).unwrap();
+
+        assert_eq!(
+            runtime.pod_status(&handle).unwrap(),
+            PodStatus::Stopped { exit_code: 0 },
+            "cooperative process must exit from SIGTERM before SIGKILL"
+        );
         runtime.remove_pod(&handle).unwrap();
     }
 

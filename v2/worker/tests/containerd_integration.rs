@@ -325,7 +325,7 @@ mod tests {
 
         rt.stop_pod(&handle, 500).ok();
         rt.remove_pod(&handle).ok();
-        volumes::unmount_juicefs(10008);
+        volumes::unmount_juicefs(10008).expect("unmount JuiceFS");
     }
 
     #[test]

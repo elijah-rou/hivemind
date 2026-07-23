@@ -52,20 +52,47 @@ pub fn mount_juicefs(pod_id: u64, juicefs_subpath: &str) -> Result<VolumeMount, 
 }
 
 /// Unmount and clean up a JuiceFS volume for a pod.
-pub fn unmount_juicefs(pod_id: u64) {
+pub fn unmount_juicefs(pod_id: u64) -> Result<(), String> {
+    const UNMOUNT_TIMEOUT_SECS: &str = "10";
+
     let mount_dir = format!("{MOUNT_BASE}/{pod_id}/juicefs");
+    if mount_is_active(&mount_dir)? {
+        let _ = Command::new("timeout")
+            .args([UNMOUNT_TIMEOUT_SECS, "juicefs", "umount", &mount_dir])
+            .output();
+        if mount_is_active(&mount_dir)? {
+            let _ = Command::new("timeout")
+                .args([UNMOUNT_TIMEOUT_SECS, "fusermount", "-uz", &mount_dir])
+                .output();
+        }
+        if mount_is_active(&mount_dir)? {
+            return Err(format!("mount remains active at {mount_dir}"));
+        }
+    }
 
-    let _ = Command::new("juicefs")
-        .args(["umount", &mount_dir])
-        .output();
+    let pod_dir = PathBuf::from(format!("{MOUNT_BASE}/{pod_id}"));
+    match fs::remove_dir_all(&pod_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {}: {error}", pod_dir.display())),
+    }
+    if pod_dir.exists() {
+        return Err(format!(
+            "pod mount directory remains at {}",
+            pod_dir.display()
+        ));
+    }
+    Ok(())
+}
 
-    // Also try fusermount as fallback
-    let _ = Command::new("fusermount")
-        .args(["-uz", &mount_dir])
-        .output();
-
-    let pod_dir = format!("{MOUNT_BASE}/{pod_id}");
-    let _ = fs::remove_dir_all(&pod_dir);
+fn mount_is_active(mount_dir: &str) -> Result<bool, String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("read mount table: {error}"))?;
+    Ok(mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mount_point| mount_point == mount_dir)
+    }))
 }
 
 /// Check if the juicefs binary is available on PATH.
@@ -92,7 +119,6 @@ mod tests {
 
     #[test]
     fn unmount_nonexistent_is_safe() {
-        // Should not panic
-        unmount_juicefs(999999);
+        unmount_juicefs(999999).unwrap();
     }
 }

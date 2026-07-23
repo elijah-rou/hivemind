@@ -11,6 +11,7 @@ extern "C" fn handle_signal(_: libc::c_int) {
 }
 
 const MAX_REPLICA_ADDRS: usize = 64;
+const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunConfig {
@@ -297,7 +298,10 @@ fn cmd_run(args: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_replica_addrs, parse_run_config, RunConfig, MAX_REPLICA_ADDRS};
+    use super::{
+        parse_replica_addrs, parse_run_config, reconcile_shutdown, RunConfig, MAX_REPLICA_ADDRS,
+        MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
+    };
     use std::collections::HashMap;
 
     fn parse(args: &[&str], env_pairs: &[(&str, &str)]) -> RunConfig {
@@ -344,6 +348,22 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reconciliation_is_bounded() {
+        let mut attempts = 0;
+        let mut waits = 0;
+
+        assert!(!reconcile_shutdown(
+            || {
+                attempts += 1;
+                false
+            },
+            || waits += 1,
+        ));
+        assert_eq!(attempts, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS);
+        assert_eq!(waits, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS - 1);
+    }
+
+    #[test]
     fn metrics_port_still_uses_env_when_flag_missing() {
         let cfg = parse(
             &["127.0.0.1:9000"],
@@ -351,6 +371,22 @@ mod tests {
         );
         assert_eq!(cfg.metrics_port, Some(8081));
     }
+}
+
+fn reconcile_shutdown<F, S>(mut shutdown: F, mut wait: S) -> bool
+where
+    F: FnMut() -> bool,
+    S: FnMut(),
+{
+    for attempt in 0..MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS {
+        if shutdown() {
+            return true;
+        }
+        if attempt + 1 < MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS {
+            wait();
+        }
+    }
+    false
 }
 
 fn run_worker_loop(
@@ -369,8 +405,15 @@ fn run_worker_loop(
 
     if SHUTDOWN.load(Ordering::SeqCst) {
         eprintln!("worker: shutting down gracefully...");
-        while !node_worker.shutdown(rio, rt) {
-            thread::sleep(Duration::from_secs(1));
+        if !reconcile_shutdown(
+            || node_worker.shutdown(rio, rt),
+            || thread::sleep(Duration::from_secs(1)),
+        ) {
+            eprintln!(
+                "worker: shutdown cleanup remains unverified after {} reconciliation attempts",
+                MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS
+            );
+            std::process::exit(1);
         }
     }
 }

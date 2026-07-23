@@ -1,5 +1,7 @@
 use crate::types::GpuType;
 
+pub const MAX_STOP_GRACE_MS: u64 = 30_000;
+
 #[cfg(target_os = "linux")]
 pub mod containerd;
 pub mod process;

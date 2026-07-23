@@ -401,7 +401,7 @@ impl Worker {
             ) {
                 pod.state = TrackedPodState::Stopping;
                 pod.state_changed_at = now;
-                pod.grace_period_ms = cmd.grace_period_ms;
+                pod.grace_period_ms = cmd.grace_period_ms.min(crate::runtime::MAX_STOP_GRACE_MS);
                 pod.lifecycle_failures = 0;
                 pod.lifecycle_retry_after_tick = 0;
             }
@@ -557,13 +557,12 @@ impl Worker {
                         if let Ok(status) = runtime.pod_status(handle) {
                             if let PodStatus::Stopped { exit_code } = status {
                                 let pod = self.pods.get_mut(&pod_id).unwrap();
-                                pod.state = TrackedPodState::Stopped { exit_code };
+                                pod.state = TrackedPodState::Stopping;
                                 pod.state_changed_at = now;
-                                self.release_pod_resources(pod_id);
-                                io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
-                                    pod_id,
-                                    status: PodStatusReport::Stopped { exit_code },
-                                }));
+                                pod.grace_period_ms = 0;
+                                pod.lifecycle_failures = STOP_ATTEMPT_MAX;
+                                pod.lifecycle_retry_after_tick = 0;
+                                self.complete_pod_stop(io, runtime, pod_id, exit_code, now);
                                 crashed = true;
                             }
                         }
@@ -864,15 +863,28 @@ impl Worker {
                         }
                         LifecycleResult::Start(Err(e)) => {
                             if self.retry_lifecycle_pod(pod_id, now) {
-                                let _ = runtime.remove_pod(&handle);
-                                if let Some(pod) = self.pods.get_mut(&pod_id) {
-                                    pod.handle = None;
-                                    pod.state = TrackedPodState::Creating;
-                                    pod.state_changed_at = now;
+                                match runtime.remove_pod(&handle) {
+                                    Ok(()) => {
+                                        if let Some(pod) = self.pods.get_mut(&pod_id) {
+                                            pod.handle = None;
+                                            pod.state = TrackedPodState::Creating;
+                                            pod.state_changed_at = now;
+                                        }
+                                        eprintln!(
+                                            "worker: pod {pod_id} container start failed transiently, recreating before retry: {e}"
+                                        );
+                                    }
+                                    Err(cleanup_error) => {
+                                        self.fail_pod(
+                                            io,
+                                            pod_id,
+                                            format!(
+                                                "{e}; failed start cleanup remains unverified: {cleanup_error}"
+                                            ),
+                                            now,
+                                        );
+                                    }
                                 }
-                                eprintln!(
-                                    "worker: pod {pod_id} container start failed transiently, recreating before retry: {e}"
-                                );
                             } else {
                                 eprintln!("worker: pod {pod_id} container start failed: {e}");
                                 self.fail_pod(io, pod_id, e.to_string(), now)
@@ -922,8 +934,16 @@ impl Worker {
                 self.schedule_stop_retry(pod_id, now);
                 return;
             }
+            self.pods
+                .get_mut(&pod_id)
+                .expect("stopping pod must remain tracked")
+                .handle = None;
         }
-        volumes::unmount_juicefs(pod_id);
+        if let Err(error) = volumes::unmount_juicefs(pod_id) {
+            eprintln!("worker: pod {pod_id} volume cleanup failed: {error}");
+            self.schedule_stop_retry(pod_id, now);
+            return;
+        }
         let failure_reason = self.pending_failure_reasons.remove(&pod_id);
         let pod = self.pods.get_mut(&pod_id).expect("stopping pod must exist");
         pod.state = match &failure_reason {
@@ -971,8 +991,22 @@ impl Worker {
 
     fn fail_pod(&mut self, io: &mut dyn Io, pod_id: u64, reason: String, now: u64) {
         eprintln!("worker: pod {pod_id} failed: {reason}");
-        let pod = self.pods.get_mut(&pod_id).expect("failed pod must exist");
-        if pod.handle.is_some() {
+        let needs_runtime_cleanup = self
+            .pods
+            .get(&pod_id)
+            .expect("failed pod must exist")
+            .handle
+            .is_some();
+        let volume_cleanup = if needs_runtime_cleanup {
+            Ok(())
+        } else {
+            volumes::unmount_juicefs(pod_id)
+        };
+        if let Err(error) = &volume_cleanup {
+            eprintln!("worker: pod {pod_id} volume cleanup failed: {error}");
+        }
+        if needs_runtime_cleanup || volume_cleanup.is_err() {
+            let pod = self.pods.get_mut(&pod_id).expect("failed pod must exist");
             pod.state = TrackedPodState::Stopping;
             pod.state_changed_at = now;
             pod.grace_period_ms = 0;
@@ -987,7 +1021,7 @@ impl Worker {
             return;
         }
 
-        volumes::unmount_juicefs(pod_id);
+        let pod = self.pods.get_mut(&pod_id).expect("failed pod must exist");
         pod.state = TrackedPodState::Failed {
             reason: reason.clone(),
         };
@@ -1089,13 +1123,36 @@ impl Worker {
 
             if let Some(ref handle) = handle_opt {
                 if let Err(remove_error) = runtime.remove_pod(handle) {
+                    let pod = self
+                        .pods
+                        .get_mut(&pod_id)
+                        .expect("shutdown pod must remain tracked");
+                    pod.state = TrackedPodState::Stopping;
+                    pod.lifecycle_failures = STOP_ATTEMPT_MAX;
+                    pod.lifecycle_retry_after_tick = u64::MAX;
                     eprintln!(
                         "worker: pod {pod_id} shutdown runtime cleanup failed: {remove_error}; retaining ownership"
                     );
                     continue;
                 }
+                self.pods
+                    .get_mut(&pod_id)
+                    .expect("shutdown pod must remain tracked")
+                    .handle = None;
             }
-            volumes::unmount_juicefs(pod_id);
+            if let Err(unmount_error) = volumes::unmount_juicefs(pod_id) {
+                let pod = self
+                    .pods
+                    .get_mut(&pod_id)
+                    .expect("shutdown pod must remain tracked");
+                pod.state = TrackedPodState::Stopping;
+                pod.lifecycle_failures = STOP_ATTEMPT_MAX;
+                pod.lifecycle_retry_after_tick = u64::MAX;
+                eprintln!(
+                    "worker: pod {pod_id} shutdown volume cleanup failed: {unmount_error}; retaining ownership"
+                );
+                continue;
+            }
             let failure_reason = self.pending_failure_reasons.remove(&pod_id);
             if !was_terminal {
                 self.release_pod_resources(pod_id);
@@ -1931,6 +1988,146 @@ mod tests {
         }
     }
 
+    struct CleanupFailingRuntime {
+        start_fails: bool,
+        remove_calls: Mutex<u32>,
+    }
+
+    impl Runtime for CleanupFailingRuntime {
+        fn pull_image(
+            &self,
+            _image: &str,
+            _auth: Option<&ImagePullAuth>,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+            Ok(PodHandle {
+                pod_id: spec.pod_id,
+                container_id: format!("cleanup-{}", spec.pod_id),
+            })
+        }
+
+        fn start_pod(&self, _handle: &PodHandle) -> Result<(), RuntimeError> {
+            if self.start_fails {
+                Err(RuntimeError::ContainerStart("start failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn forward_run(
+            &self,
+            _handle: &PodHandle,
+            _port: u16,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_pod(&self, _handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn pod_status(&self, _handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
+            Ok(PodStatus::Stopped { exit_code: 137 })
+        }
+
+        fn remove_pod(&self, _handle: &PodHandle) -> Result<(), RuntimeError> {
+            *self.remove_calls.lock().unwrap() += 1;
+            Err(RuntimeError::ContainerStop("cleanup failed".into()))
+        }
+    }
+
+    #[test]
+    fn spontaneous_crash_retains_ownership_until_cleanup_succeeds() {
+        let mut worker = Worker::new("node-crash-cleanup".into(), GpuType::T4, 1, 4000, 8192);
+        let runtime = CleanupFailingRuntime {
+            start_fails: false,
+            remove_calls: Mutex::new(0),
+        };
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+        worker.pods.insert(
+            47,
+            TrackedPod {
+                pod_id: 47,
+                deployment_id: 9,
+                image: "demo".into(),
+                entrypoint: String::new(),
+                state: TrackedPodState::Running,
+                handle: Some(PodHandle {
+                    pod_id: 47,
+                    container_id: "cleanup-47".into(),
+                }),
+                state_changed_at: 0,
+                gpu_count: 1,
+                cpu_millicores: 500,
+                memory_megabytes: 512,
+                grace_period_ms: 0,
+                port: 8080,
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                probe_interval_ms: 10000,
+                last_probe_tick: 0,
+                consecutive_failures: 0,
+                env_vars: Vec::new(),
+                juicefs_path: String::new(),
+                image_pull_auth: None,
+                lifecycle_failures: 0,
+                lifecycle_retry_after_tick: 0,
+            },
+        );
+        worker.gpu_allocated = 1;
+        worker.cpu_allocated_millicores = 500;
+        worker.memory_allocated_megabytes = 512;
+
+        worker.drive_pods(&mut io, &runtime, 100);
+
+        assert_eq!(worker.tracked_pods()[&47].state, TrackedPodState::Stopping);
+        assert_eq!(*runtime.remove_calls.lock().unwrap(), 1);
+        assert_eq!(worker.gpu_allocated(), 1);
+        assert_eq!(worker.cpu_allocated_millicores(), 500);
+        assert_eq!(worker.memory_allocated_megabytes(), 512);
+        assert!(!io.sent.iter().any(|message| matches!(
+            message,
+            WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                pod_id: 47,
+                status: PodStatusReport::Stopped { .. }
+            })
+        )));
+    }
+
+    #[test]
+    fn failed_start_cleanup_retains_handle_and_enters_fail_closed_stop() {
+        let mut worker = Worker::new("node-start-cleanup".into(), GpuType::None, 0, 4000, 8192);
+        let runtime = CleanupFailingRuntime {
+            start_fails: true,
+            remove_calls: Mutex::new(0),
+        };
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+
+        worker.handle_start_pod(&mut io, test_start_cmd(48, 100, 128), 0);
+        worker.drive_pods(&mut io, &runtime, 1);
+        worker.drive_pods(&mut io, &runtime, 2);
+        worker.drive_pods(&mut io, &runtime, 3);
+
+        let pod = &worker.tracked_pods()[&48];
+        assert_eq!(pod.state, TrackedPodState::Stopping);
+        assert!(pod.handle.is_some());
+        assert_eq!(*runtime.remove_calls.lock().unwrap(), 1);
+        assert_eq!(worker.cpu_allocated_millicores(), 100);
+        assert_eq!(worker.memory_allocated_megabytes(), 128);
+    }
+
     #[test]
     fn failed_stop_retains_running_runtime_ownership_and_capacity() {
         let mut worker = Worker::new("node-stop-fail".into(), GpuType::T4, 1, 4000, 8192);
@@ -2194,6 +2391,64 @@ mod tests {
                 status: PodStatusReport::Stopped { exit_code: 137 }
             })
         )));
+    }
+
+    #[test]
+    fn stop_grace_is_capped_before_runtime_dispatch() {
+        let mut worker = Worker::new("node-stop-cap".into(), GpuType::None, 0, 4000, 8192);
+        let runtime = StopRecordingRuntime {
+            stop_calls: Mutex::new(Vec::new()),
+            status: PodStatus::Stopped { exit_code: 0 },
+        };
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+        worker.pods.insert(
+            49,
+            TrackedPod {
+                pod_id: 49,
+                deployment_id: 9,
+                image: "demo".into(),
+                entrypoint: String::new(),
+                state: TrackedPodState::Running,
+                handle: Some(PodHandle {
+                    pod_id: 49,
+                    container_id: "cap-49".into(),
+                }),
+                state_changed_at: 0,
+                gpu_count: 0,
+                cpu_millicores: 500,
+                memory_megabytes: 512,
+                grace_period_ms: 0,
+                port: 8080,
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                probe_interval_ms: 10000,
+                last_probe_tick: 0,
+                consecutive_failures: 0,
+                env_vars: Vec::new(),
+                juicefs_path: String::new(),
+                image_pull_auth: None,
+                lifecycle_failures: 0,
+                lifecycle_retry_after_tick: 0,
+            },
+        );
+
+        worker.handle_stop_pod(
+            StopPodCmd {
+                pod_id: 49,
+                grace_period_ms: u64::MAX,
+            },
+            100,
+        );
+        worker.drive_pods(&mut io, &runtime, 100);
+
+        assert_eq!(
+            runtime.stop_calls.lock().unwrap().as_slice(),
+            &[("cap-49".to_string(), crate::runtime::MAX_STOP_GRACE_MS)]
+        );
     }
 
     #[test]

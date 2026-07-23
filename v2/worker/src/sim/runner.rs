@@ -167,17 +167,12 @@ pub fn run(config: &SimConfig) -> SimResult {
         sim.lose_agent_session(i);
     }
 
+    let phase2_received_start = sim.control_plane.received_messages().len();
     let mut phase2_ticks: u64 = 0;
 
     for tick in 0..config.liveness_ticks {
         for agent_id in 0..config.agent_count {
-            let registered = sim.control_plane.received_messages().iter().any(
-                |(_, received_agent_id, message)| {
-                    *received_agent_id == agent_id
-                        && matches!(message, crate::message::WorkerMessage::NodeRegister(_))
-                },
-            );
-            if !registered {
+            if !registered_since(&sim, agent_id, phase2_received_start) {
                 sim.retry_agent_registration(agent_id);
             }
         }
@@ -201,7 +196,7 @@ pub fn run(config: &SimConfig) -> SimResult {
             };
         }
 
-        if check_convergence(&sim) {
+        if check_convergence(&sim, phase2_received_start) {
             return SimResult {
                 seed: config.seed,
                 phase1_ticks,
@@ -269,13 +264,21 @@ pub fn run(config: &SimConfig) -> SimResult {
     }
 }
 
-fn check_convergence(sim: &WorkerSimulator) -> bool {
+fn registered_since(sim: &WorkerSimulator, agent_id: usize, received_start: usize) -> bool {
     let received = sim.control_plane.received_messages();
-    for agent_id in 0..sim.workers.len() {
-        if !received.iter().any(|(_, received_agent_id, message)| {
+    assert!(received_start <= received.len());
+    received[received_start..]
+        .iter()
+        .any(|(_, received_agent_id, message)| {
             *received_agent_id == agent_id
                 && matches!(message, crate::message::WorkerMessage::NodeRegister(_))
-        }) {
+        })
+}
+
+fn check_convergence(sim: &WorkerSimulator, phase2_received_start: usize) -> bool {
+    let received = sim.control_plane.received_messages();
+    for agent_id in 0..sim.workers.len() {
+        if !registered_since(sim, agent_id, phase2_received_start) {
             return false;
         }
     }
@@ -315,6 +318,27 @@ fn check_convergence(sim: &WorkerSimulator) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convergence_requires_registration_after_session_loss() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_21);
+        for _ in 0..4 {
+            sim.tick();
+            if !sim.control_plane.received_messages().is_empty() {
+                break;
+            }
+        }
+        let phase2_received_start = sim.control_plane.received_messages().len();
+        assert!(
+            phase2_received_start > 0,
+            "phase 1 must deliver registration"
+        );
+
+        sim.lose_agent_session(0);
+
+        assert!(!registered_since(&sim, 0, phase2_received_start));
+        assert!(!check_convergence(&sim, phase2_received_start));
+    }
 
     #[test]
     fn sim_default_seed_passes() {

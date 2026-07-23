@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use super::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
+use super::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE_MS};
 
 const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
 const DEFAULT_NAMESPACE: &str = "hivemind";
@@ -200,11 +200,52 @@ impl ContainerdRuntime {
         )
     }
 
-    fn cleanup_task_state(&self, container_id: &str) {
-        let _ = self.run_ctr(&["tasks", "kill", "--signal", "9", container_id]);
-        let _ = self.run_ctr(&["tasks", "delete", "--force", container_id]);
-        let _ = self.run_ctr(&["containers", "delete", container_id]);
-        let _ = fs::remove_dir_all(self.task_shim_dir(container_id));
+    fn cleanup_task_state(&self, container_id: &str) -> Result<(), RuntimeError> {
+        let kill_error = self
+            .run_ctr(&["tasks", "kill", "--signal", "9", container_id])
+            .err();
+        let task_delete_error = self
+            .run_ctr(&["tasks", "delete", "--force", container_id])
+            .err();
+        let container_delete_error = self.run_ctr(&["containers", "delete", container_id]).err();
+        let shim_dir = self.task_shim_dir(container_id);
+        let shim_remove_error = match fs::remove_dir_all(&shim_dir) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(error.to_string()),
+        };
+
+        let tasks = self.run_ctr(&["tasks", "list"]).map_err(|error| {
+            RuntimeError::ContainerStop(format!(
+                "{container_id} cleanup task verification failed: {error}"
+            ))
+        })?;
+        let containers = self.run_ctr(&["containers", "list"]).map_err(|error| {
+            RuntimeError::ContainerStop(format!(
+                "{container_id} cleanup container verification failed: {error}"
+            ))
+        })?;
+        let task_remains = Self::listing_contains_exact_id(&tasks, container_id);
+        let container_remains = Self::listing_contains_exact_id(&containers, container_id);
+        let shim_remains = std::path::Path::new(&shim_dir).exists();
+        if task_remains || container_remains || shim_remains {
+            return Err(RuntimeError::ContainerStop(format!(
+                "{container_id} cleanup remains unverified: task_remains={task_remains} container_remains={container_remains} shim_remains={shim_remains}; kill={}; task_delete={}; container_delete={}; shim_remove={}",
+                kill_error.as_deref().unwrap_or("ok"),
+                task_delete_error.as_deref().unwrap_or("ok"),
+                container_delete_error.as_deref().unwrap_or("ok"),
+                shim_remove_error.as_deref().unwrap_or("ok")
+            )));
+        }
+        Ok(())
+    }
+
+    fn listing_contains_exact_id(listing: &str, container_id: &str) -> bool {
+        listing
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .any(|id| id == container_id)
     }
 
     fn ids_with_prefix(listing: &str, prefix: &str, max_ids: usize) -> Vec<String> {
@@ -223,22 +264,36 @@ impl ContainerdRuntime {
         ids
     }
 
-    fn cleanup_container_family(&self, pod_id: u64) {
+    fn cleanup_container_family(&self, pod_id: u64) -> Result<(), RuntimeError> {
         const MAX_STALE_IDS: usize = 64;
         let prefix = Self::container_id_prefix(pod_id);
-
-        if let Ok(listing) = self.run_ctr(&["tasks", "list"]) {
-            for id in Self::ids_with_prefix(&listing, &prefix, MAX_STALE_IDS) {
-                self.cleanup_task_state(&id);
+        let task_listing = self.run_ctr(&["tasks", "list"]).map_err(|error| {
+            RuntimeError::ContainerCreate(format!("{prefix} task inventory failed: {error}"))
+        })?;
+        let container_listing = self.run_ctr(&["containers", "list"]).map_err(|error| {
+            RuntimeError::ContainerCreate(format!("{prefix} container inventory failed: {error}"))
+        })?;
+        let mut ids = Self::ids_with_prefix(&task_listing, &prefix, MAX_STALE_IDS + 1);
+        let container_ids = Self::ids_with_prefix(&container_listing, &prefix, MAX_STALE_IDS + 1);
+        if ids.len() > MAX_STALE_IDS || container_ids.len() > MAX_STALE_IDS {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "{prefix} stale runtime family exceeds {MAX_STALE_IDS} entries"
+            )));
+        }
+        for id in container_ids {
+            if !ids.contains(&id) {
+                if ids.len() >= MAX_STALE_IDS {
+                    return Err(RuntimeError::ContainerCreate(format!(
+                        "{prefix} stale runtime family exceeds {MAX_STALE_IDS} entries"
+                    )));
+                }
+                ids.push(id);
             }
         }
-
-        if let Ok(listing) = self.run_ctr(&["containers", "list"]) {
-            for id in Self::ids_with_prefix(&listing, &prefix, MAX_STALE_IDS) {
-                let _ = self.run_ctr(&["containers", "delete", &id]);
-                let _ = fs::remove_dir_all(self.task_shim_dir(&id));
-            }
+        for id in ids {
+            self.cleanup_task_state(&id)?;
         }
+        Ok(())
     }
 
     fn task_adoptable(status: &PodStatus) -> bool {
@@ -271,43 +326,51 @@ impl ContainerdRuntime {
 
     fn with_task_netns<T, F>(&self, pid: i32, f: F) -> Result<T, RuntimeError>
     where
-        F: FnOnce() -> Result<T, RuntimeError>,
+        T: Send,
+        F: FnOnce() -> Result<T, RuntimeError> + Send,
     {
-        let current_ns = File::open("/proc/self/ns/net")
-            .map_err(|e| RuntimeError::Internal(format!("open current netns: {e}")))?;
-        let target_ns = File::open(format!("/proc/{pid}/ns/net"))
-            .map_err(|e| RuntimeError::Internal(format!("open task netns for pid {pid}: {e}")))?;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let current_ns = File::open("/proc/self/ns/net")
+                        .map_err(|e| RuntimeError::Internal(format!("open current netns: {e}")))?;
+                    let target_ns = File::open(format!("/proc/{pid}/ns/net")).map_err(|e| {
+                        RuntimeError::Internal(format!("open task netns for pid {pid}: {e}"))
+                    })?;
 
-        unsafe {
-            if libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
-                return Err(RuntimeError::Internal(format!(
-                    "setns enter pid {pid}: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-        }
+                    unsafe {
+                        if libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
+                            return Err(RuntimeError::Internal(format!(
+                                "setns enter pid {pid}: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                        }
+                    }
 
-        let run_result = f();
+                    let run_result = f();
+                    let restore_result = unsafe {
+                        if libc::setns(current_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
+                            Err(RuntimeError::Internal(format!(
+                                "setns restore: {}",
+                                std::io::Error::last_os_error()
+                            )))
+                        } else {
+                            Ok(())
+                        }
+                    };
 
-        let restore_result = unsafe {
-            if libc::setns(current_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
-                Err(RuntimeError::Internal(format!(
-                    "setns restore: {}",
-                    std::io::Error::last_os_error()
-                )))
-            } else {
-                Ok(())
-            }
-        };
-
-        match (run_result, restore_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), Ok(())) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(run_err), Err(restore_err)) => {
-                Err(RuntimeError::Internal(format!("{run_err}; {restore_err}")))
-            }
-        }
+                    match (run_result, restore_result) {
+                        (Ok(value), Ok(())) => Ok(value),
+                        (Err(err), Ok(())) => Err(err),
+                        (Ok(_), Err(err)) => Err(err),
+                        (Err(run_err), Err(restore_err)) => {
+                            Err(RuntimeError::Internal(format!("{run_err}; {restore_err}")))
+                        }
+                    }
+                })
+                .join()
+                .expect("network namespace worker panicked")
+        })
     }
 }
 
@@ -353,7 +416,7 @@ impl Runtime for ContainerdRuntime {
     }
 
     fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
-        self.cleanup_container_family(spec.pod_id);
+        self.cleanup_container_family(spec.pod_id)?;
         let container_id = self.container_id(spec.pod_id);
 
         if let Some(status) = self.task_status_by_id(&container_id)? {
@@ -423,33 +486,21 @@ impl Runtime for ContainerdRuntime {
     fn start_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
         match self.run_ctr(&["tasks", "start", "--detach", &handle.container_id]) {
             Ok(_) => Ok(()),
-            Err(e) if Self::task_already_exists_error(&e) => {
+            Err(error) if Self::task_already_exists_error(&error) => {
                 if let Some(status) = self.task_status_by_id(&handle.container_id)? {
                     if Self::task_adoptable(&status) {
                         return Ok(());
                     }
                 }
-                self.cleanup_task_state(&handle.container_id);
-                self.run_ctr(&["tasks", "start", "--detach", &handle.container_id])
-                    .map(|_| ())
-                    .map_err(|retry_err| {
-                        RuntimeError::ContainerStart(format!(
-                            "{}: {retry_err}",
-                            handle.container_id
-                        ))
-                    })
+                Err(RuntimeError::ContainerStart(format!(
+                    "{}: {error}",
+                    handle.container_id
+                )))
             }
-            Err(e) => {
-                self.cleanup_task_state(&handle.container_id);
-                self.run_ctr(&["tasks", "start", "--detach", &handle.container_id])
-                    .map(|_| ())
-                    .map_err(|retry_err| {
-                        RuntimeError::ContainerStart(format!(
-                            "{}: first start failed: {e}; retry after cleanup failed: {retry_err}",
-                            handle.container_id
-                        ))
-                    })
-            }
+            Err(error) => Err(RuntimeError::ContainerStart(format!(
+                "{}: {error}",
+                handle.container_id
+            ))),
         }
     }
 
@@ -484,7 +535,9 @@ impl Runtime for ContainerdRuntime {
             .run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id])
             .err();
         if grace_period_ms > 0 {
-            thread::sleep(Duration::from_millis(grace_period_ms));
+            thread::sleep(Duration::from_millis(
+                grace_period_ms.min(MAX_STOP_GRACE_MS),
+            ));
         }
 
         if matches!(self.pod_status(handle), Ok(PodStatus::Stopped { .. })) {
@@ -521,8 +574,7 @@ impl Runtime for ContainerdRuntime {
     }
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
-        self.cleanup_task_state(&handle.container_id);
-        Ok(())
+        self.cleanup_task_state(&handle.container_id)
     }
 }
 
@@ -618,6 +670,21 @@ docker.io/library/busybox:1.36 application/vnd.oci.image.index.v1+json sha256:de
         assert!(!ContainerdRuntime::image_present_in_listing(
             listing,
             "docker.io/library/alpine:3.20"
+        ));
+    }
+
+    #[test]
+    fn exact_id_listing_verification_rejects_prefix_matches() {
+        let listing = "TASK PID STATUS\n\
+hivemind-pod-7-1 123 RUNNING\n\
+hivemind-pod-70-1 456 RUNNING\n";
+        assert!(ContainerdRuntime::listing_contains_exact_id(
+            listing,
+            "hivemind-pod-7-1"
+        ));
+        assert!(!ContainerdRuntime::listing_contains_exact_id(
+            listing,
+            "hivemind-pod-7"
         ));
     }
 

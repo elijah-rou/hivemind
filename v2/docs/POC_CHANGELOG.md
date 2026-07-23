@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane B final safety remediation
+
+What changed:
+- healed runner convergence and registration retries now ignore pre-session-loss recorder history and require a registration observed in the current liveness epoch
+- spontaneous crashes and failed transient-start cleanup retain runtime ownership and accounting until runtime removal and mount cleanup are verified
+- containerd cleanup verifies the exact task, container, and owned shim path are absent; stale-family inventory failure is fail-closed
+- stop grace is capped at 30 seconds; process runtime now uses TERM/grace/KILL parity, and shutdown exits nonzero after 30 unsuccessful reconciliation attempts without publishing cleanup
+- containerd network-namespace work runs in a disposable thread so restoration failure cannot contaminate subsequent caller-thread operations
+
+Why it matters:
+- prevents stale phase-1 registration from satisfying phase-2 liveness and prevents replacement capacity from being admitted while runtime or mount ownership remains unverified
+- bounds scheduler-controlled stop and process-shutdown time while preserving fail-closed accounting
+
+Evidence and limits:
+- RED: the first regression build failed because session-epoch and grace-bound contracts were absent; the bounded-shutdown regression separately failed to compile before its production helper existed
+- GREEN: `cargo test --all-targets` passed `165` library, `3` fuzz utility, `5` main, and `5` integration tests; `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0`
+- privileged containerd, actual JuiceFS mounts, GPU/CDI, real TCP reconnect timing, and cloud boundaries were not run; containerd and mount verification remain statically and locally tested rather than privileged/live evidence
+- POC v2 acceptance remains blocked; historical live infrastructure status was not revalidated
+
 ### 2026-07-23 — Lane B4 review remediation
 
 What changed:
