@@ -268,8 +268,8 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 ## Test Coverage
 
-**Current local verification (2026-07-17, branch evidence; no live infrastructure touched):**
-- Zig: `328 / 328` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
+**Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
+- Zig: `329 / 329` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
 - Rust: `128` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
@@ -285,7 +285,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
 - Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
 - Seeded ConnectionManager socketpair/fake-clock transition coverage: leader probe, fragmented client frame, client and three worker connections, dispatch, client abandonment, foreign worker response isolation, tombstone expiry, worker disconnect, leader change, and slot reconnect; every transition checks RequestQueue accounting plus exact queue/occupied/client-active/worker-busy/live-connection/counter values
-- Connection metrics count currently connected sockets rather than high-water allocated slots; the deterministic harness proves final agent/client gauges `1`/`2` and queue/in-flight/enqueued/dispatched/resolved values `0`/`0`/`1`/`1`/`1`
+- Connection metrics count currently connected sockets rather than high-water allocated slots; the deterministic harness checks exact agent/client/peer gauges and queue/in-flight/lifetime counters at queued, dispatched, abandoned/client-disconnected, and final states
 - Cross-region gossip propagation
 - Gossip under network partitions
 - Deterministic federated locality selector proof inputs (`same-locality-best`, `same-locality-failover`, `cross-locality-fallback`, `residency-restricted`)
