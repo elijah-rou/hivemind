@@ -44,6 +44,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-23 — Lane C2 canonical shared wire corpus
+
+What changed:
+- added one bounded canonical `tests/wire/contract-v6.json` corpus with exact little-endian/frame/AAD semantics and fixture-only deterministic PSK/nonce material
+- covered worker register, heartbeat, pod status, StartPod, worker/client run request and response, leader probe request and response, representative VRR peer envelopes, every legal status byte 0-9, plaintext, and deterministic encrypted worker/client/peer examples
+- Zig, Rust, Go API, and Go bench now load this same repository-relative file, decode applicable vectors through production codecs, validate message semantics, and re-encode byte-identically where applicable
+- added `tests/wire-contract-test.sh` to fail closed on schema/bound/encoding drift, prove all four protocol constants are exactly 6, and run every consumer; the aggregate runner invokes this gate
+
+Why it matters:
+- replaces language-local self-generated-only compatibility claims with one reviewable normative byte corpus
+- makes protocol drift, incomplete status inventories, accidental fixture key use, and mixed version constants active test failures
+
+Evidence and limits:
+- RED: the new shell contract failed with `FileNotFoundError` because `tests/wire/contract-v6.json` did not exist
+- GREEN: `tests/wire-contract-test.sh`; Zig Debug and ReleaseFast; Rust formatting and all targets; Go API/bench formatting, race tests, and builds; shell syntax/ShellCheck; and docs/layout gates pass on the C2 commit
+- `cd v2 && ./tests/run-all.sh --skip-containerd` passed `19` invoked phases and local smoke `16 passed, 0 failed`; it explicitly skipped containerd, so no containerd, live AWS, GPU/CDI, or cloud boundary is implied
+- upgrades remain stop-the-world: stop every replica, worker, API gateway, and bench client, replace all components, then restart; mixed-version rolling operation is unsupported
+- version compatibility is not authentication; TLS/mTLS remains required for authenticated peer identity
+
 ### 2026-07-23 — Lane C1 protocol-v6 peer envelope
 
 What changed:

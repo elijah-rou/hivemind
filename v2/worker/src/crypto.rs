@@ -148,8 +148,8 @@ mod tests {
     }
 
     #[test]
-    fn hkdf_golden_bytes_cross_language() {
-        // Must match Zig and Go implementations with same PSK
+    fn hkdf_worker_key_is_deterministic() {
+        // Cross-language agreement is owned by tests/wire/contract-v6.json consumers.
         let state = EncryptionState::from_hex(TEST_PSK).unwrap();
 
         // Deterministic: same PSK always produces same key

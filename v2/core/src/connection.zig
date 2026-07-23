@@ -1050,7 +1050,7 @@ pub const ConnectionManager = struct {
     }
 
     /// Decode one bounded frame. Every stream body starts with the global version.
-    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
+    pub fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
         if (data.len < 5) return null;
 
         const frame_len = std.mem.readInt(u32, data[0..4], .little);
@@ -1504,7 +1504,7 @@ pub const ConnectionManager = struct {
         }
     }
 
-    fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
+    pub fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
         // Wire size is 138 (packed), not @sizeOf which includes alignment padding
         if (payload.len != 138) return null;
         const gpu_type = msg.enumFromIntChecked(msg.GpuType, payload[72]) catch return null;
@@ -1519,7 +1519,7 @@ pub const ConnectionManager = struct {
         return register;
     }
 
-    fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
+    pub fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
         if (payload.len != 23) return null;
         var heartbeat = msg.WorkerHeartbeatMsg{};
         heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
@@ -1530,7 +1530,7 @@ pub const ConnectionManager = struct {
         return heartbeat;
     }
 
-    fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
+    pub fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
         if (payload.len != 150) return null;
         const old_phase = msg.enumFromIntChecked(msg.PodPhase, payload[8]) catch return null;
         const new_phase = msg.enumFromIntChecked(msg.PodPhase, payload[9]) catch return null;

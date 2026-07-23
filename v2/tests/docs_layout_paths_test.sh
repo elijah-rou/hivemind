@@ -54,12 +54,20 @@ for relative_path in \
     docs/design/TESTING.md \
     docs/frozen/ARCHITECTURE.md \
     tests/README.md \
+    tests/wire/README.md \
+    tests/wire/contract-v6.json \
+    tests/wire-contract-test.sh \
     core/src/main.zig \
     worker/src/worker.rs \
     api/main.go
 do
     assert_file "$V2_ROOT/$relative_path"
 done
+
+assert_contains "$V2_ROOT/docs/TESTING.md" 'Shared wire contract'
+assert_contains "$V2_ROOT/docs/ENGINEERING.md" 'contract-v6.json'
+assert_contains "$V2_ROOT/tests/README.md" 'wire-contract-test.sh'
+assert_contains "$V2_ROOT/tests/wire/README.md" 'bounded canonical byte corpus|bounded canonical cross-language fixture corpus'
 
 if [[ "$failures" -ne 0 ]]; then
     printf 'FAIL: docs_layout_paths_test (%d assertion(s))\n' "$failures" >&2

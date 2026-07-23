@@ -22,5 +22,6 @@ comptime {
     _ = @import("metrics.zig");
     _ = @import("encryption.zig");
     _ = @import("connection.zig");
+    _ = @import("wire_contract_test.zig");
     _ = @import("latency.zig");
 }

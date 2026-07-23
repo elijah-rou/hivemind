@@ -15,6 +15,7 @@ Each catalog row records classification/topology, dependencies and boundedness, 
 | Single-replica process-runtime smoke | `cd v2 && ./tests/local-smoke.sh --build` |
 | Standalone three-replica failover | `cd v2 && ./tests/local-failover-smoke.sh --build` |
 | Storage startup/liveness | `cd v2 && ./tests/storage_mode_smoke_test.sh` |
+| Shared protocol-v6 wire corpus | `cd v2/tests && ./wire-contract-test.sh` |
 | Privileged containerd component integration | `cd v2 && ./tests/containerd/run-tests.sh` |
 
 `run-all.sh` supports only `--skip-containerd` and `--skip-smoke`. `--skip-containerd` and Docker-missing auto-skip can both yield exit 0 while containerd remains **unverified**. `--skip-smoke` makes local process coverage unverified. Unknown flags exit 1.
@@ -39,6 +40,7 @@ The runner continues after a failed invoked phase and exits 1 if any invoked pha
 | Artifact lifecycle fixture | `tests/bench_artifact_lifecycle_test.sh` | Always invoked; stubbed/offline |
 | GPU cleanup fixture | `tests/gpu_test_cleanup_trap_test.sh` | Always invoked; stub Terraform/AWS |
 | Docs layout | `tests/docs_layout_paths_test.sh` | Always invoked; static paths/layout |
+| Shared wire contract | `tests/wire-contract-test.sh` | Always invoked; bounded schema/version validation plus Zig, Rust, Go API, and Go bench corpus consumers |
 | `/run` retry fixture | `tests/run_retry_test.sh` | Always invoked; stub curl |
 | HTTP helper fixture | `tests/http_helper_test.sh` | Always invoked; stub curl |
 | Operator retry fixture | `tests/operator_workflow_retry_test.sh` | Always invoked; stub curl |
@@ -87,6 +89,7 @@ These scripts do not contact live infrastructure when used as described. Each fi
 | `tests/build_binaries_test.sh` | Offline build-script fixture, not in `run-all.sh` | Stub Zig/Cargo/Go/Git and temporary repo; no overall bound | Output naming/copy/build contract; no real compilation evidence | Temporary repo removed; no flags; nonzero on failure |
 | `tests/deploy_ssm_wait_test.sh` | Deterministic SSM/deploy fixture | Stub AWS and fake clock; bounded waiter scenarios | Terminal status/error/deadline and captured command-ID handling; no AWS | Temporary state removed; no flags; nonzero on failure |
 | `tests/docs_layout_paths_test.sh` | Stable static layout/path fixture | Bash, grep; finite file checks | Frozen `v1`/active `v2` and owned paths; no prose counts or runtime proof | Console only; no cleanup/flags; nonzero on failure |
+| `tests/wire-contract-test.sh` | Shared protocol-v6 byte-corpus gate | Bash, bounded Python JSON validation, Zig, Cargo, and Go | Exact schema/version constants, complete fixture inventory, and all four consumers; no socket/cloud/runtime infrastructure | Console only; no cleanup/flags; nonzero on malformed corpus, version drift, or consumer failure |
 | `tests/gpu_test_cleanup_trap_test.sh` | Deterministic GPU lifecycle fixture | Stub Terraform/AWS/archive/signals; synchronized concurrency | Pre-apply trap and per-run ownership/cleanup; no GPU or cloud | Temporary state removed; no flags; nonzero on failure |
 | `tests/http_helper_test.sh` | Deterministic HTTP helper fixture | Stub curl and external timeout check | Connect/total deadlines and external deadline compatibility; no network service | Temporary state removed; no flags; nonzero on failure |
 | `tests/launcher_contract_test.sh` | Static launcher/source contract | Bash, grep; finite scans | Child cleanup, launch serialization, caller-CWD safety, required failure propagation; starts nothing | Console only; no flags; nonzero on failure |
@@ -139,7 +142,6 @@ The following are inventory only. They are absent or unsupported and must not be
 - mandatory failover, recovery, and run-contract phases in `run-all.sh`;
 - `--require-containerd` and strict containerd capability flags;
 - a Zig + Go + worker full-stack containerd restart/adoption gate;
-- one shared cross-language wire corpus and contract gate;
 - one guarded live/cloud entry point and strict GPU/Nydus/JuiceFS modes.
 
 A smoke test is only as strong as its explicit assertions. Local process runtime is not containerd evidence, deterministic fixtures are not live evidence, and startup/liveness is not recovery evidence.

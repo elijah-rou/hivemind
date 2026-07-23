@@ -1,121 +1,93 @@
 # Shared wire fixture contract
 
-> **Current limitation:** Hivemind uses protocol version 6 for client, worker, API, bench, and replica peer envelopes. Zig socketpair tests cover peer version rejection, but all languages still have only language-local protocol tests; no shared normative fixture corpus or shared contract gate exists. Everything below marked planned is not runnable today.
+`contract-v6.json` is the bounded canonical byte corpus for protocol version 6. `../wire-contract-test.sh` validates its schema, proves all four source constants equal 6, then runs the Zig, Rust, Go API, and Go bench corpus consumers.
 
-The behavioral protocol remains defined by [the control-plane contract](../../docs/design/CONTROL_PLANE_CONTRACT.md). Current constants and codecs remain source-owned by [`core/src/connection.zig`](../../core/src/connection.zig), [`worker/src/protocol.rs`](../../worker/src/protocol.rs), [`api/client.go`](../../api/client.go), and [`bench/main.go`](../../bench/main.go).
+The corpus is normative for the examples it contains. The behavioral protocol remains defined by [the control-plane contract](../../docs/design/CONTROL_PLANE_CONTRACT.md); source-owned bounds and codecs remain in [`core/src/connection.zig`](../../core/src/connection.zig), [`worker/src/protocol.rs`](../../worker/src/protocol.rs), [`api/client.go`](../../api/client.go), and [`bench/main.go`](../../bench/main.go).
 
-## Current versus planned evidence
+## Bounded schema
 
-| Fixture type | Meaning | Gate effect |
-|---|---|---|
-| Normative | One shared record specifies exact frame bytes, lengths, flags, version, tag, payload, and expected decode/re-encode result | Every applicable consumer must read the same record and reproduce or reject it exactly |
-| Illustrative | Prose, a partial decoded structure, or a language-local test explains behavior | Useful for review, but cannot satisfy the shared wire gate |
-| Current language-local | A consumer generates and checks its own bytes | Tests that consumer only; agreement can still drift |
+The top-level object has exactly these fields:
 
-There are no normative shared fixtures today. Existing “golden” values in language-local tests remain illustrative across language boundaries until all consumers load one committed corpus.
+| Field | Meaning |
+|---|---|
+| `schema` | Must equal `hivemind-wire-contract-v1`. |
+| `protocol_version` | Must equal `6`. |
+| `encoding` | Exact textual definitions for byte order, hex, frame, AAD, and peer-body semantics. |
+| `test_material` | One explicitly insecure 32-byte PSK and 24-byte nonce used only for deterministic fixtures. |
+| `statuses` | The complete legal `/run` status inventory, bytes `0` through `9`, including permitted origins. |
+| `vectors` | At most 32 canonical examples. The committed corpus contains 14. |
 
-## Planned, not implemented: corpus schema
+The file is capped at 256 KiB. A frame is capped at 64 KiB and a fixture payload at 16 KiB. Hex is lowercase, even-length, and has no prefix or separators. Duplicate vector IDs, unknown fields, unknown consumers, noncanonical status inventories, inconsistent lengths, and malformed encoding relationships fail the shell gate. Consumer parsers use bounded reads or compile-time inclusion and fail on malformed JSON or unknown fields where their JSON type owns the field set.
 
-The eventual JSON corpus must be bounded and schema-validated. The planned `contract-v6.json` does not exist yet; protocol version 6 is current but does not have a shared normative corpus. Each record needs these fields:
+Each vector has exactly:
 
 ```text
-corpus_version
-protocol_version
-vectors[]
-  id
-  direction
-  consumer_set[]
-  envelope
-    flags
-    version
-    tag
-    declared_length
-  payload_hex
-  frame_hex
-  encryption
-    enabled
-    test_key_id
-    nonce_hex
-    aad_hex
-  expected
-    decode
-    message_type
-    status
-    error_class
+id                 stable lowercase identifier
+channel            worker | client | peer
+direction          to-core | from-core | peer-to-peer
+message            semantic message name
+flags              0 plaintext | 1 encrypted
+tag                 worker/client tag, or peer sender identity
+key_purpose         null | worker | client | peer
+payload_hex         bytes after version and tag/sender identity
+plaintext_hex       version || tag/sender identity || payload
+frame_hex           complete length-prefixed frame
+consumers           nonempty subset of zig, rust, go-api, go-bench
 ```
 
-Schema rules:
+All multibyte integers in these vectors are little-endian. Plaintext frames are:
 
-- All multibyte integers declare byte order. Current client/worker framing and numeric payload fields use little-endian encoding unless the active protocol contract says otherwise.
-- Hex is lowercase, contains no separators or prefix, and has even length. Empty bytes use the empty string.
-- Vector IDs are stable, unique, lowercase identifiers. An existing ID never silently changes meaning; incompatible meaning requires a new ID.
-- `declared_length`, `payload_hex`, and `frame_hex` must agree exactly. Consumers never clamp, truncate, or ignore trailing bytes.
-- `consumer_set` explicitly names every applicable consumer. A vector cannot silently be skipped by an applicable implementation.
-- Expected failures use stable error classes such as `unknown_flags`, `short_frame`, `length_mismatch`, `oversize`, `unsupported_version`, `unknown_tag`, `invalid_status`, or `authentication_failed`, not language-specific error strings.
-- Boundary vectors include empty payloads and exact active maxima where the message permits them. Follow source links above for mutable limits.
-- Peer vectors must include the version before sender identity and prove old-version rejection occurs before identity binding or VRR dispatch.
+```text
+[u32 length of flags+body][flags=0][u16 version][u8 tag_or_from_id][payload]
+```
 
-## Deterministic encryption policy
+Encrypted frames are:
 
-Normative encrypted vectors may use fixed keys and nonces only to make exact bytes reproducible.
+```text
+[u32 length of flags+protected body][flags=1]
+[24-byte nonce][XChaCha20-Poly1305 ciphertext][16-byte authentication tag]
+```
 
-- Label every key and nonce as **insecure test material**.
-- Use a dedicated test-key identifier; never show fixture material as deployment configuration.
-- Record the exact key reference, nonce, authenticated header/AAD, plaintext, ciphertext, and authentication tag inputs.
-- For the current envelope, AAD must be the exact serialized frame header used by the codec, not a reconstructed semantic value.
-- A test key and nonce pair is deterministic corpus input, never a secrecy or nonce-generation example.
-- Production keys, credentials, tokens, and captured production ciphertext are forbidden in the corpus.
+AAD is the exact serialized five-byte length-and-flags header. The peer plaintext body is `[u16 version][u8 from_id][tagged VRR payload]`.
 
-## Planned required inventory
+## Canonical inventory
 
-| Area | Required normative vectors |
+The corpus covers:
+
+- worker register, heartbeat, and pod status;
+- StartPod with its exact fixed header and zero environment entries;
+- worker and client run requests and responses;
+- leader probe request and response;
+- representative tagged VRR peer envelopes;
+- every legal status byte: `ok` (0), `deployment_not_found` (1), `queue_full` (2), `invalid_payload` (3), `response_too_large` (4), `outcome_ambiguous` (5), `forwarding_failed` (6), `no_running_pod` (7), `unavailable` (8), and gateway-only `not_leader` (9);
+- plaintext examples for every message family;
+- fixed-nonce encrypted worker, client, and peer examples.
+
+A worker-originated status 9 remains invalid and must be rejected or disconnect the worker. Listing byte 9 in the complete global status inventory does not make it legal for the worker origin.
+
+## Deterministic encryption material
+
+The fixture PSK and nonce are **INSECURE TEST MATERIAL**. They exist only so each consumer can derive the purpose-specific HKDF key and reproduce exact XChaCha20-Poly1305 bytes. They are not deployment examples, production defaults, or valid nonce-generation guidance. Production keys, credentials, captured ciphertext, and reused production nonces are forbidden in this corpus.
+
+## Consumer obligations
+
+| Consumer | Shared-corpus behavior |
 |---|---|
-| Envelope | Minimum plaintext and encrypted frames; empty and exact-maximum payloads; flags, declared length, version, and tag boundaries |
-| Worker registration | node register and register acknowledgement |
-| Worker liveness | heartbeat and pod-status events for each legal phase/status representation |
-| Lifecycle control | StartPod, StopPod, and ProbePod, including fixed strings, environment entries, optional registry-auth trailer, and exact-length rules |
-| Request data plane | run request and run response with empty, typical, and exact-boundary bodies |
-| Leader discovery | leader probe request and response/reply framing used by API and bench clients |
-| Run statuses | legal bytes `0` through `9`, with names and origin restrictions from [ENGINEERING.md](../../docs/ENGINEERING.md) |
-| Peer traffic | representative version-6 peer envelopes, VRR messages, current-1 rejection, malformed input, plaintext, and deterministic encrypted examples |
-| Encryption | byte-identical plaintext/encrypted examples plus deterministic authentication failures |
+| Zig core | Loads the build-root-provided corpus path, decodes every applicable frame through the production frame decoder, exercises production worker parsers and leader/VRR codecs, and re-encodes applicable bytes exactly. |
+| Rust worker | Includes the repository-relative corpus, uses production frame and worker codecs, decodes StartPod/run requests, and reproduces plaintext and deterministic encrypted bytes. |
+| Go API | Resolves the corpus from the test source path, uses bounded fail-closed JSON/frame parsing, validates run/leader semantics, and reproduces plaintext and deterministic encrypted client bytes. |
+| Go bench | Resolves the same corpus from the test source path, validates status/run/leader semantics, and reproduces all applicable plaintext client bytes. |
+| Shell gate | Enforces schema, bounds, encoding relationships, complete message/status inventory, encrypted channel inventory, exact version constants, and all four consumers. |
 
-The legal run-status inventory is `ok` (0), `deployment_not_found` (1), `queue_full` (2), `invalid_payload` (3), `response_too_large` (4), `outcome_ambiguous` (5), `forwarding_failed` (6), `no_running_pod` (7), `unavailable` (8), and gateway-only `not_leader` (9). A worker-originated status 9 is invalid and must disconnect/reject that worker rather than becoming a normal response.
+Self-generated-only tests may remain useful local regressions, but they are not cross-language contract evidence. Shared contract claims must come from consumers of `contract-v6.json`.
 
-## Planned malformed and version cases
+## Version workflow and deployment rule
 
-Every applicable decoder must fail closed for:
+1. Change the corpus first for an incompatible byte or interpretation change.
+2. Update Zig, Rust, Go API, and Go bench together, including peer codecs.
+3. Bump the one global protocol version in every source constant.
+4. Add positive and fail-closed negative cases as appropriate.
+5. Run `cd v2/tests && ./wire-contract-test.sh` plus the broader language gates.
+6. Land fixture, consumers, gate, protocol docs, and deployment rule atomically.
 
-- empty, truncated, overflowed, mismatched, trailing-byte, and oversized declarations;
-- unknown flags, tags, enum values, boolean encodings, GPU types, phases, and status bytes;
-- plaintext when a key is required and encrypted frames when no key is configured;
-- altered nonce, AAD, ciphertext, or authentication tag;
-- old protocol versions and future protocol versions;
-- current-version peer envelopes, including rejection before identity binding or VRR dispatch.
-
-Old/future-version failures occur before identity binding, dispatch, state mutation, or request execution. Malformed inputs must not be “normalized” into valid values. Corpus cases should distinguish incomplete streaming input from a complete invalid frame where that distinction is observable.
-
-## Consumer matrix
-
-| Consumer | Current state | Planned normative obligation |
-|---|---|---|
-| Zig core | Self-generated client/worker frame tests plus peer-envelope socketpair tests in [`connection.zig`](../../core/src/connection.zig); peer serialization in [`replica.zig`](../../core/src/replica.zig) | Load applicable shared vectors, decode them, re-encode successful cases byte-identically, and reject every negative case |
-| Rust worker | Self-generated frame/payload tests in [`protocol.rs`](../../worker/src/protocol.rs) | Same for worker directions and shared envelope cases |
-| Go API | Self-generated client tests in [`client_test.go`](../../api/client_test.go) | Same for API client, leader, reply, and run-response cases |
-| Go bench | Self-generated tests under [`bench/`](../../bench/) | Same for probe, reply, and request cases |
-| Shared contract gate | Absent | Validate schema and uniqueness, run every consumer, and prove exact global version agreement |
-
-No executable contract-gate command is documented because no such gate exists. Its eventual location and invocation must be added only in the implementation commit that creates it.
-
-## Atomic vector and version workflow
-
-1. Specify the byte or interpretation change and identify every affected direction and consumer.
-2. Add or update the normative vectors first so the intended contract is reviewable.
-3. Update Zig, Rust, Go API, and Go bench together, including peer codecs when applicable.
-4. Bump the one global envelope version whenever bytes or interpretation become incompatible. Do not bump for prose-only clarification.
-5. Make every consumer read the same corpus and re-encode successful applicable vectors byte-identically.
-6. Add malformed, old-version, and future-version rejection vectors and prove rejection occurs before side effects.
-7. Land fixture, schema/gate, all consumers, design documentation, and this README atomically. A partial version change must not merge.
-8. Record the deployment rule and evidence for the new version.
-
-Hivemind does not support mixed-version rolling upgrades. Stop all replicas, workers, API gateways, and bench clients; replace every consumer; then restart the cluster. Do not advertise compatibility with an old or future peer until the normative corpus and implementation prove it.
+Mixed-version rolling upgrades are unsupported. Stop every replica, worker, API gateway, and bench client; replace all components; then restart the cluster. Version agreement is a compatibility gate, not peer authentication; TLS/mTLS remains separate work.

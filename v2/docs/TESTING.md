@@ -28,7 +28,8 @@ Commands are run from the repository root unless the command changes directory. 
 | Rust replay | `cd v2/worker && cargo run --release --bin fuzz -- replay <SEED> --mutate --verbose` | Replays one worker seed | Requires the exact seed/configuration |
 | Go API | `cd v2/api && go test -race ./... && go build ./...` | API/client behavior, race-enabled tests, and build | No real cluster by itself |
 | Go bench | `cd v2/bench && go test -race ./... && go build ./...` | Bench client/probe behavior and build | A build is not benchmark evidence |
-| Aggregate | `cd v2 && ./tests/run-all.sh` | The phases actually invoked, including optional local smoke/containerd when available | See skip semantics below |
+| Shared wire contract | `cd v2/tests && ./wire-contract-test.sh` | Bounded canonical protocol-v6 schema, exact global constants, and Zig/Rust/Go API/Go bench consumers of one byte corpus | Deterministic codec evidence; not authentication or real-network evidence |
+| Aggregate | `cd v2 && ./tests/run-all.sh` | The phases actually invoked, including the shared wire gate and optional local smoke/containerd when available | See skip semantics below |
 | Local process | `cd v2 && ./tests/local-smoke.sh --build` | One Zig replica, Go API, Rust worker, process runtime, deployment and successful `/run` | Single replica; process runtime is not containerd |
 | Local failover | `cd v2 && ./tests/local-failover-smoke.sh --build` | Three Zig replicas and Go API across leader loss/restart | Standalone; no worker or data-plane `/run` |
 | Storage startup | `cd v2 && ./tests/storage_mode_smoke_test.sh` | Volatile and journal mode startup, warning, listening, and liveness | Startup/liveness only; no committed-state recovery |
@@ -38,7 +39,7 @@ Commands are run from the repository root unless the command changes directory. 
 
 The aggregate runner currently supports only `--skip-containerd` and `--skip-smoke`; unknown arguments fail with exit 1. It continues through invoked phases and exits 1 if any invoked phase fails. `--skip-containerd` prints a skip and means containerd is unverified. Without that flag, missing Docker auto-skips containerd and may still produce exit 0; containerd remains unverified. `--skip-smoke` omits local real-process evidence. Local failover is not in the aggregate runner.
 
-**Planned, not implemented:** `--require-containerd`, strict containerd/live capability flags, mandatory recovery and run-contract phases, full-stack containerd, a shared wire corpus/gate, and a unified live entry point. Do not run these as commands or cite them as evidence.
+**Planned, not implemented:** `--require-containerd`, strict containerd/live capability flags, mandatory recovery and run-contract phases, full-stack containerd, and a unified live entry point. Do not run these as commands or cite them as evidence.
 
 Offline Terraform validation:
 
@@ -104,7 +105,7 @@ Zig failures append to `v2/core/fuzz_failures.jsonl`; worker failures append to 
 1. Name the production behavior and deterministic scenario(s).
 2. Add observable deterministic coverage in Zig VOPR, worker simulation/runtime, or both.
 3. Add real-process coverage when sockets, process lifecycle, filesystem, runtime, or infrastructure matter.
-4. For wire changes, update Zig, Rust, Go API, and Go bench together. Update the shared corpus when it exists; it is currently **Planned, not implemented**.
+4. For wire changes, update Zig, Rust, Go API, Go bench, and [`tests/wire/contract-v6.json`](../tests/wire/contract-v6.json) together; run the shared gate and require byte-identical re-encoding where applicable.
 5. Update this document, the harness catalog, affected contracts, and `POC_CHANGELOG.md` when POC evidence or readiness changes.
 
 ## Reviewer checklist

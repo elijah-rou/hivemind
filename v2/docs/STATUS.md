@@ -159,9 +159,11 @@ Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertex
 Peer frames (plaintext):         [4B LE len][1B flags=0x00][2B LE version][1B from_id][VRR payload]
 Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(version+from_id+VRR)][16B tag]
 PROTOCOL_VERSION = 6 (mismatch fails before peer identity binding, connection-state decisions, or VRR dispatch)
+```
 
 Mixed-version rolling upgrades are unsupported. Stop every replica, worker, API gateway, and bench client, replace all components, then restart. This compatibility gate does not authenticate peers; without TLS/mTLS, reachable senders can still claim a configured peer identity.
-```
+
+The bounded canonical corpus is `tests/wire/contract-v6.json`; `tests/wire-contract-test.sh` validates its schema and exact version constants, then runs Zig, Rust, Go API, and Go bench consumers. It covers worker lifecycle/control messages, client `/run` and leader probes, peer envelopes, status bytes 0-9, plaintext, and fixed-nonce encrypted worker/client/peer examples. Its PSK and nonce are insecure fixture-only material.
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)
 
@@ -271,11 +273,12 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
-- Zig: `331 / 331` unit/simulation tests pass in Debug and ReleaseFast, including the protocol-v6 peer-envelope socketpair scenario.
-- Rust: `165` library, `3` fuzz-harness utility, `5` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Zig: `332 / 332` unit/simulation tests pass in Debug and ReleaseFast, including the shared wire corpus and protocol-v6 peer-envelope socketpair scenario.
+- Rust: `166` library, `3` fuzz-harness utility, `5` main, and `5` integration tests pass; containerd feature integration was not enabled.
 - Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
-- Go: API and bench module tests and builds pass.
-- `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
+- Go: API and bench module race tests and builds pass; both consume the shared corpus.
+- Shared wire: `tests/wire-contract-test.sh` passes bounded schema/version validation and all four language consumers; applicable vectors re-encode byte-identically.
+- `tests/run-all.sh --skip-containerd`: `19 passed, 0 failed`, including the shared wire gate, storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
 - Local smoke within run-all: `16 passed, 0 failed`.
 - Shell: changed files pass `bash -n` and ShellCheck at style severity.
 - Residual validation: no live AWS deploy; containerd-in-Docker not run; Terraform provider-dependent offline validation is reported separately when unavailable.
@@ -334,7 +337,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - [x] Nydus snapshotter support
 - [x] GPU pod support (CDI devices with `io.containerd.runc.v2`)
 - [x] Prometheus metrics (replica + agent)
-- [x] Protocol versioning (2-byte version field)
+- [x] Protocol versioning (2-byte version field) with one bounded canonical cross-language fixture corpus
 - [x] Peer connection retry (2s interval)
 - [x] VOPR simulation testing
 

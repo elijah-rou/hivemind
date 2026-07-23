@@ -78,9 +78,11 @@ run_phase "Bench artifact lifecycle fixtures" \
 run_phase "GPU-test cleanup trap fixture" \
     bash -c "'$SCRIPT_DIR/gpu_test_cleanup_trap_test.sh'"
 
-# --- Phase 4f: Active docs layout path contract ---
+# --- Phase 4f: Active docs and shared wire contracts ---
 run_phase "Active docs layout path contract" \
     bash -c "'$SCRIPT_DIR/docs_layout_paths_test.sh'"
+run_phase "Shared protocol-v6 wire contract" \
+    bash -c "'$SCRIPT_DIR/wire-contract-test.sh'"
 
 # --- Phase 4g: Shared /run retry safety fixtures + active caller coverage ---
 run_phase "Run retry fixtures" \
