@@ -146,6 +146,7 @@ impl WorkerSimulator {
 mod tests {
     use super::*;
     use crate::message::*;
+    use crate::prng::Ratio;
     use crate::runtime::{PodStatus, Runtime};
     use crate::sim::runtime::ProbeOutcome;
     use crate::types::GpuType;
@@ -187,12 +188,35 @@ mod tests {
                 image: "sim-probe:1".into(),
                 entrypoint: String::new(),
                 port: 8080,
-                gpu_count: 0,
-                gpu_type: GpuType::None,
+                gpu_count: 8,
+                gpu_type: GpuType::H100Sxm,
                 cpu_millicores: 500,
                 memory_megabytes: 512,
                 juicefs_path: String::new(),
                 liveness_path: "/health".into(),
+                readiness_path: String::new(),
+                env_vars: vec![],
+                image_pull_registry: String::new(),
+                image_pull_username: String::new(),
+                image_pull_password: String::new(),
+                image_pull_password_is_secret: false,
+            }),
+        );
+        sim.control_plane.schedule_command(
+            30_023,
+            0,
+            ControlMessage::StartPod(StartPodCmd {
+                pod_id: 2,
+                deployment_id: 200,
+                image: "sim-replacement:1".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 1,
+                gpu_type: GpuType::H100Sxm,
+                cpu_millicores: 500,
+                memory_megabytes: 512,
+                juicefs_path: String::new(),
+                liveness_path: String::new(),
                 readiness_path: String::new(),
                 env_vars: vec![],
                 image_pull_registry: String::new(),
@@ -245,16 +269,63 @@ mod tests {
 
         advance_to_next_probe(&mut sim);
         advance_to_next_probe(&mut sim);
+        sim.set_runtime_faults(
+            0,
+            FaultConfig {
+                stop_failure_rate: Ratio::new(1, 1),
+                ..FaultConfig::default()
+            },
+        );
         advance_to_next_probe(&mut sim);
 
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&1].state,
+            TrackedPodState::Stopping,
+            "failed probe must retain ownership until runtime termination is verified"
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 8);
+        assert_eq!(sim.workers[0].cpu_allocated_millicores(), 500);
+        assert_eq!(sim.workers[0].memory_allocated_megabytes(), 512);
+        let handle = sim.workers[0].tracked_pods()[&1]
+            .handle
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            sim.sim_runtimes[0].pod_status(&handle).unwrap(),
+            PodStatus::Running
+        );
+
+        sim.tick();
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&1].state,
+            TrackedPodState::Stopping,
+            "failed stop must retain the live runtime"
+        );
+        assert_eq!(
+            sim.sim_runtimes[0].pod_status(&handle).unwrap(),
+            PodStatus::Running
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 8);
+
+        sim.tick();
+        assert!(received_pod_statuses(&sim, 2).iter().any(|status| matches!(
+            status,
+            PodStatusReport::Failed { reason } if reason == "insufficient GPU capacity"
+        )));
+
+        sim.current_tick = sim.current_tick.saturating_add(STOP_RETRY_DELAY_TICKS);
+        sim.tick();
         assert_eq!(
             sim.workers[0].tracked_pods()[&1].state,
             TrackedPodState::Failed {
                 reason: "liveness probe failed".into()
             }
         );
+        assert_eq!(sim.workers[0].gpu_allocated(), 0);
         assert_eq!(sim.workers[0].cpu_allocated_millicores(), 0);
         assert_eq!(sim.workers[0].memory_allocated_megabytes(), 0);
+        assert!(sim.sim_runtimes[0].pod_status(&handle).is_err());
     }
 
     #[test]

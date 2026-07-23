@@ -61,6 +61,7 @@ pub struct Worker {
     pub memory_megabytes: u32,
 
     pods: HashMap<u64, TrackedPod>,
+    pending_failure_reasons: HashMap<u64, String>,
     last_heartbeat_tick: u64,
     registered: bool,
     gpu_allocated: u8,
@@ -123,6 +124,7 @@ impl Worker {
             cpu_millicores,
             memory_megabytes,
             pods: HashMap::new(),
+            pending_failure_reasons: HashMap::new(),
             last_heartbeat_tick: 0,
             registered: false,
             gpu_allocated: 0,
@@ -910,14 +912,24 @@ impl Worker {
             }
         }
         volumes::unmount_juicefs(pod_id);
+        let failure_reason = self.pending_failure_reasons.remove(&pod_id);
         let pod = self.pods.get_mut(&pod_id).expect("stopping pod must exist");
-        pod.state = TrackedPodState::Stopped { exit_code };
+        pod.state = match &failure_reason {
+            Some(reason) => TrackedPodState::Failed {
+                reason: reason.clone(),
+            },
+            None => TrackedPodState::Stopped { exit_code },
+        };
         pod.state_changed_at = now;
         pod.lifecycle_retry_after_tick = 0;
         self.release_pod_resources(pod_id);
+        let status = match failure_reason {
+            Some(reason) => PodStatusReport::Failed { reason },
+            None => PodStatusReport::Stopped { exit_code },
+        };
         io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
             pod_id,
-            status: PodStatusReport::Stopped { exit_code },
+            status,
         }));
     }
 
@@ -947,14 +959,28 @@ impl Worker {
 
     fn fail_pod(&mut self, io: &mut dyn Io, pod_id: u64, reason: String, now: u64) {
         eprintln!("worker: pod {pod_id} failed: {reason}");
+        let pod = self.pods.get_mut(&pod_id).expect("failed pod must exist");
+        if pod.handle.is_some() {
+            pod.state = TrackedPodState::Stopping;
+            pod.state_changed_at = now;
+            pod.grace_period_ms = 0;
+            pod.lifecycle_failures = 0;
+            pod.lifecycle_retry_after_tick = 0;
+            let previous = self.pending_failure_reasons.insert(pod_id, reason);
+            assert!(
+                previous.is_none(),
+                "pod failure cleanup may only begin once"
+            );
+            assert!(self.pending_failure_reasons.len() <= self.pods.len());
+            return;
+        }
+
         volumes::unmount_juicefs(pod_id);
-        let pod = self.pods.get_mut(&pod_id).unwrap();
         pod.state = TrackedPodState::Failed {
             reason: reason.clone(),
         };
         pod.state_changed_at = now;
         self.release_pod_resources(pod_id);
-
         io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
             pod_id,
             status: PodStatusReport::Failed { reason },
@@ -1058,17 +1084,25 @@ impl Worker {
                 }
             }
             volumes::unmount_juicefs(pod_id);
+            let failure_reason = self.pending_failure_reasons.remove(&pod_id);
             if !was_terminal {
                 self.release_pod_resources(pod_id);
+                let status = match failure_reason {
+                    Some(reason) => PodStatusReport::Failed { reason },
+                    None => PodStatusReport::Stopped { exit_code },
+                };
                 io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
                     pod_id,
-                    status: PodStatusReport::Stopped { exit_code },
+                    status,
                 }));
+            } else {
+                assert!(failure_reason.is_none());
             }
             self.pods.remove(&pod_id);
         }
 
         if self.pods.is_empty() {
+            assert!(self.pending_failure_reasons.is_empty());
             eprintln!("agent: all pods stopped");
             true
         } else {
@@ -2397,6 +2431,7 @@ mod tests {
 
     struct FlakyStartRuntime {
         start_calls: Mutex<u32>,
+        status: Mutex<PodStatus>,
     }
 
     impl Runtime for FlakyStartRuntime {
@@ -2408,6 +2443,7 @@ mod tests {
             Ok(())
         }
         fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+            *self.status.lock().unwrap() = PodStatus::Created;
             Ok(PodHandle {
                 pod_id: spec.pod_id,
                 container_id: format!("flaky-{}", spec.pod_id),
@@ -2421,6 +2457,7 @@ mod tests {
                     "transient start failure".into(),
                 ));
             }
+            *self.status.lock().unwrap() = PodStatus::Running;
             Ok(())
         }
         fn forward_run(
@@ -2432,10 +2469,11 @@ mod tests {
             Ok(payload.to_vec())
         }
         fn stop_pod(&self, _handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
+            *self.status.lock().unwrap() = PodStatus::Stopped { exit_code: 1 };
             Ok(())
         }
         fn pod_status(&self, _handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
-            Ok(PodStatus::Running)
+            Ok(self.status.lock().unwrap().clone())
         }
         fn remove_pod(&self, _handle: &PodHandle) -> Result<(), RuntimeError> {
             Ok(())
@@ -2454,6 +2492,7 @@ mod tests {
         );
         let runtime = FlakyStartRuntime {
             start_calls: Mutex::new(0),
+            status: Mutex::new(PodStatus::Created),
         };
         let mut io = TestIo {
             sent: Vec::new(),
@@ -2497,6 +2536,7 @@ mod tests {
         );
         let runtime = FlakyStartRuntime {
             start_calls: Mutex::new(0),
+            status: Mutex::new(PodStatus::Created),
         };
         let mut io = TestIo {
             sent: Vec::new(),
@@ -2519,6 +2559,9 @@ mod tests {
             }
             worker.drive_pods(&mut io, &runtime, now + 1);
         }
+
+        assert_eq!(worker.tracked_pods()[&8].state, TrackedPodState::Stopping);
+        worker.drive_pods(&mut io, &runtime, 1_000);
 
         match &worker.tracked_pods()[&8].state {
             TrackedPodState::Failed { reason } => {

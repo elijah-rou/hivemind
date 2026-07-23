@@ -224,7 +224,7 @@ ImagePulling → Creating → Starting → Running → Stopping → Stopped
 - CPU pods: `--runtime io.containerd.runc.v2`
 - 30s timeout on ctr calls, 300s for image pulls
 - cgroup v2 resource limits (CPU quota, memory)
-- Liveness probes run through the selected runtime every 10s; success resets the counter and 3 consecutive failures transition the pod to `Failed`. Process probes parse one bounded HTTP status line exactly; containerd probes from the task network namespace.
+- Liveness probes run through the selected runtime every 10s; success resets the counter and 3 consecutive failures begin verified runtime stop/removal while retaining mounts and resource accounting, then publish `Failed`. Process probes parse one bounded HTTP status line exactly under a single absolute probe deadline; containerd probes from the task network namespace.
 
 ## HTTP API Endpoints
 
@@ -298,7 +298,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Delayed partitions retain the current session and queued traffic. Explicit session loss discards both old-session queues, calls `Worker::on_connection_lost`, and proves re-registration precedes exact new-session heartbeat, pod-status, and run-response traffic.
 - Partition blocks queued traffic in both directions; ratio-based drop, one-shot replay, and per-path capacity apply symmetrically. Accepted worker messages and encoded payload bytes contribute to network accounting.
 - Runner convergence requires control-plane-observed registration from every worker and a terminal status for every generated start command; permanent total loss fails liveness. Network and per-tick I/O staging paths retain at most 256 messages per worker, optionally reduced by configured path capacity; control-plane schedule and recorder growth is fail-loud bounded.
-- Named worker scenarios `liveness_probe_two_failures_then_success_resets_counter` and `liveness_probe_three_failures_transition_pod_to_failed` consume bounded scripted runtime outcomes and prove liveness hysteresis and the third-failure transition.
+- Named worker scenarios `liveness_probe_two_failures_then_success_resets_counter` and `liveness_probe_three_failures_transition_pod_to_failed` consume bounded scripted runtime outcomes and prove liveness hysteresis, retained runtime/resource ownership after a failed stop, replacement GPU denial, and final `Failed` publication only after verified removal.
 - Simulation does not prove kernel TCP buffering, partial-frame loss, half-close behavior, reconnect timing, real process scheduling, containerd task-network-namespace behavior, GPU/CDI, or cloud behavior.
 
 ## Codebase Size

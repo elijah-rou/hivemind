@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::MAX_RUN_RESPONSE_BODY;
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
@@ -205,18 +205,16 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
 /// Send a bounded HTTP GET and accept exactly a well-formed `200` status line.
 pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
     validate_probe_path(path)?;
+    let started = Instant::now();
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, PROBE_DEADLINE)
         .map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_read_timeout(Some(PROBE_DEADLINE))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(PROBE_DEADLINE))
-        .map_err(|e| format!("set write timeout: {e}"))?;
 
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .set_write_timeout(Some(probe_time_remaining(started)?))
+        .map_err(|e| format!("set write timeout: {e}"))?;
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
@@ -229,6 +227,9 @@ pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
                 "HTTP status line exceeds {HTTP_STATUS_LINE_MAX} bytes"
             ));
         }
+        stream
+            .set_read_timeout(Some(probe_time_remaining(started)?))
+            .map_err(|e| format!("set read timeout: {e}"))?;
         let read = stream
             .read(&mut status_line[length..])
             .map_err(|e| format!("read status line: {e}"))?;
@@ -245,6 +246,13 @@ pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
             return parse_http_status_line(&status_line[..=line_end]);
         }
     }
+}
+
+fn probe_time_remaining(started: Instant) -> Result<Duration, String> {
+    PROBE_DEADLINE
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "HTTP probe exceeded total deadline".into())
 }
 
 fn validate_probe_path(path: &str) -> Result<(), String> {
@@ -280,13 +288,11 @@ fn parse_http_status_line(line: &[u8]) -> Result<bool, String> {
         return Err("HTTP status code must contain three digits".into());
     }
     let reason = &status_and_reason[3..];
-    if !reason.is_empty() {
-        if reason[0] != b' ' {
-            return Err("HTTP status code must be followed by one space".into());
-        }
-        if !reason[1..].iter().all(|byte| (b' '..=b'~').contains(byte)) {
-            return Err("HTTP reason phrase contains unsafe bytes".into());
-        }
+    if reason.first() != Some(&b' ') {
+        return Err("HTTP status code must be followed by one space".into());
+    }
+    if !reason[1..].iter().all(|byte| (b' '..=b'~').contains(byte)) {
+        return Err("HTTP reason phrase contains unsafe bytes".into());
     }
     Ok(status == b"200")
 }
@@ -480,6 +486,7 @@ mod tests {
     fn probe_rejects_malformed_oversized_and_unsafe_status_lines() {
         for response in [
             b"not-http 200\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200\r\n".to_vec(),
             {
                 let mut line = b"HTTP/1.1 200 ".to_vec();
                 line.extend(std::iter::repeat_n(b'x', 1024));
@@ -490,6 +497,31 @@ mod tests {
         ] {
             assert!(probe_http(serve_response(response), "/health").is_err());
         }
+    }
+
+    #[test]
+    fn probe_total_deadline_stops_trickle_status_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            for byte in b"HTTP/1.1 200 OK\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(350));
+            }
+        });
+
+        let started = Instant::now();
+        assert!(probe_http(port, "/health").is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(5_750),
+            "probe exceeded its total deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
