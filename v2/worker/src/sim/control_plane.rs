@@ -26,6 +26,22 @@ impl ControlPlaneStub {
         }
     }
 
+    #[cfg(test)]
+    pub fn schedule_command(&mut self, tick: u64, agent_id: usize, command: ControlMessage) {
+        assert!(self.scheduled.len() < SCHEDULE_CAPACITY);
+        assert_eq!(
+            self.schedule_index, 0,
+            "commands must be scheduled before simulation starts"
+        );
+        if let ControlMessage::StartPod(start) = &command {
+            assert!(self.expected_starts.len() < SCHEDULE_CAPACITY / 2);
+            self.expected_starts.push((agent_id, start.pod_id));
+        }
+        self.scheduled.push((tick, agent_id, command));
+        self.scheduled
+            .sort_by_key(|(scheduled_tick, _, _)| *scheduled_tick);
+    }
+
     pub fn generate_workload(&mut self, agent_count: usize, pod_count: u32, over_ticks: u64) {
         assert!(agent_count > 0);
         assert!(over_ticks >= 2);

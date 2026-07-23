@@ -9,6 +9,9 @@ use crate::protocol::MAX_RUN_RESPONSE_BODY;
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
 
 const BASE_PORT: u16 = 15000;
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+const PROBE_PATH_MAX: usize = 1024;
+const HTTP_STATUS_LINE_MAX: usize = 1024;
 
 struct RunningProcess {
     child: Child,
@@ -142,6 +145,13 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         crate::runtime::process::forward_run(port, payload)
     }
 
+    fn probe_pod(&self, handle: &PodHandle, _port: u16, path: &str) -> Result<bool, RuntimeError> {
+        let port = self
+            .get_port(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+        probe_http(port, path).map_err(RuntimeError::Internal)
+    }
+
     fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
         let mut processes = self.processes.lock().unwrap();
         let proc = processes
@@ -192,11 +202,18 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 }
 
-/// Send an HTTP GET to a process "container" health endpoint and check for 200.
+/// Send a bounded HTTP GET and accept exactly a well-formed `200` status line.
 pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
-    let mut stream =
-        TcpStream::connect(format!("127.0.0.1:{port}")).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    validate_probe_path(path)?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, PROBE_DEADLINE)
+        .map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(PROBE_DEADLINE))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(PROBE_DEADLINE))
+        .map_err(|e| format!("set write timeout: {e}"))?;
 
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
@@ -204,13 +221,74 @@ pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
 
-    let mut response = [0u8; 1024];
-    let n = stream
-        .read(&mut response)
-        .map_err(|e| format!("read: {e}"))?;
+    let mut status_line = [0u8; HTTP_STATUS_LINE_MAX + 1];
+    let mut length = 0;
+    loop {
+        if length == status_line.len() {
+            return Err(format!(
+                "HTTP status line exceeds {HTTP_STATUS_LINE_MAX} bytes"
+            ));
+        }
+        let read = stream
+            .read(&mut status_line[length..])
+            .map_err(|e| format!("read status line: {e}"))?;
+        if read == 0 {
+            return Err("HTTP response ended before status line".into());
+        }
+        length += read;
+        if let Some(line_end) = status_line[..length].iter().position(|byte| *byte == b'\n') {
+            if line_end + 1 > HTTP_STATUS_LINE_MAX {
+                return Err(format!(
+                    "HTTP status line exceeds {HTTP_STATUS_LINE_MAX} bytes"
+                ));
+            }
+            return parse_http_status_line(&status_line[..=line_end]);
+        }
+    }
+}
 
-    let resp_str = String::from_utf8_lossy(&response[..n]);
-    Ok(resp_str.contains("200"))
+fn validate_probe_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > PROBE_PATH_MAX || !path.starts_with('/') {
+        return Err(format!(
+            "probe path must start with '/' and contain at most {PROBE_PATH_MAX} bytes"
+        ));
+    }
+    if !path.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+        return Err("probe path contains unsafe request-target bytes".into());
+    }
+    Ok(())
+}
+
+fn parse_http_status_line(line: &[u8]) -> Result<bool, String> {
+    let line = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| "HTTP status line must end with CRLF".to_string())?;
+    let Some(version_end) = line.iter().position(|byte| *byte == b' ') else {
+        return Err("HTTP status line is missing status code".into());
+    };
+    let version = &line[..version_end];
+    if version != b"HTTP/1.0" && version != b"HTTP/1.1" {
+        return Err("HTTP status line has unsupported version".into());
+    }
+
+    let status_and_reason = &line[version_end + 1..];
+    if status_and_reason.len() < 3 {
+        return Err("HTTP status code must contain three digits".into());
+    }
+    let status = &status_and_reason[..3];
+    if !status.iter().all(u8::is_ascii_digit) {
+        return Err("HTTP status code must contain three digits".into());
+    }
+    let reason = &status_and_reason[3..];
+    if !reason.is_empty() {
+        if reason[0] != b' ' {
+            return Err("HTTP status code must be followed by one space".into());
+        }
+        if !reason[1..].iter().all(|byte| (b' '..=b'~').contains(byte)) {
+            return Err("HTTP reason phrase contains unsafe bytes".into());
+        }
+    }
+    Ok(status == b"200")
 }
 
 /// Send an HTTP POST to a process "container" and return the response body.
@@ -274,6 +352,30 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_runtime_probe_uses_owned_process_port() {
+        let runtime = ProcessRuntime::with_base_port(24_500);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 78,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        assert!(runtime.probe_pod(&handle, 1, "/health").unwrap());
+        runtime.remove_pod(&handle).unwrap();
+    }
 
     #[test]
     fn stopped_process_remains_queryable_until_remove() {
@@ -351,6 +453,49 @@ mod tests {
             let _ = stream.write_all(&response);
         });
         port
+    }
+
+    #[test]
+    fn probe_accepts_only_exact_200_status() {
+        assert!(probe_http(
+            serve_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            "/health?full=1"
+        )
+        .unwrap());
+        assert!(!probe_http(
+            serve_response(b"HTTP/1.0 204 No Content\r\n\r\n".to_vec()),
+            "/health"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn probe_rejects_500_response_with_200_in_body() {
+        let response =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\n\r\n200".to_vec();
+        assert!(!probe_http(serve_response(response), "/health").unwrap());
+    }
+
+    #[test]
+    fn probe_rejects_malformed_oversized_and_unsafe_status_lines() {
+        for response in [
+            b"not-http 200\r\n\r\n".to_vec(),
+            {
+                let mut line = b"HTTP/1.1 200 ".to_vec();
+                line.extend(std::iter::repeat_n(b'x', 1024));
+                line.extend_from_slice(b"\r\n\r\n");
+                line
+            },
+            b"HTTP/1.1 200 OK\0unsafe\r\n\r\n".to_vec(),
+        ] {
+            assert!(probe_http(serve_response(response), "/health").is_err());
+        }
+    }
+
+    #[test]
+    fn probe_rejects_request_target_header_injection() {
+        let error = probe_http(1, "/health\r\nX-Injected: yes").unwrap_err();
+        assert!(error.contains("unsafe request-target bytes"));
     }
 
     #[test]

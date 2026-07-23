@@ -1,8 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use crate::prng::{Prng, Ratio};
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
+
+const PROBE_SCRIPT_MAX: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Healthy,
+    Unhealthy,
+    Error,
+}
 
 #[derive(Debug, Clone)]
 pub struct FaultConfig {
@@ -31,6 +40,7 @@ struct Inner {
     create_attempts: HashMap<u64, u64>,
     start_attempts: HashMap<u64, u64>,
     stop_attempts: HashMap<u64, u64>,
+    probe_outcomes: HashMap<u64, VecDeque<ProbeOutcome>>,
     crash_round: u64,
 }
 
@@ -52,9 +62,28 @@ impl SimulatedRuntime {
                 create_attempts: HashMap::new(),
                 start_attempts: HashMap::new(),
                 stop_attempts: HashMap::new(),
+                probe_outcomes: HashMap::new(),
                 crash_round: 0,
             }),
         }
+    }
+
+    pub fn script_probe_outcomes(&self, pod_id: u64, outcomes: &[ProbeOutcome]) {
+        assert!(!outcomes.is_empty(), "probe script must not be empty");
+        assert!(
+            outcomes.len() <= PROBE_SCRIPT_MAX,
+            "probe script exceeds bounded capacity"
+        );
+        let previous = self
+            .inner
+            .lock()
+            .unwrap()
+            .probe_outcomes
+            .insert(pod_id, outcomes.iter().copied().collect());
+        assert!(
+            previous.is_none(),
+            "probe script may only be set once per pod"
+        );
     }
 
     /// Simulate spontaneous container crashes. Called by the simulator each tick.
@@ -222,6 +251,27 @@ impl Runtime for SimulatedRuntime {
                 "simulated pod not running".into(),
             )),
             None => Err(RuntimeError::ContainerNotFound(handle.container_id.clone())),
+        }
+    }
+
+    fn probe_pod(&self, handle: &PodHandle, _port: u16, _path: &str) -> Result<bool, RuntimeError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !matches!(
+            inner.pods.get(&handle.container_id),
+            Some(PodStatus::Running)
+        ) {
+            return Err(RuntimeError::ContainerNotFound(handle.container_id.clone()));
+        }
+        let outcome = match inner.probe_outcomes.get_mut(&handle.pod_id) {
+            Some(script) => script.pop_front().ok_or_else(|| {
+                RuntimeError::Internal("scripted probe outcomes exhausted".into())
+            })?,
+            None => ProbeOutcome::Healthy,
+        };
+        match outcome {
+            ProbeOutcome::Healthy => Ok(true),
+            ProbeOutcome::Unhealthy => Ok(false),
+            ProbeOutcome::Error => Err(RuntimeError::Internal("scripted probe error".into())),
         }
     }
 

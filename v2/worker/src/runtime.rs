@@ -85,6 +85,16 @@ pub trait Runtime: Sync {
         port: u16,
         payload: &[u8],
     ) -> Result<Vec<u8>, RuntimeError>;
+    fn probe_pod(
+        &self,
+        _handle: &PodHandle,
+        _port: u16,
+        _path: &str,
+    ) -> Result<bool, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "runtime does not implement pod probes".into(),
+        ))
+    }
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError>;
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError>;
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError>;

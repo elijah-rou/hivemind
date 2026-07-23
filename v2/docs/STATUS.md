@@ -224,7 +224,7 @@ ImagePulling → Creating → Starting → Running → Stopping → Stopped
 - CPU pods: `--runtime io.containerd.runc.v2`
 - 30s timeout on ctr calls, 300s for image pulls
 - cgroup v2 resource limits (CPU quota, memory)
-- Liveness probes every 10s, 3 failures → restart
+- Liveness probes run through the selected runtime every 10s; success resets the counter and 3 consecutive failures transition the pod to `Failed`. Process probes parse one bounded HTTP status line exactly; containerd probes from the task network namespace.
 
 ## HTTP API Endpoints
 
@@ -270,7 +270,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
 - Zig: `330 / 330` unit/simulation tests pass in Debug and ReleaseFast; `zig build test` passes.
-- Rust: `139` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
+- Rust: `153` library, `3` fuzz-harness utility, `4` main, and `5` integration tests pass; containerd feature integration was intentionally skipped.
 - Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
 - Go: API and bench module tests and builds pass.
 - `tests/run-all.sh --skip-containerd`: `18 passed, 0 failed`, including storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
@@ -298,7 +298,8 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Delayed partitions retain the current session and queued traffic. Explicit session loss discards both old-session queues, calls `Worker::on_connection_lost`, and proves re-registration precedes exact new-session heartbeat, pod-status, and run-response traffic.
 - Partition blocks queued traffic in both directions; ratio-based drop, one-shot replay, and per-path capacity apply symmetrically. Accepted worker messages and encoded payload bytes contribute to network accounting.
 - Runner convergence requires control-plane-observed registration from every worker and a terminal status for every generated start command; permanent total loss fails liveness. Network and per-tick I/O staging paths retain at most 256 messages per worker, optionally reduced by configured path capacity; control-plane schedule and recorder growth is fail-loud bounded.
-- Simulation does not prove kernel TCP buffering, partial-frame loss, half-close behavior, reconnect timing, real process scheduling, containerd, GPU/CDI, or cloud behavior.
+- Named worker scenarios `liveness_probe_two_failures_then_success_resets_counter` and `liveness_probe_three_failures_transition_pod_to_failed` consume bounded scripted runtime outcomes and prove liveness hysteresis and the third-failure transition.
+- Simulation does not prove kernel TCP buffering, partial-frame loss, half-close behavior, reconnect timing, real process scheduling, containerd task-network-namespace behavior, GPU/CDI, or cloud behavior.
 
 ## Codebase Size
 

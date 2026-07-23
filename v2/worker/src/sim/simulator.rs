@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::message::*;
     use crate::runtime::{PodStatus, Runtime};
+    use crate::sim::runtime::ProbeOutcome;
     use crate::types::GpuType;
     use crate::worker::{TrackedPodState, STOP_RETRY_DELAY_TICKS};
 
@@ -171,6 +172,89 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn liveness_probe_sim(outcomes: &[ProbeOutcome]) -> WorkerSimulator {
+        let mut sim = WorkerSimulator::new(1, 0xB3_01);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.control_plane.schedule_command(
+            1,
+            0,
+            ControlMessage::StartPod(StartPodCmd {
+                pod_id: 1,
+                deployment_id: 100,
+                image: "sim-probe:1".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: GpuType::None,
+                cpu_millicores: 500,
+                memory_megabytes: 512,
+                juicefs_path: String::new(),
+                liveness_path: "/health".into(),
+                readiness_path: String::new(),
+                env_vars: vec![],
+                image_pull_registry: String::new(),
+                image_pull_username: String::new(),
+                image_pull_password: String::new(),
+                image_pull_password_is_secret: false,
+            }),
+        );
+        sim.sim_runtimes[0].script_probe_outcomes(1, outcomes);
+        sim.run(20);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&1].state,
+            TrackedPodState::Running
+        );
+        sim
+    }
+
+    fn advance_to_next_probe(sim: &mut WorkerSimulator) {
+        sim.current_tick = sim.current_tick.saturating_add(10_000);
+        sim.tick();
+    }
+
+    #[test]
+    fn liveness_probe_two_failures_then_success_resets_counter() {
+        let mut sim = liveness_probe_sim(&[
+            ProbeOutcome::Unhealthy,
+            ProbeOutcome::Error,
+            ProbeOutcome::Healthy,
+        ]);
+
+        advance_to_next_probe(&mut sim);
+        assert_eq!(sim.workers[0].tracked_pods()[&1].consecutive_failures, 1);
+        advance_to_next_probe(&mut sim);
+        assert_eq!(sim.workers[0].tracked_pods()[&1].consecutive_failures, 2);
+        advance_to_next_probe(&mut sim);
+        assert_eq!(sim.workers[0].tracked_pods()[&1].consecutive_failures, 0);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&1].state,
+            TrackedPodState::Running
+        );
+    }
+
+    #[test]
+    fn liveness_probe_three_failures_transition_pod_to_failed() {
+        let mut sim = liveness_probe_sim(&[
+            ProbeOutcome::Unhealthy,
+            ProbeOutcome::Error,
+            ProbeOutcome::Unhealthy,
+        ]);
+
+        advance_to_next_probe(&mut sim);
+        advance_to_next_probe(&mut sim);
+        advance_to_next_probe(&mut sim);
+
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&1].state,
+            TrackedPodState::Failed {
+                reason: "liveness probe failed".into()
+            }
+        );
+        assert_eq!(sim.workers[0].cpu_allocated_millicores(), 0);
+        assert_eq!(sim.workers[0].memory_allocated_megabytes(), 0);
     }
 
     #[test]

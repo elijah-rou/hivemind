@@ -469,6 +469,16 @@ impl Runtime for ContainerdRuntime {
             })
     }
 
+    fn probe_pod(&self, handle: &PodHandle, port: u16, path: &str) -> Result<bool, RuntimeError> {
+        let pid = self.task_pid(&handle.container_id)?;
+        self.with_task_netns(pid, || {
+            crate::runtime::process::probe_http(port, path).map_err(RuntimeError::Internal)
+        })
+        .map_err(|error| {
+            RuntimeError::Internal(format!("probe pod {}: {error}", handle.container_id))
+        })
+    }
+
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
         let terminate_error = self
             .run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id])

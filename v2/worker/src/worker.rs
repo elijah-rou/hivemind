@@ -564,17 +564,23 @@ impl Worker {
                                 && now >= pod.last_probe_tick + pod.probe_interval_ms
                         };
                         if should_probe {
-                            let port = self.pods[&pod_id].port;
-                            let path = self.pods[&pod_id].liveness_path.clone();
+                            let pod = &self.pods[&pod_id];
+                            let handle = pod
+                                .handle
+                                .clone()
+                                .expect("running pod must retain its runtime handle");
+                            let port = pod.port;
+                            let path = pod.liveness_path.clone();
                             self.pods.get_mut(&pod_id).unwrap().last_probe_tick = now;
 
-                            match crate::runtime::process::probe_http(port, &path) {
+                            match runtime.probe_pod(&handle, port, &path) {
                                 Ok(true) => {
                                     self.pods.get_mut(&pod_id).unwrap().consecutive_failures = 0;
                                 }
-                                _ => {
+                                Ok(false) | Err(_) => {
                                     let pod = self.pods.get_mut(&pod_id).unwrap();
-                                    pod.consecutive_failures += 1;
+                                    pod.consecutive_failures =
+                                        pod.consecutive_failures.saturating_add(1);
                                     if pod.consecutive_failures >= 3 {
                                         self.fail_pod(
                                             io,

@@ -343,6 +343,10 @@ mod tests {
         rt.start_pod(&handle).expect("start");
         std::thread::sleep(Duration::from_secs(2));
 
+        assert!(
+            rt.probe_pod(&handle, 8080, "/").expect("probe_pod"),
+            "containerd probe must reach the workload through its task network namespace"
+        );
         let response = rt
             .forward_run(&handle, 8080, br#"{"probe":"containerd-run"}"#)
             .expect("forward_run");
