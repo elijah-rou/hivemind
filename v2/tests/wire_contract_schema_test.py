@@ -8,6 +8,14 @@ import wire_contract_validator as validator
 
 
 CONTRACT_PATH = pathlib.Path(__file__).with_name("wire") / "contract-v6.json"
+ENCODING_FIELDS = (
+    "byte_order",
+    "hex",
+    "plaintext_frame",
+    "encrypted_frame",
+    "aad",
+    "peer_body",
+)
 
 
 class WireContractSchemaTest(unittest.TestCase):
@@ -38,6 +46,14 @@ class WireContractSchemaTest(unittest.TestCase):
         contract["statuses"][1]["origins"] = ["core"]
         with self.assertRaisesRegex(validator.ContractError, "origins"):
             self.validate(contract)
+
+    def test_encoding_definitions_are_exact(self):
+        for field in ENCODING_FIELDS:
+            with self.subTest(field=field):
+                contract = copy.deepcopy(self.contract)
+                contract["encoding"][field] = "contradictory definition"
+                with self.assertRaisesRegex(validator.ContractError, f"encoding {field} differs"):
+                    self.validate(contract)
 
     def test_each_legal_status_origin_has_a_run_response_vector(self):
         contract = copy.deepcopy(self.contract)

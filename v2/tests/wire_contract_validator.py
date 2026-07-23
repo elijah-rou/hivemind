@@ -48,6 +48,14 @@ VECTOR_KEYS = {
 }
 HEX_PATTERN = re.compile(r"(?:[0-9a-f]{2})*")
 ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+EXPECTED_ENCODING = {
+    "byte_order": "little-endian",
+    "hex": "lowercase, even-length, no prefix",
+    "plaintext_frame": "u32 length including flags and body; flags=0; body=protocol_version || tag_or_peer_id || payload",
+    "encrypted_frame": "u32 length including flags and protected body; flags=1; nonce || XChaCha20-Poly1305 ciphertext || tag",
+    "aad": "the exact 5-byte serialized length-and-flags header",
+    "peer_body": "protocol_version || from_id || tagged VRR payload",
+}
 
 
 class ContractError(ValueError):
@@ -90,9 +98,9 @@ def validate_contract_bytes(raw):
 
     encoding = contract["encoding"]
     require(isinstance(encoding, dict), "encoding must be an object")
-    require(set(encoding) == {"byte_order", "hex", "plaintext_frame", "encrypted_frame", "aad", "peer_body"}, "encoding fields differ")
-    require(encoding["byte_order"] == "little-endian", "byte order differs")
-    require(encoding["hex"] == "lowercase, even-length, no prefix", "hex definition differs")
+    require(set(encoding) == set(EXPECTED_ENCODING), "encoding fields differ")
+    for field, definition in EXPECTED_ENCODING.items():
+        require(encoding[field] == definition, f"encoding {field} differs")
 
     material = contract["test_material"]
     require(isinstance(material, dict), "test_material must be an object")
