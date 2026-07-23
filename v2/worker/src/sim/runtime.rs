@@ -10,6 +10,7 @@ pub struct FaultConfig {
     pub container_crash_rate: Ratio,
     pub gpu_failure_rate: Ratio,
     pub create_failure_rate: Ratio,
+    pub stop_failure_rate: Ratio,
 }
 
 impl Default for FaultConfig {
@@ -19,6 +20,7 @@ impl Default for FaultConfig {
             container_crash_rate: Ratio::zero(),
             gpu_failure_rate: Ratio::zero(),
             create_failure_rate: Ratio::zero(),
+            stop_failure_rate: Ratio::zero(),
         }
     }
 }
@@ -28,6 +30,7 @@ struct Inner {
     pull_attempts: HashMap<String, u64>,
     create_attempts: HashMap<u64, u64>,
     start_attempts: HashMap<u64, u64>,
+    stop_attempts: HashMap<u64, u64>,
     crash_round: u64,
 }
 
@@ -48,6 +51,7 @@ impl SimulatedRuntime {
                 pull_attempts: HashMap::new(),
                 create_attempts: HashMap::new(),
                 start_attempts: HashMap::new(),
+                stop_attempts: HashMap::new(),
                 crash_round: 0,
             }),
         }
@@ -223,10 +227,22 @@ impl Runtime for SimulatedRuntime {
 
     fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
         let mut inner = self.inner.lock().unwrap();
-        inner.pods.insert(
-            handle.container_id.clone(),
-            PodStatus::Stopped { exit_code: 0 },
-        );
+        let attempt = next_attempt(&mut inner.stop_attempts, handle.pod_id);
+        if attempt == 0
+            && deterministic_chance(
+                self.seed,
+                0x5354_4f50_0000_0000,
+                handle.pod_id,
+                self.fault_config.stop_failure_rate,
+            )
+        {
+            return Err(RuntimeError::ContainerStop("simulated stop failure".into()));
+        }
+        let status = inner
+            .pods
+            .get_mut(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+        *status = PodStatus::Stopped { exit_code: 0 };
         Ok(())
     }
 
@@ -317,6 +333,31 @@ mod tests {
             },
         );
         assert!(rt.pull_image("test:latest", None).is_err());
+    }
+
+    #[test]
+    fn deterministic_stop_failure_keeps_runtime_running_until_retry() {
+        let rt = SimulatedRuntime::new(
+            0xB2_01,
+            FaultConfig {
+                stop_failure_rate: Ratio::new(1, 1),
+                ..Default::default()
+            },
+        );
+        let handle = rt.create_pod(&test_spec(1)).unwrap();
+        rt.start_pod(&handle).unwrap();
+
+        assert!(matches!(
+            rt.stop_pod(&handle, 0),
+            Err(RuntimeError::ContainerStop(_))
+        ));
+        assert_eq!(rt.pod_status(&handle).unwrap(), PodStatus::Running);
+
+        rt.stop_pod(&handle, 0).unwrap();
+        assert_eq!(
+            rt.pod_status(&handle).unwrap(),
+            PodStatus::Stopped { exit_code: 0 }
+        );
     }
 
     #[test]

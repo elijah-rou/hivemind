@@ -146,8 +146,9 @@ impl WorkerSimulator {
 mod tests {
     use super::*;
     use crate::message::*;
+    use crate::runtime::{PodStatus, Runtime};
     use crate::types::GpuType;
-    use crate::worker::TrackedPodState;
+    use crate::worker::{TrackedPodState, STOP_RETRY_DELAY_TICKS};
 
     fn received_count(sim: &WorkerSimulator, predicate: impl Fn(&WorkerMessage) -> bool) -> usize {
         sim.control_plane
@@ -535,6 +536,89 @@ mod tests {
                 _ => false,
             })
             .count()
+    }
+
+    #[test]
+    fn stop_fault_retains_runtime_resources_and_denies_replacement_gpu() {
+        let mut sim = WorkerSimulator::new(1, 0xB2_02);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.set_runtime_faults(
+            0,
+            FaultConfig {
+                stop_failure_rate: crate::prng::Ratio::new(1, 1),
+                ..Default::default()
+            },
+        );
+        let gpu_start = |pod_id, deployment_id| {
+            ControlMessage::StartPod(StartPodCmd {
+                pod_id,
+                deployment_id,
+                image: "gpu:latest".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 8,
+                gpu_type: GpuType::H100Sxm,
+                cpu_millicores: 32_000,
+                memory_megabytes: 65_536,
+                juicefs_path: String::new(),
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                env_vars: vec![],
+                image_pull_registry: String::new(),
+                image_pull_username: String::new(),
+                image_pull_password: String::new(),
+                image_pull_password_is_secret: false,
+            })
+        };
+
+        sim.sim_ios[0].push_inbound(gpu_start(900, 9_000));
+        sim.run(3);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&900].state,
+            TrackedPodState::Running
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 8);
+
+        sim.sim_ios[0].push_inbound(stop_cmd(900));
+        sim.tick();
+        let handle = sim.workers[0].tracked_pods()[&900]
+            .handle
+            .as_ref()
+            .expect("running pod has runtime handle");
+        assert_eq!(
+            sim.sim_runtimes[0].pod_status(handle).unwrap(),
+            PodStatus::Running,
+            "deterministic stop fault must leave the runtime running"
+        );
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&900].state,
+            TrackedPodState::Stopping
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 8);
+        assert_eq!(sim.workers[0].cpu_allocated_millicores(), 32_000);
+        assert_eq!(sim.workers[0].memory_allocated_megabytes(), 65_536);
+
+        sim.sim_ios[0].push_inbound(gpu_start(901, 9_001));
+        sim.tick();
+        assert!(
+            !sim.workers[0].tracked_pods().contains_key(&901),
+            "replacement GPU admission must fail while the old runtime is unverified"
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 8);
+        assert!(!received_pod_statuses(&sim, 900)
+            .iter()
+            .any(|status| matches!(status, PodStatusReport::Stopped { .. })));
+
+        sim.run(STOP_RETRY_DELAY_TICKS as u64);
+        assert!(matches!(
+            sim.workers[0].tracked_pods()[&900].state,
+            TrackedPodState::Stopped { exit_code: 0 }
+        ));
+        assert_eq!(sim.workers[0].gpu_allocated(), 0);
+        assert_eq!(sim.workers[0].cpu_allocated_millicores(), 0);
+        assert_eq!(sim.workers[0].memory_allocated_megabytes(), 0);
+        assert_eq!(sim.checker.safety_violations, 0);
     }
 
     #[test]

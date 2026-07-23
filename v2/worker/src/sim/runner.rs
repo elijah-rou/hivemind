@@ -96,6 +96,7 @@ pub fn run(config: &SimConfig) -> SimResult {
         container_crash_rate: config.container_crash_rate,
         gpu_failure_rate: config.gpu_failure_rate,
         create_failure_rate: Ratio::zero(),
+        stop_failure_rate: Ratio::zero(),
     };
     for i in 0..config.agent_count {
         sim.set_runtime_faults(i, fault_config.clone());
