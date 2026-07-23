@@ -1724,10 +1724,11 @@ mod tests {
                     _ => panic!("{id}: expected RunRequest"),
                 },
                 "run-response" => {
+                    assert!(payload.len() >= 9, "{id}");
                     let message = WorkerMessage::RunResponse(RunResponseMsg {
-                        request_id: 0x0102030405060708,
-                        status: RunStatus::ForwardingFailed as u8,
-                        payload: b"dial failed".to_vec(),
+                        request_id: u64::from_le_bytes(payload[..8].try_into().unwrap()),
+                        status: payload[8],
+                        payload: payload[9..].to_vec(),
                     });
                     let mut encoded = [0u8; 256];
                     let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();

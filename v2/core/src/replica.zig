@@ -38,6 +38,76 @@ const WORKER_DISPATCH_RETRY_INTERVAL: i64 = 5000;
 const MAX_PENDING_STOPS: usize = sm_mod.MAX_PODS;
 /// Max flush loop iterations per tick (prepare barrier + commit barrier).
 const FLUSH_BARRIER_MAX: u8 = 4;
+const START_POD_ENV_MAX: usize = 16;
+const START_POD_FIXED_BYTES: usize = 8 + 8 + 256 + 256 + 2 + 1 + 1 + 4 + 4 + 128 + 64 + 64 + 1;
+const START_POD_ENV_BYTES: usize = 64 + 256 + 1;
+const START_POD_REGISTRY_AUTH_BYTES: usize = 1 + 128 + 64 + 256 + 1;
+pub const START_POD_FRAME_BYTES_MAX: usize = 7 + START_POD_FIXED_BYTES + (START_POD_ENV_MAX * START_POD_ENV_BYTES) + START_POD_REGISTRY_AUTH_BYTES;
+
+pub fn encodeStartPodFrame(pod_id: u64, deployment: *const sm_mod.Deployment, out: []u8) ![]u8 {
+    if (deployment.env_count > START_POD_ENV_MAX) return error.TooManyEnvironmentVariables;
+    if (out.len < START_POD_FRAME_BYTES_MAX) return error.FrameBufferTooSmall;
+
+    var pos: usize = 7;
+    std.mem.writeInt(u64, out[pos..][0..8], pod_id, .little);
+    pos += 8;
+    std.mem.writeInt(u64, out[pos..][0..8], deployment.id, .little);
+    pos += 8;
+    @memcpy(out[pos..][0..256], &deployment.image);
+    pos += 256;
+    @memcpy(out[pos..][0..256], &deployment.entrypoint);
+    pos += 256;
+    std.mem.writeInt(u16, out[pos..][0..2], deployment.port, .little);
+    pos += 2;
+    out[pos] = deployment.gpu_count;
+    pos += 1;
+    out[pos] = @intFromEnum(deployment.gpu_type);
+    pos += 1;
+    std.mem.writeInt(u32, out[pos..][0..4], deployment.cpu_millicores, .little);
+    pos += 4;
+    std.mem.writeInt(u32, out[pos..][0..4], deployment.memory_megabytes, .little);
+    pos += 4;
+    @memcpy(out[pos..][0..128], &deployment.juicefs_path);
+    pos += 128;
+    @memcpy(out[pos..][0..64], &deployment.liveness.path);
+    pos += 64;
+    @memcpy(out[pos..][0..64], &deployment.readiness.path);
+    pos += 64;
+    out[pos] = deployment.env_count;
+    pos += 1;
+    for (deployment.env_vars[0..deployment.env_count]) |env| {
+        @memcpy(out[pos..][0..64], &env.name);
+        pos += 64;
+        @memcpy(out[pos..][0..256], &env.value);
+        pos += 256;
+        out[pos] = @intFromBool(env.is_secret_ref);
+        pos += 1;
+    }
+
+    const has_registry_auth = std.mem.indexOfNone(u8, &deployment.image_pull_registry, &.{0}) != null or
+        std.mem.indexOfNone(u8, &deployment.image_pull_username, &.{0}) != null or
+        std.mem.indexOfNone(u8, &deployment.image_pull_password, &.{0}) != null;
+    if (has_registry_auth) {
+        out[pos] = 1;
+        pos += 1;
+        @memcpy(out[pos..][0..128], &deployment.image_pull_registry);
+        pos += 128;
+        @memcpy(out[pos..][0..64], &deployment.image_pull_username);
+        pos += 64;
+        @memcpy(out[pos..][0..256], &deployment.image_pull_password);
+        pos += 256;
+        out[pos] = deployment.image_pull_password_is_secret;
+        pos += 1;
+    }
+
+    const frame_body_len = pos - 4;
+    std.mem.writeInt(u32, out[0..4], @intCast(frame_body_len), .little);
+    std.mem.writeInt(u16, out[4..6], msg.PROTOCOL_VERSION, .little);
+    out[6] = @intFromEnum(msg.WorkerTag.start_pod);
+    std.debug.assert(pos <= START_POD_FRAME_BYTES_MAX);
+    std.debug.assert(std.mem.readInt(u32, out[0..4], .little) == pos - 4);
+    return out[0..pos];
+}
 
 pub fn journalSlot(op: msg.OpNumber) usize {
     std.debug.assert(op > 0);
@@ -1753,100 +1823,15 @@ pub const Replica = struct {
         // [env_count:u8][env_count x (name:64 + value:256 + is_secret:u8)]
         // Optional registry auth trailer (only if deployment has credentials):
         //   [0x01][registry:128][username:64][password:256][password_is_secret:u8]
-        const max_env: usize = 16;
-        const fixed_size: usize = 8 + 8 + 256 + 256 + 2 + 1 + 1 + 4 + 4 + 128 + 64 + 64 + 1;
-        const env_entry_size: usize = 64 + 256 + 1;
-        const registry_auth_block: usize = 1 + 128 + 64 + 256 + 1;
-        const max_payload = fixed_size + (max_env * env_entry_size) + registry_auth_block;
-        var payload: [max_payload]u8 = undefined;
-        var pos: usize = 0;
-
-        // pod_id
-        @memcpy(payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, pod_id)));
-        pos += 8;
-        // deployment_id
-        @memcpy(payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, pod.deployment_id)));
-        pos += 8;
-        // image
-        @memcpy(payload[pos..][0..256], &dep.image);
-        pos += 256;
-        // entrypoint
-        @memcpy(payload[pos..][0..256], &dep.entrypoint);
-        pos += 256;
-        // port
-        @memcpy(payload[pos..][0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, dep.port)));
-        pos += 2;
-        // gpu_count
-        payload[pos] = dep.gpu_count;
-        pos += 1;
-        // gpu_type
-        payload[pos] = @intFromEnum(dep.gpu_type);
-        pos += 1;
-        // cpu_millicores
-        @memcpy(payload[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, dep.cpu_millicores)));
-        pos += 4;
-        // memory_megabytes
-        @memcpy(payload[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, dep.memory_megabytes)));
-        pos += 4;
-        // juicefs_path
-        @memcpy(payload[pos..][0..128], &dep.juicefs_path);
-        pos += 128;
-        // liveness path
-        @memcpy(payload[pos..][0..64], &dep.liveness.path);
-        pos += 64;
-        // readiness path
-        @memcpy(payload[pos..][0..64], &dep.readiness.path);
-        pos += 64;
-        // env_count
-        payload[pos] = dep.env_count;
-        pos += 1;
-        // env vars
-        for (dep.env_vars[0..dep.env_count]) |env| {
-            @memcpy(payload[pos..][0..64], &env.name);
-            pos += 64;
-            @memcpy(payload[pos..][0..256], &env.value);
-            pos += 256;
-            payload[pos] = if (env.is_secret_ref) 1 else 0;
-            pos += 1;
-        }
-
-        const has_registry_auth = blk: {
-            for (&dep.image_pull_registry) |b| if (b != 0) break :blk true;
-            for (&dep.image_pull_username) |b| if (b != 0) break :blk true;
-            for (&dep.image_pull_password) |b| if (b != 0) break :blk true;
-            break :blk false;
-        };
-
-        if (has_registry_auth) {
-            payload[pos] = 0x01;
-            pos += 1;
-            @memcpy(payload[pos..][0..128], &dep.image_pull_registry);
-            pos += 128;
-            @memcpy(payload[pos..][0..64], &dep.image_pull_username);
-            pos += 64;
-            @memcpy(payload[pos..][0..256], &dep.image_pull_password);
-            pos += 256;
-            payload[pos] = dep.image_pull_password_is_secret;
-            pos += 1;
-        }
-
-        // Frame it: [4-byte len][2-byte version][tag][payload]
-        const conn = @import("connection.zig");
-        const frame_header = conn.FRAME_HEADER;
-        const frame_buf_size = frame_header + max_payload;
-        var frame: [frame_buf_size]u8 = undefined;
-        const frame_len: u32 = @intCast(2 + 1 + pos); // version + tag + payload
-        @memcpy(frame[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, frame_len)));
-        @memcpy(frame[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, conn.PROTOCOL_VERSION)));
-        frame[6] = @intFromEnum(msg.WorkerTag.start_pod);
-        @memcpy(frame[frame_header..][0..pos], payload[0..pos]);
+        var frame: [START_POD_FRAME_BYTES_MAX]u8 = undefined;
+        const encoded = encodeStartPodFrame(pod_id, dep, &frame) catch unreachable;
 
         debugLog(
             "hivemind replica: dispatch pod_id={d} dep_id={d} node_id={d} worker_idx={d}\n",
             .{ pod_id, pod.deployment_id, node_id, worker_idx },
         );
         const send_start = io_mod.nowTick(self.io);
-        send_fn(ctx, worker_idx, frame[0 .. frame_header + pos]);
+        send_fn(ctx, worker_idx, encoded);
         const send_end = io_mod.nowTick(self.io);
         latency.record(.{ .phase = "dispatch_send", .op = "start_pod", .deployment_id = pod.deployment_id, .pod_id = pod_id, .name = msg.fixedToSlice(&pod.name), .start_ms = send_start, .end_ms = send_end, .source = "core/src/replica.zig" });
     }

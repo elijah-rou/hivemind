@@ -193,6 +193,134 @@
       ]
     },
     {
+      "id": "worker-run-response-status-0-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201007374617475732d30",
+      "plaintext_hex": "0600130807060504030201007374617475732d30",
+      "frame_hex": "15000000000600130807060504030201007374617475732d30",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-1-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201017374617475732d31",
+      "plaintext_hex": "0600130807060504030201017374617475732d31",
+      "frame_hex": "15000000000600130807060504030201017374617475732d31",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-2-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201027374617475732d32",
+      "plaintext_hex": "0600130807060504030201027374617475732d32",
+      "frame_hex": "15000000000600130807060504030201027374617475732d32",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-3-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201037374617475732d33",
+      "plaintext_hex": "0600130807060504030201037374617475732d33",
+      "frame_hex": "15000000000600130807060504030201037374617475732d33",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-4-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201047374617475732d34",
+      "plaintext_hex": "0600130807060504030201047374617475732d34",
+      "frame_hex": "15000000000600130807060504030201047374617475732d34",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-5-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201057374617475732d35",
+      "plaintext_hex": "0600130807060504030201057374617475732d35",
+      "frame_hex": "15000000000600130807060504030201057374617475732d35",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-7-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201077374617475732d37",
+      "plaintext_hex": "0600130807060504030201077374617475732d37",
+      "frame_hex": "15000000000600130807060504030201077374617475732d37",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
+      "id": "worker-run-response-status-8-plaintext",
+      "channel": "worker",
+      "direction": "to-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 19,
+      "key_purpose": null,
+      "payload_hex": "0807060504030201087374617475732d38",
+      "plaintext_hex": "0600130807060504030201087374617475732d38",
+      "frame_hex": "15000000000600130807060504030201087374617475732d38",
+      "consumers": [
+        "zig",
+        "rust"
+      ]
+    },
+    {
       "id": "client-run-request-plaintext",
       "channel": "client",
       "direction": "to-core",
@@ -220,6 +348,159 @@
       "payload_hex": "08070605040302010004000000706f6e67",
       "plaintext_hex": "06002308070605040302010004000000706f6e67",
       "frame_hex": "150000000006002308070605040302010004000000706f6e67",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-1-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020101",
+      "plaintext_hex": "060023080706050403020101",
+      "frame_hex": "0d00000000060023080706050403020101",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-2-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020102",
+      "plaintext_hex": "060023080706050403020102",
+      "frame_hex": "0d00000000060023080706050403020102",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-3-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020103",
+      "plaintext_hex": "060023080706050403020103",
+      "frame_hex": "0d00000000060023080706050403020103",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-4-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020104",
+      "plaintext_hex": "060023080706050403020104",
+      "frame_hex": "0d00000000060023080706050403020104",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-5-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020105",
+      "plaintext_hex": "060023080706050403020105",
+      "frame_hex": "0d00000000060023080706050403020105",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-6-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020106",
+      "plaintext_hex": "060023080706050403020106",
+      "frame_hex": "0d00000000060023080706050403020106",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-7-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020107",
+      "plaintext_hex": "060023080706050403020107",
+      "frame_hex": "0d00000000060023080706050403020107",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-8-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020108",
+      "plaintext_hex": "060023080706050403020108",
+      "frame_hex": "0d00000000060023080706050403020108",
+      "consumers": [
+        "zig",
+        "go-api",
+        "go-bench"
+      ]
+    },
+    {
+      "id": "client-run-response-status-9-plaintext",
+      "channel": "client",
+      "direction": "from-core",
+      "message": "run-response",
+      "flags": 0,
+      "tag": 35,
+      "key_purpose": null,
+      "payload_hex": "080706050403020109",
+      "plaintext_hex": "060023080706050403020109",
+      "frame_hex": "0d00000000060023080706050403020109",
       "consumers": [
         "zig",
         "go-api",

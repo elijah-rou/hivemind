@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -61,11 +60,11 @@ type benchWireContract struct {
 
 func loadBenchWireContract(t *testing.T) benchWireContract {
 	t.Helper()
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve wire contract test source")
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolve test working directory: %v", err)
 	}
-	path := filepath.Join(filepath.Dir(sourceFile), "..", "tests", "wire", "contract-v6.json")
+	path := filepath.Join(workingDirectory, "..", "tests", "wire", "contract-v6.json")
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatalf("open wire contract: %v", err)
@@ -187,8 +186,15 @@ func TestWireContract(t *testing.T) {
 					t.Fatalf("invalid client run request")
 				}
 			case "run-response":
-				if err := expectSuccessRunResponse(payload, 0x0102030405060708); err != nil {
-					t.Fatalf("invalid run response: %v", err)
+				if len(payload) < 9 || binary.LittleEndian.Uint64(payload[:8]) != 0x0102030405060708 || RunStatus(payload[8]) > RunStatusNotLeader {
+					t.Fatalf("invalid run response: %x", payload)
+				}
+				if RunStatus(payload[8]) == RunStatusOK {
+					if err := expectSuccessRunResponse(payload, 0x0102030405060708); err != nil {
+						t.Fatalf("invalid successful run response: %v", err)
+					}
+				} else if len(payload) != 9 {
+					t.Fatalf("error run response has trailing bytes: %x", payload)
 				}
 			case "leader-probe-request":
 				if len(payload) != 0 {

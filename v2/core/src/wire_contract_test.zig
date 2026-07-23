@@ -3,6 +3,8 @@ const connection = @import("connection.zig");
 const encryption = @import("encryption.zig");
 const message = @import("message.zig");
 const request_queue = @import("request_queue.zig");
+const replica = @import("replica.zig");
+const state_machine = @import("state_machine.zig");
 
 const Encoding = struct {
     byte_order: []const u8,
@@ -132,10 +134,21 @@ fn validatePayload(vector: Vector, payload: []const u8) !void {
         return;
     }
     if (std.mem.eql(u8, vector.message, "start-pod")) {
-        try std.testing.expectEqual(@as(usize, 797), payload.len);
-        try std.testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, payload[0..8], .little));
-        try std.testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, payload[8..16], .little));
-        try std.testing.expectEqual(@as(u8, 0), payload[796]);
+        var deployment = std.mem.zeroes(state_machine.Deployment);
+        deployment.id = 100;
+        deployment.image = message.strToFixed(256, "registry.io/model:v1");
+        deployment.entrypoint = message.strToFixed(256, "/serve");
+        deployment.port = 8080;
+        deployment.gpu_count = 2;
+        deployment.gpu_type = .h100_sxm;
+        deployment.cpu_millicores = 4000;
+        deployment.memory_megabytes = 8192;
+        deployment.juicefs_path = message.strToFixed(128, "/mnt/models");
+        deployment.liveness.path = message.strToFixed(64, "/live");
+        deployment.readiness.path = message.strToFixed(64, "/ready");
+        var frame: [replica.START_POD_FRAME_BYTES_MAX]u8 = undefined;
+        const encoded = try replica.encodeStartPodFrame(42, &deployment, &frame);
+        try std.testing.expectEqualSlices(u8, payload, encoded[connection.FRAME_HEADER..]);
         return;
     }
     if (std.mem.eql(u8, vector.message, "run-request")) {
@@ -178,7 +191,7 @@ fn readContractFile(allocator: std.mem.Allocator) ![]u8 {
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
     defer _ = std.c.close(fd);
     const max_bytes = 256 * 1024;
-    const buffer = try allocator.alloc(u8, max_bytes);
+    const buffer = try allocator.alloc(u8, max_bytes + 1);
     errdefer allocator.free(buffer);
     var length: usize = 0;
     while (length < buffer.len) {
@@ -187,7 +200,7 @@ fn readContractFile(allocator: std.mem.Allocator) ![]u8 {
         length += count;
     }
     if (length == 0) return error.EmptyContract;
-    if (length == buffer.len) return error.ContractTooLarge;
+    if (length > max_bytes) return error.ContractTooLarge;
     return allocator.realloc(buffer, length);
 }
 

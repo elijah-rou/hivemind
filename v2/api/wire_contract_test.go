@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -63,11 +62,11 @@ type wireContract struct {
 
 func loadWireContract(t *testing.T) wireContract {
 	t.Helper()
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve wire contract test source")
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolve test working directory: %v", err)
 	}
-	path := filepath.Join(filepath.Dir(sourceFile), "..", "tests", "wire", "contract-v6.json")
+	path := filepath.Join(workingDirectory, "..", "tests", "wire", "contract-v6.json")
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatalf("open wire contract: %v", err)
@@ -218,8 +217,11 @@ func TestWireContract(t *testing.T) {
 				}
 			case "run-response":
 				response, err := parseRunResponse(payload)
-				if err != nil || response.RequestID != 0x0102030405060708 || response.Status != RunStatusOK || string(response.Body) != "pong" {
+				if err != nil || response.RequestID != 0x0102030405060708 || byte(response.Status) != payload[8] {
 					t.Fatalf("invalid run response: %#v %v", response, err)
+				}
+				if response.Status == RunStatusOK && string(response.Body) != "pong" {
+					t.Fatalf("invalid successful run response body: %q", response.Body)
 				}
 			case "leader-probe-request":
 				if len(payload) != 0 {
