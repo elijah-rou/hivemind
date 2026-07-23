@@ -35,7 +35,222 @@ These principles are non-negotiable. Every component must be built with these in
 - Mature ecosystem (K8s clients, HTTP servers, Prometheus)
 - Good enough performance for orchestration layers
 
-See `docs/STATUS.md` for current implementation architecture and `docs/frozen/ARCHITECTURE.md` for historical rationale.
+See [STATUS.md](STATUS.md) for current implementation architecture and [frozen/ARCHITECTURE.md](frozen/ARCHITECTURE.md) for historical rationale.
+
+---
+
+## Test-harness architecture and boundaries
+
+This section describes executable topology separately from future acceptance topology. Mutable limits, ports, and wire constants remain source-owned; follow the linked files instead of copying values from this document into automation. [TESTING.md](TESTING.md) defines evidence semantics, and the [harness catalog](../tests/README.md) defines script operation.
+
+### Component and boundary map
+
+| Layer | Current, implemented components | Boundary actually crossed | Source of truth |
+|---|---|---|---|
+| Zig control-plane DST | VRR replicas and state machines, simulated `Io`, network and disk, virtual clock, checker, trace, seeded VOPR runner | Deterministic message-level and whole-I/O model | [`core/src/vopr/`](../core/src/vopr/), [`core/src/disk.zig`](../core/src/disk.zig) |
+| Rust worker DST | production `Worker`, `SimulatedIo`, structurally bidirectional `SimulatedNetwork`, `SimulatedRuntime`, `ControlPlaneStub`, `WorkerChecker`, runner | Deterministic worker lifecycle/runtime model | [`worker/src/sim/`](../worker/src/sim/) |
+| Local full-stack smoke | one Zig replica, Go API, Rust worker, process runtime | Real processes, localhost sockets, filesystem journal, child workload process | [`tests/local-smoke.sh`](../tests/local-smoke.sh) |
+| Local failover smoke | normally three Zig replicas and Go API | Real replica/API processes, VRR TCP, leader loss, one replica restart | [`tests/local-failover-smoke.sh`](../tests/local-failover-smoke.sh) |
+| Storage startup smoke | sequential volatile and journal-backed Zig processes | Startup logs and process liveness only | [`tests/storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) |
+| Containerd component integration | privileged Docker test environment, containerd, Rust runtime tests | Real runtime namespace/task/cgroup behavior; not the full stack | [`tests/containerd/`](../tests/containerd/), [`worker/tests/containerd_integration.rs`](../worker/tests/containerd_integration.rs) |
+| Infrastructure tooling | Terraform, ECR, S3/SSM helpers, SSH/systemd deployment, POC CPU/GPU scripts | Historical and operator tooling boundaries; no guarded current live gate | [`infra/`](../infra/) |
+
+### Current, implemented: Zig VOPR topology
+
+```text
+                         seeded driver
+                  fuzz.zig / vopr.zig
+                              |
+             fault schedule + requests + virtual ticks
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+   Replica 0             Replica 1             Replica N
+   StateMachine          StateMachine          StateMachine
+   SimulatedIo           SimulatedIo           SimulatedIo
+   SimulatedDisk         SimulatedDisk         SimulatedDisk
+        |                     |                     |
+        +---------- bounded SimulatedNetwork ------+
+                              |
+                 StateChecker / safety oracles
+                              |
+                 trace + seed replay + JSONL
+                    generated failure corpus
+```
+
+[`TestCluster`](../core/src/vopr/test_harness.zig) owns the replicas, state machines, per-replica disks, running/paused state, seeded PRNG, virtual tick, network, and checker. [`SimulatedIo`](../core/src/vopr/simulated_io.zig) maps a tick to virtual time and routes replica traffic through in-memory queues. Paused replicas retain memory and disk but do not tick, sync, publish, or receive queued traffic. Crash/restart discards modeled unsynced writes and rebuilds memory from durable simulated disk.
+
+[`SimulatedNetwork`](../core/src/vopr/simulated_net.zig) bounds destination queues and message size and models delay, asymmetric partition, drop, replay, path capacity, and selected one-shot drops. [`VoprConfig`](../core/src/vopr/vopr.zig) owns current replica/tick/workload defaults and available network, pause, crash, disk, and durability-cut faults. [`StateChecker`](../core/src/vopr/checker.zig) bounds canonical history to the retained log and checks complete committed identity, durable commit regression, replica invariants, and healed convergence including active log and committed state digest. [`TraceCollector`](../core/src/vopr/trace.zig) owns trace bounds and event inventory.
+
+The [fuzz runner](../core/src/fuzz.zig) supplies sequential, random, and replay seed modes, mutation, bounded thread/budget options, and trace output. Failures append to `core/fuzz_failures.jsonl`; that generated replay corpus is evidence, not a normative wire corpus. Exact invocations are in [TESTING.md](TESTING.md).
+
+**Current limitation:** VOPR proves invariants only within its deterministic message-level and whole-I/O fault model. It does not prove kernel TCP behavior, process scheduling, actual filesystem ordering, torn sectors, power loss, systemd, containerd namespaces/cgroups, GPU/CDI, or cloud-provider correctness.
+
+### Current, implemented: Rust worker simulation topology
+
+```text
+                    seeded runner / fault schedule
+                          runner.rs
+                              |
+                      ControlPlaneStub
+                        |           ^
+               inbound |           | outbound structure
+                        v           |
+                    SimulatedNetwork
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+     Worker 0              Worker 1              Worker N
+  SimulatedIo           SimulatedIo           SimulatedIo
+  SimulatedRuntime      SimulatedRuntime      SimulatedRuntime
+        |                     |                     |
+        +------------- WorkerChecker ---------------+
+```
+
+| Component | Current role | Current limitation |
+|---|---|---|
+| [`Worker`](../worker/src/worker.rs) | Production worker state machine exercised through injected I/O and runtime interfaces | Simulation cannot attest host or cloud integration |
+| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Dynamic queues are bounded by runner workload rather than compile-time capacity |
+| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate control-plane-to-worker and worker-to-control-plane queues, delays, partition fields, drop/replay fields, and path capacity | The simulator does not currently deliver worker output through the outbound queue |
+| [`SimulatedRuntime`](../worker/src/sim/runtime.rs) | Pull/create/start/forward/stop/status/remove and spontaneous crash model | No real process namespace, containerd, cgroup, mount, CDI, or GPU behavior |
+| [`ControlPlaneStub`](../worker/src/sim/control_plane.rs) | Seeded command schedule and received-message recorder | Not a Zig replica or real protocol endpoint |
+| [`WorkerChecker`](../worker/src/sim/checker.rs) | GPU/CPU/memory accounting, legal pod transitions, heartbeat liveness | No cross-language protocol oracle |
+| [`runner.rs`](../worker/src/sim/runner.rs) | Seeded safety/liveness phases and fault scheduling | Pause partitions instead of freezing execution; configured ratio drop/replay values are not applied |
+
+**Current limitation:** the network is structurally bidirectional, but [`WorkerSimulator::tick`](../worker/src/sim/simulator.rs) records worker output in the control-plane stub before enqueueing it and never drains `pop_outbound` into that stub. Worker-to-control-plane partition, drop, delay, replay, capacity, and healed delivery are therefore not proven. The runner also leaves legacy drop/replay percentages at zero instead of applying `SimConfig` ratios. Evidence must name the exact scenario and must not claim bidirectional fault coverage.
+
+### Current, implemented: local real-process boundaries
+
+#### One-replica full-stack smoke
+
+```text
+HTTP client -> Go API -> one journal-backed Zig replica
+                               |
+                               v
+                     Rust worker, process runtime
+                               |
+                               v
+                        child workload process
+```
+
+[`local-smoke.sh`](../tests/local-smoke.sh) crosses real process, localhost TCP, filesystem, and process-runtime boundaries. It checks API/dashboard surfaces, worker registration, deployment creation/listing, one successful echo `/run`, queue surface, metrics, and worker health, then kills its processes and removes temporary logs/data. It does not prove quorum, leader failover, retained-state recovery, negative run outcomes, abandonment accounting, containerd, GPU, or cloud behavior. Follow the script for mutable ports and deadlines.
+
+#### Three-replica API-only failover
+
+```text
+                              Go API
+                        /       |       \
+                       v        v        v
+                Zig replica 0  replica 1  replica 2
+                journal dir    journal   journal
+                    ^------------+------------^
+                             VRR peer TCP
+
+commit -> kill leader -> reconnect/elect -> commit
+       -> restart old replica from its retained directory
+```
+
+[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) defaults to three replicas but keeps topology and port derivation configurable in source. It checks connection and leader discovery, a commit before leader loss, a different leader, a commit after loss, old-replica restart, and normal replica metrics. It starts no Rust worker, sends no `/run`, does not prove exact commit-watermark/state convergence or full-cluster retained-state recovery, and remains standalone outside `run-all.sh`.
+
+#### Storage startup smoke
+
+[`storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) starts real Zig processes sequentially in volatile and journal modes and checks warning/listening text plus liveness. It performs no command, crash, restart, or committed-state recovery assertion.
+
+### Planned, not implemented: combined local recovery and run contract
+
+```text
+HTTP and bench clients
+          |
+          v
+        Go API
+          |
+          +------ three journal-backed Zig replicas ------+
+          |                 VRR peer TCP                   |
+          +------------------------------------------------+
+                              |
+                              v
+                    real Rust worker process
+                       process runtime
+                              |
+                         workload process
+
+commit state + successful /run
+ -> kill leader while traffic continues
+ -> elect new leader and restart old leader
+ -> prove watermark and state convergence
+ -> stop/restart the full cluster from retained directories
+ -> verify old state and commit new state
+ -> exercise negative /run and abandonment outcomes
+ -> require queue and in-flight metrics to return to zero
+```
+
+No reusable local-cluster library, storage-recovery smoke, or run-contract smoke exists today. This topology becomes current only when those scripts land and are mandatory in the aggregate gate.
+
+### Current, implemented: privileged runtime-component containerd
+
+```text
+host Docker
+    |
+    v
+privileged test container
+    |
+    +-- real containerd daemon
+    |
+    `-- Rust containerd integration tests
+             |
+             v
+       ContainerdRuntime
+       namespace/tasks/cgroups/network namespace
+```
+
+[`tests/containerd/run-tests.sh`](../tests/containerd/run-tests.sh) builds the test image and uses privileged Docker; [`run.sh`](../tests/containerd/run.sh) starts containerd, checks `ctr`, and runs Rust integration tests serially. The tests cover runtime lifecycle and include constructing a replacement runtime that handles an existing task. Runtime socket, namespace, runtime, snapshotter, command bounds, and cleanup behavior remain owned by [`containerd.rs`](../worker/src/runtime/containerd.rs). This gate starts neither Zig nor Go nor a networked worker process. Optional gVisor, GPU, Nydus, and JuiceFS branches can skip or tolerate absence and are not strict acceptance evidence.
+
+### Planned, not implemented: full-stack containerd recovery
+
+```text
+HTTP client -> Go API -> Zig replica cluster -> Rust worker process
+                                                     |
+                                                     v
+                                               real containerd
+                                        namespace / cgroups / task shims
+                                                     |
+                                              workload container
+
+restart worker -> adopt or safely recreate owned task
+               -> recover request path
+               -> remove owned task/container state
+```
+
+No full-stack containerd harness currently proves worker restart, task adoption/recreation through the control plane, request recovery, and final task cleanup together.
+
+### Historical/tooling boundary: infrastructure and cloud
+
+```text
+operator
+   |
+Terraform roots ----> EC2/network/ECR resources
+   |
+deploy tooling -----> SSH + systemd + replicas/workers
+   |
+POC tooling --------> CPU/GPU workload and failure scripts
+   |
+artifacts ----------> local files + ownership-scoped S3 + SSM output
+```
+
+[`infra/poc/`](../infra/poc/), [`infra/bench/`](../infra/bench/), [`infra/gpu-test/`](../infra/gpu-test/), and [`infra/poc-eks/`](../infra/poc-eks/) contain Terraform, ECR, S3/SSM, SSH/systemd, CPU/GPU, workload, benchmark, and cleanup tooling. Some deterministic fixtures validate these scripts, and some retained artifacts describe historical cloud runs. Neither is a guarded current live acceptance gate. Fixed or mutable topology values belong to the Terraform and scripts, not this diagram. [The live safety contract](../tests/live/README.md) describes the planned guardrails without making the existing tooling a default gate.
+
+### Protocol and version process
+
+| Surface | Current framing/version owner | Fixture state | Change rule |
+|---|---|---|---|
+| Zig client/worker | Versioned envelope; [`connection.zig`](../core/src/connection.zig) owns the current constant and frame limits | Zig-local tests | Change atomically with Rust and both Go consumers |
+| Rust worker | Versioned envelope; [`protocol.rs`](../worker/src/protocol.rs) owns the current constant and codecs | Rust-local generated vectors | Same global client/worker version |
+| Go API | Versioned envelope; [`api/client.go`](../api/client.go) owns the current constant and codecs | Go API-local tests | Same global client/worker version |
+| Go bench | Versioned envelope; [`bench/main.go`](../bench/main.go) owns the current constant and codecs | Go bench-local tests | Same global client/worker version |
+| Zig replica peers | Length plus sender identity and serialized VRR message in [`replica.zig`](../core/src/replica.zig); no peer-envelope version | No shared fixture | A versioned peer envelope requires a future atomic global bump |
+| Shared corpus/gate | None currently | Planned in [wire fixture contract](../tests/wire/README.md) | Fixture, consumers, gate, version, and docs land together |
+
+Protocol version 5 currently applies to client and worker envelopes. Replica peer frames are unversioned, and no shared normative cross-language corpus exists. A future peer envelope and shared corpus must land atomically across Zig, Rust, Go API, and Go bench. Do not reserve a proposed future number as current merely because it appears in planning history. Mixed-version rolling upgrades are unsupported: stop the entire cluster, upgrade every component, then restart it.
 
 ---
 

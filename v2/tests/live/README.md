@@ -1,0 +1,149 @@
+# Live test safety contract
+
+> **Unavailable as a unified gate:** The repository contains Terraform roots and individual POC, GPU, and benchmark scripts, but no single guarded live acceptance entry point implements the safety contract below. Nothing in this document is a default live command. Live execution requires separate authorization and must not be inferred from deterministic fixtures, offline Terraform validation, privileged runtime-component fixtures, or historical artifacts.
+
+This is the contract a future unified gate must implement before it can be offered as a command. It does not authorize cloud, paid, privileged, GPU, containerd, or destructive execution.
+
+## Current safety gaps
+
+The repository does not currently provide a unified `HIVEMIND_ALLOW_LIVE=1` gate, AWS account allowlist, account/region/cost/destructive preflight, or acceptance-wide strict capability mode. Unified `REQUIRE_CONTAINERD`, `REQUIRE_GPU`, `REQUIRE_NYDUS`, and `REQUIRE_JUICEFS` gates are absent. `KEEP_INFRA` exists in the standalone [`infra/gpu-test/run-tests.sh`](../../infra/gpu-test/run-tests.sh), but that does not supply the other unified guardrails.
+
+Existing scripts under [`infra/`](../../infra/) are operator tooling with script-specific behavior. Mocks and fixtures under [`tests/`](../), backend-disabled Terraform validation, historical AWS artifacts, host-only GPU checks, and [`tests/containerd/`](../containerd/) runtime-component tests are not current live evidence.
+
+## Planned, not implemented: mandatory preflight
+
+A future live entry point must exit nonzero before any mutation unless every condition below is satisfied:
+
+1. `HIVEMIND_ALLOW_LIVE` is exactly `1`.
+2. The caller identity is resolved read-only and its account matches an explicit external allowlist. Documentation, logs, and committed configuration must not contain a real account number.
+3. Region is explicitly selected, appears in an allowlist, and is echoed for approval. There is no implicit provider-default region.
+4. Required service quotas, instance types, GPU availability, addresses, registry limits, and storage prerequisites are checked without mutation.
+5. The complete cost scope and estimated maximum run duration are displayed and explicitly approved for this run.
+6. Terraform destroy, bucket/repository deletion, process termination, container removal, unmount, and other destructive cleanup are separately and explicitly approved.
+7. Run ID, Terraform workspace, bucket, ECR repository, and ownership token are unique and unpredictable. Provider resource names/tags derive from the run identity where supported.
+8. `KEEP_INFRA=0` is the default. Only literal `0` and `1` are accepted. `1` requires named ownership, cost approval, expiry, and a later cleanup plan.
+9. Cleanup traps are installed and tested before the process can acquire resource ownership.
+10. Terraform is initialized safely and produces a saved plan. A human reviews that saved plan, including replacements and deletes, before apply; apply uses exactly the reviewed plan.
+11. Pre-apply inventory proves the run does not already own resources. The gate refuses to adopt, mutate, unlock, or delete anything without an exact ownership token/marker and expected run tags/state.
+12. Acceptance mode enables strict capability semantics. Any required capability that is absent, skipped, degraded, or unverifiable fails nonzero before acceptance.
+
+Authorization is per run. Prior credentials, a prior approval, or an existing Terraform workspace do not satisfy a new run.
+
+## Planned functional matrix
+
+Every row is **planned/unavailable** until a guarded entry point and evidence manifest exist.
+
+| ID | Required topology/capability | Observable pass condition | Required artifacts |
+|---|---|---|---|
+| F1 | Reviewed Terraform plan | Saved plan digest matches the applied plan; apply exits zero | Saved plan, digest, review record, apply log, outputs |
+| F2 | Five replicas | All five are active and exactly one is leader | Health JSON, per-replica metrics, systemd journals |
+| F3 | CPU worker | Worker registers with expected CPU/memory capacity | Worker/dashboard snapshot, metrics, journal |
+| F4 | GPU worker | Worker registers with expected GPU type and count | Worker snapshot, metrics, CDI inventory |
+| F5 | CPU inference | Real CPU workload returns the expected semantic response through `/run` | Request/response, image digest, latency |
+| F6 | CUDA inference | Real GPU workload returns the expected CUDA result through `/run` | Request/response, image digest, latency |
+| F7 | GPU isolation | CDI-selected device is visible and `nvidia-smi` succeeds inside the actual workload task | `ctr` task/container identity and in-container output |
+| F8 | Containerd | Real worker uses real containerd namespace/cgroups and leaves the expected task inventory | `ctr` tasks/containers plus cgroup evidence |
+| F9 | Private image | Unique private ECR image is cold-pulled after removing the owned cache entry | ECR digest, pull logs, pre/post cache inventory |
+| F10 | Nydus when required | `REQUIRE_NYDUS=1`; active use is proven, not merely installation | Runtime, configuration, snapshotter, and task evidence |
+| F11 | JuiceFS when required | `REQUIRE_JUICEFS=1`; required mount succeeds and workload reads/writes it | Mount table, workload output, cleanup table |
+| F12 | Observability | Metrics and journals identify the run and remain readable through faults | Before/during/after snapshots |
+| F13 | Journal permissions and recovery | Data directory/file modes match the contract; controlled restart recovers committed state | `stat`, journal metadata/checksums, restart log |
+
+A strict containerd/GPU/Nydus/JuiceFS requirement must fail if unavailable; logging “skip” cannot satisfy its row. The current POC smoke's host GPU and task-presence checks do not satisfy F7.
+
+## Planned resilience matrix
+
+| ID | Fault | Required observation | Pass condition |
+|---|---|---|---|
+| R1 | Kill current leader | Leader identity before/after, continuous requests, metrics and journals | A different leader is elected and requests continue |
+| R2 | Restart old leader | Replica status, commit watermark, committed state digest | Old replica rejoins and converges to committed state |
+| R3 | Restart worker | Registration, request identity, containerd inventory | Existing task is safely adopted or recreated; request path recovers without duplicate unsafe execution |
+| R4 | Force client timeout/abandonment | Queue and in-flight metrics before/during/after | Both return to exact zero within a recorded bounded deadline |
+| R5 | Controlled full-service restart | Retained journals and original named state | Original committed state survives and a new command commits |
+| R6 | GPU workload during/after recovery | GPU task/device evidence and `/run` result | GPU request succeeds with the intended device after recovery |
+| R7 | Required capability unavailable | Strict flag, mutation inventory, exit status | Gate fails nonzero before affected mutation; no skip counts as acceptance |
+
+[`infra/poc/failure-drills.sh`](../../infra/poc/failure-drills.sh) exercises portions of leader, worker, and timeout flows, but does not prove old-replica committed-state convergence or exact-zero abandonment cleanup. It is not this matrix's gate.
+
+## Planned cleanup matrix
+
+Acceptance remains incomplete until each owned category is proven absent, or retained under an explicitly approved `KEEP_INFRA=1` record.
+
+| Owned category | Ownership proof before mutation | Cleanup action | Post-cleanup pass evidence |
+|---|---|---|---|
+| Terraform workspace/state | Unique run/workspace token and expected state backend | Destroy, select default, delete owned workspace | Destroy exit zero and workspace absent |
+| EC2 instances | Exact run tags/token and Terraform state | Terraform destroy; targeted cleanup only for proven owned leftovers | No owned instances remain |
+| EBS volumes | Run tags/token plus attachment inventory | Terraform destroy or delete proven owned leftovers | No owned volumes remain |
+| S3 buckets/prefixes | Exact conditional marker and ownership claim | Delete owned prefix, then owned bucket | Marker, prefix, and bucket absent |
+| ECR repository/images | Unique repository plus exact ownership tags/token | Force-delete the owned repository | Repository absent |
+| Security groups, key pairs, and network resources | Terraform state plus exact ownership tags | Terraform destroy | No owned network/key resources remain |
+| SSM commands/artifacts | Run-scoped command IDs | Record terminal status; remove owned artifacts where applicable | Inventory records terminal or absent state |
+| systemd units/processes | Host and run inventory | Restore expected services; remove transient owned units/processes | Expected services active or owned units/processes absent |
+| containerd tasks/containers | Namespace plus exact run/pod identity | Stop and remove owned tasks/containers | No owned task/container remains |
+| JuiceFS mounts/temp paths | Run token and exact mount path | Unmount and remove owned path | Mount and filesystem inventories clean |
+| Local temporary files | Recorded artifact/temp manifest | Remove secret-bearing temporary files | Inventory clean |
+| Test deployments | Recorded deployment IDs | Delete through API | Deployments absent |
+| Terraform locks | Workspace/state ownership proof | Normal unlock only | No owned lock remains; never break an unowned lock |
+
+Useful current patterns do not form a unified gate: [`infra/gpu-test/run-tests.sh`](../../infra/gpu-test/run-tests.sh) installs cleanup and propagates cleanup failure, while [`infra/bench/artifact_lifecycle.sh`](../../infra/bench/artifact_lifecycle.sh) conditionally claims and revalidates exact S3 ownership before scoped deletion. Future orchestration should preserve those fail-closed properties.
+
+## Planned evidence manifest
+
+A successful live run must retain a bounded, reviewable manifest containing:
+
+- full source commit SHA and explicit clean/dirty declaration;
+- UTC start/end timestamps, exact command, phase exit statuses, and final exit status;
+- account alias, region, run ID, and workspace, with the numeric account identifier redacted;
+- every capability flag and any capability detected as unavailable;
+- Terraform saved-plan SHA-256, review record, apply log, outputs, destroy log, and state/workspace disposition;
+- binary and image SHA-256 digests, including the exact private ECR digest when exercised;
+- API request/response artifacts and request identities needed to reason about retries;
+- metrics before, during, and after each fault;
+- systemd journals and service-state snapshots;
+- containerd task/container/CDI/cgroup evidence and in-task GPU output;
+- journal metadata/checksums and permission evidence;
+- resource inventory before ownership, after apply, before cleanup, and after cleanup;
+- `KEEP_INFRA` value and, when `1`, owner/reason/expiry/cost/cleanup record;
+- exact redaction and credential-scan command/result.
+
+Evidence is current only for the recorded commit, environment, capabilities, and run. Historical evidence is not silently promoted.
+
+## Redaction contract
+
+- Never commit or publish numeric account IDs, credentials, session tokens, private keys, ownership tokens, registry passwords, secret values, signed URLs, private addresses, or raw Terraform state.
+- Hash the ownership token when correlating logs; retain the original only in the protected run workspace needed for cleanup.
+- Redact account numbers from ARN-like values while preserving service, region, resource type, and run-scoped name needed for review.
+- Keep raw secret-bearing command output in an access-controlled temporary location, not the evidence bundle.
+- Scan changed/generated evidence before publication and record the scanner and exit status.
+- Redaction must not remove the run ID, resource category, digest, timestamps, exits, or cleanup disposition needed to audit the run.
+
+## Cleanup-failure recovery
+
+If automatic cleanup fails:
+
+1. Preserve the original test exit status and record cleanup failures separately; cleanup failure makes the overall run failed.
+2. Emit the account alias, region, run ID, workspace, ownership-token hash, and redacted resource inventory.
+3. Do not retry broad deletion and do not adopt resources lacking exact ownership proof.
+4. Re-run bounded read-only inventory commands and save their exits/output.
+5. Obtain explicit approval before manual destructive recovery.
+6. Clean one proven-owned category at a time and record each action.
+7. Re-run the full inventory and redaction scan.
+8. Keep the run failed until inventory proves every owned category absent.
+9. If authorized `KEEP_INFRA=1` applies, record owner, reason, expiry, estimated continuing cost, and the exact later cleanup command in the protected handoff.
+
+Do not break a lock, reuse a workspace, or broaden selectors merely to make cleanup succeed.
+
+## Forbidden behavior
+
+| Forbidden action or claim | Reason |
+|---|---|
+| Default, CI-default, or automatic live execution | Live work requires per-run authorization, cost, and destructive approval |
+| Live mutation without exact `HIVEMIND_ALLOW_LIVE=1` and separate authorization | Environment presence is not consent |
+| Embedding real account IDs, credentials, tokens, keys, or resource identifiers | Secrets and infrastructure identity must not enter repository docs/artifacts |
+| Adopting, mutating, unlocking, or deleting an unowned or ambiguously owned resource | Cleanup and deployment are scoped to exact ownership proof |
+| Treating an optional skip as acceptance | Required capability absence must fail nonzero |
+| `KEEP_INFRA=1` without owner, cost approval, expiry, and cleanup plan | Retained infrastructure has cost and cleanup liability |
+| Applying a regenerated or unreviewed plan | Approval covers the saved reviewed plan only |
+| Calling mocks, Terraform validation, fixtures, historical cloud artifacts, or runtime-only containerd tests live evidence | They do not cross the guarded current live boundary |
+| Claiming private ECR, Nydus, JuiceFS, GPU/CDI, S3/SSM/systemd, Doppler, or containerd acceptance without strict current-head artifacts | Tooling presence and host-only checks do not prove the functional contract |
+| Declaring success while cleanup inventory is incomplete or cleanup failed | A live run includes destruction and absence proof |
