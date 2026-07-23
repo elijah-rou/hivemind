@@ -44,6 +44,27 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-17 — Deterministic VOPR message and durability cuts
+
+What changed:
+- simulated networking can arm one bounded drop-next selection by cut ID, sender, receiver, and VRR tag; counters and JSONL traces expose the consumed cut
+- VOPR mutation includes random whole-sync failures in addition to read/write faults
+- one-shot barrier cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication; recovery tests distinguish old durable state from synced-but-unpublished state
+- a five-replica gapped selection test drives real RequestPrepare/SendPrepare traffic through a dropped false hint, rejected wrong identity, missing selected-source ancestor, and unhinted exact holder before durable StartView publication
+
+Why it matters:
+- deterministic cut IDs make barrier and repair failures reproducible without weakening durability or convergence checks
+- bounded peer fallback is now exercised against message loss and misleading retention metadata rather than direct handler injection
+
+Progress:
+- focused drop-next, sync-fault, sixteen barrier-cut, and five-replica repair tests pass
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- faults model whole operation failures and process cuts, not torn sectors or power-loss corruption
+- snapshot/compaction remains outside the 1024-op retained-log contract
+
 ### 2026-07-17 — Strict VOPR convergence and true process pause
 
 What changed:

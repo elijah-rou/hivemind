@@ -280,9 +280,9 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 **VOPR simulation coverage:**
 - VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state
-- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled)
+- Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled); random sync faults and deterministic cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
-- Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection)
+- Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
 - Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
 - Cross-region gossip propagation
 - Gossip under network partitions

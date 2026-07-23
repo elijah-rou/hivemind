@@ -42,6 +42,7 @@ pub const VoprConfig = struct {
     // Storage faults
     disk_read_fault_rate: Ratio = Ratio.zero(),
     disk_write_fault_rate: Ratio = Ratio.zero(),
+    disk_sync_fault_rate: Ratio = Ratio.zero(),
 
     // Workload
     deployment_count: u8 = 0,
@@ -82,6 +83,7 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
         // recovery with faults disabled models the healed network phase.
         tc.disks[i].read_fault_rate = Ratio.zero();
         tc.disks[i].write_fault_rate = Ratio.zero();
+        tc.disks[i].sync_fault_rate = Ratio.zero();
         tc.disks[i].fail_next_write = false;
         tc.disks[i].fail_next_sync = false;
         if (!tc.replica_running[i] or tc.replicas[i].storage_failed) {
@@ -107,6 +109,7 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
     for (0..config.replica_count) |i| {
         tc.disks[i].read_fault_rate = config.disk_read_fault_rate;
         tc.disks[i].write_fault_rate = config.disk_write_fault_rate;
+        tc.disks[i].sync_fault_rate = config.disk_sync_fault_rate;
         // Seed each disk's fault PRNG differently
         tc.disks[i].fault_prng = Prng.init(config.seed +% 0xD15C +% @as(u64, i));
     }
@@ -310,6 +313,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
     for (0..config.replica_count) |i| {
         tc.disks[i].read_fault_rate = config.disk_read_fault_rate;
         tc.disks[i].write_fault_rate = config.disk_write_fault_rate;
+        tc.disks[i].sync_fault_rate = config.disk_sync_fault_rate;
         tc.disks[i].fault_prng = Prng.init(config.seed +% 0xD15C +% @as(u64, i));
     }
 
@@ -452,7 +456,10 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         // Periodic state dump (every 50 ticks)
         if (tick_count % 50 == 0) {
             traceClusterState(tc, tick_count);
-            if (collector) |c| c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
+            if (collector) |c| {
+                c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
+                c.addDropNext(tick_count, tc.network.drop_next_count, tc.network.last_drop_next_id, tc.network.last_drop_next_from, tc.network.last_drop_next_to, tc.network.last_drop_next_tag);
+            }
         }
 
         // Check for new violations
@@ -462,6 +469,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
             traceJournalState(tc);
             if (collector) |c| {
                 c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
+                c.addDropNext(tick_count, tc.network.drop_next_count, tc.network.last_drop_next_id, tc.network.last_drop_next_from, tc.network.last_drop_next_to, tc.network.last_drop_next_tag);
                 c.addViolation(tick_count, 0, "safety violation detected");
                 for (0..tc.replica_count) |i| {
                     c.addJournal(tick_count, @intCast(i), tc.replicas[i]);

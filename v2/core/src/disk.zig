@@ -71,7 +71,7 @@ pub const DiskInterface = struct {
 //
 // Fault model (intentional scope):
 //   - whole write() failures (fail-next / write_fault_rate)
-//   - whole sync() failures (fail-next / fail_at_sync_count)
+//   - whole sync() failures (fail-next / fail-at-count / sync_fault_rate)
 //   - loss of unsynced pending writes via crash()
 // Torn/partial sector writes and power-loss bit corruption are NOT modeled.
 // ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ pub const SimulatedDisk = struct {
     syncs: u64,
     read_faults: u64,
     write_faults: u64,
+    sync_faults: u64,
 
     // Deterministic fail-next controls
     fail_next_write: bool,
@@ -114,6 +115,7 @@ pub const SimulatedDisk = struct {
     // Fault injection (set by VOPR)
     read_fault_rate: prng_mod.Ratio,
     write_fault_rate: prng_mod.Ratio,
+    sync_fault_rate: prng_mod.Ratio,
     fault_prng: prng_mod.Prng,
 
     pub fn init() SimulatedDisk {
@@ -132,11 +134,13 @@ pub const SimulatedDisk = struct {
             .syncs = 0,
             .read_faults = 0,
             .write_faults = 0,
+            .sync_faults = 0,
             .fail_next_write = false,
             .fail_next_sync = false,
             .fail_at_sync_count = null,
             .read_fault_rate = prng_mod.Ratio.zero(),
             .write_fault_rate = prng_mod.Ratio.zero(),
+            .sync_fault_rate = prng_mod.Ratio.zero(),
             .fault_prng = prng_mod.Prng.init(0xD15C),
         };
     }
@@ -152,6 +156,7 @@ pub const SimulatedDisk = struct {
         self.syncs = 0;
         self.read_faults = 0;
         self.write_faults = 0;
+        self.sync_faults = 0;
     }
 
     /// Discard unsynced writes (process crash before durability barrier).
@@ -261,11 +266,17 @@ pub const SimulatedDisk = struct {
     pub fn sync(self: *SimulatedDisk) DiskError!void {
         if (self.fail_next_sync) {
             self.fail_next_sync = false;
+            self.sync_faults += 1;
+            return error.SyncFailed;
+        }
+        if (self.fault_prng.chance(self.sync_fault_rate)) {
+            self.sync_faults += 1;
             return error.SyncFailed;
         }
         if (self.fail_at_sync_count) |target| {
             if (self.syncs == target) {
                 self.fail_at_sync_count = null;
+                self.sync_faults += 1;
                 return error.SyncFailed;
             }
         }
@@ -946,6 +957,14 @@ test "FileDisk: creation-crash partial journal fails closed" {
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
     try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
+}
+
+test "durable storage: sync_fault_rate fails before publication" {
+    var sim = SimulatedDisk.init();
+    sim.sync_fault_rate = prng_mod.Ratio.init(1, 1);
+    try std.testing.expectError(error.SyncFailed, sim.sync());
+    try std.testing.expectEqual(@as(u64, 1), sim.sync_faults);
+    try std.testing.expectEqual(@as(u64, 0), sim.syncs);
 }
 
 test "durable storage: write_fault_rate applies to metadata writes" {

@@ -350,6 +350,7 @@ fn baseConfig() VoprConfig {
         .pause_stability = 15,
         .disk_read_fault_rate = Ratio.init(1, 1000),
         .disk_write_fault_rate = Ratio.init(1, 1000),
+        .disk_sync_fault_rate = Ratio.init(1, 1000),
         .deployment_count = 3,
         .worker_count = 4,
         .agent_pod_crash_probability = Ratio.init(1, 100),

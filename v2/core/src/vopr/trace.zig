@@ -16,6 +16,7 @@ pub const EventKind = union(enum) {
     crash: struct { replica: u8, pre_view: u64, pre_op: u64, pre_commit: u64, post_view: u64, post_op: u64, post_commit: u64 },
     pause: struct { replica: u8, duration: u16 },
     unpause: struct { replica: u8 },
+    drop_next: struct { count: u64, id: u64, from: u8, to: u8, tag: u8 },
     request: struct { leader: u8, request_num: u32 },
     state: [8]ReplicaSnapshot,
     violation: struct { message_buf: [256]u8, message_len: usize, replica: u8 },
@@ -31,6 +32,8 @@ pub const ReplicaSnapshot = struct {
     commit: u64 = 0,
     is_leader: bool = false,
     paused: bool = false,
+    barrier_cut_count: u64 = 0,
+    last_barrier_cut_id: u64 = 0,
     active: bool = false,
 };
 
@@ -90,6 +93,10 @@ pub const TraceCollector = struct {
         } } });
     }
 
+    pub fn addDropNext(self: *TraceCollector, tick: u64, count: u64, id: u64, from: u8, to: u8, tag: u8) void {
+        self.push(.{ .tick = tick, .kind = .{ .drop_next = .{ .count = count, .id = id, .from = from, .to = to, .tag = tag } } });
+    }
+
     pub fn addRequest(self: *TraceCollector, tick: u64, leader: u8, request_num: u32) void {
         self.push(.{ .tick = tick, .kind = .{ .request = .{ .leader = leader, .request_num = request_num } } });
     }
@@ -106,6 +113,8 @@ pub const TraceCollector = struct {
                 .commit = r.commit_min,
                 .is_leader = r.isLeader() and r.status == .normal,
                 .paused = i < paused.len and paused[i],
+                .barrier_cut_count = r.barrier_cut_count,
+                .last_barrier_cut_id = r.last_barrier_cut_id,
                 .active = true,
             };
         }
@@ -189,6 +198,7 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
         }) catch null,
         .pause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"pause\",\"replica\":{d},\"duration\":{d}}}\n", .{ event.tick, e.replica, e.duration }) catch null,
         .unpause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"unpause\",\"replica\":{d}}}\n", .{ event.tick, e.replica }) catch null,
+        .drop_next => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"drop_next\",\"count\":{d},\"id\":{d},\"from\":{d},\"to\":{d},\"tag\":{d}}}\n", .{ event.tick, e.count, e.id, e.from, e.to, e.tag }) catch null,
         .request => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"request\",\"leader\":{d},\"num\":{d}}}\n", .{ event.tick, e.leader, e.request_num }) catch null,
         .state => |snaps| blk: {
             var pos: usize = 0;
@@ -208,8 +218,8 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
                     2 => "R",
                     else => "?",
                 };
-                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{},\"paused\":{}}}", .{
-                    s.id, status_str, s.view, s.op, s.commit, s.is_leader, s.paused,
+                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{},\"paused\":{},\"barrier_cuts\":{d},\"last_barrier_cut_id\":{d}}}", .{
+                    s.id, status_str, s.view, s.op, s.commit, s.is_leader, s.paused, s.barrier_cut_count, s.last_barrier_cut_id,
                 }) catch break :blk null;
                 pos += entry.len;
             }

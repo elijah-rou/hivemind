@@ -223,6 +223,8 @@ pub const TestCluster = struct {
     pub fn crashReplica(self: *TestCluster, id: u8) void {
         const i: usize = id;
         self.replica_paused[i] = false;
+        const barrier_cut_count = self.replicas[i].barrier_cut_count;
+        const last_barrier_cut_id = self.replicas[i].last_barrier_cut_id;
 
         self.disks[i].crash();
         self.state_machines[i].initInPlace(self.state_machines[i].seed);
@@ -235,6 +237,8 @@ pub const TestCluster = struct {
             .state_machine = self.state_machines[i],
             .disk = self.disks[i].diskInterface(),
         });
+        self.replicas[i].barrier_cut_count = barrier_cut_count;
+        self.replicas[i].last_barrier_cut_id = last_barrier_cut_id;
 
         const recovered = self.replicas[i].recoverFromDisk() catch {
             // Corrupt local durable prefix: production exits nonzero. Keep this
@@ -2147,6 +2151,89 @@ fn stageTwoEntryLeaderStartView(tc: *TestCluster) [2]msg.LogEntry {
     return entries;
 }
 
+test "Prepare and Commit barrier cut table recovers old or durable state" {
+    const points = [_]replica_mod.BarrierCutPoint{ .before_slot_write, .before_metadata_write, .before_sync, .before_publication };
+    const kinds = [_]replica_mod.BarrierKind{ .prepare, .commit };
+    for (kinds, 0..) |kind, kind_index| {
+        for (points, 0..) |point, point_index| {
+            const tc = try TestCluster.init(std.testing.allocator, 1, 0xBA2200 + kind_index * 16 + point_index);
+            defer tc.deinit();
+            var capture = ReplyCapture{};
+            const replica = tc.replicas[0];
+            replica.client_reply_ctx = &capture;
+            replica.client_reply_fn = ReplyCapture.reply;
+            const cut_id: u64 = 100 + kind_index * 16 + point_index;
+            replica.armBarrierCut(.{ .id = cut_id, .kind = kind, .point = point });
+
+            tc.requestWithIdentity(0, 9, 1, .{ .noop = {} });
+            replica.tick();
+            try std.testing.expect(replica.storage_failed);
+            try std.testing.expectEqual(@as(u64, 1), replica.barrier_cut_count);
+            try std.testing.expectEqual(cut_id, replica.last_barrier_cut_id);
+            try std.testing.expectEqual(@as(usize, 0), capture.count);
+
+            tc.crashReplica(0);
+            try std.testing.expectEqual(cut_id, tc.replicas[0].last_barrier_cut_id);
+            const durable_new = point == .before_publication;
+            if (kind == .prepare) {
+                try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), tc.replicas[0].op_number);
+                try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[0].commit_min);
+            } else {
+                try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].op_number);
+                try std.testing.expectEqual(@as(msg.OpNumber, if (durable_new) 1 else 0), tc.replicas[0].commit_min);
+            }
+        }
+    }
+}
+
+test "leader and follower StartView barrier cut table recovers old or durable selection" {
+    const points = [_]replica_mod.BarrierCutPoint{ .before_slot_write, .before_metadata_write, .before_sync, .before_publication };
+    const kinds = [_]replica_mod.BarrierKind{ .leader_start_view, .follower_start_view };
+    for (kinds, 0..) |kind, kind_index| {
+        for (points, 0..) |point, point_index| {
+            const tc = try TestCluster.init(std.testing.allocator, 3, 0xBA2300 + kind_index * 16 + point_index);
+            defer tc.deinit();
+            const replica_index: usize = if (kind == .leader_start_view) 0 else 1;
+            const replica = tc.replicas[replica_index];
+            var expected_tip: u64 = 0;
+            var expected_op: msg.OpNumber = 0;
+
+            if (kind == .leader_start_view) {
+                const entries = stageTwoEntryLeaderStartView(tc);
+                expected_tip = entries[1].checksum;
+                expected_op = 2;
+            } else {
+                replica.status = .view_change;
+                replica.view_number = 3;
+                var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+                entry.checksum = entry.computeChecksum();
+                var sv = msg.StartViewMsg{ .view_number = 3, .selected_last_normal_view = 2, .op_number = 1, .tip_checksum = entry.checksum, .log_entry_count = 1 };
+                sv.log_entries[0] = entry;
+                tc.deliver(1, 0, .{ .start_view = sv });
+                expected_tip = entry.checksum;
+                expected_op = 1;
+            }
+            try std.testing.expect(replica.pending_start_view.active);
+            const cut_id: u64 = 200 + kind_index * 16 + point_index;
+            replica.armBarrierCut(.{ .id = cut_id, .kind = kind, .point = point });
+            const start_view_before = tc.network.stats.sent[@intFromEnum(msg.Tag.start_view)];
+
+            replica.tick();
+            try std.testing.expect(replica.storage_failed);
+            try std.testing.expect(replica.pending_start_view.active);
+            try std.testing.expectEqual(msg.Status.view_change, replica.status);
+            try std.testing.expectEqual(start_view_before, tc.network.stats.sent[@intFromEnum(msg.Tag.start_view)]);
+            try std.testing.expectEqual(cut_id, replica.last_barrier_cut_id);
+
+            tc.crashReplica(@intCast(replica_index));
+            try std.testing.expectEqual(cut_id, tc.replicas[replica_index].last_barrier_cut_id);
+            const durable_op: msg.OpNumber = if (point == .before_publication) expected_op else 0;
+            try std.testing.expectEqual(durable_op, tc.replicas[replica_index].op_number);
+            if (durable_op > 0) try std.testing.expectEqual(expected_tip, tc.replicas[replica_index].journalGet(durable_op).?.checksum);
+        }
+    }
+}
+
 test "view change selects one source chain instead of mixing per-op candidates" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0x51A6E);
     defer tc.deinit();
@@ -2429,106 +2516,77 @@ test "validated StartView replaces conflicting uncommitted durable prepare and s
     try std.testing.expectEqual(conflicting.checksum, tc.replicas[0].journalGet(1).?.checksum);
 }
 
-test "incomplete selected suffix repairs backward by exact content identity" {
-    const tc = try TestCluster.init(std.testing.allocator, 3, 0xB0A0D);
+test "five-replica gapped selection repairs through dropped false hint and unhinted holder" {
+    const tc = try TestCluster.init(std.testing.allocator, 5, 0xB0A0D);
     defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
     const leader = tc.replicas[0];
     leader.status = .view_change;
-    leader.view_number = 3;
+    leader.view_number = 5;
 
     var entries: [10]msg.LogEntry = undefined;
     var parent: u64 = 0;
     for (&entries, 0..) |*entry, i| {
-        entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.* = .{ .view_number = 4, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
         entry.checksum = entry.computeChecksum();
         parent = entry.checksum;
         if (i >= 2) tc.replicas[1].journalPut(entry.*);
     }
     tc.replicas[1].op_number = 10;
-    tc.replicas[1].last_normal_view = 2;
-    tc.replicas[1].view_number = 3;
-    tc.replicas[1].status = .view_change;
+    tc.replicas[1].last_normal_view = 4;
+    for (1..5) |i| {
+        tc.replicas[i].view_number = 5;
+        tc.replicas[i].status = .view_change;
+    }
 
-    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
+    // Replica 2 advertises a false retention hint. Replica 4 has the exact
+    // ancestors but contributes no hint or DVC.
+    var source = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 1, .last_normal_view = 4, .op_number = 10, .log_entry_count = 8 };
     for (0..8) |i| source.log_entries[i] = entries[9 - i];
     for (3..11) |op| msg.bitsetSet(&source.present_bitset, op % replica_mod.LOG_SIZE_MAX);
-    // Replica 2 retains the exact interior ancestors but contributes no DVC hint.
-    tc.replicas[2].journalPut(entries[0]);
-    tc.replicas[2].journalPut(entries[1]);
-    tc.replicas[2].op_number = 2;
-    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    var false_hint = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 2, .last_normal_view = 1, .op_number = 0 };
+    msg.bitsetSet(&false_hint.present_bitset, 2);
+    tc.replicas[4].journalPut(entries[0]);
+    tc.replicas[4].journalPut(entries[1]);
+    tc.replicas[4].op_number = 2;
+
+    tc.network.armDropNext(0xB0A0D, 0, 2, @intFromEnum(msg.Tag.request_prepare));
+    const empty = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
     tc.deliver(0, 0, .{ .do_view_change = empty });
     tc.deliver(0, 1, .{ .do_view_change = source });
+    tc.deliver(0, 2, .{ .do_view_change = false_hint });
 
-    try std.testing.expectEqual(msg.Status.view_change, leader.status);
     try std.testing.expect(leader.pending_view_selection);
     try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.selected_next_op);
-    try std.testing.expectEqual(entries[1].checksum, leader.selected_expected_checksum);
-    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
-    try std.testing.expectEqual(@as(usize, 8), leader.view_change_candidate.present_count);
+    try std.testing.expectEqual(@as(u64, 1), tc.network.drop_next_count);
+    try std.testing.expectEqual(@as(u64, 0xB0A0D), tc.network.last_drop_next_id);
 
+    // Inject a wrong identity from the requested false-hint replica through the
+    // real network. The leader rejects it and continues bounded peer fallback.
     var wrong_identity = entries[1];
     wrong_identity.client_id +%= 1;
     wrong_identity.checksum = wrong_identity.computeChecksum();
-    tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3,
+    var wire: [net_mod.MESSAGE_SIZE_MAX]u8 = undefined;
+    const wire_len = msg.serialize(.{ .send_prepare = .{
+        .view_number = 5,
         .entry = wrong_identity,
         .selected_source = 1,
-        .selected_last_normal_view = 2,
+        .selected_last_normal_view = 4,
         .selected_tip_op = 10,
         .selected_tip_checksum = entries[9].checksum,
         .expected_entry_checksum = entries[1].checksum,
-    } });
-    try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.selected_next_op);
-    try std.testing.expectEqual(@as(usize, 8), leader.view_change_candidate.present_count);
+    } }, &wire);
+    tc.network.enqueueSend(2, 0, wire[0..wire_len]);
 
-    // The selected source receives the real request but has neither the bit nor
-    // the interior entry. The next tick boundedly advances to replica 2.
-    tc.tick();
-    tc.tick();
-    tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3,
-        .entry = entries[1],
-        .selected_source = 1,
-        .selected_last_normal_view = 2,
-        .selected_tip_op = 10,
-        .selected_tip_checksum = entries[9].checksum,
-        .expected_entry_checksum = entries[1].checksum,
-    } });
-    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.selected_next_op);
-    try std.testing.expectEqual(entries[0].checksum, leader.selected_expected_checksum);
-
-    var wrong_parent = entries[0];
-    wrong_parent.client_id +%= 1;
-    wrong_parent.checksum = wrong_parent.computeChecksum();
-    tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3,
-        .entry = wrong_parent,
-        .selected_source = 1,
-        .selected_last_normal_view = 2,
-        .selected_tip_op = 10,
-        .selected_tip_checksum = entries[9].checksum,
-        .expected_entry_checksum = entries[0].checksum,
-    } });
-    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.selected_next_op);
-    tc.tick();
-    tc.tick();
-
+    const deadline = leader.view_change_candidate.metadata.deadline_tick;
     const syncs_before = tc.disks[0].syncs;
-    tc.deliver(0, 2, .{ .send_prepare = .{
-        .view_number = 3,
-        .entry = entries[0],
-        .selected_source = 1,
-        .selected_last_normal_view = 2,
-        .selected_tip_op = 10,
-        .selected_tip_checksum = entries[9].checksum,
-        .expected_entry_checksum = entries[0].checksum,
-    } });
-    try std.testing.expect(leader.pending_start_view.active);
-    leader.tick();
-    try std.testing.expectEqual(syncs_before + 1, tc.disks[0].syncs);
+    while (leader.status != .normal and @as(u64, @intCast(tc.current_tick)) < deadline) tc.tick();
     try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expect(@as(u64, @intCast(tc.current_tick)) < deadline);
+    try std.testing.expect(tc.disks[0].syncs > syncs_before);
     try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 10), tc.disks[0].readMetadata().?.op_number);
 }
 
 test "selected source mutation aborts candidate without changing active journal" {

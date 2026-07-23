@@ -92,6 +92,13 @@ pub const MessageStats = struct {
     }
 };
 
+pub const DropNext = struct {
+    id: u64,
+    from: u8,
+    to: u8,
+    tag: u8,
+};
+
 pub const SimulatedNetwork = struct {
     queues: [msg.REPLICA_COUNT_MAX]MessageQueue,
     // Asymmetric partition matrix: partitioned[from][to] can differ from [to][from]
@@ -115,6 +122,14 @@ pub const SimulatedNetwork = struct {
     partition_stability: i64, // minimum ticks a partition persists
     heal_stability: i64, // minimum ticks after heal before next partition
 
+    // Deterministic one-shot message fault and accounting.
+    drop_next: ?DropNext,
+    drop_next_count: u64,
+    last_drop_next_id: u64,
+    last_drop_next_from: u8,
+    last_drop_next_to: u8,
+    last_drop_next_tag: u8,
+
     // Message accounting
     stats: MessageStats,
 
@@ -134,6 +149,12 @@ pub const SimulatedNetwork = struct {
             .heal_stable_until = 0,
             .partition_stability = 0,
             .heal_stability = 0,
+            .drop_next = null,
+            .drop_next_count = 0,
+            .last_drop_next_id = 0,
+            .last_drop_next_from = 0,
+            .last_drop_next_to = 0,
+            .last_drop_next_tag = 0,
             .stats = MessageStats.init(),
         };
         for (&network.queues) |*q| {
@@ -156,15 +177,42 @@ pub const SimulatedNetwork = struct {
         self.heal_stable_until = 0;
         self.partition_stability = 0;
         self.heal_stability = 0;
+        self.drop_next = null;
+        self.drop_next_count = 0;
+        self.last_drop_next_id = 0;
+        self.last_drop_next_from = 0;
+        self.last_drop_next_to = 0;
+        self.last_drop_next_tag = 0;
         self.stats = MessageStats.init();
         for (&self.queues) |*q| {
             q.* = MessageQueue.init();
         }
     }
 
+    pub fn armDropNext(self: *SimulatedNetwork, id: u64, from: u8, to: u8, tag: u8) void {
+        std.debug.assert(id > 0);
+        std.debug.assert(from < self.replica_count);
+        std.debug.assert(to < self.replica_count);
+        std.debug.assert(self.drop_next == null);
+        self.drop_next = .{ .id = id, .from = from, .to = to, .tag = tag };
+    }
+
     pub fn enqueueSend(self: *SimulatedNetwork, from: u8, to: u8, data: []const u8) void {
-        if (to >= self.replica_count) return;
+        if (from >= self.replica_count or to >= self.replica_count) return;
         if (self.partitioned[from][to]) return;
+
+        if (self.drop_next) |selection| {
+            const tag: u8 = if (data.len == 0) 0 else data[0];
+            if (selection.from == from and selection.to == to and selection.tag == tag) {
+                self.drop_next = null;
+                self.drop_next_count += 1;
+                self.last_drop_next_id = selection.id;
+                self.last_drop_next_from = from;
+                self.last_drop_next_to = to;
+                self.last_drop_next_tag = tag;
+                return;
+            }
+        }
 
         // Drop
         if (!self.drop_rate.isZero()) {
@@ -256,3 +304,25 @@ pub const SimulatedNetwork = struct {
         }
     }
 };
+
+test "drop-next selection matches sender receiver and message tag once" {
+    var tick: i64 = 0;
+    const network = try std.testing.allocator.create(SimulatedNetwork);
+    defer std.testing.allocator.destroy(network);
+    network.initInPlace(1, 3, &tick);
+    network.min_delay = 0;
+    network.max_delay = 0;
+    network.armDropNext(77, 1, 2, @intFromEnum(msg.Tag.request_prepare));
+
+    const matching = [_]u8{@intFromEnum(msg.Tag.request_prepare)};
+    const other = [_]u8{@intFromEnum(msg.Tag.commit)};
+    network.enqueueSend(0, 2, &matching);
+    network.enqueueSend(1, 2, &other);
+    try std.testing.expectEqual(@as(u64, 0), network.drop_next_count);
+    network.enqueueSend(1, 2, &matching);
+    try std.testing.expectEqual(@as(u64, 1), network.drop_next_count);
+    try std.testing.expectEqual(@as(u64, 77), network.last_drop_next_id);
+    try std.testing.expect(network.drop_next == null);
+    network.enqueueSend(1, 2, &matching);
+    try std.testing.expectEqual(@as(usize, 3), network.queues[2].count);
+}
