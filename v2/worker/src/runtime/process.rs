@@ -23,6 +23,8 @@ struct RunningProcess {
 pub struct ProcessRuntime {
     processes: Mutex<HashMap<String, RunningProcess>>,
     next_port: Mutex<u16>,
+    test_controls_enabled: bool,
+    run_deadline: Duration,
 }
 
 impl ProcessRuntime {
@@ -34,6 +36,18 @@ impl ProcessRuntime {
         Self {
             processes: Mutex::new(HashMap::new()),
             next_port: Mutex::new(base_port),
+            test_controls_enabled: false,
+            run_deadline: Duration::from_secs(25),
+        }
+    }
+
+    pub fn with_test_controls(base_port: u16) -> Self {
+        assert!(base_port > 0, "test process base port must be nonzero");
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            next_port: Mutex::new(base_port),
+            test_controls_enabled: true,
+            run_deadline: Duration::from_millis(600),
         }
     }
 
@@ -71,6 +85,8 @@ impl Runtime for ProcessRuntime {
                 r#"
 import http.server, json, os, sys
 class H(http.server.BaseHTTPRequestHandler):
+    execution_counts = {{}}
+    test_controls = {}
     def do_GET(self):
         response = json.dumps(dict(os.environ))
         self.send_response(200)
@@ -80,15 +96,42 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('content-length', 0))
         body = self.rfile.read(length) if length > 0 else b''
-        response = json.dumps({{"status": "ok", "echo": body.decode('utf-8', errors='replace'), "pod_id": {}}})
+        key = body.decode('utf-8', errors='replace')
+        H.execution_counts[key] = H.execution_counts.get(key, 0) + 1
+        if H.test_controls and body == b'__hivemind_test_response_too_large__':
+            response = b'x' * {}
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            return
+        if H.test_controls and body == b'__hivemind_test_forwarding_failure__':
+            self.connection.shutdown(2)
+            self.connection.close()
+            return
+        if H.test_controls and body == b'__hivemind_test_trickle_deadline__':
+            self.send_response(200)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            for _ in range(10):
+                self.wfile.write(b'1\r\nx\r\n')
+                self.wfile.flush()
+                import time; time.sleep(0.2)
+            self.wfile.write(b'0\r\n\r\n')
+            return
+        response = json.dumps({{"status": "ok", "echo": key, "pod_id": {}, "execution_count": H.execution_counts[key]}})
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response.encode())
     def log_message(self, format, *args): pass
 http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
 "#,
-                spec.pod_id, port
+                if self.test_controls_enabled { "True" } else { "False" },
+                MAX_RUN_RESPONSE_BODY + 1,
+                spec.pod_id,
+                port
             ),
         ]);
 
@@ -142,7 +185,7 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
             .get_port(&handle.container_id)
             .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
 
-        crate::runtime::process::forward_run(port, payload)
+        forward_run_with_deadline(port, payload, self.run_deadline)
     }
 
     fn probe_pod(&self, handle: &PodHandle, _port: u16, path: &str) -> Result<bool, RuntimeError> {
@@ -414,6 +457,37 @@ mod tests {
         runtime.start_pod(&handle).unwrap();
 
         assert!(runtime.probe_pod(&handle, 1, "/health").unwrap());
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn process_runtime_retains_owned_pod_across_control_plane_reconnect() {
+        let runtime = ProcessRuntime::with_base_port(24_600);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 80,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        // Control-plane reconnects must reuse this runtime instance. Its owned
+        // process remains forwardable instead of becoming an orphan.
+        let body = runtime
+            .forward_run(&handle, 8080, b"after-reconnect")
+            .unwrap();
+        assert!(body
+            .windows(b"after-reconnect".len())
+            .any(|part| part == b"after-reconnect"));
         runtime.remove_pod(&handle).unwrap();
     }
 

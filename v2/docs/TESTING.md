@@ -30,16 +30,16 @@ Commands are run from the repository root unless the command changes directory. 
 | Go bench | `cd v2/bench && go test -race ./... && go build ./...` | Bench client/probe behavior and build | A build is not benchmark evidence |
 | Shared wire contract | `cd v2/tests && ./wire-contract-test.sh` | Bounded canonical protocol-v6 schema, exact global constants, and Zig/Rust/Go API/Go bench consumers of one byte corpus | Deterministic codec evidence; not authentication or real-network evidence |
 | Aggregate | `cd v2 && ./tests/run-all.sh` | The phases actually invoked, including the shared wire gate and optional local smoke/containerd when available | See skip semantics below |
-| Local process | `cd v2 && ./tests/local-smoke.sh --build` | One Zig replica, Go API, Rust worker, process runtime, deployment and successful `/run` | Single replica; process runtime is not containerd |
-| Local failover | `cd v2 && ./tests/local-failover-smoke.sh --build` | Three Zig replicas and Go API across leader loss/restart | Standalone; no worker or data-plane `/run` |
-| Storage startup | `cd v2 && ./tests/storage_mode_smoke_test.sh` | Volatile and journal mode startup, warning, listening, and liveness | Startup/liveness only; no committed-state recovery |
+| Local run contract | `cd v2 && ./tests/local-run-contract-smoke.sh --build` | Three journal-backed Zig replicas, Go API, Rust worker/process runtime, bench, statuses 0/4/6/9, abandonment, kill/restart reprobe, exactly-once execution, and zero accounting | Real localhost processes/sockets/filesystem; not containerd |
+| Local failover | `cd v2 && ./tests/local-failover-smoke.sh --build` | Three journal-backed Zig replicas, Go API, Rust worker/process runtime, leader kill/restart, and data-plane continuity | Real localhost processes/sockets/filesystem; not containerd |
+| Storage recovery | `cd v2 && ./tests/local-storage-recovery-smoke.sh --build` | Commit, leader failover/rejoin, full retained-directory restart, convergence, and a new post-recovery commit | Experimental journal/process/filesystem boundary; not torn-write or power-loss proof |
 | Containerd component | `cd v2 && ./tests/containerd/run-tests.sh` | Privileged Docker-hosted Rust containerd integration tests | Worker runtime component only, not full stack |
 | Terraform offline | commands below | Formatting, backend-disabled initialization, static validation | No apply or cloud proof |
 | Live/cloud | unavailable | No unified guarded live gate exists | **Planned, not implemented** |
 
-The aggregate runner currently supports only `--skip-containerd` and `--skip-smoke`; unknown arguments fail with exit 1. It continues through invoked phases and exits 1 if any invoked phase fails. `--skip-containerd` prints a skip and means containerd is unverified. Without that flag, missing Docker auto-skips containerd and may still produce exit 0; containerd remains unverified. `--skip-smoke` omits local real-process evidence. Local failover is not in the aggregate runner.
+The aggregate runner supports only `--skip-containerd` and `--skip-smoke`; unknown arguments fail with exit 1. It continues through invoked phases and exits 1 if any invoked phase fails. `--skip-containerd` prints a skip and means containerd is unverified. Without that flag, missing Docker auto-skips containerd and may still produce exit 0; containerd remains unverified. Unless `--skip-smoke` is explicit, failover, retained-storage recovery, and run-contract phases are mandatory.
 
-**Planned, not implemented:** `--require-containerd`, strict containerd/live capability flags, mandatory recovery and run-contract phases, full-stack containerd, and a unified live entry point. Do not run these as commands or cite them as evidence.
+**Planned, not implemented:** `--require-containerd`, strict containerd/live capability flags, full-stack containerd, and a unified live entry point. Do not run these as commands or cite them as evidence.
 
 Offline Terraform validation:
 
@@ -59,7 +59,7 @@ The worker simulator models the worker state machine, fail-loud bounded I/O stag
 
 Named deterministic socket scenario `peer envelope socketpair rejects before identity binding and VRR dispatch` covers protocol-v6 plaintext and fixed-nonce encrypted peer envelopes plus current-1, malformed, and plaintext-on-keyed-connection rejection. Rejected frames leave the socket unbound and connected and do not increment replica VRR counters; only current version 6 can bind identity or reach replica dispatch. AF_UNIX socketpairs cover kernel stream framing but not TCP routing, half-close behavior, process scheduling, or authenticated peer identity.
 
-Real-process tests are required when behavior crosses sockets, process lifecycle, retained filesystem state, or OS deadlines. Privileged containerd evidence is required for namespaces, cgroups, task adoption, and the real runtime. GPU, private registry, JuiceFS, S3/SSM/systemd, Terraform apply, and provider cleanup require separately authorized live evidence.
+Real-process tests are required when behavior crosses sockets, process lifecycle, retained filesystem state, or OS deadlines. The local cluster harness launches each owned component in a separate process group, records PID start identity, resumes stopped owned groups before TERM, uses bounded TERM/KILL waits, releases only token-owned port locks, and fails cleanup if an owned process, exact listener, or lock remains. It never uses broad process-name killing. Privileged containerd evidence is required for namespaces, cgroups, task adoption, and the real runtime. GPU, private registry, JuiceFS, S3/SSM/systemd, Terraform apply, and provider cleanup require separately authorized live evidence.
 
 ## Pass, fail, skip, unavailable
 

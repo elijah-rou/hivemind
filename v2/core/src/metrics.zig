@@ -287,6 +287,10 @@ pub const MetricsServer = struct {
         pos += write(buf, pos, "# TYPE hivemind_consensus_op gauge\n");
         pos += writeFmt(buf, pos, "hivemind_consensus_op {d}\n", .{self.replica.op_number});
 
+        pos += write(buf, pos, "# HELP hivemind_committed_state_digest Deterministic digest of command-derived state\n");
+        pos += write(buf, pos, "# TYPE hivemind_committed_state_digest gauge\n");
+        pos += writeFmt(buf, pos, "hivemind_committed_state_digest {d}\n", .{sm.committedDigest()});
+
         pos += write(buf, pos, "# HELP hivemind_consensus_pipeline_guard_drops_total Requests dropped by the VRR pipeline guard\n");
         pos += write(buf, pos, "# TYPE hivemind_consensus_pipeline_guard_drops_total counter\n");
         pos += writeFmt(buf, pos, "hivemind_consensus_pipeline_guard_drops_total {d}\n", .{self.replica.pipeline_guard_drops});
@@ -822,6 +826,7 @@ test "metrics include origin-aware gossip labels and cpu summaries" {
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_pipeline_guard_drops_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_log_full_rejections_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_storage_failures_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_committed_state_digest") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_queue_depth") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_available_millicores") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_total_millicores") != null);

@@ -49,9 +49,9 @@ This section describes executable topology separately from future acceptance top
 |---|---|---|---|
 | Zig control-plane DST | VRR replicas and state machines, simulated `Io`, network and disk, virtual clock, checker, trace, seeded VOPR runner | Deterministic message-level and whole-I/O model | [`core/src/vopr/`](../core/src/vopr/), [`core/src/disk.zig`](../core/src/disk.zig) |
 | Rust worker DST | production `Worker`, `SimulatedIo`, structurally bidirectional `SimulatedNetwork`, `SimulatedRuntime`, `ControlPlaneStub`, `WorkerChecker`, runner | Deterministic worker lifecycle/runtime model | [`worker/src/sim/`](../worker/src/sim/) |
-| Local full-stack smoke | one Zig replica, Go API, Rust worker, process runtime | Real processes, localhost sockets, filesystem journal, child workload process | [`tests/local-smoke.sh`](../tests/local-smoke.sh) |
-| Local failover smoke | normally three Zig replicas and Go API | Real replica/API processes, VRR TCP, leader loss, one replica restart | [`tests/local-failover-smoke.sh`](../tests/local-failover-smoke.sh) |
-| Storage startup smoke | sequential volatile and journal-backed Zig processes | Startup logs and process liveness only | [`tests/storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) |
+| Local run contract | three journal-backed Zig replicas, Go API, Rust worker/process runtime, Go bench | Real processes, localhost sockets, retained filesystem state, negative `/run` outcomes, kill/restart reprobe | [`tests/local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh) |
+| Local failover contract | three journal-backed Zig replicas, Go API, Rust worker/process runtime | Real process/runtime traffic across leader kill, election, retained restart, and convergence | [`tests/local-failover-smoke.sh`](../tests/local-failover-smoke.sh) |
+| Local storage recovery | the same cluster stopped and restarted from three retained journal directories | Committed state survives failover, rejoin, and full restart; a new command commits afterward | [`tests/local-storage-recovery-smoke.sh`](../tests/local-storage-recovery-smoke.sh) |
 | Containerd component integration | privileged Docker test environment, containerd, Rust runtime tests | Real runtime namespace/task/cgroup behavior; not the full stack | [`tests/containerd/`](../tests/containerd/), [`worker/tests/containerd_integration.rs`](../worker/tests/containerd_integration.rs) |
 | Infrastructure tooling | Terraform, ECR, S3/SSM helpers, SSH/systemd deployment, POC CPU/GPU scripts | Historical and operator tooling boundaries; no guarded current live gate | [`infra/`](../infra/) |
 
@@ -123,23 +123,23 @@ Runner convergence requires a control-plane-observed registration from every wor
 
 **Current limitation:** delayed partitions are a bounded queued-delivery model, while explicit session loss drops whole queued messages. Neither is a complete model of kernel TCP buffers, partial-frame loss, half-close, or reconnect timing. Pause still partitions rather than freezing worker execution. Evidence must not generalize these scenarios to process, containerd, GPU, or cloud behavior.
 
-### Current, implemented: local real-process boundaries
+### Current, implemented: reusable local real-process contracts
 
-#### One-replica full-stack smoke
+#### Three-replica full-stack run contract
 
 ```text
-HTTP client -> Go API -> one journal-backed Zig replica
-                               |
-                               v
-                     Rust worker, process runtime
-                               |
-                               v
-                        child workload process
+HTTP/bench -> Go API -> three journal-backed Zig replicas
+                                  |
+                                  v
+                        Rust worker, process runtime
+                                  |
+                                  v
+                           child workload process
 ```
 
-[`local-smoke.sh`](../tests/local-smoke.sh) crosses real process, localhost TCP, filesystem, and process-runtime boundaries. It checks API/dashboard surfaces, worker registration, deployment creation/listing, one successful echo `/run`, queue surface, metrics, and worker health, then kills its processes and removes temporary logs/data. It does not prove quorum, leader failover, retained-state recovery, negative run outcomes, abandonment accounting, containerd, GPU, or cloud behavior. Follow the script for mutable ports and deadlines.
+[`local-smoke.sh`](../tests/local-smoke.sh) is now a compatibility entry point for the three-replica [`local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh). The maintained contract crosses real process, localhost TCP, retained journal, process-runtime child, API reprobe, and bench boundaries. It checks success, statuses 4/6/9, abandonment, exactly-once execution, and exact zero queue/in-flight metrics. Explicit test-only process controls are disabled by default and enabled only for deterministic negative outcomes.
 
-#### Three-replica API-only failover
+#### Three-replica data-plane failover
 
 ```text
                               Go API
@@ -154,13 +154,13 @@ commit -> kill leader -> reconnect/elect -> commit
        -> restart old replica from its retained directory
 ```
 
-[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) defaults to three replicas but keeps topology and port derivation configurable in source. It checks connection and leader discovery, a commit before leader loss, a different leader, a commit after loss, old-replica restart, and normal replica metrics. It starts no Rust worker, sends no `/run`, does not prove exact commit-watermark/state convergence or full-cluster retained-state recovery, and remains standalone outside `run-all.sh`.
+[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) uses the shared three-replica harness, starts the Rust worker/process runtime, executes `/run` before and after killing the elected leader, restarts the old replica with the same journal, and requires commit/state convergence plus exact zero accounting. It is mandatory in `run-all.sh` unless `--skip-smoke` is explicit.
 
-#### Storage startup smoke
+#### Retained storage recovery
 
-[`storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) starts real Zig processes sequentially in volatile and journal modes and checks warning/listening text plus liveness. It performs no command, crash, restart, or committed-state recovery assertion.
+[`storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) is now a compatibility entry point for [`local-storage-recovery-smoke.sh`](../tests/local-storage-recovery-smoke.sh). The maintained contract commits named state, kills and rejoins a leader from its journal, stops and restarts the full cluster from all three retained directories, verifies original state and commit/state convergence, and commits new state.
 
-### Planned, not implemented: combined local recovery and run contract
+### Current, implemented: combined local recovery and run contract
 
 ```text
 HTTP and bench clients
@@ -188,7 +188,7 @@ commit state + successful /run
  -> require queue and in-flight metrics to return to zero
 ```
 
-No reusable local-cluster library, storage-recovery smoke, or run-contract smoke exists today. This topology becomes current only when those scripts land and are mandatory in the aggregate gate.
+[`tests/lib/local_cluster.sh`](../tests/lib/local_cluster.sh) implements this topology with isolated exact ports and token-owned locks. Every component leads an inventoried owned process group; cleanup sends CONT before TERM, polls boundedly, falls back to KILL, and verifies no owned process, exact listener, or lock remains on both pass and failure. It does not use broad process-name killing. Failover, storage recovery, and run contract are mandatory aggregate phases unless `--skip-smoke` is explicit.
 
 ### Current, implemented: privileged runtime-component containerd
 

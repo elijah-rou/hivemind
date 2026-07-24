@@ -5,6 +5,7 @@ use crate::types::GpuType;
 
 // -- Message type constants --
 
+#[cfg(test)]
 const MSG_REGISTER_ACK: u8 = 0x01;
 const MSG_START_POD: u8 = 0x02;
 const MSG_STOP_POD: u8 = 0x03;

@@ -20,6 +20,8 @@ struct RunConfig {
     snapshotter: String,
     metrics_port: Option<u16>,
     encryption_key_hex: String,
+    test_process_controls: bool,
+    test_process_base_port: u16,
 }
 
 fn parse_replica_addrs(replica_addr: &str) -> Vec<String> {
@@ -46,6 +48,8 @@ where
     let mut snapshotter = "overlayfs".to_string();
     let mut metrics_port: Option<u16> = None;
     let mut encryption_key_hex = String::new();
+    let mut test_process_controls = false;
+    let mut test_process_base_port = 15_000;
 
     let mut i = 0;
     while i < args.len() {
@@ -64,6 +68,14 @@ where
             }
             "--encryption-key" if i + 1 < args.len() => {
                 encryption_key_hex = args[i + 1].clone();
+                i += 2;
+            }
+            "--test-process-controls" => {
+                test_process_controls = true;
+                i += 1;
+            }
+            "--test-process-base-port" if i + 1 < args.len() => {
+                test_process_base_port = args[i + 1].parse().unwrap_or(0);
                 i += 2;
             }
             _ if replica_addr.is_empty() => {
@@ -100,6 +112,8 @@ where
         snapshotter,
         metrics_port,
         encryption_key_hex,
+        test_process_controls,
+        test_process_base_port,
     }
 }
 
@@ -138,6 +152,21 @@ fn cmd_run(args: &[String]) {
     let snapshotter = cfg.snapshotter;
     let metrics_port = cfg.metrics_port;
     let encryption_key_hex = cfg.encryption_key_hex;
+    let test_process_controls = cfg.test_process_controls;
+    let test_process_base_port = cfg.test_process_base_port;
+
+    if test_process_controls && runtime_mode != "process" {
+        eprintln!("--test-process-controls requires --runtime process");
+        std::process::exit(2);
+    }
+    if !test_process_controls && test_process_base_port != 15_000 {
+        eprintln!("--test-process-base-port requires --test-process-controls");
+        std::process::exit(2);
+    }
+    if test_process_base_port == 0 {
+        eprintln!("--test-process-base-port must be nonzero");
+        std::process::exit(2);
+    }
 
     #[cfg(not(target_os = "linux"))]
     let _ = &snapshotter;
@@ -231,6 +260,36 @@ fn cmd_run(args: &[String]) {
         );
     }
 
+    let runtime: Box<dyn runtime::Runtime> = match runtime_mode.as_str() {
+        "process" => {
+            if test_process_controls {
+                eprintln!("worker: explicit test-only process controls enabled");
+                Box::new(runtime::process::ProcessRuntime::with_test_controls(
+                    test_process_base_port,
+                ))
+            } else {
+                Box::new(runtime::process::ProcessRuntime::new())
+            }
+        }
+        "simulated" => Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())),
+        #[cfg(target_os = "linux")]
+        "containerd" => {
+            let snap = if snapshotter == "overlayfs" {
+                None
+            } else {
+                Some(snapshotter.as_str())
+            };
+            Box::new(
+                runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
+                    .expect("failed to init containerd runtime"),
+            )
+        }
+        other => {
+            eprintln!("unknown runtime: {other}");
+            std::process::exit(1);
+        }
+    };
+
     let mut backoff_ms: u64 = 100;
     let max_backoff_ms: u64 = 10_000;
     let mut replica_idx: usize = 0;
@@ -246,32 +305,12 @@ fn cmd_run(args: &[String]) {
                 eprintln!("worker {node_name}: connected to {current_replica_addr}");
                 backoff_ms = 100;
 
-                match runtime_mode.as_str() {
-                    "process" => {
-                        let rt = runtime::process::ProcessRuntime::new();
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    "simulated" => {
-                        let rt = sim::runtime::SimulatedRuntime::new(0, Default::default());
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    #[cfg(target_os = "linux")]
-                    "containerd" => {
-                        let snap = if snapshotter == "overlayfs" {
-                            None
-                        } else {
-                            Some(snapshotter.as_str())
-                        };
-                        let rt =
-                            runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
-                                .expect("failed to init containerd runtime");
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    other => {
-                        eprintln!("unknown runtime: {other}");
-                        std::process::exit(1);
-                    }
-                }
+                run_worker_loop(
+                    &mut node_worker,
+                    &mut rio,
+                    runtime.as_ref(),
+                    &metrics_server,
+                );
 
                 if SHUTDOWN.load(Ordering::SeqCst) {
                     eprintln!("worker {node_name}: shutdown complete");
@@ -370,6 +409,27 @@ mod tests {
             &[("HIVEMIND_AGENT_METRICS_PORT", "8081")],
         );
         assert_eq!(cfg.metrics_port, Some(8081));
+    }
+
+    #[test]
+    fn process_test_controls_are_disabled_by_default_and_require_explicit_flag() {
+        let default_cfg = parse(&["127.0.0.1:9000"], &[]);
+        assert!(!default_cfg.test_process_controls);
+
+        let enabled_cfg = parse(&["127.0.0.1:9000", "--test-process-controls"], &[]);
+        assert!(enabled_cfg.test_process_controls);
+        assert_eq!(default_cfg.test_process_base_port, 15_000);
+
+        let isolated_cfg = parse(
+            &[
+                "127.0.0.1:9000",
+                "--test-process-controls",
+                "--test-process-base-port",
+                "24500",
+            ],
+            &[],
+        );
+        assert_eq!(isolated_cfg.test_process_base_port, 24_500);
     }
 }
 

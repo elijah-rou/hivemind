@@ -91,8 +91,9 @@ set -e
 [[ ! -e "$TMP_DIR/no-such-parent/result.json" ]]
 [[ -z "$(find "$cleanup_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
+# Live operator scripts retry only statuses proven safe. The local D1 contract
+# intentionally sends each case once so it can assert exact wire outcomes.
 for caller in \
-    tests/local-smoke.sh \
     infra/poc/operator-workflow.sh \
     infra/poc/workload-test.sh \
     infra/poc/smoke-test.sh \

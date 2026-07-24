@@ -1,6 +1,6 @@
 # Hivemind Status Report
 
-*Last updated: 2026-07-23*
+*Last updated: 2026-07-24*
 
 
 ## Current Presentation Gate (2026-05-05)
@@ -273,14 +273,16 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ## Test Coverage
 
 **Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
-- Zig: `332 / 332` unit/simulation tests pass in Debug and ReleaseFast, including the shared wire corpus and protocol-v6 peer-envelope socketpair scenario.
-- Rust: `166` library, `3` fuzz-harness utility, `5` main, and `5` integration tests pass; containerd feature integration was not enabled.
+- Zig Debug and ReleaseFast suites pass, including the shared wire corpus, protocol-v6 peer-envelope socketpair scenario, and committed-state digest metric used by retained recovery.
+- Rust: `167` library, `3` fuzz-harness utility, `6` main, and `5` integration tests pass; containerd feature integration was not enabled. Release builds emit no warning from test-only protocol constants.
 - Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
 - Go: API and bench module race tests and builds pass; both consume the shared corpus.
 - Shared wire: `tests/wire-contract-test.sh` passes bounded schema/version validation and all four language consumers; applicable vectors re-encode byte-identically.
-- `tests/run-all.sh --skip-containerd`: `19 passed, 0 failed`, including the shared wire gate, storage-mode, launcher, deploy-output, SSM, systemd, artifact ownership, retry, docs, and local smoke fixtures.
-- Local smoke within run-all: `16 passed, 0 failed`.
-- Shell: changed files pass `bash -n` and ShellCheck at style severity.
+- `tests/run-all.sh --skip-containerd` passed `21` invoked phases with `0` failures in `151s`; containerd was explicitly skipped.
+- Focused real-process contracts pass under explicit outer bounds: run contract in `9s`, failover in `20s`, and retained-storage recovery in `14s`; three later run-contract stability repetitions passed in `49s`, `21s`, and `14s`.
+- The reusable cluster uses three retained journals, real Go API, real Rust process worker, and real Go bench. It proves connected/leader health, commit/failover/rejoin/full retained restart/convergence/new commit, statuses 0/4/6/9, abandonment cleanup, exactly-once reprobe, and exact zero queue/in-flight metrics.
+- Cleanup records owned PID start identity and process groups, resumes stopped owned groups before TERM, uses bounded KILL fallback, releases only token-owned locks, and verifies zero owned process/listener/lock residue on pass and failure without broad `pkill`.
+- Shell: all `v2/tests/*.sh` pass `bash -n`; changed shell files pass ShellCheck at style severity.
 - Residual validation: no live AWS deploy; containerd-in-Docker not run; Terraform provider-dependent offline validation is reported separately when unavailable.
 - Acceptance counts remain `6 / 8` POC v1 sections and `16 / 16` warm-cache execution items. Historical live-infra state is unchanged by this verification.
 

@@ -12,13 +12,13 @@ Each catalog row records classification/topology, dependencies and boundedness, 
 |---|---|
 | Aggregate current phases | `cd v2 && ./tests/run-all.sh` |
 | Deterministic aggregate without containerd | `cd v2 && ./tests/run-all.sh --skip-containerd` |
-| Single-replica process-runtime smoke | `cd v2 && ./tests/local-smoke.sh --build` |
-| Standalone three-replica failover | `cd v2 && ./tests/local-failover-smoke.sh --build` |
-| Storage startup/liveness | `cd v2 && ./tests/storage_mode_smoke_test.sh` |
+| Three-replica process-runtime run contract | `cd v2 && ./tests/local-run-contract-smoke.sh --build` |
+| Three-replica data-plane failover | `cd v2 && ./tests/local-failover-smoke.sh --build` |
+| Retained storage recovery | `cd v2 && ./tests/local-storage-recovery-smoke.sh --build` |
 | Shared protocol-v6 wire corpus | `cd v2/tests && ./wire-contract-test.sh` |
 | Privileged containerd component integration | `cd v2 && ./tests/containerd/run-tests.sh` |
 
-`run-all.sh` supports only `--skip-containerd` and `--skip-smoke`. `--skip-containerd` and Docker-missing auto-skip can both yield exit 0 while containerd remains **unverified**. `--skip-smoke` makes local process coverage unverified. Unknown flags exit 1.
+`run-all.sh` supports only `--skip-containerd` and `--skip-smoke`. `--skip-containerd` and Docker-missing auto-skip can both yield exit 0 while containerd remains **unverified**. `--skip-smoke` skips all three mandatory local failover/recovery/run contracts and makes local process coverage unverified. Unknown flags exit 1.
 
 ## `run-all.sh` phases
 
@@ -33,7 +33,6 @@ The runner continues after a failed invoked phase and exits 1 if any invoked pha
 | Go builds | API and bench `go build ./...` | Always invoked |
 | Worker-env fixture | `infra/poc/test-worker-env.sh` | Always invoked; offline fixture |
 | Deploy-output fixture | `tests/poc_deploy_outputs_test.sh` | Always invoked; offline fixture |
-| Storage-mode smoke | `tests/storage_mode_smoke_test.sh` | Always invoked; real local binary |
 | Launcher contract | `tests/launcher_contract_test.sh` | Always invoked; static fixture |
 | SSM wait fixture | `tests/deploy_ssm_wait_test.sh` | Always invoked; stub AWS |
 | systemd lifecycle fixture | `tests/bench_systemd_lifecycle_test.sh` | Always invoked; stubbed/offline |
@@ -45,27 +44,28 @@ The runner continues after a failed invoked phase and exits 1 if any invoked pha
 | HTTP helper fixture | `tests/http_helper_test.sh` | Always invoked; stub curl |
 | Operator retry fixture | `tests/operator_workflow_retry_test.sh` | Always invoked; stub curl |
 | Containerd component integration | `tests/containerd/run-tests.sh` | Conditional on Docker and no `--skip-containerd` |
-| Local process smoke | `tests/local-smoke.sh --build` | Conditional on no `--skip-smoke` |
+| Local cleanup contract | `tests/local_cluster_cleanup_test.sh` | Always invoked; stopped-owned-child pass/failure residue contract |
+| Local data-plane failover | `tests/local-failover-smoke.sh --build` | Conditional on no `--skip-smoke`; mandatory local phase |
+| Local retained-storage recovery | `tests/storage_mode_smoke_test.sh` | Conditional on no `--skip-smoke`; compatibility entry point to the maintained recovery contract |
+| Local run contract | `tests/local-smoke.sh` | Conditional on no `--skip-smoke`; compatibility entry point to the maintained run contract |
 
-`local-failover-smoke.sh` is standalone and absent from this table by design. `build_binaries_test.sh` is maintained but is also absent from the runner.
+`build_binaries_test.sh` is maintained but remains absent from the runner.
 
 ## Detailed local and containerd harnesses
 
-### `tests/local-smoke.sh`
+### `tests/local-run-contract-smoke.sh` and `tests/local-smoke.sh`
 
-Topology: one Zig replica, one Rust worker using process runtime, and one Go API. It uses worker/client/metrics/API ports `19000`, `19001`, `19200`, `18081`, and `18080`, plus a `mktemp` journal directory. Dependencies are Bash, curl, Zig/Cargo/Go with `--build`, Python/process workload dependencies used by the worker, and free ports. Startup uses fixed sleeps; registration and `/run` polling use 12 attempts at two seconds. There is no overall timeout.
+Topology: three journal-backed Zig replicas, one Rust worker using process runtime, one Go API, one Go bench, and a process workload. `local-smoke.sh` is a compatibility entry point. The shared helper chooses an isolated exact port set and temporary retained journal root. Every test invocation still requires an outer timeout.
 
-It asserts process liveness, API/dashboard responses, worker registration surface, deployment creation/listing, one successful echo `/run`, queue page, replica/worker metrics, and worker health. It does not prove replica failover, retained-state recovery, negative run statuses, containerd, GPU, or cloud behavior. Logs are written under `/tmp/hivemind-smoke-*.log`; the trap kills tracked PIDs and removes logs/data. `--build` is the only flag. Unknown flags and any failed assertion exit 1.
+The run contract asserts parsed connected/leader health; a successful request; response overflow status 4; forwarding failure and trickle deadline status 6; abandoned-client cleanup; killed-leader election and retained restart; a real follower status 9 followed by delivery of that proven pre-enqueue outcome through a bounded relay to exercise the Go API's safe one-time reprobe; exactly-once workload execution; real bench leader probe/workload traffic; one real worker dispatch path; and exact zero queue/in-flight metrics. Negative process controls require explicit `--test-process-controls`, are disabled by default, and do not affect containerd. `--build` is the only flag. Failure preserves the temporary root; success removes it.
 
 ### `tests/local-failover-smoke.sh`
 
-Topology: `REPLICA_COUNT` Zig replicas, default three, plus one Go API and no worker. `BASE_PORT` defaults to `21000`; worker/client/peer/metrics ports are offsets `+100`, `+200`, `+300`, and `+400` per replica; API uses `18080`. Each replica has a temporary retained data directory across its restart.
+Topology: the shared three-journal replica cluster, Go API, Rust worker using process runtime, and one process workload. It executes a successful `/run`, kills the elected leader, requires a different leader, continues real data-plane traffic, restarts the old replica from the same directory, requires commit/state convergence, and checks exact zero queue/in-flight metrics. It is mandatory in `run-all.sh` unless `--skip-smoke` is explicit. `--build` is the only flag.
 
-It has bounded HTTP polling of 60, 80, or 120 one-second attempts, plus fixed sleeps; no overall timeout. It asserts initial connection/leader, a pre-failure commit, leader kill, reconnection to a different leader, a post-failure commit, old-replica restart, and normal replica metrics. It does not start Rust, execute `/run`, prove worker/data-plane continuity, assert exact commit-watermark/state convergence, or belong to `run-all.sh`. The cleanup trap kills tracked PIDs and removes data. Logs/diagnostic metrics remain on failure or `KEEP_LOGS=true`; otherwise they are removed. `--build` is the only CLI flag; environment variables above configure topology. Failure exits 1.
+### `tests/local-storage-recovery-smoke.sh` and `tests/storage_mode_smoke_test.sh`
 
-### `tests/storage_mode_smoke_test.sh`
-
-Topology: two sequential single-replica real Zig processes on PID-derived high ports, one volatile and one journal-backed. It builds Debug, uses a temporary directory, polls log patterns for at most five seconds by default, and has no overall timeout. It asserts storage-mode/warning/listening text and process liveness. It proves startup/liveness only, not writes, restart, or recovery. The trap kills PIDs and removes all temporary logs/data. No flags; failure exits 1.
+Topology: the shared three-journal replica cluster plus Go API and Rust process worker. `storage_mode_smoke_test.sh` is a compatibility entry point. The contract commits named state, kills the leader, commits through the replacement, rejoins the old replica from its journal, stops the complete cluster, restarts all components from the same directories, verifies both original states and exact convergence metrics, then commits and converges a new command. `--build` is optional; failure preserves the temporary root and success removes it.
 
 ### `tests/containerd/run-tests.sh` and `tests/containerd/run.sh`
 
@@ -137,9 +137,6 @@ These paths are maintained, but invoking live-capable entry points is not part o
 
 The following are inventory only. They are absent or unsupported and must not be presented as runnable:
 
-- `tests/local-storage-recovery-smoke.sh` and a reusable retained-state cluster helper;
-- `tests/local-run-contract-smoke.sh`;
-- mandatory failover, recovery, and run-contract phases in `run-all.sh`;
 - `--require-containerd` and strict containerd capability flags;
 - a Zig + Go + worker full-stack containerd restart/adoption gate;
 - one guarded live/cloud entry point and strict GPU/Nydus/JuiceFS modes.

@@ -1,6 +1,6 @@
 # Hivemind POC Changelog
 
-_Last updated: 2026-07-23_
+_Last updated: 2026-07-24_
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
@@ -43,6 +43,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-07-24 — D1 reusable local failover, recovery, and `/run` contracts
+
+What changed:
+- added one reusable isolated three-journal replica harness with real Go API, Rust process worker, process workload, and Go bench
+- cleanup inventories PID start identity and one process group per owned component, resumes stopped groups before TERM, uses bounded TERM/KILL polling, removes only token-owned port locks, and fails on owned process/listener/lock residue without broad process-name killing
+- made data-plane failover, full retained-storage recovery, and `/run` contract phases mandatory in `run-all.sh` unless `--skip-smoke` is explicit
+- added explicit default-disabled process-runtime test controls for overflow, forwarding failure, trickle deadline, execution count, and isolated process ports
+
+Why it matters:
+- local evidence now crosses real processes, TCP sockets, retained journal directories, process runtime, and OS deadlines instead of treating startup text or API-only failover as recovery evidence
+- the leader is actually killed, followers elect, and the old replica restarts from its same journal; a real surviving follower returns status 9, then a bounded frame relay delivers that proven pre-enqueue outcome to the Go gateway and exercises its one safe reprobe without duplicate workload execution
+
+Evidence and limits:
+- RED: `timeout --foreground 10 ./local_cluster_cleanup_test.sh` exited `124` because the interrupted helper waited without a bound for a SIGSTOP'ed owned child
+- GREEN focused contracts: cleanup passed under `15s`; run contract passed in `9s`; failover passed in `20s`; retained-storage recovery passed in `14s`; three later run-contract stability repetitions passed in `49s`, `21s`, and `14s`; all commands had outer timeouts
+- Zig Debug/ReleaseFast, Rust formatting/all-targets (`167 + 3 + 6 + 5`), and Go API/bench race/build gates pass; `tests/run-all.sh --skip-containerd` passed `21` invoked phases with `0` failures in `151s`
+- containerd was explicitly skipped; no containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, AWS, or other live/cloud boundary ran
+- the journal remains experimental single-copy storage without torn-write or power-loss proof; POC acceptance remains `6 / 8`, and historical live infrastructure state was not revalidated or changed
 
 ### 2026-07-23 — Lane C2 canonical shared wire corpus
 

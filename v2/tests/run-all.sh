@@ -58,10 +58,6 @@ run_phase "Infra POC script tests" \
 run_phase "POC deploy output fixtures" \
     bash -c "'$SCRIPT_DIR/poc_deploy_outputs_test.sh'"
 
-# --- Phase 4b: Storage-mode smoke (real binary, no live infra) ---
-run_phase "Storage-mode smoke (volatile + experimental)" \
-    bash -c "'$SCRIPT_DIR/storage_mode_smoke_test.sh'"
-
 # --- Phase 4c: Launcher contract (static HM-BLK-04/05 checks) ---
 run_phase "Launcher contract (smoke/bench/infra)" \
     bash -c "'$SCRIPT_DIR/launcher_contract_test.sh'"
@@ -105,12 +101,18 @@ else
     echo "  SKIP: containerd tests (--skip-containerd)"
 fi
 
-# --- Phase 6: Local smoke test ---
+# --- Phase 6: Mandatory local real-process contracts ---
+run_phase "Local cluster cleanup contract" \
+    bash -c "'$SCRIPT_DIR/local_cluster_cleanup_test.sh'"
 if [ "$SKIP_SMOKE" = false ]; then
-    run_phase "Local smoke test" \
-        bash -c "'$SCRIPT_DIR/local-smoke.sh' --build"
+    run_phase "Local failover contract" \
+        bash -c "'$SCRIPT_DIR/local-failover-smoke.sh' --build"
+    run_phase "Local retained-storage recovery contract" \
+        bash -c "'$SCRIPT_DIR/storage_mode_smoke_test.sh'"
+    run_phase "Local run contract" \
+        bash -c "'$SCRIPT_DIR/local-smoke.sh'"
 else
-    echo "  SKIP: smoke test (--skip-smoke)"
+    echo "  SKIP: local failover, retained-storage recovery, and run contracts (--skip-smoke)"
 fi
 
 echo ""
