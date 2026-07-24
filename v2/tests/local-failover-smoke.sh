@@ -12,7 +12,7 @@ BUILD=false
 [[ "${1:-}" == "--build" ]] && { BUILD=true; shift; }
 [[ $# -eq 0 ]] || { echo "usage: $0 [--build]" >&2; exit 2; }
 
-local_cluster_init "$BUILD" false
+local_cluster_init "$BUILD" true
 local_cluster_start_replicas
 local_cluster_start_api
 local_cluster_start_worker
@@ -31,6 +31,7 @@ done
 
 status="$(local_cluster_run "$deployment" 'before-leader-loss' "$LOCAL_CLUSTER_ROOT/before.out")"
 [[ "$status" == 200 ]]
+python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["echo"] == "before-leader-loss"; assert value["execution_count"] == 1' "$LOCAL_CLUSTER_ROOT/before.out"
 old_leader="$(local_cluster_leader_id)"
 commit_before="$(local_cluster_metric "$old_leader" hivemind_consensus_commit)"
 local_cluster_stop_replica "$old_leader"
@@ -38,15 +39,20 @@ new_leader="$(local_cluster_wait_new_leader "$old_leader")"
 local_cluster_wait_health
 [[ "$new_leader" != "$old_leader" ]]
 
-# The worker rotates across replica addresses after disconnect and preserves the
-# real process-runtime pod while reconnecting.
+# Wait for the worker to reconnect before issuing the non-idempotent workload
+# exactly once. A transport or ambiguous result is a hard failure, never retried.
 for _ in $(seq 1 100); do
-    status="$(local_cluster_run "$deployment" 'after-leader-loss' "$LOCAL_CLUSTER_ROOT/after.out" 2>/dev/null || true)"
-    [[ "$status" == 200 ]] && break
+    if [[ "$(local_cluster_metric "$new_leader" 'hivemind_connections{type="agents"}' 2>/dev/null || echo 0)" == 1 ]] &&
+       [[ "$(local_cluster_metric "$new_leader" 'hivemind_pods{phase="running"}' 2>/dev/null || echo 0)" == 1 ]]; then
+        break
+    fi
     sleep 0.2
 done
+[[ "$(local_cluster_metric "$new_leader" 'hivemind_connections{type="agents"}')" == 1 ]]
+[[ "$(local_cluster_metric "$new_leader" 'hivemind_pods{phase="running"}')" == 1 ]]
+status="$(local_cluster_run "$deployment" 'after-leader-loss' "$LOCAL_CLUSTER_ROOT/after.out")"
 [[ "$status" == 200 ]]
-python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["echo"] == "after-leader-loss"' "$LOCAL_CLUSTER_ROOT/after.out"
+python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["echo"] == "after-leader-loss"; assert value["execution_count"] == 1' "$LOCAL_CLUSTER_ROOT/after.out"
 
 local_cluster_start_replica "$old_leader"
 local_cluster_wait_convergence "$deployment" "$commit_before"

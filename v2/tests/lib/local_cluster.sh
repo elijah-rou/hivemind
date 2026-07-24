@@ -58,27 +58,48 @@ local_cluster_pid_running() {
     [[ -n "$state" && "${state:0:1}" != Z ]]
 }
 
+local_cluster_group_members() {
+    local pgid="$1"
+    [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || return 1
+    ps -eo pid=,pgid=,stat= | awk -v pgid="$pgid" '$2 == pgid && substr($3, 1, 1) != "Z" {print $1}'
+}
+
+local_cluster_group_running() {
+    local members
+    members="$(local_cluster_group_members "$1")" || return 1
+    [[ -n "$members" ]]
+}
+
 local_cluster_stop_pid() {
     local pid="$1" attempt
     [[ -n "$pid" ]] || return 0
-    local_cluster_pid_owned "$pid" || return 0
+    [[ -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || return 0
+    if [[ -r "/proc/$pid/stat" ]] && ! local_cluster_pid_owned "$pid"; then
+        echo "owned process leader $pid changed identity before cleanup" >&2
+        return 1
+    fi
+    if ! local_cluster_group_running "$pid"; then
+        wait "$pid" 2>/dev/null || true
+        unset 'LOCAL_CLUSTER_PID_START_TIMES[$pid]'
+        return 0
+    fi
 
     # A stopped process cannot handle TERM. Resume the complete owned group first.
     kill -CONT -- "-$pid" 2>/dev/null || true
     kill -TERM -- "-$pid" 2>/dev/null || true
     for attempt in $(seq 1 30); do
-        local_cluster_pid_running "$pid" || break
+        local_cluster_group_running "$pid" || break
         sleep 0.1
     done
-    if local_cluster_pid_running "$pid"; then
+    if local_cluster_group_running "$pid"; then
         kill -KILL -- "-$pid" 2>/dev/null || true
         for attempt in $(seq 1 20); do
-            local_cluster_pid_running "$pid" || break
+            local_cluster_group_running "$pid" || break
             sleep 0.1
         done
     fi
-    if local_cluster_pid_running "$pid"; then
-        echo "owned process group $pid survived bounded TERM/KILL cleanup" >&2
+    if local_cluster_group_running "$pid"; then
+        echo "owned process group $pid survived bounded TERM/KILL cleanup: $(local_cluster_group_members "$pid" | tr '\n' ' ')" >&2
         return 1
     fi
     wait "$pid" 2>/dev/null || true
@@ -89,12 +110,12 @@ local_cluster_cleanup_inventory() {
     local pid failed=0
     for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
         [[ -n "$pid" ]] || continue
-        if local_cluster_pid_running "$pid"; then
-            echo "cleanup residue: owned process group $pid" >&2
+        if local_cluster_group_running "$pid"; then
+            echo "cleanup residue: owned process group $pid members $(local_cluster_group_members "$pid" | tr '\n' ' ')" >&2
             failed=1
         fi
     done
-    if [[ -n "${LOCAL_CLUSTER_BASE_PORT:-}" ]] && command -v ss >/dev/null 2>&1; then
+    if [[ -n "${LOCAL_CLUSTER_BASE_PORT:-}" ]]; then
         local offset port
         for offset in {1..12} 20 21 22 30 31 32 40 41 42; do
             port=$((LOCAL_CLUSTER_BASE_PORT + offset))
@@ -152,20 +173,22 @@ local_cluster_init() {
     trap 'exit 130' INT TERM
     LOCAL_CLUSTER_BUILD="$build"
     LOCAL_CLUSTER_TEST_CONTROLS="$test_controls"
+    command -v ss >/dev/null 2>&1 || {
+        echo "local cluster requires ss for mandatory listener inventory" >&2
+        return 1
+    }
 
     for attempt in $(seq 0 99); do
         candidate=$((24000 + (($$ + attempt * 37) % 1200) * 20))
         LOCAL_CLUSTER_PORT_LOCK="/tmp/hivemind-local-ports-$candidate.lock"
         local ports_free=true offset port
-        if command -v ss >/dev/null 2>&1; then
-            for offset in {1..12} 20 21 22 30 31 32 40 41 42; do
-                port=$((candidate + offset))
-                if ss -H -ltn 2>/dev/null | awk -v port="$port" '{address=$4; sub(/^.*:/, "", address); if (address == port) found=1} END {exit !found}'; then
-                    ports_free=false
-                    break
-                fi
-            done
-        fi
+        for offset in {1..12} 20 21 22 30 31 32 40 41 42; do
+            port=$((candidate + offset))
+            if ss -H -ltn 2>/dev/null | awk -v port="$port" '{address=$4; sub(/^.*:/, "", address); if (address == port) found=1} END {exit !found}'; then
+                ports_free=false
+                break
+            fi
+        done
         [[ "$ports_free" == true ]] || continue
         if mkdir "$LOCAL_CLUSTER_PORT_LOCK" 2>/dev/null; then
             LOCAL_CLUSTER_PORT_LOCK_TOKEN="$$:$RANDOM:$candidate"

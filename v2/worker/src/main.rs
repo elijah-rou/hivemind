@@ -13,6 +13,23 @@ extern "C" fn handle_signal(_: libc::c_int) {
 const MAX_REPLICA_ADDRS: usize = 64;
 const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 30;
 
+struct RuntimeOwner {
+    runtime: Box<dyn runtime::Runtime>,
+}
+
+impl RuntimeOwner {
+    fn new<F>(build: F) -> Self
+    where
+        F: FnOnce() -> Box<dyn runtime::Runtime>,
+    {
+        Self { runtime: build() }
+    }
+
+    fn runtime(&self) -> &dyn runtime::Runtime {
+        self.runtime.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunConfig {
     replica_addr: String,
@@ -260,7 +277,9 @@ fn cmd_run(args: &[String]) {
         );
     }
 
-    let runtime: Box<dyn runtime::Runtime> = match runtime_mode.as_str() {
+    // Runtime ownership spans every control-plane session. Reconnects reset
+    // transport registration only; recreating this owner would orphan pods.
+    let runtime_owner = RuntimeOwner::new(|| match runtime_mode.as_str() {
         "process" => {
             if test_process_controls {
                 eprintln!("worker: explicit test-only process controls enabled");
@@ -288,7 +307,7 @@ fn cmd_run(args: &[String]) {
             eprintln!("unknown runtime: {other}");
             std::process::exit(1);
         }
-    };
+    });
 
     let mut backoff_ms: u64 = 100;
     let max_backoff_ms: u64 = 10_000;
@@ -308,7 +327,7 @@ fn cmd_run(args: &[String]) {
                 run_worker_loop(
                     &mut node_worker,
                     &mut rio,
-                    runtime.as_ref(),
+                    runtime_owner.runtime(),
                     &metrics_server,
                 );
 
@@ -338,9 +357,11 @@ fn cmd_run(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_replica_addrs, parse_run_config, reconcile_shutdown, RunConfig, MAX_REPLICA_ADDRS,
-        MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
+        parse_replica_addrs, parse_run_config, reconcile_shutdown, RunConfig, RuntimeOwner,
+        MAX_REPLICA_ADDRS, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
     };
+    use hivemind_worker::{runtime::Runtime, sim, types, worker};
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     fn parse(args: &[&str], env_pairs: &[(&str, &str)]) -> RunConfig {
@@ -409,6 +430,29 @@ mod tests {
             &[("HIVEMIND_AGENT_METRICS_PORT", "8081")],
         );
         assert_eq!(cfg.metrics_port, Some(8081));
+    }
+
+    #[test]
+    fn runtime_owner_is_constructed_once_across_connection_loss() {
+        let constructions = Cell::new(0);
+        let owner = RuntimeOwner::new(|| {
+            constructions.set(constructions.get() + 1);
+            Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())) as Box<dyn Runtime>
+        });
+        let first_runtime = owner.runtime() as *const dyn Runtime as *const ();
+
+        let mut node_worker = worker::Worker::new(
+            "runtime-owner-test".into(),
+            types::GpuType::None,
+            0,
+            1000,
+            1024,
+        );
+        node_worker.on_connection_lost();
+        let second_runtime = owner.runtime() as *const dyn Runtime as *const ();
+
+        assert_eq!(constructions.get(), 1);
+        assert_eq!(first_runtime, second_runtime);
     }
 
     #[test]

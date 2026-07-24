@@ -19,6 +19,7 @@ done
 
 PASS=0
 FAIL=0
+RUN_PHASE_TIMEOUT_SECONDS=900
 
 run_phase() {
     local name="$1"
@@ -27,7 +28,7 @@ run_phase() {
     echo "============================================"
     echo "  $name"
     echo "============================================"
-    if "$@"; then
+    if timeout --foreground --kill-after=10s "${RUN_PHASE_TIMEOUT_SECONDS}s" "$@"; then
         echo "  => $name: PASSED"
         PASS=$((PASS + 1))
     else

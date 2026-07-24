@@ -4,25 +4,25 @@ This catalog describes every maintained shell script under `v2/`. [Testing and e
 
 ## Field conventions
 
-Each catalog row records classification/topology, dependencies and boundedness, assertions/boundaries, artifacts/cleanup, and flags/exits. **No script has a repository-wide default timeout.** “Internal bounds” means the script contains explicit polling/command deadlines; “none” means no overall deadline is imposed, even if individual tools have deadlines. Unless stated otherwise, nonzero means setup or an assertion failed; zero means only that the invoked assertions completed.
+Each catalog row records classification/topology, dependencies and boundedness, assertions/boundaries, artifacts/cleanup, and flags/exits. `run-all.sh` bounds each phase to 900 seconds with a 10-second TERM-to-KILL interval; callers still apply the published aggregate outer bound. Other scripts have no repository-wide default timeout. “Internal bounds” means the script contains explicit polling/command deadlines; “none” means no overall deadline is imposed, even if individual tools have deadlines. Unless stated otherwise, nonzero means setup or an assertion failed; zero means only that the invoked assertions completed.
 
 ## Quick commands
 
 | Purpose | Command |
 |---|---|
-| Aggregate current phases | `cd v2 && ./tests/run-all.sh` |
-| Deterministic aggregate without containerd | `cd v2 && ./tests/run-all.sh --skip-containerd` |
-| Three-replica process-runtime run contract | `cd v2 && ./tests/local-run-contract-smoke.sh --build` |
-| Three-replica data-plane failover | `cd v2 && ./tests/local-failover-smoke.sh --build` |
-| Retained storage recovery | `cd v2 && ./tests/local-storage-recovery-smoke.sh --build` |
-| Shared protocol-v6 wire corpus | `cd v2/tests && ./wire-contract-test.sh` |
-| Privileged containerd component integration | `cd v2 && ./tests/containerd/run-tests.sh` |
+| Aggregate current phases | `cd v2 && timeout --foreground --kill-after=10s 3600s ./tests/run-all.sh` |
+| Deterministic aggregate without containerd | `cd v2 && timeout --foreground --kill-after=10s 3600s ./tests/run-all.sh --skip-containerd` |
+| Three-replica process-runtime run contract | `cd v2 && timeout --foreground --kill-after=10s 300s ./tests/local-run-contract-smoke.sh --build` |
+| Three-replica data-plane failover | `cd v2 && timeout --foreground --kill-after=10s 300s ./tests/local-failover-smoke.sh --build` |
+| Retained storage recovery | `cd v2 && timeout --foreground --kill-after=10s 300s ./tests/local-storage-recovery-smoke.sh --build` |
+| Shared protocol-v6 wire corpus | `cd v2/tests && timeout --foreground --kill-after=10s 600s ./wire-contract-test.sh` |
+| Privileged containerd component integration | `cd v2 && timeout --foreground --kill-after=10s 1800s ./tests/containerd/run-tests.sh` |
 
 `run-all.sh` supports only `--skip-containerd` and `--skip-smoke`. `--skip-containerd` and Docker-missing auto-skip can both yield exit 0 while containerd remains **unverified**. `--skip-smoke` skips all three mandatory local failover/recovery/run contracts and makes local process coverage unverified. Unknown flags exit 1.
 
 ## `run-all.sh` phases
 
-The runner continues after a failed invoked phase and exits 1 if any invoked phase failed. Do not infer a fixed phase total.
+The runner gives every phase a 900-second deadline, continues after a failed or timed-out invoked phase, and exits 1 if any invoked phase failed. Do not infer a fixed phase total.
 
 | Phase | Invocation | Requirement |
 |---|---|---|

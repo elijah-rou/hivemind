@@ -43,11 +43,14 @@ python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["e
 started="$(date +%s%3N)"
 status="$(local_cluster_run "$deployment" '__hivemind_test_trickle_deadline__' "$LOCAL_CLUSTER_ROOT/run-trickle.json")"
 elapsed=$(( $(date +%s%3N) - started ))
-[[ "$status" == 502 && "$elapsed" -lt 3000 ]]
+[[ "$status" == 502 && "$elapsed" -ge 400 && "$elapsed" -lt 3000 ]]
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["error"] == "forwarding_failed"; assert value["status"] == 6' "$LOCAL_CLUSTER_ROOT/run-trickle.json"
 
 # Abandon a real client after sending a request that cannot complete immediately.
-python3 - "$(local_cluster_client_port "$(local_cluster_leader_id)")" "$deployment" <<'PY'
+abandon_leader="$(local_cluster_leader_id)"
+abandon_enqueued_before="$(local_cluster_metric "$abandon_leader" hivemind_requests_enqueued_total)"
+abandon_dispatched_before="$(local_cluster_metric "$abandon_leader" hivemind_requests_dispatched_total)"
+python3 - "$(local_cluster_client_port "$abandon_leader")" "$deployment" <<'PY'
 import socket,struct,sys
 port=int(sys.argv[1]); name=sys.argv[2].encode(); payload=b'__hivemind_test_trickle_deadline__'
 body=struct.pack('<Q', 0xabad1dea)+name.ljust(64,b'\0')+struct.pack('<I',len(payload))+payload
@@ -56,17 +59,33 @@ frame=struct.pack('<I',1+len(inner))+b'\0'+inner
 with socket.create_connection(('127.0.0.1',port),timeout=2) as sock:
     sock.sendall(frame)
 PY
+for _ in $(seq 1 100); do
+    abandon_enqueued_after="$(local_cluster_metric "$abandon_leader" hivemind_requests_enqueued_total 2>/dev/null || echo x)"
+    [[ "$abandon_enqueued_after" =~ ^[0-9]+$ ]] &&
+        (( abandon_enqueued_after == abandon_enqueued_before + 1 )) && break
+    sleep 0.05
+done
+[[ "$abandon_enqueued_after" =~ ^[0-9]+$ ]]
+(( abandon_enqueued_after == abandon_enqueued_before + 1 ))
+for _ in $(seq 1 100); do
+    abandon_dispatched_after="$(local_cluster_metric "$abandon_leader" hivemind_requests_dispatched_total 2>/dev/null || echo x)"
+    [[ "$abandon_dispatched_after" =~ ^[0-9]+$ ]] &&
+        (( abandon_dispatched_after == abandon_dispatched_before + 1 )) && break
+    sleep 0.05
+done
+[[ "$abandon_dispatched_after" =~ ^[0-9]+$ ]]
+(( abandon_dispatched_after == abandon_dispatched_before + 1 ))
 local_cluster_wait_queue_zero
 
 # Keep the API-side socket open through a frame relay while the actual leader
 # process is killed. After that replica restarts from the same journal as a
-# follower, the relay delivers one request to it, records status 9, and the API
-# safely reprobes the real addresses exactly once.
+# follower, the relay forwards one request to that real replica, records its
+# actual status 9, and the API safely reprobes the real addresses exactly once.
 stale_leader="$(local_cluster_leader_id)"
 relay_port=$((LOCAL_CLUSTER_BASE_PORT + 4))
-setsid python3 - "$relay_port" "$(local_cluster_client_port "$stale_leader")" "$LOCAL_CLUSTER_ROOT/stale-relay.log" "$LOCAL_CLUSTER_ROOT/inject-status-9" <<'PY' &
-import os, socket, struct, sys
-listen_port, backend_port, log_path, inject_path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+setsid python3 - "$relay_port" "$(local_cluster_client_port "$stale_leader")" "$LOCAL_CLUSTER_ROOT/stale-relay.log" <<'PY' &
+import socket, struct, sys
+listen_port, backend_port, log_path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 
 def read_exact(sock, length):
     data = b''
@@ -92,14 +111,6 @@ with socket.socket() as listener:
                     assert 1 <= length <= 65536
                     request_body = read_exact(front, length)
                     request = header + request_body
-                    if len(request_body) >= 12 and request_body[3] == 0x22 and os.path.exists(inject_path):
-                        request_id = request_body[4:12]
-                        reply_body = b'\0' + struct.pack('<H', 6) + b'\x23' + request_id + b'\x09'
-                        front.sendall(struct.pack('<I', len(reply_body)) + reply_body)
-                        os.unlink(inject_path)
-                        with open(log_path, 'a', encoding='utf-8') as log:
-                            log.write('run_status=9\n')
-                        continue
                     with socket.create_connection(('127.0.0.1', backend_port), timeout=5) as backend:
                         backend.settimeout(5)
                         backend.sendall(request)
@@ -129,21 +140,17 @@ local_cluster_wait_health
 
 local_cluster_stop_replica "$stale_leader"
 new_leader="$(local_cluster_wait_new_leader "$stale_leader")"
-status_follower=""
-for id in 0 1 2; do
-    [[ "$id" == "$stale_leader" || "$id" == "$new_leader" ]] || status_follower="$id"
-done
-[[ -n "$status_follower" ]]
+local_cluster_start_replica "$stale_leader"
 for _ in $(seq 1 100); do
-    if [[ "$(local_cluster_metric "$status_follower" hivemind_replica_status 2>/dev/null || echo x)" == 0 ]] &&
-       [[ "$(local_cluster_metric "$status_follower" hivemind_is_leader 2>/dev/null || echo x)" == 0 ]]; then
+    if [[ "$(local_cluster_metric "$stale_leader" hivemind_replica_status 2>/dev/null || echo x)" == 0 ]] &&
+       [[ "$(local_cluster_metric "$stale_leader" hivemind_is_leader 2>/dev/null || echo x)" == 0 ]]; then
         break
     fi
     sleep 0.1
 done
-[[ "$(local_cluster_metric "$status_follower" hivemind_replica_status)" == 0 ]]
-[[ "$(local_cluster_metric "$status_follower" hivemind_is_leader)" == 0 ]]
-python3 - "$(local_cluster_client_port "$status_follower")" "$deployment" <<'PY'
+[[ "$(local_cluster_metric "$stale_leader" hivemind_replica_status)" == 0 ]]
+[[ "$(local_cluster_metric "$stale_leader" hivemind_is_leader)" == 0 ]]
+python3 - "$(local_cluster_client_port "$stale_leader")" "$deployment" <<'PY'
 import socket, struct, sys
 port, name = int(sys.argv[1]), sys.argv[2].encode()
 payload = b'core-status-9-proof'
@@ -167,13 +174,14 @@ assert response[3] == 0x23
 assert struct.unpack('<Q', response[4:12])[0] == request_id
 assert response[12] == 9
 PY
-local_cluster_start_replica "$stale_leader"
-touch "$LOCAL_CLUSTER_ROOT/inject-status-9"
+reprobe_dispatched_before="$(local_cluster_metric "$new_leader" hivemind_requests_dispatched_total)"
 status="$(local_cluster_run "$deployment" 'safe-reprobe-once' "$LOCAL_CLUSTER_ROOT/run-reprobe.out")"
 [[ "$status" == 200 ]]
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["echo"] == "safe-reprobe-once"; assert value["execution_count"] == 1' "$LOCAL_CLUSTER_ROOT/run-reprobe.out"
 grep -qx 'run_status=9' "$LOCAL_CLUSTER_ROOT/stale-relay.log"
 [[ "$(local_cluster_metric "$stale_leader" hivemind_requests_enqueued_total)" == 0 ]]
+reprobe_dispatched_after="$(local_cluster_metric "$new_leader" hivemind_requests_dispatched_total)"
+(( reprobe_dispatched_after == reprobe_dispatched_before + 1 ))
 local_cluster_wait_convergence "$deployment" 1
 
 # Real bench performs its production leader probe and workload traffic.

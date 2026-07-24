@@ -85,7 +85,8 @@ impl Runtime for ProcessRuntime {
                 r#"
 import http.server, json, os, sys
 class H(http.server.BaseHTTPRequestHandler):
-    execution_counts = {{}}
+    last_body = None
+    execution_count = 0
     test_controls = {}
     def do_GET(self):
         response = json.dumps(dict(os.environ))
@@ -97,7 +98,12 @@ class H(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get('content-length', 0))
         body = self.rfile.read(length) if length > 0 else b''
         key = body.decode('utf-8', errors='replace')
-        H.execution_counts[key] = H.execution_counts.get(key, 0) + 1
+        if H.test_controls:
+            if H.last_body == body:
+                H.execution_count += 1
+            else:
+                H.last_body = body
+                H.execution_count = 1
         if H.test_controls and body == b'__hivemind_test_response_too_large__':
             response = b'x' * {}
             self.send_response(200)
@@ -119,7 +125,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 import time; time.sleep(0.2)
             self.wfile.write(b'0\r\n\r\n')
             return
-        response = json.dumps({{"status": "ok", "echo": key, "pod_id": {}, "execution_count": H.execution_counts[key]}})
+        result = {{"status": "ok", "echo": key, "pod_id": {}}}
+        if H.test_controls:
+            result["execution_count"] = H.execution_count
+        response = json.dumps(result)
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(response)))
@@ -128,7 +137,11 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
 "#,
-                if self.test_controls_enabled { "True" } else { "False" },
+                if self.test_controls_enabled {
+                    "True"
+                } else {
+                    "False"
+                },
                 MAX_RUN_RESPONSE_BODY + 1,
                 spec.pod_id,
                 port
@@ -488,6 +501,33 @@ mod tests {
         assert!(body
             .windows(b"after-reconnect".len())
             .any(|part| part == b"after-reconnect"));
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn default_process_response_omits_test_execution_count() {
+        let runtime = ProcessRuntime::with_base_port(24_700);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 81,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        let body = runtime.forward_run(&handle, 8080, b"ordinary").unwrap();
+        let response = String::from_utf8(body).unwrap();
+        assert!(response.contains("\"echo\": \"ordinary\""));
+        assert!(!response.contains("execution_count"));
         runtime.remove_pod(&handle).unwrap();
     }
 
