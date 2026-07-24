@@ -123,11 +123,11 @@ validate_zero_inventory() {
     local file="$1" key value count=0
     declare -A seen=()
     while IFS='=' read -r key value; do
-        [[ "$key" =~ ^(instances|volumes|network_resources|buckets|repositories|locks|units|processes)$ ]] || return 1
+        [[ "$key" =~ ^(instances|volumes|network_resources|buckets|repositories|locks|units|processes|deployments|containerd_tasks|containerd_containers|juicefs_mounts|ssm_commands|temporary_secret_files)$ ]] || return 1
         [[ "$value" == 0 && -z "${seen[$key]:-}" ]] || return 1
         seen[$key]=1; count=$((count + 1))
     done <"$file"
-    [[ "$count" == 8 ]]
+    [[ "$count" == 14 ]]
 }
 
 # shellcheck disable=SC2329 # Invoked by EXIT trap.
@@ -179,6 +179,11 @@ finish() {
                     --command-statuses "$STATUS_FILE" --metrics "$EVIDENCE_DIR/metrics.txt" \
                     --journals "$EVIDENCE_DIR/journals.txt" --source-state "$EVIDENCE_DIR/source-state.txt" \
                     --pre-inventory "$PRE_INVENTORY_FILE" --cleanup "$INVENTORY_FILE" \
+                    --review-record "$EVIDENCE_DIR/reviewed-plan-record.txt" \
+                    --apply-log "$EVIDENCE_DIR/terraform-apply.log" \
+                    --destroy-log "$EVIDENCE_DIR/terraform-destroy.log" \
+                    --terraform-outputs "$EVIDENCE_DIR/terraform-outputs.json" \
+                    --runbook-artifacts "$EVIDENCE_DIR/runbook" \
                     --redaction-status 0 --output "$EVIDENCE_DIR/manifest.json" || status=1
                 if [[ "$status" == 0 ]] && ! HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" \
                     "$SCRIPT_DIR/redaction-scan.sh" "$EVIDENCE_DIR" >/dev/null; then

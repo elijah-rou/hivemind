@@ -6,6 +6,8 @@ import argparse, hashlib, json, os, re, sys
 
 MAX_ARTIFACT_BYTES = 1_048_576
 MAX_COMMANDS = 128
+MAX_TREE_FILES = 256
+MAX_TREE_BYTES = 64 * 1_048_576
 sha256_pattern = re.compile(r"^[0-9a-f]{64}$")
 commit_pattern = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -22,6 +24,11 @@ parser.add_argument("--journals", required=True)
 parser.add_argument("--cleanup", required=True)
 parser.add_argument("--source-state", required=True)
 parser.add_argument("--pre-inventory", required=True)
+parser.add_argument("--review-record", required=True)
+parser.add_argument("--apply-log", required=True)
+parser.add_argument("--destroy-log", required=True)
+parser.add_argument("--terraform-outputs", required=True)
+parser.add_argument("--runbook-artifacts", required=True)
 parser.add_argument("--redaction-status", required=True, type=int)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
@@ -45,6 +52,30 @@ def artifact(path):
         while chunk := source.read(65536):
             digest.update(chunk)
     return {"path": os.path.abspath(path), "bytes": size, "sha256": digest.hexdigest()}
+
+def artifact_tree(root):
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise SystemExit(f"artifact tree must be a directory: {root}")
+    records = []
+    total_bytes = 0
+    for directory, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        if any(os.path.islink(os.path.join(directory, name)) for name in directories):
+            raise SystemExit(f"artifact tree contains a symlink directory: {directory}")
+        for name in files:
+            path = os.path.join(directory, name)
+            record = artifact(path)
+            total_bytes += record["bytes"]
+            if total_bytes > MAX_TREE_BYTES:
+                raise SystemExit(f"artifact tree exceeds {MAX_TREE_BYTES} bytes: {root}")
+            record["relative_path"] = os.path.relpath(path, root)
+            records.append(record)
+            if len(records) > MAX_TREE_FILES:
+                raise SystemExit(f"artifact tree exceeds {MAX_TREE_FILES} files: {root}")
+    if not records:
+        raise SystemExit(f"artifact tree is empty: {root}")
+    return records
 
 statuses = {}
 status_artifact = artifact(args.command_statuses)
@@ -93,6 +124,11 @@ manifest = {
     "exact_binary_digests": artifact(args.binary_list),
     "exact_image_digests": artifact(args.image_digests),
     "terraform_plan_sha256": args.plan_sha,
+    "reviewed_plan_record": artifact(args.review_record),
+    "terraform_apply_log": artifact(args.apply_log),
+    "terraform_destroy_log": artifact(args.destroy_log),
+    "terraform_outputs": artifact(args.terraform_outputs),
+    "runbook_artifacts": artifact_tree(args.runbook_artifacts),
     "command_exit_statuses": statuses,
     "command_status_artifact": status_artifact,
     "metrics": artifact(args.metrics),

@@ -16,6 +16,7 @@ WORKSPACE="${TF_WORKSPACE:?}"
 BUCKET="${HIVEMIND_LIVE_BUCKET:?}"
 REGION="${AWS_REGION:?}"
 KEEP_INFRA="${KEEP_INFRA:-0}"
+EVIDENCE_DIR="${HIVEMIND_LIVE_EVIDENCE_DIR:?}"
 [[ "$WORKSPACE" == *"$RUN_TOKEN"* && "$BUCKET" == *"$RUN_TOKEN"* ]]
 
 if [[ "$KEEP_INFRA" == 1 ]]; then
@@ -26,7 +27,8 @@ fi
 terraform -chdir="$TF_ROOT" workspace select "$WORKSPACE" >/dev/null
 timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_DESTROY_TIMEOUT_SECONDS:-1800}s" \
     terraform -chdir="$TF_ROOT" destroy -auto-approve \
-    -var "run_token=$RUN_TOKEN" -var "ecr_repository_name=${HIVEMIND_LIVE_ECR:?}" -var "region=$REGION"
+    -var "run_token=$RUN_TOKEN" -var "ecr_repository_name=${HIVEMIND_LIVE_ECR:?}" -var "region=$REGION" \
+    > >(tee "$EVIDENCE_DIR/terraform-destroy.log") 2>&1
 
 marker="$(mktemp)"
 trap 'rm -f "$marker"' EXIT

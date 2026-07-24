@@ -63,6 +63,7 @@ for change in changes:
         raise SystemExit("plan ECR repository differs from guarded name")
 PY
 rm -f "$PLAN_JSON"
+install -m 600 "$REVIEW_RECORD" "$EVIDENCE_DIR/reviewed-plan-record.txt"
 record_success reviewed_plan_validation
 
 # Ownership starts only after the parent wrapper's cleanup trap and zero inventory.
@@ -73,14 +74,21 @@ aws s3api put-object --bucket "$BUCKET" --key .hivemind-owner --body "$marker_fi
 rm -f "$marker_file"
 record_success bucket_ownership
 
-run_recorded terraform_apply timeout --foreground --kill-after=30s \
-    "${HIVEMIND_TERRAFORM_APPLY_TIMEOUT_SECONDS:-1800}s" terraform -chdir="$TF_ROOT" apply "$PLAN"
+set +e
+timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_APPLY_TIMEOUT_SECONDS:-1800}s" \
+    terraform -chdir="$TF_ROOT" apply "$PLAN" > >(tee "$EVIDENCE_DIR/terraform-apply.log") 2>&1
+apply_status=$?
+set -e
+printf 'terraform_apply\t%s\n' "$apply_status" >>"$STATUS_FILE"
+[[ "$apply_status" == 0 ]] || exit "$apply_status"
+terraform -chdir="$TF_ROOT" output -json >"$EVIDENCE_DIR/terraform-outputs.json"
 
 export TF_VAR_run_token="$RUN_TOKEN" TF_VAR_ecr_repository_name="$ECR_NAME" TF_VAR_region="$REGION"
 export ECR_REPOSITORY="$ECR_NAME" TAG="live-${RUN_TOKEN:0:8}" SKIP_HIVEMIND_APPLY=true
 export DESTROY_HIVEMIND_AFTER=false DESTROY_EKS_AFTER=false RUN_EKS=false
 export ARTIFACT_ROOT="$EVIDENCE_DIR/runbook"
 run_recorded poc_runbook bash "$ROOT_DIR/scripts/poc-runbook.sh"
+[[ -d "$EVIDENCE_DIR/runbook" ]] || { echo "FAIL: runbook evidence directory missing" >&2; exit 1; }
 
 replica_ips="$(terraform -chdir="$TF_ROOT" output -json replica_public_ips)"
 worker_cpu="$(terraform -chdir="$TF_ROOT" output -raw worker_cpu_public_ip)"

@@ -49,8 +49,26 @@ else
 fi
 units="$({ systemctl list-units --all --no-legend "*$RUN_TOKEN*" 2>/dev/null || true; } | awk 'END {print NR + 0}')"
 processes="$(ps -eo args= | awk -v token="$RUN_TOKEN" -v self="$0" 'index($0, token) && !index($0, self) {count++} END {print count + 0}')"
-for value in "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes"; do
+# Runtime-owned deployments, tasks, containers, and mounts cannot outlive their
+# token-owned hosts. Count every remaining host conservatively until teardown
+# proves that the host boundary itself is absent.
+deployments="$instances"
+containerd_tasks="$instances"
+containerd_containers="$instances"
+juicefs_mounts="$instances"
+ssm_commands=0
+for command_status in Pending InProgress Delayed Cancelling; do
+    active_commands="$(aws_count ssm list-commands --region "$REGION" --filters \
+        "key=Comment,value=$RUN_TOKEN" "key=Status,value=$command_status" \
+        --query 'length(Commands)' --output text)"
+    [[ "$active_commands" =~ ^[0-9]+$ ]] || { echo "invalid SSM inventory count" >&2; exit 1; }
+    ssm_commands=$((ssm_commands + active_commands))
+done
+temporary_secret_files="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name "*${RUN_TOKEN}*" -print 2>/dev/null | awk 'END {print NR + 0}')"
+for value in "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes" \
+    "$deployments" "$containerd_tasks" "$containerd_containers" "$juicefs_mounts" "$ssm_commands" "$temporary_secret_files"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "invalid inventory count" >&2; exit 1; }
 done
-printf 'instances=%s\nvolumes=%s\nnetwork_resources=%s\nbuckets=%s\nrepositories=%s\nlocks=%s\nunits=%s\nprocesses=%s\n' \
-    "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes"
+printf 'instances=%s\nvolumes=%s\nnetwork_resources=%s\nbuckets=%s\nrepositories=%s\nlocks=%s\nunits=%s\nprocesses=%s\ndeployments=%s\ncontainerd_tasks=%s\ncontainerd_containers=%s\njuicefs_mounts=%s\nssm_commands=%s\ntemporary_secret_files=%s\n' \
+    "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes" \
+    "$deployments" "$containerd_tasks" "$containerd_containers" "$juicefs_mounts" "$ssm_commands" "$temporary_secret_files"

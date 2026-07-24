@@ -23,18 +23,24 @@ printf '%s  fixture-binary\n' "$sha" >"$HIVEMIND_LIVE_EVIDENCE_DIR/binary-list.s
 printf 'sha256:%s\n' "$sha" >"$HIVEMIND_LIVE_EVIDENCE_DIR/image-digests.txt"
 printf 'queue=0 in_flight=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/metrics.txt"
 printf 'journal=fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/journals.txt"
+printf 'reviewed fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/reviewed-plan-record.txt"
+printf 'apply fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-apply.log"
+printf '{}\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-outputs.json"
+mkdir "$HIVEMIND_LIVE_EVIDENCE_DIR/runbook"
+printf 'request=1 status=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/api-identities.txt"
 exit "${EXECUTOR_RC:-0}"
 STUB
 cat >"$TMP/cleanup" <<'STUB'
 #!/usr/bin/env bash
 printf 'cleanup\n' >>"${FIXTURE_LOG:?}"
+printf 'destroy fixture\n' >"${HIVEMIND_LIVE_EVIDENCE_DIR:?}/terraform-destroy.log"
 exit "${CLEANUP_RC:-0}"
 STUB
 cat >"$TMP/inventory" <<'STUB'
 #!/usr/bin/env bash
 instances=0
 if [[ "${OWNED_INSTANCES:-0}" == 1 ]] && grep -q '^cleanup$' "${FIXTURE_LOG:?}"; then instances=1; fi
-printf 'instances=%s\nvolumes=0\nnetwork_resources=0\nbuckets=0\nrepositories=0\nlocks=0\nunits=0\nprocesses=0\n' "$instances"
+printf 'instances=%s\nvolumes=0\nnetwork_resources=0\nbuckets=0\nrepositories=0\nlocks=0\nunits=0\nprocesses=0\ndeployments=0\ncontainerd_tasks=0\ncontainerd_containers=0\njuicefs_mounts=0\nssm_commands=0\ntemporary_secret_files=0\n' "$instances"
 STUB
 chmod +x "$TMP/bin/aws" "$TMP/executor" "$TMP/cleanup" "$TMP/inventory"
 : >"$TMP/review"
@@ -66,6 +72,12 @@ if "$SCRIPT_DIR/../scripts/poc-runbook.sh" >"$TMP/direct-runbook.out" 2>&1; then
 fi
 grep -q 'refusing live runbook outside' "$TMP/direct-runbook.out"
 [[ ! -s "$FIXTURE_LOG" ]] || { echo "FAIL: direct runbook called AWS before guard" >&2; exit 1; }
+if env HIVEMIND_ALLOW_LIVE=1 HIVEMIND_GUARDRAILS_ACTIVE=1 \
+    "$SCRIPT_DIR/../scripts/poc-runbook.sh" >"$TMP/forged-runbook.out" 2>&1; then
+  echo "FAIL: forged live guard environment accepted" >&2; exit 1
+fi
+grep -q 'refusing live runbook outside' "$TMP/forged-runbook.out"
+[[ ! -s "$FIXTURE_LOG" ]] || { echo "FAIL: forged runbook called AWS before parent validation" >&2; exit 1; }
 
 if env -u HIVEMIND_ALLOW_LIVE "$RUNNER" >"$TMP/deny.out" 2>&1; then
   echo "FAIL: missing live authorization accepted" >&2; exit 1

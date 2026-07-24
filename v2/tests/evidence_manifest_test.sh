@@ -13,6 +13,15 @@ printf 'commit=%s\ndirty=\n' "$sha" >"$TMP/source-state.txt"
 printf 'instances=0\n' >"$TMP/pre.txt"
 printf '%s  fixture-binary\n' "$sha" >"$TMP/binary-list.sha256"
 printf 'sha256:%s\n' "$sha" >"$TMP/image-digests.txt"
+printf '%s\n' "$sha" >"$TMP/review-record.txt"
+printf 'apply complete\n' >"$TMP/terraform-apply.log"
+printf 'destroy complete\n' >"$TMP/terraform-destroy.log"
+printf '{"api_url":"[REDACTED]"}\n' >"$TMP/terraform-outputs.json"
+mkdir "$TMP/runbook-artifacts"
+printf '{"request_id":1,"status":0}\n' >"$TMP/runbook-artifacts/api-identities.jsonl"
+printf 'fault_queue=0\n' >"$TMP/runbook-artifacts/fault-period-metrics.txt"
+printf 'tasks=1 containers=1 cdi=0 cgroup=verified gpu=verified\n' >"$TMP/runbook-artifacts/runtime-proof.txt"
+printf 'instances=1\n' >"$TMP/runbook-artifacts/intermediate-inventory.txt"
 export HIVEMIND_EVIDENCE_STARTED_AT=2026-07-24T00:00:00Z HIVEMIND_EVIDENCE_ENDED_AT=2026-07-24T00:01:00Z
 export HIVEMIND_EVIDENCE_COMMAND='./tests/live/run.sh' HIVEMIND_EVIDENCE_REGION=us-test-1
 export HIVEMIND_EVIDENCE_OWNERSHIP_HASH="$sha" HIVEMIND_EVIDENCE_WORKSPACE_HASH="$sha"
@@ -22,14 +31,18 @@ export HIVEMIND_EVIDENCE_KEEP_INFRA=0 HIVEMIND_EVIDENCE_FINAL_STATUS=0
   --binary-list "$TMP/binary-list.sha256" --image-digests "$TMP/image-digests.txt" --plan-sha "$sha" \
   --command-statuses "$TMP/status.tsv" --metrics "$TMP/metrics.txt" --journals "$TMP/journals.txt" \
   --source-state "$TMP/source-state.txt" --pre-inventory "$TMP/pre.txt" \
+  --review-record "$TMP/review-record.txt" --apply-log "$TMP/terraform-apply.log" \
+  --destroy-log "$TMP/terraform-destroy.log" --terraform-outputs "$TMP/terraform-outputs.json" \
+  --runbook-artifacts "$TMP/runbook-artifacts" \
   --cleanup "$TMP/cleanup.txt" --redaction-status 0 --output "$TMP/manifest.json"
 python3 - "$TMP/manifest.json" <<'PY'
 import json, sys
 m=json.load(open(sys.argv[1]))
-required={"commit_sha","binary_sha256","image_sha256","exact_binary_digests","exact_image_digests","terraform_plan_sha256","command_exit_statuses","metrics","journals","source_state","pre_ownership_inventory","cleanup_inventory","started_at_utc","ended_at_utc","exact_command","region","ownership_token_sha256","workspace_sha256","keep_infra","capability_requirements","final_exit_status","redaction_scan_command","redaction_scan_exit_status"}
+required={"commit_sha","binary_sha256","image_sha256","exact_binary_digests","exact_image_digests","terraform_plan_sha256","reviewed_plan_record","terraform_apply_log","terraform_destroy_log","terraform_outputs","runbook_artifacts","command_exit_statuses","metrics","journals","source_state","pre_ownership_inventory","cleanup_inventory","started_at_utc","ended_at_utc","exact_command","region","ownership_token_sha256","workspace_sha256","keep_infra","capability_requirements","final_exit_status","redaction_scan_command","redaction_scan_exit_status"}
 assert required <= m.keys()
 assert m["command_exit_statuses"] == {"preflight": 0, "workload": 0, "cleanup": 0, "redaction_scan": 0}
 assert m["cleanup_inventory"]["sha256"]
+assert {item["relative_path"] for item in m["runbook_artifacts"]} == {"api-identities.jsonl", "fault-period-metrics.txt", "intermediate-inventory.txt", "runtime-proof.txt"}
 PY
 
 too_large="$TMP/large"

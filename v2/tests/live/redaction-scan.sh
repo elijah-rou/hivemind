@@ -8,7 +8,11 @@ mapfile -d '' -t entries < <(find "$DIR" -mindepth 1 -print0 | sort -z)
 [[ "${#entries[@]}" -le 256 ]] || { echo "FAIL: more than 256 evidence entries" >&2; exit 1; }
 files=()
 for entry in "${entries[@]}"; do
-    [[ -f "$entry" && ! -L "$entry" ]] || { echo "FAIL: evidence entry is not a regular file: $entry" >&2; exit 1; }
+    [[ ! -L "$entry" ]] || { echo "FAIL: evidence entry is a symlink: $entry" >&2; exit 1; }
+    if [[ -d "$entry" ]]; then
+        continue
+    fi
+    [[ -f "$entry" ]] || { echo "FAIL: evidence entry is not a regular file: $entry" >&2; exit 1; }
     size="$(stat -c %s -- "$entry")"
     [[ "$size" =~ ^[0-9]+$ && "$size" -le 1048576 ]] || { echo "FAIL: evidence file exceeds 1048576 bytes: $entry" >&2; exit 1; }
     files+=("$entry")
