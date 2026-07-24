@@ -258,10 +258,13 @@ pub const StateChecker = struct {
         if (target.op_number < target.commit_min) return "op_number below commit_min";
         if (target.logHighOp() != target.op_number) return "active log high mismatch";
         var op: msg.OpNumber = 1;
+        var parent_checksum: u64 = 0;
         while (op <= target.op_number) : (op += 1) {
-            if (!target.journalHas(op)) return "active journal gap";
+            const entry = target.journalGet(op) orelse return "active journal gap";
+            if (!entry.valid()) return "invalid active journal entry";
+            if (entry.parent_checksum != parent_checksum) return "broken active journal parent chain";
+            parent_checksum = entry.checksum;
         }
-        const target_tip_checksum = if (target.op_number == 0) 0 else target.journalGet(target.op_number).?.checksum;
         const target_state_digest = target.state_machine.committedDigest();
 
         for (1..count) |i| {
@@ -275,11 +278,15 @@ pub const StateChecker = struct {
             if (replica.logHighOp() != replica.op_number) return "active log high mismatch";
 
             op = 1;
+            parent_checksum = 0;
             while (op <= replica.op_number) : (op += 1) {
-                if (!replica.journalHas(op)) return "active journal gap";
+                const entry = replica.journalGet(op) orelse return "active journal gap";
+                if (!entry.valid()) return "invalid active journal entry";
+                if (entry.parent_checksum != parent_checksum) return "broken active journal parent chain";
+                const target_entry = target.journalGet(op) orelse unreachable;
+                if (entry.checksum != target_entry.checksum) return "active journal checksum mismatch across replicas";
+                parent_checksum = entry.checksum;
             }
-            const tip_checksum = if (replica.op_number == 0) 0 else replica.journalGet(replica.op_number).?.checksum;
-            if (tip_checksum != target_tip_checksum) return "active tip checksum mismatch across replicas";
             if (replica.state_machine.committedDigest() != target_state_digest) return "committed state digest mismatch across replicas";
         }
 

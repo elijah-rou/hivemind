@@ -345,7 +345,7 @@ pub const TestCluster = struct {
     fn tickOneWorker(self: *TestCluster, worker_idx: usize) void {
         var agent = &self.sim_agents[worker_idx];
         const target: usize = agent.target_replica;
-        if (!self.replica_running[target]) return;
+        if (!self.replica_running[target] or self.replica_paused[target]) return;
 
         // Register on first tick
         if (!agent.registered) {
@@ -801,6 +801,18 @@ test "strict convergence rejects divergent active replica state" {
     tc.replicas[1].journal[tip_slot] = second;
 
     const first_slot = replica_mod.journalSlot(1);
+    var divergent_prefix = first;
+    divergent_prefix.client_id = 2;
+    divergent_prefix.checksum = divergent_prefix.computeChecksum();
+    tc.replicas[1].journal[first_slot] = divergent_prefix;
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.replicas[1].journal[first_slot] = first;
+
+    tc.replicas[1].journal[first_slot].parent_checksum = 99;
+    tc.replicas[1].journal[first_slot].checksum = tc.replicas[1].journal[first_slot].computeChecksum();
+    try std.testing.expect(tc.checkConvergence() != null);
+    tc.replicas[1].journal[first_slot] = first;
+
     tc.replicas[1].journal_occupied[first_slot] = false;
     try std.testing.expect(tc.checkConvergence() != null);
     tc.replicas[1].journal_occupied[first_slot] = true;
@@ -1099,6 +1111,43 @@ test "paused replica freezes queued inbound and outbound delivery" {
     tc.deliverAll();
     try std.testing.expectEqual(@as(msg.ViewNumber, 3), tc.replicas[0].view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
+}
+
+test "paused replica rejects simulated worker registration heartbeat and pod status" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA2A003);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+    try std.testing.expect(replica.isLeader());
+
+    tc.addSimWorker("paused-worker", 1);
+    tc.pauseReplica(0);
+    tc.tickWorkers();
+    try std.testing.expectEqual(@as(usize, 0), replica.worker_count);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.op_number);
+    try std.testing.expect(!tc.sim_agents[0].registered);
+
+    tc.resumeReplica(0);
+    tc.tickWorkers();
+    try std.testing.expectEqual(@as(usize, 1), replica.worker_count);
+    try std.testing.expect(tc.sim_agents[0].registered);
+
+    tc.sim_agents[0].pods[0] = .{
+        .pod_id = 7,
+        .phase = .scheduled,
+        .started_at_tick = tc.current_tick - TestCluster.AGENT_START_DELAY_TICKS,
+        .active = true,
+    };
+    tc.sim_agents[0].pod_count = 1;
+    tc.sim_agents[0].last_heartbeat_tick = tc.current_tick - TestCluster.AGENT_HEARTBEAT_INTERVAL;
+    const worker_before = replica.workers[0];
+    const op_before = replica.op_number;
+
+    tc.pauseReplica(0);
+    tc.tickWorkers();
+    try std.testing.expectEqualDeep(worker_before, replica.workers[0]);
+    try std.testing.expectEqual(op_before, replica.op_number);
+    try std.testing.expectEqual(msg.PodPhase.scheduled, tc.sim_agents[0].pods[0].phase);
+    try std.testing.expectEqual(tc.current_tick - TestCluster.AGENT_HEARTBEAT_INTERVAL, tc.sim_agents[0].last_heartbeat_tick);
 }
 
 test "paused follower defers pending Prepare barrier and acknowledgement" {
