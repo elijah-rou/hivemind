@@ -184,6 +184,17 @@ fn cmd_run(args: &[String]) {
         eprintln!("--test-process-base-port must be nonzero");
         std::process::exit(2);
     }
+    if test_process_controls
+        && test_process_base_port
+            .checked_add(runtime::process::TEST_PROCESS_PORT_COUNT)
+            .is_none()
+    {
+        eprintln!(
+            "--test-process-base-port must leave room for {} bounded ports",
+            runtime::process::TEST_PROCESS_PORT_COUNT
+        );
+        std::process::exit(2);
+    }
 
     #[cfg(not(target_os = "linux"))]
     let _ = &snapshotter;

@@ -126,8 +126,12 @@ local_cluster_cleanup_inventory() {
         done
     fi
     if [[ -n "$LOCAL_CLUSTER_PORT_LOCK" && -e "$LOCAL_CLUSTER_PORT_LOCK" ]]; then
-        echo "cleanup residue: owned port lock $LOCAL_CLUSTER_PORT_LOCK" >&2
-        failed=1
+        local lock_token
+        lock_token="$(cat "$LOCAL_CLUSTER_PORT_LOCK/owner" 2>/dev/null || true)"
+        if [[ -z "$LOCAL_CLUSTER_PORT_LOCK_TOKEN" || "$lock_token" != "$LOCAL_CLUSTER_PORT_LOCK_TOKEN" ]]; then
+            echo "cleanup residue: unowned port lock $LOCAL_CLUSTER_PORT_LOCK" >&2
+            failed=1
+        fi
     fi
     return "$failed"
 }
@@ -144,15 +148,61 @@ local_cluster_release_port_lock() {
 }
 
 local_cluster_cleanup() {
-    local status=$? pid cleanup_failed=0
+    local status=$? pid attempt cleanup_failed=0 groups_running=false
     trap - EXIT INT TERM
     set +e
+
+    # Apply each deadline once across every owned group. Serial per-group grace
+    # windows can outlive an aggregate runner's bounded TERM-to-KILL interval.
     for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
-        [[ -n "$pid" ]] || continue
-        local_cluster_stop_pid "$pid" || cleanup_failed=1
+        [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
+        if [[ -r "/proc/$pid/stat" ]] && ! local_cluster_pid_owned "$pid"; then
+            echo "owned process leader $pid changed identity before cleanup" >&2
+            cleanup_failed=1
+            continue
+        fi
+        local_cluster_group_running "$pid" || continue
+        kill -CONT -- "-$pid" 2>/dev/null || true
+        kill -TERM -- "-$pid" 2>/dev/null || true
     done
-    local_cluster_release_port_lock || cleanup_failed=1
+    for attempt in $(seq 1 30); do
+        groups_running=false
+        for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
+            [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
+            local_cluster_group_running "$pid" && { groups_running=true; break; }
+        done
+        [[ "$groups_running" == false ]] && break
+        sleep 0.1
+    done
+    for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
+        [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
+        local_cluster_group_running "$pid" || continue
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    done
+    for attempt in $(seq 1 20); do
+        groups_running=false
+        for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
+            [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
+            local_cluster_group_running "$pid" && { groups_running=true; break; }
+        done
+        [[ "$groups_running" == false ]] && break
+        sleep 0.1
+    done
+    for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
+        [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
+        if local_cluster_group_running "$pid"; then
+            echo "owned process group $pid survived bounded TERM/KILL cleanup: $(local_cluster_group_members "$pid" | tr '\n' ' ')" >&2
+            cleanup_failed=1
+            continue
+        fi
+        wait "$pid" 2>/dev/null || true
+        unset 'LOCAL_CLUSTER_PID_START_TIMES[$pid]'
+    done
+
+    # Inventory while this invocation still owns the reservation. Releasing
+    # first would allow a replacement token to be misreported as our residue.
     local_cluster_cleanup_inventory || cleanup_failed=1
+    local_cluster_release_port_lock || cleanup_failed=1
     if [[ -n "$LOCAL_CLUSTER_ROOT" ]]; then
         if [[ "$status" -ne 0 || "$LOCAL_CLUSTER_KEEP" == true || "$cleanup_failed" -ne 0 ]]; then
             echo "local cluster artifacts: $LOCAL_CLUSTER_ROOT" >&2
@@ -206,7 +256,8 @@ local_cluster_init() {
 
     LOCAL_CLUSTER_API_PORT=$((LOCAL_CLUSTER_BASE_PORT + 1))
     LOCAL_CLUSTER_WORKER_METRICS_PORT=$((LOCAL_CLUSTER_BASE_PORT + 2))
-    LOCAL_CLUSTER_PROCESS_BASE_PORT=$((LOCAL_CLUSTER_BASE_PORT + 3))
+    # Four test-process ports occupy +5..+8; +4 is the stale-leader relay.
+    LOCAL_CLUSTER_PROCESS_BASE_PORT=$((LOCAL_CLUSTER_BASE_PORT + 5))
 
     if [[ "$LOCAL_CLUSTER_BUILD" == true ]]; then
         (cd "$LOCAL_CLUSTER_REPO_ROOT/core" && zig build -Doptimize=ReleaseFast)

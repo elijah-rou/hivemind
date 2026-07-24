@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,8 @@ const BASE_PORT: u16 = 15000;
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_PATH_MAX: usize = 1024;
 const HTTP_STATUS_LINE_MAX: usize = 1024;
+const POST_KILL_WAIT: Duration = Duration::from_secs(2);
+pub const TEST_PROCESS_PORT_COUNT: u16 = 4;
 
 struct RunningProcess {
     child: Child,
@@ -23,6 +25,7 @@ struct RunningProcess {
 pub struct ProcessRuntime {
     processes: Mutex<HashMap<String, RunningProcess>>,
     next_port: Mutex<u16>,
+    port_end_exclusive: Option<u16>,
     test_controls_enabled: bool,
     run_deadline: Duration,
 }
@@ -36,6 +39,7 @@ impl ProcessRuntime {
         Self {
             processes: Mutex::new(HashMap::new()),
             next_port: Mutex::new(base_port),
+            port_end_exclusive: None,
             test_controls_enabled: false,
             run_deadline: Duration::from_secs(25),
         }
@@ -43,9 +47,13 @@ impl ProcessRuntime {
 
     pub fn with_test_controls(base_port: u16) -> Self {
         assert!(base_port > 0, "test process base port must be nonzero");
+        let port_end_exclusive = base_port
+            .checked_add(TEST_PROCESS_PORT_COUNT)
+            .expect("test process port range must fit in u16");
         Self {
             processes: Mutex::new(HashMap::new()),
             next_port: Mutex::new(base_port),
+            port_end_exclusive: Some(port_end_exclusive),
             test_controls_enabled: true,
             run_deadline: Duration::from_millis(600),
         }
@@ -72,7 +80,14 @@ impl Runtime for ProcessRuntime {
     fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
         let mut next = self.next_port.lock().unwrap();
         let port = *next;
-        *next += 1;
+        if self.port_end_exclusive == Some(port) {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "test process port range exhausted after {TEST_PROCESS_PORT_COUNT} pods"
+            )));
+        }
+        *next = next.checked_add(1).ok_or_else(|| {
+            RuntimeError::ContainerCreate("process runtime port range exhausted".into())
+        })?;
 
         let container_id = format!("proc-pod-{}:{}", spec.pod_id, port);
 
@@ -260,10 +275,19 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         proc.child.kill().map_err(|error| {
             RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
         })?;
-        proc.child.wait().map_err(|error| {
-            RuntimeError::ContainerStop(format!("{} wait: {error}", handle.container_id))
-        })?;
-        Ok(())
+        let deadline = Instant::now() + POST_KILL_WAIT;
+        match wait_for_child_exit_until(deadline, || proc.child.try_wait()) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(RuntimeError::ContainerStop(format!(
+                "{} did not exit within {}ms after KILL",
+                handle.container_id,
+                POST_KILL_WAIT.as_millis()
+            ))),
+            Err(error) => Err(RuntimeError::ContainerStop(format!(
+                "{} status after KILL: {error}",
+                handle.container_id
+            ))),
+        }
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
@@ -289,6 +313,27 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
             "stopped process must remain owned until removal"
         );
         Ok(())
+    }
+}
+
+fn wait_for_child_exit_until<F>(
+    deadline: Instant,
+    mut try_wait: F,
+) -> std::io::Result<Option<ExitStatus>>
+where
+    F: FnMut() -> std::io::Result<Option<ExitStatus>>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    loop {
+        if let Some(status) = try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
 }
 
@@ -471,6 +516,57 @@ mod tests {
 
         assert!(runtime.probe_pod(&handle, 1, "/health").unwrap());
         runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn test_process_runtime_has_a_bounded_four_port_range() {
+        let runtime = ProcessRuntime::with_test_controls(24_300);
+        let mut handles = Vec::new();
+        for pod_id in 0..4 {
+            handles.push(
+                runtime
+                    .create_pod(&PodSpec {
+                        pod_id,
+                        deployment_id: 1,
+                        image: "process".into(),
+                        entrypoint: String::new(),
+                        port: 8080,
+                        gpu_count: 0,
+                        gpu_type: crate::types::GpuType::None,
+                        cpu_millicores: 100,
+                        memory_megabytes: 128,
+                        env_vars: Vec::new(),
+                        mounts: Vec::new(),
+                    })
+                    .unwrap(),
+            );
+        }
+        let overflow = runtime.create_pod(&PodSpec {
+            pod_id: 4,
+            deployment_id: 1,
+            image: "process".into(),
+            entrypoint: String::new(),
+            port: 8080,
+            gpu_count: 0,
+            gpu_type: crate::types::GpuType::None,
+            cpu_millicores: 100,
+            memory_megabytes: 128,
+            env_vars: Vec::new(),
+            mounts: Vec::new(),
+        });
+        assert!(matches!(overflow, Err(RuntimeError::ContainerCreate(_))));
+        for handle in handles {
+            runtime.remove_pod(&handle).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_kill_wait_is_bounded_when_exit_remains_unobservable() {
+        let started = Instant::now();
+        let status =
+            wait_for_child_exit_until(started + Duration::from_millis(20), || Ok(None)).unwrap();
+        assert!(status.is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

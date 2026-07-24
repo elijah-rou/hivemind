@@ -5,11 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP_DIR="$(mktemp -d /tmp/hivemind-local-cleanup-test.XXXXXX)"
 CHILD_PID=""
 cleanup_fixture() {
-    if [[ -f "$TMP_DIR/child.pid" ]]; then
-        CHILD_PID="$(cat "$TMP_DIR/child.pid")"
-        kill -CONT -- "-$CHILD_PID" 2>/dev/null || true
-        kill -KILL -- "-$CHILD_PID" 2>/dev/null || true
-    fi
+    local pid_file
+    for pid_file in "$TMP_DIR"/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        while read -r CHILD_PID; do
+            [[ "$CHILD_PID" =~ ^[1-9][0-9]*$ ]] || continue
+            kill -CONT -- "-$CHILD_PID" 2>/dev/null || true
+            kill -KILL -- "-$CHILD_PID" 2>/dev/null || true
+        done <"$pid_file"
+    done
     rm -rf "$TMP_DIR"
 }
 trap cleanup_fixture EXIT
@@ -40,6 +44,15 @@ def terminate(_signum, _frame):
 signal.signal(signal.SIGTERM, terminate)
 with open(os.path.join(root, "ready"), "w", encoding="utf-8") as output:
     output.write("ready\n")
+while True:
+    time.sleep(1)
+PY
+
+cat >"$TMP_DIR/stubborn_group.py" <<'PY'
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 while True:
     time.sleep(1)
 PY
@@ -95,4 +108,49 @@ set -e
 [[ "$status" -eq 23 ]]
 assert_cleaned_gracefully
 
-echo "PASS: local cluster cleanup resumes and terminates complete owned process groups without residue"
+# Cleanup must apply TERM/KILL deadlines across all groups, not serially. Three
+# TERM-resistant groups must fit within one shared TERM window.
+: >"$TMP_DIR/stubborn.pids"
+# shellcheck disable=SC2016 # The child shell receives all values positionally.
+timeout --foreground --kill-after=1s 7s bash -c '
+    set -euo pipefail
+    source "$1/lib/local_cluster.sh"
+    LOCAL_CLUSTER_ROOT="$2/multi-root"
+    mkdir -p "$LOCAL_CLUSTER_ROOT"
+    for _ in 1 2 3; do
+        setsid python3 "$2/stubborn_group.py" &
+        child=$!
+        printf "%s\n" "$child" >>"$2/stubborn.pids"
+        local_cluster_record_pid "$child"
+    done
+    local_cluster_cleanup
+' multi-group-case "$SCRIPT_DIR" "$TMP_DIR"
+while read -r CHILD_PID; do
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+        exit 1
+    fi
+done <"$TMP_DIR/stubborn.pids"
+
+# Inventory belongs to the completed token. A replacement token acquired only
+# after release must not be reported as residue from the completed run.
+# shellcheck disable=SC2016 # The child shell receives all values positionally.
+timeout --foreground --kill-after=1s 3s bash -c '
+    set -euo pipefail
+    source "$1/lib/local_cluster.sh"
+    LOCAL_CLUSTER_ROOT="$2/lock-root"
+    LOCAL_CLUSTER_PORT_LOCK="$2/reused.lock"
+    LOCAL_CLUSTER_PORT_LOCK_TOKEN="completed-token"
+    mkdir -p "$LOCAL_CLUSTER_ROOT" "$LOCAL_CLUSTER_PORT_LOCK"
+    printf "%s\n" "$LOCAL_CLUSTER_PORT_LOCK_TOKEN" >"$LOCAL_CLUSTER_PORT_LOCK/owner"
+    local_cluster_release_port_lock() {
+        rm -f "$LOCAL_CLUSTER_PORT_LOCK/owner"
+        rmdir "$LOCAL_CLUSTER_PORT_LOCK"
+        mkdir "$LOCAL_CLUSTER_PORT_LOCK"
+        printf "%s\n" "replacement-token" >"$LOCAL_CLUSTER_PORT_LOCK/owner"
+    }
+    local_cluster_cleanup
+    [[ "$(cat "$LOCAL_CLUSTER_PORT_LOCK/owner")" == replacement-token ]]
+' lock-reuse-case "$SCRIPT_DIR" "$TMP_DIR"
+rm -rf "$TMP_DIR/reused.lock"
+
+echo "PASS: local cluster cleanup uses shared group deadlines and token-scoped residue inventory"

@@ -83,6 +83,7 @@ local_cluster_wait_queue_zero
 # actual status 9, and the API safely reprobes the real addresses exactly once.
 stale_leader="$(local_cluster_leader_id)"
 relay_port=$((LOCAL_CLUSTER_BASE_PORT + 4))
+[[ "$relay_port" -lt "$LOCAL_CLUSTER_PROCESS_BASE_PORT" ]]
 setsid python3 - "$relay_port" "$(local_cluster_client_port "$stale_leader")" "$LOCAL_CLUSTER_ROOT/stale-relay.log" <<'PY' &
 import socket, struct, sys
 listen_port, backend_port, log_path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
