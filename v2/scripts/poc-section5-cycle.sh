@@ -129,6 +129,7 @@ configure_ssh_cidr() {
     export TF_VAR_ssh_cidr="$SSH_CIDR"
     export TF_VAR_region="$AWS_REGION"
     export TF_VAR_ecr_repository_name="$ECR_REPOSITORY"
+    export TF_VAR_run_token="${HIVEMIND_RUN_TOKEN:?HIVEMIND_RUN_TOKEN is required for isolated POC ownership}"
     echo "ssh_cidr=$SSH_CIDR"
 }
 

@@ -9,6 +9,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SKIP_CONTAINERD=false
 SKIP_SMOKE=false
 REQUIRE_CONTAINERD="${REQUIRE_CONTAINERD:-0}"
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
+REQUIRE_NYDUS="${REQUIRE_NYDUS:-0}"
+REQUIRE_JUICEFS="${REQUIRE_JUICEFS:-0}"
 CONTAINERD_RUNNER="${HIVEMIND_CONTAINERD_RUNNER:-$SCRIPT_DIR/containerd/run-tests.sh}"
 
 while [[ $# -gt 0 ]]; do
@@ -20,9 +23,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$REQUIRE_CONTAINERD" != "0" && "$REQUIRE_CONTAINERD" != "1" ]]; then
-    echo "REQUIRE_CONTAINERD must be 0 or 1" >&2
-    exit 2
+for pair in "REQUIRE_CONTAINERD:$REQUIRE_CONTAINERD" "REQUIRE_GPU:$REQUIRE_GPU" "REQUIRE_NYDUS:$REQUIRE_NYDUS" "REQUIRE_JUICEFS:$REQUIRE_JUICEFS"; do
+    name="${pair%%:*}"
+    value="${pair#*:}"
+    if [[ "$value" != 0 && "$value" != 1 ]]; then
+        echo "$name must be 0 or 1" >&2
+        exit 2
+    fi
+done
+if [[ "$REQUIRE_GPU" == 1 || "$REQUIRE_NYDUS" == 1 || "$REQUIRE_JUICEFS" == 1 ]]; then
+    REQUIRE_CONTAINERD=1
 fi
 if [[ "$SKIP_CONTAINERD" == true && "$REQUIRE_CONTAINERD" == "1" ]]; then
     echo "cannot combine --skip-containerd and --require-containerd" >&2

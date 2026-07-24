@@ -167,10 +167,12 @@ remote_ssh() {
 }
 
 wait_for_gpu_container_evidence() {
-    local max_attempts="${1:-24}" delay="${2:-10}" result
+    local expected_task="$1" max_attempts="${2:-24}" delay="${3:-10}" result
+    [[ "$expected_task" =~ ^hivemind-pod-[0-9]+$ ]] || { echo "  FAIL: invalid expected GPU task identity" >&2; return 1; }
     for i in $(seq 1 "$max_attempts"); do
         result="$({
             printf 'export HIVEMIND_GPU_PROBE_TOKEN=%q\n' "gpu-$RUN_ID"
+            printf 'export HIVEMIND_EXPECTED_GPU_TASK=%q\n' "$expected_task"
             cat "$SCRIPT_DIR/../../tests/lib/gpu_container_evidence.sh"
         } | ssh "${SSH_OPTS[@]}" "$GPU_SSH_USER@$GPU_WORKER_IP" \
             'HIVEMIND_CTR_SUDO=1 bash -s' 2>/dev/null || true)"
@@ -276,7 +278,21 @@ wait_for_run "gpu run request echoes payload" "$API_URL/v1/deployments/$GPU_DEPL
 # 9. Remote proof from the actual CDI-selected task, not host-only visibility.
 echo "[9/11] Remote GPU runtime proof..."
 if remote_gpu_checks_enabled; then
-    wait_for_gpu_container_evidence 24 10
+    pods_html="$(curl -fsS --connect-timeout 2 --max-time 10 "$API_URL/dashboard/pods")"
+    gpu_pod_id="$(PODS_HTML="$pods_html" python3 - "$GPU_DEPLOYMENT_ID" <<'PY'
+import html, os, re, sys
+wanted = int(sys.argv[1])
+rows = re.findall(r"<tr>(.*?)</tr>", os.environ["PODS_HTML"], re.S)
+matched = []
+for row in rows:
+    cells = [html.unescape(re.sub(r"<[^>]+>", "", cell)).strip() for cell in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+    if len(cells) >= 4 and int(cells[1], 16) == wanted and cells[3] == "Running":
+        matched.append(int(cells[0], 16))
+assert len(matched) == 1
+print(matched[0])
+PY
+)"
+    wait_for_gpu_container_evidence "hivemind-pod-$gpu_pod_id" 24 10
 elif [[ "$REQUIRE_GPU" == 1 ]]; then
     echo "  FAIL: REQUIRE_GPU=1 cannot skip remote GPU runtime proof" >&2
     FAIL=$((FAIL + 1))

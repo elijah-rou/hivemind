@@ -40,7 +40,22 @@ terraform_destroy_dir() {
     (cd "$dir" && terraform init -input=false && terraform destroy -auto-approve)
 }
 
+resolve_poc_run_token() {
+    if [[ -n "${TF_VAR_run_token:-}" ]]; then
+        return 0
+    fi
+    local token
+    token="$(terraform -chdir="$ROOT_DIR/infra/poc" show -json 2>/dev/null | jq -r \
+        '[.. | objects | .HivemindRunToken? // empty] | unique | if length == 1 then .[0] else empty end')"
+    [[ "$token" =~ ^[a-z][a-z0-9]{11,31}$ ]] || {
+        echo "unable to derive one exact run token from existing POC state; set TF_VAR_run_token" >&2
+        exit 1
+    }
+    export TF_VAR_run_token="$token"
+}
+
 need terraform
+need jq
 
 if [[ "$DESTROY_EKS" == "true" ]]; then
     section "Destroy isolated EKS baseline"
@@ -51,6 +66,7 @@ fi
 
 if [[ "$DESTROY_HIVEMIND" == "true" ]]; then
     section "Destroy isolated Hivemind POC infra"
+    resolve_poc_run_token
     terraform_destroy_dir "$ROOT_DIR/infra/poc"
 else
     echo "skip Hivemind destroy"

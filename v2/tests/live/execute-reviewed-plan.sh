@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[[ "${HIVEMIND_ALLOW_LIVE:-0}" == 1 && "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_LIVE_GUARD_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || {
+    echo "FAIL: private live helper requires guarded parent" >&2
+    exit 1
+}
+guard_parent="$(awk '{print $4}' "/proc/$PPID/stat" 2>/dev/null || true)"
+tr '\0' ' ' <"/proc/$guard_parent/cmdline" 2>/dev/null | grep -Fq '/tests/live/run.sh' || {
+    echo "FAIL: private live helper requires guarded parent" >&2
+    exit 1
+}
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TF_ROOT="$ROOT_DIR/infra/poc"
 RUN_TOKEN="${HIVEMIND_RUN_TOKEN:?}"
@@ -14,6 +23,16 @@ REVIEW_RECORD="${HIVEMIND_PLAN_REVIEW_RECORD:?}"
 SSH_KEY="${SSH_KEY:?SSH_KEY is required}"
 STATUS_FILE="${HIVEMIND_LIVE_STATUS_FILE:?}"
 record_success() { printf '%s\t0\n' "$1" >>"$STATUS_FILE"; }
+run_recorded() {
+    local phase="$1" status
+    shift
+    set +e
+    "$@"
+    status=$?
+    set -e
+    printf '%s\t%s\n' "$phase" "$status" >>"$STATUS_FILE"
+    return "$status"
+}
 
 [[ -f "$PLAN" && ! -L "$PLAN" && "$(stat -c %s "$PLAN")" -le 104857600 ]] || { echo "FAIL: saved plan must be a regular file no larger than 100 MiB" >&2; exit 1; }
 PLAN="$(realpath -- "$PLAN")"
@@ -54,16 +73,14 @@ aws s3api put-object --bucket "$BUCKET" --key .hivemind-owner --body "$marker_fi
 rm -f "$marker_file"
 record_success bucket_ownership
 
-timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_APPLY_TIMEOUT_SECONDS:-1800}s" \
-    terraform -chdir="$TF_ROOT" apply "$PLAN"
-record_success terraform_apply
+run_recorded terraform_apply timeout --foreground --kill-after=30s \
+    "${HIVEMIND_TERRAFORM_APPLY_TIMEOUT_SECONDS:-1800}s" terraform -chdir="$TF_ROOT" apply "$PLAN"
 
 export TF_VAR_run_token="$RUN_TOKEN" TF_VAR_ecr_repository_name="$ECR_NAME" TF_VAR_region="$REGION"
-export HIVEMIND_GUARDRAILS_ACTIVE=1
-export ECR_REPOSITORY="$ECR_NAME" TAG="$RUN_TOKEN" SKIP_HIVEMIND_APPLY=true
+export ECR_REPOSITORY="$ECR_NAME" TAG="live-${RUN_TOKEN:0:8}" SKIP_HIVEMIND_APPLY=true
 export DESTROY_HIVEMIND_AFTER=false DESTROY_EKS_AFTER=false RUN_EKS=false
-bash "$ROOT_DIR/scripts/poc-runbook.sh"
-record_success poc_runbook
+export ARTIFACT_ROOT="$EVIDENCE_DIR/runbook"
+run_recorded poc_runbook bash "$ROOT_DIR/scripts/poc-runbook.sh"
 
 replica_ips="$(terraform -chdir="$TF_ROOT" output -json replica_public_ips)"
 worker_cpu="$(terraform -chdir="$TF_ROOT" output -raw worker_cpu_public_ip)"

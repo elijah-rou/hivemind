@@ -9,7 +9,11 @@ cat >"$TMP/bin/ctr" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
-  "-n hivemind tasks list -q") [[ "${FIXTURE_TASK:-present}" == present ]] && echo task-owned ;;
+  "-n hivemind tasks list -q")
+    echo unrelated-task
+    [[ "${FIXTURE_TASK:-present}" == present ]] && echo task-owned
+    ;;
+  "-n hivemind containers info unrelated-task") echo 'devices: nvidia.com/gpu=7' ;;
   "-n hivemind containers info task-owned")
     [[ "${FIXTURE_CDI:-present}" == present ]] && echo 'devices: nvidia.com/gpu=0' || echo 'runtime: nvidia'
     ;;
@@ -33,10 +37,11 @@ run_case() {
         echo "FAIL: $name rc=$rc" >&2; cat "$TMP/$name.out" >&2; return 1
     fi
 }
-run_case no-task fail FIXTURE_TASK=absent
-run_case no-cdi fail FIXTURE_CDI=absent
-run_case smi-failure fail FIXTURE_SMI=failure
-run_case complete-evidence pass FIXTURE_TASK=present FIXTURE_CDI=present FIXTURE_SMI=success
+run_case no-task fail HIVEMIND_EXPECTED_GPU_TASK=task-owned FIXTURE_TASK=absent
+run_case no-cdi fail HIVEMIND_EXPECTED_GPU_TASK=task-owned FIXTURE_CDI=absent
+run_case smi-failure fail HIVEMIND_EXPECTED_GPU_TASK=task-owned FIXTURE_SMI=failure
+run_case complete-evidence pass HIVEMIND_EXPECTED_GPU_TASK=task-owned FIXTURE_TASK=present FIXTURE_CDI=present FIXTURE_SMI=success
+run_case unrelated-task-rejected fail HIVEMIND_EXPECTED_GPU_TASK=missing-task FIXTURE_TASK=present FIXTURE_CDI=present FIXTURE_SMI=success
 
 grep -q '^task_id=task-owned$' "$TMP/complete-evidence.out"
 grep -q '^cdi_device=nvidia.com/gpu=0$' "$TMP/complete-evidence.out"

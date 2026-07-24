@@ -22,7 +22,7 @@ cat >/dev/null
 cat <<EOF
 cache_before=owned
 removed_exact=${FIXTURE_IMAGE:?}
-pull_auth=aws-ecr-credential-helper-executed
+pull_auth=temporary-ecr-hosts-file
 pulled_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 cache_after=owned
 EOF
@@ -40,7 +40,7 @@ else echo "FAIL: optional cold-cache mode" >&2; exit 1; fi
 
 REQUIRE_ECR_COLD_PULL=1 "$SCRIPT" "$image" e1fixtureabc123 host user "$TMP/evidence"
 grep -q 'removed_exact=.*hm-e1fixtureabc123:run' "$TMP/evidence/cold-pull.txt"
-grep -q 'pull_auth=aws-ecr-credential-helper-executed' "$TMP/evidence/cold-pull.txt"
+grep -q 'pull_auth=temporary-ecr-hosts-file' "$TMP/evidence/cold-pull.txt"
 grep -q 'pulled_digest=sha256:' "$TMP/evidence/cold-pull.txt"
 
 if REQUIRE_ECR_COLD_PULL=1 "$SCRIPT" 'docker.io/library/nginx:latest' e1fixtureabc123 host user "$TMP/bad" 2>/dev/null; then

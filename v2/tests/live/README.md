@@ -6,7 +6,7 @@ The wrapper requires an already reviewed saved Terraform plan and separate per-r
 
 The POC runbook refuses direct invocation unless the wrapper activates guardrails. Other legacy/operator scripts under `infra/` are not unified acceptance entry points. Deterministic fixtures, offline Terraform validation, historical artifacts, and prepared privileged scripts are not live evidence.
 
-Required execution environment includes `HIVEMIND_ALLOW_LIVE=1`, `HIVEMIND_AWS_ACCOUNT_ALLOWLIST`, `HIVEMIND_AWS_REGION_ALLOWLIST`, `AWS_REGION`, `HIVEMIND_RUN_TOKEN`, token-containing `TF_WORKSPACE`, `HIVEMIND_LIVE_BUCKET`, and `HIVEMIND_LIVE_ECR`, `HIVEMIND_COST_APPROVED=1`, `HIVEMIND_CLEANUP_APPROVED=1`, `HIVEMIND_TF_PLAN`, `HIVEMIND_APPROVED_PLAN_SHA256`, `HIVEMIND_PLAN_REVIEW_RECORD`, and the required capability flags. `KEEP_INFRA` defaults to `0`. The exact command is `cd v2 && timeout --foreground --kill-after=30s 14400s ./tests/live/run.sh`; setting variables is intentionally verbose and per-run. Do not paste numeric account identifiers or credentials into tracked files or command transcripts.
+Required execution environment includes `HIVEMIND_ALLOW_LIVE=1`, `HIVEMIND_AWS_ACCOUNT_ALLOWLIST`, `HIVEMIND_AWS_REGION_ALLOWLIST`, `AWS_REGION`, `HIVEMIND_RUN_TOKEN`, token-containing `TF_WORKSPACE`, `HIVEMIND_LIVE_BUCKET`, and `HIVEMIND_LIVE_ECR`, `HIVEMIND_COST_APPROVED=1`, `HIVEMIND_CLEANUP_APPROVED=1`, `HIVEMIND_QUOTA_CONFIRMED=1`, `HIVEMIND_TF_PLAN`, `HIVEMIND_APPROVED_PLAN_SHA256`, `HIVEMIND_PLAN_REVIEW_RECORD`, `HIVEMIND_WORKSPACE_CREATION_RECORD`, and every required capability flag set to `1`. Production mode accepts only repository-owned executor, cleanup, and inventory hooks. `KEEP_INFRA` defaults to `0`. The exact command is `cd v2 && timeout --kill-after=30s 14400s ./tests/live/run.sh`; omitting `--foreground` gives the executor a killable process group. The wrapper currently refuses before ownership because required JuiceFS AppSpec semantics are absent. Do not paste numeric account identifiers or credentials into tracked files or command transcripts.
 
 ## Mandatory preflight
 
@@ -61,7 +61,7 @@ A strict containerd/GPU/Nydus/JuiceFS requirement fails if unavailable; logging 
 | R6 | GPU workload during/after recovery | GPU task/device evidence and `/run` result | GPU request succeeds with the intended device after recovery |
 | R7 | Required capability unavailable | Strict flag, mutation inventory, exit status | Gate fails nonzero before affected mutation; no skip counts as acceptance |
 
-[`infra/poc/failure-drills.sh`](../../infra/poc/failure-drills.sh) exercises portions of leader, worker, and timeout flows, but does not prove old-replica committed-state convergence or exact-zero abandonment cleanup. It is not this matrix's gate.
+[`infra/poc/failure-drills.sh`](../../infra/poc/failure-drills.sh) now requires old-replica normal rejoin, equal commit/state digests, and exact-zero queue/in-flight gauges. It remains only one part of this larger matrix and has not been executed for E1.
 
 ## Required cleanup matrix
 

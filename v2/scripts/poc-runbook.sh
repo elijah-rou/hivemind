@@ -64,7 +64,8 @@ REPLICA_PUBLIC_IPS=""
 WORKER_CPU_PUBLIC_IP=""
 WORKER_GPU_PUBLIC_IP=""
 
-ARTIFACT_ROOT="$ROOT_DIR/artifacts/poc-final"
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-$ROOT_DIR/artifacts/poc-final}"
+[[ "$ARTIFACT_ROOT" == /* ]] || { echo "ARTIFACT_ROOT must be absolute" >&2; exit 2; }
 mkdir -p "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
 chmod 700 "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
 LOG="$ARTIFACT_ROOT/00-runbook/runbook-$TAG.log"

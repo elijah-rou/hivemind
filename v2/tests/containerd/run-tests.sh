@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODE="${1:---component}"
 DOCKER="${DOCKER:-docker}"
 IMAGE="hivemind-containerd-test"
+PRIVILEGED_PROBE_IMAGE="${HIVEMIND_PRIVILEGED_PROBE_IMAGE:-docker.io/library/alpine:3.20}"
 
 check_host() {
     command -v "$DOCKER" >/dev/null 2>&1 || { echo "containerd check: docker command unavailable" >&2; return 1; }
@@ -17,7 +18,12 @@ check_host() {
         return 1
     }
     [[ "$os_type" == "linux" ]] || { echo "containerd check: Docker daemon is not Linux" >&2; return 1; }
-    printf 'docker=%s os=%s privileged=true-required\n' "$DOCKER" "$os_type"
+    if ! timeout --kill-after=5s 60s "$DOCKER" run --rm --privileged --network none \
+        --entrypoint /bin/true "$PRIVILEGED_PROBE_IMAGE"; then
+        echo "containerd check: disposable privileged container probe failed" >&2
+        return 1
+    fi
+    printf 'docker=%s os=%s privileged=verified\n' "$DOCKER" "$os_type"
 }
 
 case "$MODE" in

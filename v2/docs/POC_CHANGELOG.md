@@ -44,6 +44,20 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-24 — Lane E1 review remediation
+
+What changed:
+- made every subordinate aggregate strict flag imply required full-stack containerd mode; malformed flags and unavailable runners now fail before aggregate phases
+- bound GPU proof to the exact deployment task, removed ECR credentials from `ctr` argv via a temporary mode-0600 hosts file, added the disposable privileged-Docker probe, and bounded full-stack containerd inventory/daemon cleanup
+- made production live hooks canonical-only and private helpers guarded, moved executor descendants into a killable process group, bounded timeout configuration, required quota confirmation plus a regional quota/offering preflight, and bound workspace freshness to the reviewed plan
+- made live acceptance require all capabilities and no operator/drill/preload skips; the wrapper now refuses before ownership because required JuiceFS AppSpec semantics remain absent
+- removed raw ownership data from publishable output/path defaults, rejected oversized evidence, scanned for the raw token, ran redaction before recording success, expanded manifest metadata, and added network/workspace post-cleanup checks
+
+Evidence and limits:
+- RED fixtures reproduced aggregate strict-flag fallthrough, unrelated-task GPU acceptance, production hook substitution/direct-helper access, prospective redaction status, and oversized evidence omission
+- focused deterministic fixtures pass after remediation; no Docker/containerd, GPU/CDI, Nydus, JuiceFS, Doppler, ECR, AWS, Terraform provider, or other live/cloud boundary was executed
+- historical live state was not inventoried or changed; current guarded live acceptance remains blocked before ownership on the missing required JuiceFS AppSpec/API surface
+
 ### 2026-07-24 — Lane E1 strict containerd/live harness preparation
 
 What changed:

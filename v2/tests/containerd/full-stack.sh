@@ -33,7 +33,7 @@ done
 
 ctr_ids() {
     local kind="$1"
-    ctr -n hivemind "$kind" list -q 2>/dev/null | LC_ALL=C sort
+    timeout --foreground --kill-after=2s 15s ctr -n hivemind "$kind" list -q 2>/dev/null | LC_ALL=C sort
 }
 
 owned_ids() {
@@ -50,7 +50,7 @@ cleanup_full_stack() {
         curl --connect-timeout 1 --max-time 5 -fsS -X DELETE \
             "http://127.0.0.1:$LOCAL_CLUSTER_API_PORT/v1/deployments/$DEPLOYMENT_ID" >/dev/null || true
     fi
-    if command -v ctr >/dev/null 2>&1 && ctr version >/dev/null 2>&1; then
+    if command -v ctr >/dev/null 2>&1 && timeout --foreground --kill-after=2s 15s ctr version >/dev/null 2>&1; then
         while IFS= read -r id; do
             [[ -n "$id" ]] || continue
             timeout --foreground --kill-after=2s 15s ctr -n hivemind tasks kill --signal SIGKILL "$id" >/dev/null 2>&1 || true
@@ -73,7 +73,15 @@ cleanup_full_stack() {
     fi
     if [[ -n "$CONTAINERD_PID" ]]; then
         kill -TERM "$CONTAINERD_PID" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$CONTAINERD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$CONTAINERD_PID" 2>/dev/null; then
+            kill -KILL "$CONTAINERD_PID" 2>/dev/null || true
+        fi
         wait "$CONTAINERD_PID" 2>/dev/null || true
+        kill -0 "$CONTAINERD_PID" 2>/dev/null && cleanup_failed=1
     fi
     [[ "$cleanup_failed" == 0 ]] || status=1
     exit "$status"

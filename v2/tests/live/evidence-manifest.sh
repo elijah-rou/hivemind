@@ -13,11 +13,15 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--commit", required=True)
 parser.add_argument("--binary-sha", required=True)
 parser.add_argument("--image-sha", required=True)
+parser.add_argument("--binary-list", required=True)
+parser.add_argument("--image-digests", required=True)
 parser.add_argument("--plan-sha", required=True)
 parser.add_argument("--command-statuses", required=True)
 parser.add_argument("--metrics", required=True)
 parser.add_argument("--journals", required=True)
 parser.add_argument("--cleanup", required=True)
+parser.add_argument("--source-state", required=True)
+parser.add_argument("--pre-inventory", required=True)
 parser.add_argument("--redaction-status", required=True, type=int)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
@@ -61,16 +65,51 @@ with open(args.command_statuses, encoding="utf-8") as source:
 if not statuses:
     raise SystemExit("at least one command status is required")
 
+required_environment = (
+    "HIVEMIND_EVIDENCE_STARTED_AT", "HIVEMIND_EVIDENCE_ENDED_AT",
+    "HIVEMIND_EVIDENCE_COMMAND", "HIVEMIND_EVIDENCE_REGION",
+    "HIVEMIND_EVIDENCE_OWNERSHIP_HASH", "HIVEMIND_EVIDENCE_WORKSPACE_HASH",
+    "HIVEMIND_EVIDENCE_KEEP_INFRA", "HIVEMIND_EVIDENCE_FINAL_STATUS",
+)
+environment = {name: os.environ.get(name, "") for name in required_environment}
+if any(not value for value in environment.values()):
+    missing = [name for name, value in environment.items() if not value]
+    raise SystemExit(f"missing evidence environment: {', '.join(missing)}")
+if environment["HIVEMIND_EVIDENCE_KEEP_INFRA"] not in ("0", "1"):
+    raise SystemExit("invalid KEEP_INFRA evidence value")
+if environment["HIVEMIND_EVIDENCE_FINAL_STATUS"] != "0":
+    raise SystemExit("successful manifest requires final status 0")
+capabilities = {}
+for name in ("REQUIRE_CONTAINERD", "REQUIRE_GPU", "REQUIRE_NYDUS", "REQUIRE_JUICEFS", "REQUIRE_ECR_COLD_PULL"):
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise SystemExit(f"invalid capability evidence: {name}")
+    capabilities[name] = int(value)
+
 manifest = {
     "commit_sha": args.commit,
     "binary_sha256": args.binary_sha,
     "image_sha256": args.image_sha,
+    "exact_binary_digests": artifact(args.binary_list),
+    "exact_image_digests": artifact(args.image_digests),
     "terraform_plan_sha256": args.plan_sha,
     "command_exit_statuses": statuses,
     "command_status_artifact": status_artifact,
     "metrics": artifact(args.metrics),
     "journals": artifact(args.journals),
+    "source_state": artifact(args.source_state),
+    "pre_ownership_inventory": artifact(args.pre_inventory),
     "cleanup_inventory": artifact(args.cleanup),
+    "started_at_utc": environment["HIVEMIND_EVIDENCE_STARTED_AT"],
+    "ended_at_utc": environment["HIVEMIND_EVIDENCE_ENDED_AT"],
+    "exact_command": environment["HIVEMIND_EVIDENCE_COMMAND"],
+    "region": environment["HIVEMIND_EVIDENCE_REGION"],
+    "ownership_token_sha256": environment["HIVEMIND_EVIDENCE_OWNERSHIP_HASH"],
+    "workspace_sha256": environment["HIVEMIND_EVIDENCE_WORKSPACE_HASH"],
+    "keep_infra": int(environment["HIVEMIND_EVIDENCE_KEEP_INFRA"]),
+    "capability_requirements": capabilities,
+    "final_exit_status": int(environment["HIVEMIND_EVIDENCE_FINAL_STATUS"]),
+    "redaction_scan_command": "tests/live/redaction-scan.sh EVIDENCE_DIR",
     "redaction_scan_exit_status": args.redaction_status,
 }
 output_parent = os.path.dirname(os.path.abspath(args.output))

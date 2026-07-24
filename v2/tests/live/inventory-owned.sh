@@ -16,11 +16,16 @@ aws_count() {
     timeout --foreground --kill-after=2s 30s aws "$@"
 }
 instances="$(aws_count ec2 describe-instances --region "$REGION" \
-    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
     --query 'length(Reservations[].Instances[])' --output text)"
 volumes="$(aws_count ec2 describe-volumes --region "$REGION" \
     --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" \
     --query 'length(Volumes)' --output text)"
+security_groups="$(aws_count ec2 describe-security-groups --region "$REGION" \
+    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" --query 'length(SecurityGroups)' --output text)"
+key_pairs="$(aws_count ec2 describe-key-pairs --region "$REGION" \
+    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" --query 'length(KeyPairs)' --output text)"
+network_resources=$((security_groups + key_pairs))
 buckets="$(aws_count s3api list-buckets --query "length(Buckets[?Name=='$BUCKET'])" --output text)"
 ecr_error="$(mktemp)"
 trap 'rm -f "$ecr_error"' EXIT
@@ -34,15 +39,18 @@ else
 fi
 locks=0
 [[ ! -e "$ROOT_DIR/infra/poc/.terraform.tfstate.lock.info" ]] || locks=1
+selected_workspace="$(terraform -chdir="$ROOT_DIR/infra/poc" workspace show 2>/dev/null || true)"
+workspace_count="$(terraform -chdir="$ROOT_DIR/infra/poc" workspace list 2>/dev/null | sed 's/^[* ]*//' | grep -Fxc "${TF_WORKSPACE:?}" || true)"
 if [[ "$PHASE" == pre ]]; then
-    selected_workspace="$(terraform -chdir="$ROOT_DIR/infra/poc" workspace show 2>/dev/null || true)"
     state_count="$(terraform -chdir="$ROOT_DIR/infra/poc" state list 2>/dev/null | awk 'END {print NR + 0}')"
-    [[ "$selected_workspace" == "${TF_WORKSPACE:?}" && "$state_count" == 0 ]] || locks=$((locks + 1))
+    [[ "$selected_workspace" == "$TF_WORKSPACE" && "$workspace_count" == 1 && "$state_count" == 0 ]] || locks=$((locks + 1))
+else
+    [[ "$workspace_count" == 0 ]] || locks=$((locks + 1))
 fi
 units="$({ systemctl list-units --all --no-legend "*$RUN_TOKEN*" 2>/dev/null || true; } | awk 'END {print NR + 0}')"
 processes="$(ps -eo args= | awk -v token="$RUN_TOKEN" -v self="$0" 'index($0, token) && !index($0, self) {count++} END {print count + 0}')"
-for value in "$instances" "$volumes" "$buckets" "$repositories" "$locks" "$units" "$processes"; do
+for value in "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes"; do
     [[ "$value" =~ ^[0-9]+$ ]] || { echo "invalid inventory count" >&2; exit 1; }
 done
-printf 'instances=%s\nvolumes=%s\nbuckets=%s\nrepositories=%s\nlocks=%s\nunits=%s\nprocesses=%s\n' \
-    "$instances" "$volumes" "$buckets" "$repositories" "$locks" "$units" "$processes"
+printf 'instances=%s\nvolumes=%s\nnetwork_resources=%s\nbuckets=%s\nrepositories=%s\nlocks=%s\nunits=%s\nprocesses=%s\n' \
+    "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes"

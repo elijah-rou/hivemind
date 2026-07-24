@@ -111,7 +111,7 @@ A section becomes passed only when every required criterion in it is passed. The
 ### `P-LIVE`
 
 - **Requirement class:** Provider/runtime/workload boundary requires a guarded current live run.
-- **Exact current command or blocker:** `cd v2 && timeout --foreground --kill-after=30s 14400s ./tests/live/run.sh` with the mandatory environment in `tests/live/README.md`. Direct `scripts/poc-runbook.sh` execution is rejected.
+- **Exact current command or blocker:** `cd v2 && timeout --kill-after=30s 14400s ./tests/live/run.sh` with the mandatory environment in `tests/live/README.md`. Direct private-helper and `scripts/poc-runbook.sh` execution is rejected. The wrapper currently refuses before ownership because required JuiceFS AppSpec semantics are absent.
 - **Environment and required capabilities:** Separate authorization, credentials, account/region allowlists, cost and destructive approval, unique ownership token, and criterion-specific CPU/GPU/private-registry/JuiceFS capabilities. Optional skips are forbidden.
 - **Observable pass condition:** The stated behavior succeeds on the representative workload and all required capability checks and cleanup assertions pass.
 - **Required artifacts:** Source SHA/time manifest, plan digest, image digest, request/response, API state/events/logs, runtime/provider inventories, cleanup proof.
@@ -382,8 +382,8 @@ Historical POC v1 AWS, benchmark, artifact, and continuation records remain labe
 ## Residual limitations
 
 - Current worker simulation covers bounded bidirectional network/session behavior, stop/probe ownership, GPU admission, and `/run` outcome/status/accounting scenarios. These are deterministic model evidence only and do not establish AppSpec, readiness/routability, full-stack containerd, GPU/CDI, JuiceFS, private registry, or live product acceptance.
-- Local smoke is single-replica process-runtime evidence. Standalone local failover has no worker or data-plane path. Storage smoke checks startup/liveness only.
-- The privileged containerd harness is a Rust runtime-component gate, not a full Hivemind stack.
+- The maintained local run, failover, and retained-storage contracts use three journal-backed replicas, the Go API, and a real Rust process-runtime worker. They cross local process/socket/filesystem boundaries only, not containerd or cloud.
+- The privileged component harness remains a Rust runtime-component gate. The separate prepared full-stack containerd harness includes three Zig replicas, Go API, Rust worker/containerd, traffic, worker restart/adoption, and exact task/container baseline restoration; it has not been executed.
 - The shared protocol-v6 corpus and guarded live harness are prepared; the guarded live matrix remains unexecuted and incomplete.
 - Experimental journal durability excludes torn writes and power loss and has a bounded retained-log lifetime.
 - POC v2 has no parity claim. Required product surfaces and current live evidence remain incomplete.

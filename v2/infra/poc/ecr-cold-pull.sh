@@ -52,11 +52,27 @@ fi
 printf 'removed_exact=%s\n' "$image"
 password="$(aws ecr get-login-password --region "$region")"
 [[ -n "$password" ]]
-sudo ctr -n hivemind images pull --user "AWS:$password" "$image" >/dev/null
+registry="${image%%/*}"
+hosts_dir="$(mktemp -d)"
+trap 'rm -rf "$hosts_dir"' EXIT
+chmod 700 "$hosts_dir"
+auth="$(printf 'AWS:%s' "$password" | base64 | tr -d '\n')"
 unset password
+cat >"$hosts_dir/hosts.toml" <<EOF
+server = "https://$registry"
+[host."https://$registry"]
+  capabilities = ["pull", "resolve"]
+  [host."https://$registry".header]
+    authorization = "Basic $auth"
+EOF
+unset auth
+chmod 600 "$hosts_dir/hosts.toml"
+sudo ctr -n hivemind images pull --hosts-dir "$hosts_dir" "$image" >/dev/null
+rm -rf "$hosts_dir"
+trap - EXIT
 actual_digest="$(sudo ctr -n hivemind images info "$image" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n1)"
 [[ "$actual_digest" == "$expected_digest" ]]
-printf 'pull_auth=aws-ecr-credential-helper-executed\n'
+printf 'pull_auth=temporary-ecr-hosts-file\n'
 printf 'pulled_digest=%s\n' "$actual_digest"
 sudo ctr -n hivemind images list -q | grep -Fx "$image" >/dev/null
 printf 'cache_after=owned\n'
@@ -64,7 +80,7 @@ REMOTE
 
 grep -q '^cache_before=owned$' "$RAW_EVIDENCE"
 grep -q "^removed_exact=$IMAGE$" "$RAW_EVIDENCE"
-grep -q '^pull_auth=aws-ecr-credential-helper-executed$' "$RAW_EVIDENCE"
+grep -q '^pull_auth=temporary-ecr-hosts-file$' "$RAW_EVIDENCE"
 grep -q "^pulled_digest=$EXPECTED_DIGEST$" "$RAW_EVIDENCE"
 grep -q '^cache_after=owned$' "$RAW_EVIDENCE"
 redacted_image="[REDACTED_ACCOUNT].${IMAGE#*.}"

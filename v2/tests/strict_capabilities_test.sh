@@ -76,6 +76,25 @@ else
     fail "conflicting containerd flags lack an explicit error"
 fi
 
+for strict_flag in REQUIRE_GPU REQUIRE_NYDUS REQUIRE_JUICEFS; do
+    if env "$strict_flag=1" HIVEMIND_CONTAINERD_RUNNER="$missing_runner" "$RUN_ALL" >"$TMP_DIR/$strict_flag.aggregate" 2>&1; then
+        fail "$strict_flag=1 must imply required full-stack containerd mode"
+    elif grep -q 'required containerd runner is not executable' "$TMP_DIR/$strict_flag.aggregate" &&
+         ! grep -q 'Zig tests' "$TMP_DIR/$strict_flag.aggregate"; then
+        pass "$strict_flag=1 implies fail-fast required full-stack mode"
+    else
+        fail "$strict_flag=1 aggregate failure was late or unclear"
+    fi
+done
+
+if REQUIRE_GPU=yes "$RUN_ALL" --skip-containerd >"$TMP_DIR/malformed-strict.out" 2>&1; then
+    fail "malformed subordinate strict flag must fail"
+elif grep -q 'REQUIRE_GPU must be 0 or 1' "$TMP_DIR/malformed-strict.out"; then
+    pass "malformed subordinate strict flag fails explicitly"
+else
+    fail "malformed subordinate strict flag failure was unclear"
+fi
+
 if [[ "$FAIL" -ne 0 ]]; then
     echo "FAIL: strict_capabilities_test ($FAIL assertion(s))" >&2
     exit 1

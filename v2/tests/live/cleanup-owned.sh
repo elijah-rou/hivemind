@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[[ "${HIVEMIND_ALLOW_LIVE:-0}" == 1 && "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_LIVE_GUARD_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || {
+    echo "FAIL: private live helper requires guarded parent" >&2
+    exit 1
+}
+guard_parent="$(awk '{print $4}' "/proc/$PPID/stat" 2>/dev/null || true)"
+tr '\0' ' ' <"/proc/$guard_parent/cmdline" 2>/dev/null | grep -Fq '/tests/live/run.sh' || {
+    echo "FAIL: private live helper requires guarded parent" >&2
+    exit 1
+}
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 TF_ROOT="$ROOT_DIR/infra/poc"
 RUN_TOKEN="${HIVEMIND_RUN_TOKEN:?}"
