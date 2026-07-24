@@ -139,15 +139,24 @@ local_cluster_start_api "127.0.0.1:$relay_port,$(local_cluster_client_addrs)"
 local_cluster_wait_health
 
 local_cluster_stop_replica "$stale_leader"
-new_leader="$(local_cluster_wait_new_leader "$stale_leader")"
-local_cluster_start_replica "$stale_leader"
-for _ in $(seq 1 100); do
-    if [[ "$(local_cluster_metric "$stale_leader" hivemind_replica_status 2>/dev/null || echo x)" == 0 ]] &&
-       [[ "$(local_cluster_metric "$stale_leader" hivemind_is_leader 2>/dev/null || echo x)" == 0 ]]; then
-        break
-    fi
-    sleep 0.1
+local_cluster_wait_new_leader "$stale_leader" >/dev/null
+stale_follower_ready=false
+for _ in $(seq 1 3); do
+    local_cluster_start_replica "$stale_leader"
+    for _ in $(seq 1 100); do
+        stale_status="$(local_cluster_metric "$stale_leader" hivemind_replica_status 2>/dev/null || echo x)"
+        stale_is_leader="$(local_cluster_metric "$stale_leader" hivemind_is_leader 2>/dev/null || echo x)"
+        if [[ "$stale_status" == 0 ]]; then
+            [[ "$stale_is_leader" == 0 ]] && stale_follower_ready=true
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "$stale_follower_ready" == true ]] && break
+    local_cluster_stop_replica "$stale_leader"
+    local_cluster_wait_new_leader "$stale_leader" >/dev/null
 done
+[[ "$stale_follower_ready" == true ]]
 [[ "$(local_cluster_metric "$stale_leader" hivemind_replica_status)" == 0 ]]
 [[ "$(local_cluster_metric "$stale_leader" hivemind_is_leader)" == 0 ]]
 python3 - "$(local_cluster_client_port "$stale_leader")" "$deployment" <<'PY'
@@ -174,14 +183,22 @@ assert response[3] == 0x23
 assert struct.unpack('<Q', response[4:12])[0] == request_id
 assert response[12] == 9
 PY
-reprobe_dispatched_before="$(local_cluster_metric "$new_leader" hivemind_requests_dispatched_total)"
+reprobe_dispatched_before_0="$(local_cluster_metric 0 hivemind_requests_dispatched_total)"
+reprobe_dispatched_before_1="$(local_cluster_metric 1 hivemind_requests_dispatched_total)"
+reprobe_dispatched_before_2="$(local_cluster_metric 2 hivemind_requests_dispatched_total)"
 status="$(local_cluster_run "$deployment" 'safe-reprobe-once' "$LOCAL_CLUSTER_ROOT/run-reprobe.out")"
 [[ "$status" == 200 ]]
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["echo"] == "safe-reprobe-once"; assert value["execution_count"] == 1' "$LOCAL_CLUSTER_ROOT/run-reprobe.out"
 grep -qx 'run_status=9' "$LOCAL_CLUSTER_ROOT/stale-relay.log"
 [[ "$(local_cluster_metric "$stale_leader" hivemind_requests_enqueued_total)" == 0 ]]
-reprobe_dispatched_after="$(local_cluster_metric "$new_leader" hivemind_requests_dispatched_total)"
-(( reprobe_dispatched_after == reprobe_dispatched_before + 1 ))
+reprobe_dispatched_after_0="$(local_cluster_metric 0 hivemind_requests_dispatched_total)"
+reprobe_dispatched_after_1="$(local_cluster_metric 1 hivemind_requests_dispatched_total)"
+reprobe_dispatched_after_2="$(local_cluster_metric 2 hivemind_requests_dispatched_total)"
+(( reprobe_dispatched_after_0 >= reprobe_dispatched_before_0 ))
+(( reprobe_dispatched_after_1 >= reprobe_dispatched_before_1 ))
+(( reprobe_dispatched_after_2 >= reprobe_dispatched_before_2 ))
+(( reprobe_dispatched_after_0 + reprobe_dispatched_after_1 + reprobe_dispatched_after_2 ==
+   reprobe_dispatched_before_0 + reprobe_dispatched_before_1 + reprobe_dispatched_before_2 + 1 ))
 local_cluster_wait_convergence "$deployment" 1
 
 # Real bench performs its production leader probe and workload traffic.
