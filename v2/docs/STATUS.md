@@ -272,19 +272,17 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 ## Test Coverage
 
-**Current local verification (2026-07-23, branch evidence; no live infrastructure touched):**
-- Zig Debug and ReleaseFast suites pass, including the shared wire corpus, protocol-v6 peer-envelope socketpair scenario, and committed-state digest metric used by retained recovery.
-- Rust: `167` library, `3` fuzz-harness utility, `6` main, and `5` integration tests pass; containerd feature integration was not enabled. Release builds emit no warning from test-only protocol constants.
-- Worker simulation: mutated sequential seeds `0..999` passed with zero failures using the release fuzz runner.
-- Go: API and bench module race tests and builds pass; both consume the shared corpus.
-- Shared wire: `tests/wire-contract-test.sh` passes bounded schema/version validation and all four language consumers; applicable vectors re-encode byte-identically.
-- `tests/run-all.sh --skip-containerd` passed `21` invoked phases with `0` failures in `151s`; containerd was explicitly skipped.
-- Focused real-process contracts pass under explicit outer bounds: run contract in `9s`, failover in `20s`, and retained-storage recovery in `14s`; three later run-contract stability repetitions passed in `49s`, `21s`, and `14s`.
-- The reusable cluster uses three retained journals, real Go API, real Rust process worker, and real Go bench. It proves connected/leader health, commit/failover/rejoin/full retained restart/convergence/new commit, statuses 0/4/6/9, abandonment cleanup, exactly-once reprobe, and exact zero queue/in-flight metrics.
-- Cleanup records owned PID start identity and process groups, resumes stopped owned groups before TERM, uses bounded KILL fallback, releases only token-owned locks, and verifies zero owned process/listener/lock residue on pass and failure without broad `pkill`.
+**Current local verification (2026-07-24, tested commit `dc0dc633aa8bbdd94d86713f4b0669b648b0d715`; no live infrastructure touched):**
+- Environment: Linux x86_64, Zig `0.16.0`, Rust `1.95.0`, and Go `1.26.3-X:nodwarf5`.
+- Exact aggregate command: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `149s`, with `21` invoked phases passed and containerd explicitly skipped. Every aggregate phase also had its own 900-second TERM/KILL deadline.
+- A prior aggregate at `2527c4e9667dcf110cda094d24cded2a5f2e39dd` exited `1` in `131s`: `20` phases passed and the run contract exposed a leader-rotation race in its exact dispatch-delta assertion. The bounded restarted-replica follower acquisition was then fixed; three consecutive focused run contracts passed in `37s` total before the final aggregate.
+- Zig Debug and ReleaseFast suites pass. The committed-state digest regression mutates state, computes `StateMachine.committedDigest()`, and requires the exact rendered metric value.
+- Rust passes `168` library, `3` fuzz-harness utility, `7` main, and `5` integration tests; containerd feature integration was not enabled. Deterministic coverage requires one runtime owner across connection loss and default process responses omit test-only execution counts.
+- The reusable cluster uses three retained journals, real Go API, real Rust process worker, and real Go bench. The relay forwards the API request to the restarted old leader only after that exact replica is a normal follower, records its real status 9, and then observes one aggregate dispatch delta after the gateway reprobe. Abandonment requires exact enqueue and dispatch counter deltas before queue/in-flight gauges return to zero.
+- Failover waits for worker and pod readiness, sends the post-failover workload once without ambiguous retry, and requires test-only `execution_count == 1`. The process runtime keeps only one bounded last-payload counter slot when explicit test controls are enabled and exposes no counter field by default.
+- Cleanup records leader PID start identity, inventories every non-zombie member of each owned process group, resumes stopped groups before TERM, uses bounded KILL fallback, requires `ss` for exact listener inventory, releases only token-owned locks, and verifies zero owned process/listener/lock residue without broad process-name killing. The cleanup regression requires graceful TERM delivery and descendant removal.
 - Shell: all `v2/tests/*.sh` pass `bash -n`; changed shell files pass ShellCheck at style severity.
-- Residual validation: no live AWS deploy; containerd-in-Docker not run; Terraform provider-dependent offline validation is reported separately when unavailable.
-- Acceptance counts remain `6 / 8` POC v1 sections and `16 / 16` warm-cache execution items. Historical live-infra state is unchanged by this verification.
+- This evidence manifest is the only post-test documentation change: it does not alter the tested runtime or harness. Residual validation remains containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider execution, AWS, and all live/cloud boundaries. Historical live-infrastructure state was not inventoried or changed.
 
 **VOPR simulation coverage:**
 - VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state

@@ -137,7 +137,7 @@ HTTP/bench -> Go API -> three journal-backed Zig replicas
                            child workload process
 ```
 
-[`local-smoke.sh`](../tests/local-smoke.sh) is now a compatibility entry point for the three-replica [`local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh). The maintained contract crosses real process, localhost TCP, retained journal, process-runtime child, API reprobe, and bench boundaries. It checks success, statuses 4/6/9, abandonment, exactly-once execution, and exact zero queue/in-flight metrics. Explicit test-only process controls are disabled by default and enabled only for deterministic negative outcomes.
+[`local-smoke.sh`](../tests/local-smoke.sh) is now a compatibility entry point for the three-replica [`local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh). The maintained contract crosses real process, localhost TCP, retained journal, process-runtime child, API reprobe, and bench boundaries. It checks success, statuses 4/6/9, exact enqueue/dispatch deltas for abandonment, status 9 from the restarted old leader after that exact replica becomes a normal follower, one aggregate dispatch delta after the API reprobe, exactly-once execution, and exact zero queue/in-flight metrics. Explicit test-only process controls are disabled by default, retain only one bounded last-payload execution counter slot when enabled, and do not alter default process responses.
 
 #### Three-replica data-plane failover
 
@@ -154,7 +154,7 @@ commit -> kill leader -> reconnect/elect -> commit
        -> restart old replica from its retained directory
 ```
 
-[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) uses the shared three-replica harness, starts the Rust worker/process runtime, executes `/run` before and after killing the elected leader, restarts the old replica with the same journal, and requires commit/state convergence plus exact zero accounting. It is mandatory in `run-all.sh` unless `--skip-smoke` is explicit.
+[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) uses the shared three-replica harness, starts the Rust worker/process runtime, executes `/run` before killing the elected leader, waits separately for replacement-leader worker/pod readiness, then executes the post-failover workload exactly once without manually retrying an ambiguous result. Explicit test controls require `execution_count == 1`. The contract restarts the old replica with the same journal and requires commit/state convergence plus exact zero accounting. It is mandatory in `run-all.sh` unless `--skip-smoke` is explicit.
 
 #### Retained storage recovery
 
@@ -188,7 +188,7 @@ commit state + successful /run
  -> require queue and in-flight metrics to return to zero
 ```
 
-[`tests/lib/local_cluster.sh`](../tests/lib/local_cluster.sh) implements this topology with isolated exact ports and token-owned locks. Every component leads an inventoried owned process group; cleanup sends CONT before TERM, polls boundedly, falls back to KILL, and verifies no owned process, exact listener, or lock remains on both pass and failure. It does not use broad process-name killing. Failover, storage recovery, and run contract are mandatory aggregate phases unless `--skip-smoke` is explicit.
+[`tests/lib/local_cluster.sh`](../tests/lib/local_cluster.sh) implements this topology with isolated exact ports and token-owned locks. Every component leads an inventoried owned process group; cleanup records the leader's start identity, inventories all non-zombie members by PGID even after the leader exits, sends CONT before TERM, polls boundedly, falls back to group KILL, and verifies no owned process, exact listener, or lock remains on both pass and failure. `ss` is mandatory for listener allocation and cleanup inventory. Cleanup does not use broad process-name killing. Failover, storage recovery, and run contract are mandatory aggregate phases unless `--skip-smoke` is explicit, and every aggregate phase has a 900-second deadline.
 
 ### Current, implemented: privileged runtime-component containerd
 

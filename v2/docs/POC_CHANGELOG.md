@@ -44,6 +44,23 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-24 — D1 review remediation and current-head evidence
+
+What changed:
+- replaced the synthetic relay status 9 with a frame forwarded to the exact restarted old leader after bounded acquisition of that replica as a normal follower; the API reprobe now requires one aggregate dispatch delta
+- made abandonment require exact enqueue and dispatch counter deltas before zero gauges, added a lower bound to the trickle deadline, and changed failover to wait for readiness and issue the post-failover workload once without ambiguous retries
+- removed default process-runtime execution counting and response-schema changes; explicit test controls retain only one bounded last-payload counter slot
+- made runtime ownership explicit across control-plane sessions and added deterministic connection-loss ownership coverage; the committed-state digest test now requires the exact rendered value after a state mutation
+- cleanup now inventories every non-zombie PGID member after leader exit, requires `ss`, and has a stopped-group regression that proves graceful TERM delivery and descendant removal
+- aggregate phases now have 900-second deadlines and published quick commands include outer TERM/KILL bounds
+
+Evidence and limits:
+- RED: `cargo test --lib runtime::process::tests::default_process_response_omits_test_execution_count` failed because default responses exposed `execution_count`; the first post-fix aggregate at `2527c4e9667dcf110cda094d24cded2a5f2e39dd` exited `1` in `131s` after the new exact dispatch assertion exposed leader rotation
+- GREEN tested commit: `dc0dc633aa8bbdd94d86713f4b0669b648b0d715`
+- `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `149s`: `21` invoked phases passed and containerd was explicitly skipped
+- focused run contract passed three consecutive times in `37s` total after the bounded restarted-follower acquisition fix; focused failover passed in `56s`, retained-storage recovery in `23s`, and cleanup in under one second
+- no containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider, AWS, live, or cloud boundary ran; historical live state was not inventoried or changed
+
 ### 2026-07-24 — D1 reusable local failover, recovery, and `/run` contracts
 
 What changed:
