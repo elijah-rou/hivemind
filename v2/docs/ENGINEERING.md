@@ -209,7 +209,7 @@ privileged test container
 
 [`tests/containerd/run-tests.sh`](../tests/containerd/run-tests.sh) builds the test image and uses privileged Docker; [`run.sh`](../tests/containerd/run.sh) starts containerd, checks `ctr`, and runs Rust integration tests serially. The tests cover runtime lifecycle and include constructing a replacement runtime that handles an existing task. Runtime socket, namespace, runtime, snapshotter, command bounds, and cleanup behavior remain owned by [`containerd.rs`](../worker/src/runtime/containerd.rs). This gate starts neither Zig nor Go nor a networked worker process. Optional gVisor, GPU, Nydus, and JuiceFS branches can skip or tolerate absence and are not strict acceptance evidence.
 
-### Planned, not implemented: full-stack containerd recovery
+### Prepared, not executed: full-stack containerd recovery
 
 ```text
 HTTP client -> Go API -> Zig replica cluster -> Rust worker process
@@ -225,7 +225,7 @@ restart worker -> adopt or safely recreate owned task
                -> remove owned task/container state
 ```
 
-No full-stack containerd harness currently proves worker restart, task adoption/recreation through the control plane, request recovery, and final task cleanup together.
+[`tests/containerd/full-stack.sh`](../tests/containerd/full-stack.sh) prepares this exact topology inside the privileged full-stack image. It records baseline task/container inventories, starts three retained Zig replicas plus Go API and Rust worker/containerd, sends traffic, restarts the worker, requires adoption/recreation and recovered traffic, deletes the deployment, and requires exact baseline inventory. Cleanup removes only inventory deltas and chains into the bounded local process cleanup. `--require-containerd` makes component and full-stack absence/failure nonzero. E1 did not execute this privileged boundary, so it is prepared harness code, not containerd evidence.
 
 ### Historical/tooling boundary: infrastructure and cloud
 
@@ -241,7 +241,7 @@ POC tooling --------> CPU/GPU workload and failure scripts
 artifacts ----------> local files + ownership-scoped S3 + SSM output
 ```
 
-[`infra/poc/`](../infra/poc/), [`infra/bench/`](../infra/bench/), [`infra/gpu-test/`](../infra/gpu-test/), and [`infra/poc-eks/`](../infra/poc-eks/) contain Terraform, ECR, S3/SSM, SSH/systemd, CPU/GPU, workload, benchmark, and cleanup tooling. Some deterministic fixtures validate these scripts, and some retained artifacts describe historical cloud runs. Neither is a guarded current live acceptance gate. Fixed or mutable topology values belong to the Terraform and scripts, not this diagram. [The live safety contract](../tests/live/README.md) describes the planned guardrails without making the existing tooling a default gate.
+[`infra/poc/`](../infra/poc/), [`infra/bench/`](../infra/bench/), [`infra/gpu-test/`](../infra/gpu-test/), and [`infra/poc-eks/`](../infra/poc-eks/) contain Terraform, ECR, S3/SSM, SSH/systemd, CPU/GPU, workload, benchmark, and cleanup tooling. [`tests/live/run.sh`](../tests/live/run.sh) is the only prepared unified acceptance wrapper: it requires literal authorization, account/region allowlists, unique token-derived workspace/bucket/ECR names, reviewed-plan digest binding, cost/cleanup approvals, pre-ownership zero inventory, trap installation before execution, and post-cleanup zero inventory. The wrapped runbook refuses direct live execution outside that guard. Evidence generation is bounded and redaction-scanned. E1 ran deterministic stubs only, so no current cloud, provider, systemd, S3/SSM, GPU, ECR, or cleanup evidence exists.
 
 ### Protocol and version process
 

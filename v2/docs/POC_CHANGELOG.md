@@ -44,6 +44,22 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 
 ## Entries
 
+### 2026-07-24 — Lane E1 strict containerd/live harness preparation
+
+What changed:
+- added `--require-containerd` and literal strict capability semantics; optional absence records a skip, while required containerd/GPU/Nydus/JuiceFS absence or incomplete evidence is nonzero
+- prepared a privileged full-stack containerd variant with three real Zig replicas, Go API, Rust worker/containerd, requests, worker restart/adoption, and exact task/container inventory cleanup
+- replaced host-only GPU acceptance with exact CDI-selected task evidence and successful in-container `nvidia-smi`; added exact owned-image ECR cold-pull/auth/digest evidence mode
+- strengthened live leader-restart drills to require normal rejoin, equal committed watermark/state digest, and exact queue/in-flight zero on every replica
+- added a guarded reviewed-plan live wrapper with account/region allowlists, unique run ownership, default teardown, pre/post inventory, bounded manifest generation, and redaction scan; direct runbook use now fails closed
+
+Evidence and limits:
+- RED: the new strict capability fixture initially failed all 14 unavailable/success/conflict assertions because the helper and `--require-containerd` did not exist; GPU, manifest, ECR, and live-guard fixtures likewise failed before their entry points existed
+- GREEN: deterministic strict-capability, GPU CDI/`nvidia-smi`, ECR cold-pull, evidence-manifest, and live-guard fixtures pass without provider, GPU, containerd, registry, or cloud access
+- no privileged containerd image, GPU/CDI, Nydus, JuiceFS, Doppler, ECR, S3/SSM/systemd, Terraform provider, AWS, EKS, or other live resource was executed; all such harnesses are prepared only
+- `REQUIRE_JUICEFS=1` fails before apply because required AppSpec/API mount semantics remain a product blocker; private ECR success remains unclaimed until credentials and the exact cold pull execute
+- existing journal, snapshot, rolling-upgrade, authentication, AppSpec/readiness/logging/isolation, and production-readiness limits are unchanged; historical live state was not inventoried or changed
+
 ### 2026-07-24 — D1 review remediation and current-head evidence
 
 What changed:

@@ -97,21 +97,21 @@ A section becomes passed only when every required criterion in it is passed. The
 
 ### `P-PRIV`
 
-- **Requirement class:** Current privileged harness tests only the Rust containerd component; the broader product boundary is unavailable.
-- **Exact current command or blocker:** Nearest current command: `cd v2 && ./tests/containerd/run-tests.sh`; no full-stack containerd acceptance command exists.
+- **Requirement class:** Prepared privileged full-stack containerd boundary; execution evidence is required.
+- **Exact current command or blocker:** `cd v2 && REQUIRE_CONTAINERD=1 ./tests/containerd/run-tests.sh --full-stack` or the aggregate `./tests/run-all.sh --require-containerd`.
 - **Environment and required capabilities:** Docker and privileged Linux container support; real containerd/ctr. Docker absence or skip fails this required row.
 - **Observable pass condition:** Criterion holds through the real worker/control-plane path and post-run runtime inventory is clean.
 - **Required artifacts:** Container/task/cgroup/mount inventories, worker logs, command output.
 - **Deterministic evidence sufficient:** No
-- **Required execution boundary:** Privileged containerd and usually local full-stack required; current harness covers only the component.
-- **Cleanup:** Docker `--rm`; tests remove owned component resources; final inventory required.
-- **Default status:** blocked
-- **Current evidence:** Blocker: no full-stack privileged containerd harness proves this criterion.
+- **Required execution boundary:** Privileged containerd and real Zig/Go/Rust full stack.
+- **Cleanup:** Exact task/container baseline restoration plus bounded owned-process cleanup and Docker `--rm`.
+- **Default status:** not-run
+- **Current evidence:** Prepared only; E1 did not execute the privileged command.
 
 ### `P-LIVE`
 
 - **Requirement class:** Provider/runtime/workload boundary requires a guarded current live run.
-- **Exact current command or blocker:** Unavailable: no unified guarded live acceptance command exists; existing `cd v2 && ./scripts/poc-runbook.sh` is operator tooling, not the required guarded gate.
+- **Exact current command or blocker:** `cd v2 && timeout --foreground --kill-after=30s 14400s ./tests/live/run.sh` with the mandatory environment in `tests/live/README.md`. Direct `scripts/poc-runbook.sh` execution is rejected.
 - **Environment and required capabilities:** Separate authorization, credentials, account/region allowlists, cost and destructive approval, unique ownership token, and criterion-specific CPU/GPU/private-registry/JuiceFS capabilities. Optional skips are forbidden.
 - **Observable pass condition:** The stated behavior succeeds on the representative workload and all required capability checks and cleanup assertions pass.
 - **Required artifacts:** Source SHA/time manifest, plan digest, image digest, request/response, API state/events/logs, runtime/provider inventories, cleanup proof.
@@ -119,7 +119,7 @@ A section becomes passed only when every required criterion in it is passed. The
 - **Required execution boundary:** Live required; local real-process and privileged containerd are also required when named by the criterion.
 - **Cleanup:** Destroy only exactly owned resources; prove deployments, tasks, mounts, instances, volumes, registry objects, workspaces, and temp secrets absent.
 - **Default status:** blocked
-- **Current evidence:** Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable.
+- **Current evidence:** Prepared only; no current authorization, execution, manifest, or post-destroy inventory exists.
 
 ### `P-BENCH`
 
@@ -153,14 +153,14 @@ A section becomes passed only when every required criterion in it is passed. The
 
 | Stable ID | Requirement | Evidence profile | Deterministic sufficient | Required boundary | Status | Current evidence |
 |---|---|---|---|---|---|---|
-| `V2-01-private-image` | Workload image is private or private-auth-equivalent. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-01-env-secret` | Workload uses env vars and at least one secret ref. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-01-readiness` | Workload has a readiness endpoint distinct from process start. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-01-private-image` | Workload image is private or private-auth-equivalent. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Guarded cold-pull mode is prepared but unexecuted; current private-auth evidence is absent. |
+| `V2-01-env-secret` | Workload uses env vars and at least one secret ref. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Product surface remains incomplete; guarded live execution was not run. |
+| `V2-01-readiness` | Workload has a readiness endpoint distinct from process start. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Readiness/routability product surface remains absent; guarded live execution was not run. |
 | `V2-01-logs` | Workload writes logs retrievable through Hivemind tooling. | `P-ABSENT` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: required product surface or acceptance harness is absent. |
-| `V2-01-juicefs` | Workload reads or writes a JuiceFS-mounted path. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-01-cpu` | Workload runs on CPU. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-01-gpu` | Workload has a GPU variant or GPU dependency smoke when the target product path needs GPU. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-01-request` | Workload serves a request through the Hivemind request path. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-01-juicefs` | Workload reads or writes a JuiceFS-mounted path. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | `REQUIRE_JUICEFS=1` fails before apply because required AppSpec/API mount semantics remain absent. |
+| `V2-01-cpu` | Workload runs on CPU. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Guarded current-head live execution and cleanup manifest were not run. |
+| `V2-01-gpu` | Workload has a GPU variant or GPU dependency smoke when the target product path needs GPU. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Strict CDI/in-container evidence is prepared but no current GPU run exists. |
+| `V2-01-request` | Workload serves a request through the Hivemind request path. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Guarded current-head live execution and cleanup manifest were not run. |
 
 **Required evidence set:** Live request/response; worker journals and pod logs; lifecycle/readiness/routability state dump; equivalent EKS/Kubernetes manifest.
 
@@ -199,12 +199,12 @@ A section becomes passed only when every required criterion in it is passed. The
 
 | Stable ID | Requirement | Evidence profile | Deterministic sufficient | Required boundary | Status | Current evidence |
 |---|---|---|---|---|---|---|
-| `V2-03-host-cli` | Hivemind host image/AMI includes the `juicefs` CLI or documented equivalent. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-03-host-cli` | Hivemind host image/AMI includes the `juicefs` CLI or documented equivalent. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | No current guarded host/JuiceFS execution exists. |
 | `V2-03-appspec-mount` | `AppSpec v1` exposes a required JuiceFS mount. | `P-ABSENT` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-03-mount-event` | Worker mount success is visible in events. | `P-ABSENT` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-03-mount-fail` | Required mount failure fails the pod before routing. | `P-MIXED` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: current subset does not implement or prove the complete cross-component criterion. |
-| `V2-03-unmount` | Worker unmounts on stop, failure, and shutdown drain. | `P-PRIV` | no | local real-process + privileged containerd | blocked | Blocker: no full-stack privileged containerd harness proves this criterion. |
-| `V2-03-no-leak` | Repeated start/stop does not leak mountpoints. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-03-unmount` | Worker unmounts on stop, failure, and shutdown drain. | `P-PRIV` | no | local real-process + privileged containerd | blocked | Prepared full-stack harness was not executed; required JuiceFS AppSpec path also remains absent. |
+| `V2-03-no-leak` | Repeated start/stop does not leak mountpoints. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Required mount product path remains absent and no guarded mount inventory was run. |
 
 **Required evidence set:** Deterministic mount-failure/not-routable coverage; live mounted-path read/write; mount table before and after cleanup.
 
@@ -214,7 +214,7 @@ A section becomes passed only when every required criterion in it is passed. The
 
 | Stable ID | Requirement | Evidence profile | Deterministic sufficient | Required boundary | Status | Current evidence |
 |---|---|---|---|---|---|---|
-| `V2-04-registry-auth` | Registry auth supports private ECR or the selected registry without 256-byte password truncation. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-04-registry-auth` | Registry auth supports private ECR or the selected registry without 256-byte password truncation. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Exact cold-pull/auth/digest mode is prepared but was not executed with credentials. |
 | `V2-04-precedence` | Auth precedence is documented: per-deployment secret ref, then AMI/containerd hosts config, then public pull. | `P-DOC` | documentation only | artifact review; referenced rows retain their boundaries | blocked | Blocker: current curated artifact or prerequisite current evidence is absent. |
 | `V2-04-env-secret` | Environment secret refs resolve through the selected secret provider. | `P-MIXED` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: current subset does not implement or prove the complete cross-component criterion. |
 | `V2-04-redaction` | Secret values are redacted in API responses, events, logs, traces, and errors. | `P-MIXED` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: current subset does not implement or prove the complete cross-component criterion. |
@@ -245,9 +245,9 @@ A section becomes passed only when every required criterion in it is passed. The
 |---|---|---|---|---|---|---|
 | `V2-06-api-auth` | API authentication is required for mutating endpoints. | `P-ABSENT` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-06-traffic-security` | Agent/replica traffic is authenticated and encrypted, or explicitly scoped to a PSK-encrypted internal-alpha model. | `P-MIXED` | no | deterministic + local real-process + privileged containerd + live | blocked | Blocker: current subset does not implement or prove the complete cross-component criterion. |
-| `V2-06-isolation` | An isolation profile applies resource limits, drops capabilities where possible, uses readonly rootfs when supported, and forbids privileged containers by default. | `P-PRIV` | no | local real-process + privileged containerd | blocked | Blocker: no full-stack privileged containerd harness proves this criterion. |
-| `V2-06-gpu-device` | GPU device exposure is limited to requested devices. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
-| `V2-06-credential-isolation` | Workloads cannot access Hivemind control-plane credentials through env, mounts, or filesystem. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Blocker: unified guarded live gate, authorization, current manifest, and cleanup inventory are unavailable. |
+| `V2-06-isolation` | An isolation profile applies resource limits, drops capabilities where possible, uses readonly rootfs when supported, and forbids privileged containers by default. | `P-PRIV` | no | local real-process + privileged containerd | blocked | Prepared full-stack harness was not executed, and the complete isolation-profile product surface remains absent. |
+| `V2-06-gpu-device` | GPU device exposure is limited to requested devices. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | CDI-selected in-container evidence is prepared but no current GPU run exists. |
+| `V2-06-credential-isolation` | Workloads cannot access Hivemind control-plane credentials through env, mounts, or filesystem. | `P-LIVE` | no | local real-process + privileged containerd + live | blocked | Product isolation proof remains incomplete and guarded live execution was not run. |
 | `V2-06-limitations` | Security limitations state clearly what the model does and does not protect against. | `P-DOC` | documentation only | artifact review; referenced rows retain their boundaries | blocked | Blocker: current curated artifact or prerequisite current evidence is absent. |
 
 **Required evidence set:** Isolation-model documentation; auth-failure tests; unauthenticated live mutation denial; container/device/resource inspection.
@@ -384,6 +384,6 @@ Historical POC v1 AWS, benchmark, artifact, and continuation records remain labe
 - Current worker simulation covers bounded bidirectional network/session behavior, stop/probe ownership, GPU admission, and `/run` outcome/status/accounting scenarios. These are deterministic model evidence only and do not establish AppSpec, readiness/routability, full-stack containerd, GPU/CDI, JuiceFS, private registry, or live product acceptance.
 - Local smoke is single-replica process-runtime evidence. Standalone local failover has no worker or data-plane path. Storage smoke checks startup/liveness only.
 - The privileged containerd harness is a Rust runtime-component gate, not a full Hivemind stack.
-- No shared normative wire corpus and no unified guarded live acceptance gate exist.
+- The shared protocol-v6 corpus and guarded live harness are prepared; the guarded live matrix remains unexecuted and incomplete.
 - Experimental journal durability excludes torn writes and power loss and has a bounded retained-log lifetime.
 - POC v2 has no parity claim. Required product surfaces and current live evidence remain incomplete.

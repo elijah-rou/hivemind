@@ -16,9 +16,10 @@ Each catalog row records classification/topology, dependencies and boundedness, 
 | Three-replica data-plane failover | `cd v2 && timeout --foreground --kill-after=10s 300s ./tests/local-failover-smoke.sh --build` |
 | Retained storage recovery | `cd v2 && timeout --foreground --kill-after=10s 300s ./tests/local-storage-recovery-smoke.sh --build` |
 | Shared protocol-v6 wire corpus | `cd v2/tests && timeout --foreground --kill-after=10s 600s ./wire-contract-test.sh` |
-| Privileged containerd component integration | `cd v2 && timeout --foreground --kill-after=10s 1800s ./tests/containerd/run-tests.sh` |
+| Privileged containerd component integration | `cd v2 && timeout --foreground --kill-after=10s 1800s ./tests/containerd/run-tests.sh --component` |
+| Required component + full-stack containerd | `cd v2 && timeout --foreground --kill-after=10s 3600s ./tests/run-all.sh --require-containerd` |
 
-`run-all.sh` supports only `--skip-containerd` and `--skip-smoke`. `--skip-containerd` and Docker-missing auto-skip can both yield exit 0 while containerd remains **unverified**. `--skip-smoke` skips all three mandatory local failover/recovery/run contracts and makes local process coverage unverified. Unknown flags exit 1.
+`run-all.sh` supports `--skip-containerd`, `--require-containerd`, and `--skip-smoke`. Skip and require conflict. Required mode preflights the runner/Docker/Linux boundary before aggregate phases and makes missing/incompatible containerd, either phase failure, or cleanup residue nonzero. Optional absence is an explicit skip and remains unverified. `--skip-smoke` skips all three mandatory local failover/recovery/run contracts. Unknown flags exit 1.
 
 ## `run-all.sh` phases
 
@@ -38,6 +39,11 @@ The runner gives every phase a 900-second deadline, continues after a failed or 
 | systemd lifecycle fixture | `tests/bench_systemd_lifecycle_test.sh` | Always invoked; stubbed/offline |
 | Artifact lifecycle fixture | `tests/bench_artifact_lifecycle_test.sh` | Always invoked; stubbed/offline |
 | GPU cleanup fixture | `tests/gpu_test_cleanup_trap_test.sh` | Always invoked; stub Terraform/AWS |
+| Strict capabilities | `tests/strict_capabilities_test.sh` | Always invoked; optional/required/evidence branches for containerd/GPU/Nydus/JuiceFS |
+| GPU task evidence | `tests/gpu_evidence_test.sh` | Always invoked; stub CDI selection and in-container `nvidia-smi` decisions |
+| ECR cold pull | `tests/ecr_cold_pull_test.sh` | Always invoked; stub exact-cache/auth/digest decisions |
+| Live guardrails | `tests/live_guardrails_test.sh` | Always invoked; stub identity/executor/cleanup/inventory |
+| Evidence manifest | `tests/evidence_manifest_test.sh` | Always invoked; bounded fields and malformed/oversized rejection |
 | Docs layout | `tests/docs_layout_paths_test.sh` | Always invoked; static paths/layout |
 | Shared wire contract | `tests/wire-contract-test.sh` | Always invoked; bounded schema/version validation plus Zig, Rust, Go API, and Go bench corpus consumers |
 | `/run` retry fixture | `tests/run_retry_test.sh` | Always invoked; stub curl |
@@ -69,7 +75,7 @@ Topology: the shared three-journal replica cluster plus Go API and Rust process 
 
 ### `tests/containerd/run-tests.sh` and `tests/containerd/run.sh`
 
-`run-tests.sh` builds the local Docker test image and starts it with `docker run --rm --privileged`; `run.sh` starts containerd, checks `ctr version`, then runs release Rust `containerd-integration` tests with one test thread and a `containerd` filter. Dependencies are Docker, privileged Linux container support, Cargo, containerd, and `ctr`. There is no script-wide timeout. Docker `--rm` removes the outer container; the tests own component cleanup. These scripts prove Rust runtime-component integration only, not Zig + Go + worker full-stack behavior, restart/adoption, GPU, or cloud behavior. They take no flags and propagate nonzero failures.
+`run-tests.sh --check` performs bounded read-only Docker/Linux compatibility detection. `--component` runs the existing serial Rust integration image. `--full-stack` builds a separate image containing real Zig, Go, and Rust binaries, then starts three replicas/API/worker/containerd, exercises requests and worker restart/adoption, and requires exact task/container inventory restoration. Cleanup is installed before resource acquisition and removes only exact inventory deltas. `REQUIRE_GPU=1` adds CDI plus in-task `nvidia-smi`; `REQUIRE_NYDUS=1` proves the selected snapshotter; `REQUIRE_JUICEFS=1` requires explicit bounded mount/read/write/unmount proof. These are prepared commands, not E1 execution evidence.
 
 ### Compatibility wrappers
 
@@ -128,17 +134,13 @@ These paths are maintained, but invoking live-capable entry points is not part o
 | `infra/poc/update-worker-env.sh` | Worker-env mutation helper | Bash/filesystem permissions; finite operation | Atomic required env update | Replaces specified env file; arguments required; nonzero on failure |
 | `infra/poc/worker-init.sh` | Terraform-rendered worker cloud-init template | EC2 metadata, Linux/systemd/containerd; no overall default | Bootstrap commands only | Creates host env/unit/config; provisioning owns cleanup |
 | `infra/poc/workload-test.sh` | CPU/GPU workload entry point | Live API/images/curl/JQ; bounded retry helper | Requested CPU/GPU create and run results | JSON/summary in `OUT_DIR`; trap deletes created deployments/temp secrets |
-| `scripts/poc-runbook.sh` | Live orchestration entry point | Terraform/AWS/Docker/SSH and POC scripts; per-step bounds, no unified safety gate | Runs selected apply/deploy/workload/drill/EKS phases | `artifacts/poc-final`; exit trap can destroy requested resources; env-driven |
+| `scripts/poc-runbook.sh` | Guarded live executor component | Terraform/AWS/Docker/SSH and POC scripts; refuses execution unless `tests/live/run.sh` activated guardrails | Runs selected deploy/workload/drill phases after exact reviewed-plan apply | `artifacts/poc-final`; unified wrapper owns final destroy/inventory/evidence |
 | `scripts/poc-section5-cycle.sh` | Bounded live Section 5 cycle | Same live dependencies; explicit apply/build/deploy/preload/overall bounds | Selected Section 5 cycle | Dated artifact log; teardown defaults documented in script; env-driven |
 | `scripts/poc-section5-drill.sh` | Live drill against already-up POC | Existing Terraform outputs, SSH/API; explicit section timeout | Failure drills only; no apply/teardown | Dated drill log/artifacts; leaves existing infra intact |
 | `scripts/poc-teardown.sh` | Destructive cleanup entry point | Terraform/AWS and existing states; no overall default | Destroy commands, not post-destroy proof by themselves | Terraform logs/state; environment selects POC/EKS destruction |
 
-## Planned, not implemented
+## Prepared opt-in live boundary
 
-The following are inventory only. They are absent or unsupported and must not be presented as runnable:
+`tests/live/run.sh` is fail-closed and non-default. It requires literal live/cost/cleanup authorization, account/region allowlists, token-derived workspace/bucket/ECR names, a clean tracked tree, a digest-bound reviewed plan, `KEEP_INFRA=0` by default, zero pre-ownership inventory, and bounded hooks. Its trap is installed before execution. Success requires zero owned instances, volumes, buckets, repositories, locks, units, and processes after cleanup plus a bounded redaction-clean manifest with source, binary/image/plan hashes, command exits, metrics, journals, and cleanup inventory. `HIVEMIND_LIVE_PREFLIGHT_ONLY=1` stops before ownership. See `tests/live/README.md`; E1 did not execute it live.
 
-- `--require-containerd` and strict containerd capability flags;
-- a Zig + Go + worker full-stack containerd restart/adoption gate;
-- one guarded live/cloud entry point and strict GPU/Nydus/JuiceFS modes.
-
-A smoke test is only as strong as its explicit assertions. Local process runtime is not containerd evidence, deterministic fixtures are not live evidence, and startup/liveness is not recovery evidence.
+A smoke test is only as strong as its explicit assertions. Local process runtime is not containerd evidence, deterministic fixtures are not live evidence, prepared commands are not passes, and startup/liveness is not recovery evidence.

@@ -14,6 +14,7 @@ REGION="us-east-1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKER_DIR="$SCRIPT_DIR/../../worker"
 KEEP_INFRA="${KEEP_INFRA:-0}"
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
 BUCKET=""
 INSTANCE_ID=""
 CLEANUP_INSTALLED=0
@@ -28,6 +29,10 @@ hivemind_ssm_assert_poll_bounds
 
 if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
   echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_GPU" != "0" && "$REQUIRE_GPU" != "1" ]]; then
+  echo "FAIL: REQUIRE_GPU must be 0 or 1" >&2
   exit 2
 fi
 if [[ ! -d "$WORKER_DIR" ]]; then
@@ -107,6 +112,11 @@ hivemind_ssm_wait_online "$REGION" "$INSTANCE_ID"
 
 echo ""
 echo "=== Step 4: Setup instance ==="
+if [[ "$REQUIRE_GPU" == "1" ]]; then
+  STRICT_GPU_REMOTE='sudo ctr -n hivemind images pull docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04; sudo ctr -n hivemind run --rm --runtime io.containerd.runc.v2 --device nvidia.com/gpu=0 docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 hivemind-strict-gpu nvidia-smi | tee /tmp/hivemind-strict-gpu.txt; grep -E "NVIDIA-SMI|Driver Version" /tmp/hivemind-strict-gpu.txt'
+else
+  STRICT_GPU_REMOTE='echo "SKIP: REQUIRE_GPU=0; CDI-selected in-container nvidia-smi acceptance unavailable"'
+fi
 # Upload worker source and build on-instance (avoids cross-compilation issues)
 BUCKET_CANDIDATE="hivemind-gpu-test-${RUN_WORKSPACE#hivemind-gpu-}"
 aws s3 mb "s3://$BUCKET_CANDIDATE" --region "$REGION"
@@ -129,6 +139,7 @@ CMD_ID=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
     \"aws s3 cp s3://$BUCKET/worker-src.tar.gz /tmp/worker-src.tar.gz --region $REGION\",
     \"cd /tmp && tar xzf worker-src.tar.gz\",
     \"cd /tmp/worker && cargo test --test containerd_integration --features containerd-integration -- --test-threads=1\",
+    \"$STRICT_GPU_REMOTE\",
     \"echo TESTS_COMPLETE\"
   ]" \
   --query 'Command.CommandId' --output text)

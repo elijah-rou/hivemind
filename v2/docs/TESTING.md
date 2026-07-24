@@ -29,17 +29,18 @@ Commands are run from the repository root unless the command changes directory. 
 | Go API | `cd v2/api && go test -race ./... && go build ./...` | API/client behavior, race-enabled tests, and build | No real cluster by itself |
 | Go bench | `cd v2/bench && go test -race ./... && go build ./...` | Bench client/probe behavior and build | A build is not benchmark evidence |
 | Shared wire contract | `cd v2/tests && ./wire-contract-test.sh` | Bounded canonical protocol-v6 schema, exact global constants, and Zig/Rust/Go API/Go bench consumers of one byte corpus | Deterministic codec evidence; not authentication or real-network evidence |
-| Aggregate | `cd v2 && ./tests/run-all.sh` | The phases actually invoked, including the shared wire gate and optional local smoke/containerd when available | See skip semantics below |
+| Aggregate | `cd v2 && ./tests/run-all.sh` | The phases actually invoked, including shared wire/capability/live-guard fixtures and optional local smoke/containerd when available | See skip semantics below |
 | Local run contract | `cd v2 && ./tests/local-run-contract-smoke.sh --build` | Three journal-backed Zig replicas, Go API, Rust worker/process runtime, bench, statuses 0/4/6/9, abandonment, kill/restart reprobe, exactly-once execution, and zero accounting | Real localhost processes/sockets/filesystem; not containerd |
 | Local failover | `cd v2 && ./tests/local-failover-smoke.sh --build` | Three journal-backed Zig replicas, Go API, Rust worker/process runtime, leader kill/restart, and data-plane continuity | Real localhost processes/sockets/filesystem; not containerd |
 | Storage recovery | `cd v2 && ./tests/local-storage-recovery-smoke.sh --build` | Commit, leader failover/rejoin, full retained-directory restart, convergence, and a new post-recovery commit | Experimental journal/process/filesystem boundary; not torn-write or power-loss proof |
-| Containerd component | `cd v2 && ./tests/containerd/run-tests.sh` | Privileged Docker-hosted Rust containerd integration tests | Worker runtime component only, not full stack |
+| Containerd component | `cd v2 && ./tests/containerd/run-tests.sh --component` | Privileged Docker-hosted Rust containerd integration tests | Worker runtime component only |
+| Containerd full stack | `cd v2 && REQUIRE_CONTAINERD=1 ./tests/containerd/run-tests.sh --full-stack` | Three Zig replicas, Go API, Rust worker/containerd, request traffic, worker restart/adoption, and exact task/container inventory | Prepared opt-in privileged boundary; not executed for E1 |
 | Terraform offline | commands below | Formatting, backend-disabled initialization, static validation | No apply or cloud proof |
-| Live/cloud | unavailable | No unified guarded live gate exists | **Planned, not implemented** |
+| Live/cloud | `cd v2 && ./tests/live/run.sh` with the documented authorization environment and reviewed saved plan | Guarded executor, strict capabilities, evidence, destroy, and zero post-cleanup inventory | Prepared opt-in boundary; no E1 live execution or evidence |
 
-The aggregate runner supports only `--skip-containerd` and `--skip-smoke`; unknown arguments fail with exit 1. It continues through invoked phases and exits 1 if any invoked phase fails. `--skip-containerd` prints a skip and means containerd is unverified. Without that flag, missing Docker auto-skips containerd and may still produce exit 0; containerd remains unverified. Unless `--skip-smoke` is explicit, failover, retained-storage recovery, and run-contract phases are mandatory.
+The aggregate runner supports `--skip-containerd`, `--require-containerd`, and `--skip-smoke`; unknown arguments fail with exit 1. It continues through invoked phases and exits 1 if any invoked phase fails. `--skip-containerd` prints an explicit component/full-stack skip. Without either containerd flag, unavailable/incompatible Docker explicitly skips both boundaries. `--require-containerd` performs a read-only compatibility preflight before aggregate phases and makes any missing runner, Docker daemon, component phase, or full-stack phase nonzero. `REQUIRE_CONTAINERD=1` is equivalent acceptance semantics. Unless `--skip-smoke` is explicit, failover, retained-storage recovery, and run-contract phases are mandatory.
 
-**Planned, not implemented:** `--require-containerd`, strict containerd/live capability flags, full-stack containerd, and a unified live entry point. Do not run these as commands or cite them as evidence.
+Strict opt-in surfaces validate literal `REQUIRE_CONTAINERD`, `REQUIRE_GPU`, `REQUIRE_NYDUS`, and `REQUIRE_JUICEFS` values. Required absence is always a failure. `REQUIRE_GPU=1` additionally requires one CDI-selected task and successful in-container `nvidia-smi`. `REQUIRE_JUICEFS=1` fails before live apply because the current API/AppSpec cannot request the required workload mount; this preserves the product blocker rather than converting it to a skip. Deterministic fixtures exercise optional-unavailable, required-unavailable, required-success-evidence, empty-evidence, GPU CDI/command, ECR cold-pull, manifest, and live-guard decisions without provider/runtime access.
 
 Offline Terraform validation:
 
@@ -68,7 +69,7 @@ Real-process tests are required when behavior crosses sockets, process lifecycle
 - **Skipped:** an executable path was deliberately or automatically omitted. A zero aggregate exit does not convert a skip into a pass.
 - **Unavailable:** no current entry point, authorization, credentials, privilege, host capability, or prerequisite exists.
 
-A future required-capability mode must fail nonzero when its capability is absent. Until implemented, planned strict flags are documentation only.
+Required-capability modes fail nonzero when absent. Their deterministic fixtures prove decision semantics only; the privileged/containerd/GPU/Nydus/JuiceFS/cloud boundary remains unverified until the corresponding opt-in command actually completes.
 
 ## Fault model
 

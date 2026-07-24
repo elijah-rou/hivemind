@@ -2,20 +2,42 @@
 set -euo pipefail
 
 # Run all Hivemind tests: unit, simulation, integration, smoke
-# Usage: ./tests/run-all.sh [--skip-containerd] [--skip-smoke]
+# Usage: ./tests/run-all.sh [--skip-containerd|--require-containerd] [--skip-smoke]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SKIP_CONTAINERD=false
 SKIP_SMOKE=false
+REQUIRE_CONTAINERD="${REQUIRE_CONTAINERD:-0}"
+CONTAINERD_RUNNER="${HIVEMIND_CONTAINERD_RUNNER:-$SCRIPT_DIR/containerd/run-tests.sh}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-containerd) SKIP_CONTAINERD=true; shift ;;
+        --require-containerd) REQUIRE_CONTAINERD=1; shift ;;
         --skip-smoke) SKIP_SMOKE=true; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+if [[ "$REQUIRE_CONTAINERD" != "0" && "$REQUIRE_CONTAINERD" != "1" ]]; then
+    echo "REQUIRE_CONTAINERD must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$SKIP_CONTAINERD" == true && "$REQUIRE_CONTAINERD" == "1" ]]; then
+    echo "cannot combine --skip-containerd and --require-containerd" >&2
+    exit 2
+fi
+if [[ "$REQUIRE_CONTAINERD" == "1" ]]; then
+    if [[ ! -x "$CONTAINERD_RUNNER" ]]; then
+        echo "required containerd runner is not executable: $CONTAINERD_RUNNER" >&2
+        exit 1
+    fi
+    if ! "$CONTAINERD_RUNNER" --check; then
+        echo "REQUIRE_CONTAINERD=1: containerd prerequisite/compatibility check failed" >&2
+        exit 1
+    fi
+fi
 
 PASS=0
 FAIL=0
@@ -74,6 +96,16 @@ run_phase "Bench artifact lifecycle fixtures" \
 # --- Phase 4e: GPU-test cleanup trap fixture (stub terraform, no live infra) ---
 run_phase "GPU-test cleanup trap fixture" \
     bash -c "'$SCRIPT_DIR/gpu_test_cleanup_trap_test.sh'"
+run_phase "Strict capability flag fixtures" \
+    bash -c "'$SCRIPT_DIR/strict_capabilities_test.sh'"
+run_phase "GPU CDI/in-container evidence fixtures" \
+    bash -c "'$SCRIPT_DIR/gpu_evidence_test.sh'"
+run_phase "ECR cold-cache evidence fixtures" \
+    bash -c "'$SCRIPT_DIR/ecr_cold_pull_test.sh'"
+run_phase "Live guardrail fixtures" \
+    bash -c "'$SCRIPT_DIR/live_guardrails_test.sh'"
+run_phase "Evidence manifest fixtures" \
+    bash -c "'$SCRIPT_DIR/evidence_manifest_test.sh'"
 
 # --- Phase 4f: Active docs and shared wire contracts ---
 run_phase "Active docs layout path contract" \
@@ -90,16 +122,21 @@ run_phase "Shared bounded HTTP fixtures" \
 run_phase "Operator workflow retry fixtures" \
     bash -c "'$SCRIPT_DIR/operator_workflow_retry_test.sh'"
 
-# --- Phase 5: Containerd integration (Docker/OrbStack) ---
-if [ "$SKIP_CONTAINERD" = false ]; then
-    if command -v docker &>/dev/null; then
-        run_phase "Containerd integration (Docker)" \
-            bash -c "'$SCRIPT_DIR/containerd/run-tests.sh'"
+# --- Phase 5: Containerd integration (Docker/privileged Linux) ---
+if [[ "$SKIP_CONTAINERD" == true ]]; then
+    echo "  SKIP: containerd component and full-stack tests (--skip-containerd)"
+elif "$CONTAINERD_RUNNER" --check; then
+    run_phase "Containerd integration (Docker)" "$CONTAINERD_RUNNER" --component
+    if [[ "$REQUIRE_CONTAINERD" == "1" ]]; then
+        run_phase "Containerd full-stack restart/adoption contract" "$CONTAINERD_RUNNER" --full-stack
     else
-        echo "  SKIP: Docker not available, skipping containerd tests"
+        echo "  SKIP: containerd full-stack restart/adoption contract (use --require-containerd)"
     fi
+elif [[ "$REQUIRE_CONTAINERD" == "1" ]]; then
+    echo "  REQUIRE_CONTAINERD=1: containerd unavailable or incompatible" >&2
+    FAIL=$((FAIL + 1))
 else
-    echo "  SKIP: containerd tests (--skip-containerd)"
+    echo "  SKIP: containerd unavailable or incompatible; component and full-stack boundaries unverified"
 fi
 
 # --- Phase 6: Mandatory local real-process contracts ---

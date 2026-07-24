@@ -1,18 +1,16 @@
 # Live test safety contract
 
-> **Unavailable as a unified gate:** The repository contains Terraform roots and individual POC, GPU, and benchmark scripts, but no single guarded live acceptance entry point implements the safety contract below. Nothing in this document is a default live command. Live execution requires separate authorization and must not be inferred from deterministic fixtures, offline Terraform validation, privileged runtime-component fixtures, or historical artifacts.
+> **Prepared, never default:** `tests/live/run.sh` is the unified guarded acceptance wrapper. E1 exercised only deterministic stub fixtures. No cloud, provider, containerd, GPU, registry, storage, systemd, SSM, S3, or destructive boundary ran. This document does not authorize a live run.
 
-This is the contract a future unified gate must implement before it can be offered as a command. It does not authorize cloud, paid, privileged, GPU, containerd, or destructive execution.
+The wrapper requires an already reviewed saved Terraform plan and separate per-run authorization, credentials, cost approval, quota review, and destructive-cleanup approval. Prepare the plan outside the execution command, record its SHA-256 as the sole line in a protected review record, then supply both to the wrapper. `HIVEMIND_LIVE_PREFLIGHT_ONLY=1` performs guard and read-only zero-inventory checks without invoking the executor. Do not use fixture mode outside `live_guardrails_test.sh`.
 
-## Current safety gaps
+The POC runbook refuses direct invocation unless the wrapper activates guardrails. Other legacy/operator scripts under `infra/` are not unified acceptance entry points. Deterministic fixtures, offline Terraform validation, historical artifacts, and prepared privileged scripts are not live evidence.
 
-The repository does not currently provide a unified `HIVEMIND_ALLOW_LIVE=1` gate, AWS account allowlist, account/region/cost/destructive preflight, or acceptance-wide strict capability mode. Unified `REQUIRE_CONTAINERD`, `REQUIRE_GPU`, `REQUIRE_NYDUS`, and `REQUIRE_JUICEFS` gates are absent. `KEEP_INFRA` exists in the standalone [`infra/gpu-test/run-tests.sh`](../../infra/gpu-test/run-tests.sh), but that does not supply the other unified guardrails.
+Required execution environment includes `HIVEMIND_ALLOW_LIVE=1`, `HIVEMIND_AWS_ACCOUNT_ALLOWLIST`, `HIVEMIND_AWS_REGION_ALLOWLIST`, `AWS_REGION`, `HIVEMIND_RUN_TOKEN`, token-containing `TF_WORKSPACE`, `HIVEMIND_LIVE_BUCKET`, and `HIVEMIND_LIVE_ECR`, `HIVEMIND_COST_APPROVED=1`, `HIVEMIND_CLEANUP_APPROVED=1`, `HIVEMIND_TF_PLAN`, `HIVEMIND_APPROVED_PLAN_SHA256`, `HIVEMIND_PLAN_REVIEW_RECORD`, and the required capability flags. `KEEP_INFRA` defaults to `0`. The exact command is `cd v2 && timeout --foreground --kill-after=30s 14400s ./tests/live/run.sh`; setting variables is intentionally verbose and per-run. Do not paste numeric account identifiers or credentials into tracked files or command transcripts.
 
-Existing scripts under [`infra/`](../../infra/) are operator tooling with script-specific behavior. Mocks and fixtures under [`tests/`](../), backend-disabled Terraform validation, historical AWS artifacts, host-only GPU checks, and [`tests/containerd/`](../containerd/) runtime-component tests are not current live evidence.
+## Mandatory preflight
 
-## Planned, not implemented: mandatory preflight
-
-A future live entry point must exit nonzero before any mutation unless every condition below is satisfied:
+The live entry point exits nonzero before ownership unless every condition below is satisfied:
 
 1. `HIVEMIND_ALLOW_LIVE` is exactly `1`.
 2. The caller identity is resolved read-only and its account matches an explicit external allowlist. Documentation, logs, and committed configuration must not contain a real account number.
@@ -29,9 +27,9 @@ A future live entry point must exit nonzero before any mutation unless every con
 
 Authorization is per run. Prior credentials, a prior approval, or an existing Terraform workspace do not satisfy a new run.
 
-## Planned functional matrix
+## Required functional matrix
 
-Every row is **planned/unavailable** until a guarded entry point and evidence manifest exist.
+Every row remains **not run for E1** until the guarded entry point completes and produces a valid current manifest.
 
 | ID | Required topology/capability | Observable pass condition | Required artifacts |
 |---|---|---|---|
@@ -49,9 +47,9 @@ Every row is **planned/unavailable** until a guarded entry point and evidence ma
 | F12 | Observability | Metrics and journals identify the run and remain readable through faults | Before/during/after snapshots |
 | F13 | Journal permissions and recovery | Data directory/file modes match the contract; controlled restart recovers committed state | `stat`, journal metadata/checksums, restart log |
 
-A strict containerd/GPU/Nydus/JuiceFS requirement must fail if unavailable; logging “skip” cannot satisfy its row. The current POC smoke's host GPU and task-presence checks do not satisfy F7.
+A strict containerd/GPU/Nydus/JuiceFS requirement fails if unavailable; logging “skip” cannot satisfy its row. `REQUIRE_GPU=1` requires one CDI-selected task plus successful in-container `nvidia-smi`. `REQUIRE_JUICEFS=1` currently fails before apply because the AppSpec/API required-mount surface is absent, so that row remains blocked rather than skipped.
 
-## Planned resilience matrix
+## Required resilience matrix
 
 | ID | Fault | Required observation | Pass condition |
 |---|---|---|---|
@@ -65,7 +63,7 @@ A strict containerd/GPU/Nydus/JuiceFS requirement must fail if unavailable; logg
 
 [`infra/poc/failure-drills.sh`](../../infra/poc/failure-drills.sh) exercises portions of leader, worker, and timeout flows, but does not prove old-replica committed-state convergence or exact-zero abandonment cleanup. It is not this matrix's gate.
 
-## Planned cleanup matrix
+## Required cleanup matrix
 
 Acceptance remains incomplete until each owned category is proven absent, or retained under an explicitly approved `KEEP_INFRA=1` record.
 
@@ -87,7 +85,7 @@ Acceptance remains incomplete until each owned category is proven absent, or ret
 
 Useful current patterns do not form a unified gate: [`infra/gpu-test/run-tests.sh`](../../infra/gpu-test/run-tests.sh) installs cleanup and propagates cleanup failure, while [`infra/bench/artifact_lifecycle.sh`](../../infra/bench/artifact_lifecycle.sh) conditionally claims and revalidates exact S3 ownership before scoped deletion. Future orchestration should preserve those fail-closed properties.
 
-## Planned evidence manifest
+## Required evidence manifest
 
 A successful live run must retain a bounded, reviewable manifest containing:
 

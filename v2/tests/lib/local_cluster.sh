@@ -148,7 +148,11 @@ local_cluster_release_port_lock() {
 }
 
 local_cluster_cleanup() {
-    local status=$? pid attempt cleanup_failed=0 groups_running=false
+    local status="${1:-$?}" pid attempt cleanup_failed=0 groups_running=false
+    [[ "$status" =~ ^[0-9]+$ && "$status" -le 255 ]] || {
+        echo "invalid local cluster cleanup status: $status" >&2
+        status=1
+    }
     trap - EXIT INT TERM
     set +e
 

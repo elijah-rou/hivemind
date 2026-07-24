@@ -16,10 +16,14 @@ set -euo pipefail
 #   SSH_CIDR=<deployer-ip>/32     # auto-detected if omitted
 #   ADOPT_EXISTING_ECR=true       # import an existing same-name repo into Terraform state
 #
-# Typical full run with teardown:
-#   SSH_KEY=~/.ssh/id_ed25519 ECR_REPOSITORY=hivemind-poc RUN_EKS=true DESTROY_HIVEMIND_AFTER=true DESTROY_EKS_AFTER=true bash scripts/poc-runbook.sh
+# This executor is invoked only by tests/live/execute-reviewed-plan.sh after
+# guarded authorization, reviewed-plan verification, and cleanup trap setup.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_ALLOW_LIVE:-0}" == 1 ]] || {
+    echo "refusing live runbook outside tests/live/run.sh guardrails" >&2
+    exit 1
+}
 # shellcheck source=../infra/poc/http.sh
 # shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
 source "$ROOT_DIR/infra/poc/http.sh"
@@ -41,6 +45,19 @@ SKIP_WORKLOAD_PRELOAD="${SKIP_WORKLOAD_PRELOAD:-false}"
 PRELOAD_EKS_WORKLOAD_IMAGES="${PRELOAD_EKS_WORKLOAD_IMAGES:-false}"
 CAPTURE_REMOTE_LOGS="${CAPTURE_REMOTE_LOGS:-true}"
 ADOPT_EXISTING_ECR="${ADOPT_EXISTING_ECR:-false}"
+REQUIRE_CONTAINERD="${REQUIRE_CONTAINERD:-0}"
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
+REQUIRE_NYDUS="${REQUIRE_NYDUS:-0}"
+REQUIRE_JUICEFS="${REQUIRE_JUICEFS:-0}"
+REQUIRE_ECR_COLD_PULL="${REQUIRE_ECR_COLD_PULL:-0}"
+for pair in "REQUIRE_CONTAINERD:$REQUIRE_CONTAINERD" "REQUIRE_GPU:$REQUIRE_GPU" "REQUIRE_NYDUS:$REQUIRE_NYDUS" "REQUIRE_JUICEFS:$REQUIRE_JUICEFS" "REQUIRE_ECR_COLD_PULL:$REQUIRE_ECR_COLD_PULL"; do
+    name="${pair%%:*}"; value="${pair#*:}"
+    [[ "$value" == 0 || "$value" == 1 ]] || { echo "$name must be 0 or 1" >&2; exit 2; }
+done
+if [[ "$REQUIRE_JUICEFS" == 1 ]]; then
+    echo "REQUIRE_JUICEFS=1: current API/AppSpec cannot request a required JuiceFS mount; failing rather than skipping" >&2
+    exit 1
+fi
 
 API_URL=""
 REPLICA_PUBLIC_IPS=""
@@ -243,6 +260,25 @@ preload_image_to_worker() {
         ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" 'bash -s'
 }
 
+prove_worker_runtime_capabilities() {
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$SSH_KEY")
+    if [[ "$REQUIRE_CONTAINERD" == 1 ]]; then
+        printf '%s\n' 'set -euo pipefail; sudo ctr version; systemctl cat hivemind-worker | grep -F -- "--runtime containerd"' |
+            ssh "${ssh_opts[@]}" "ubuntu@$WORKER_CPU_PUBLIC_IP" 'bash -s'
+        echo "PASS: REQUIRE_CONTAINERD=1 worker service uses reachable containerd"
+    else
+        echo "SKIP: strict containerd worker proof not required"
+    fi
+    if [[ "$REQUIRE_NYDUS" == 1 ]]; then
+        # shellcheck disable=SC2016 # This complete script is intentionally evaluated by the remote shell.
+        printf '%s\n' 'set -euo pipefail; sudo ctr plugins list | awk '\''$1 == "io.containerd.snapshotter.v1" && $2 == "nydus" && $4 == "ok" {found=1} END {exit !found}'\''; for id in $(sudo ctr -n hivemind containers list -q); do sudo ctr -n hivemind containers info "$id"; done | grep -qi nydus' |
+            ssh "${ssh_opts[@]}" "ubuntu@$WORKER_CPU_PUBLIC_IP" 'bash -s'
+        echo "PASS: REQUIRE_NYDUS=1 healthy plugin and active container evidence"
+    else
+        echo "SKIP: strict Nydus proof not required"
+    fi
+}
+
 preload_worker_images() {
     if [[ "$SKIP_WORKLOAD_PRELOAD" == "true" ]]; then
         echo "skip workload image preload"
@@ -387,6 +423,13 @@ preload_worker_images
 section "5. Fresh Hivemind smoke"
 (cd "$ROOT_DIR/infra/poc" && bash smoke-test.sh "$API_URL" --gpu-worker "$WORKER_GPU_PUBLIC_IP" --ssh-key "$SSH_KEY" --gpu-type "$GPU_TYPE") \
     | tee "$ARTIFACT_ROOT/01-infra/smoke-fresh-$TAG.txt"
+prove_worker_runtime_capabilities
+if [[ "$REQUIRE_ECR_COLD_PULL" == 1 ]]; then
+    bash "$ROOT_DIR/infra/poc/ecr-cold-pull.sh" "$CPU_IMAGE" "${HIVEMIND_RUN_TOKEN:?}" \
+        "$WORKER_CPU_PUBLIC_IP" ubuntu "$ARTIFACT_ROOT/01-infra/ecr-cold-$TAG"
+else
+    echo "SKIP: private ECR cold-cache pull not required; private-auth acceptance unavailable"
+fi
 
 section "6. Section 3 real workload validation"
 CPU_IMAGE="$CPU_IMAGE" GPU_IMAGE="$GPU_IMAGE" GPU_TYPE="$GPU_TYPE" OUT_DIR="$ARTIFACT_ROOT/04-workloads" \

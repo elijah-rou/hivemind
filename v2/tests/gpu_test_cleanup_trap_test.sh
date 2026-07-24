@@ -158,6 +158,14 @@ else
 fi
 
 reset_state
+run_gpu_test strict-gpu KEEP_INFRA=0 REQUIRE_GPU=1 STUB_APPLY=success STUB_REMOTE_STATUS=Success
+if [[ "$RUN_RC" -eq 0 ]] && grep -q -- '--device nvidia.com/gpu=0' "$STUB_STATE/aws.log" && grep -q 'nvidia-smi' "$STUB_STATE/aws.log"; then
+  pass "REQUIRE_GPU=1 sends CDI-selected in-container nvidia-smi proof"
+else
+  fail "REQUIRE_GPU=1 must send CDI/in-container proof (rc=$RUN_RC)"
+fi
+
+reset_state
 run_gpu_test success-destroy-failure KEEP_INFRA=0 STUB_APPLY=success STUB_REMOTE_STATUS=Success STUB_DESTROY=failure
 if [[ "$RUN_RC" -ne 0 ]] && grep -q 'CLEANUP ERROR: terraform destroy' "$TMP_DIR/success-destroy-failure.err"; then
   pass "terraform teardown failure turns successful tests nonzero and is recorded"

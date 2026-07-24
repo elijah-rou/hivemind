@@ -272,6 +272,14 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 ## Test Coverage
 
+**Lane E1 prepared harnesses (2026-07-24; not live evidence):**
+- `run-all.sh` accepts `--require-containerd`; the required mode preflights before aggregate phases and runs both component and full-stack gates. Missing/incompatible containerd is nonzero. Optional developer mode records an explicit skip.
+- The prepared full-stack privileged image runs three real Zig replicas, Go API, Rust worker/containerd, traffic, worker restart/adoption, and exact baseline task/container cleanup. It was not built or run for E1.
+- Strict containerd, GPU, Nydus, and JuiceFS decisions are fixture-tested. Required GPU evidence is one CDI-selected task plus successful in-container `nvidia-smi`. Required JuiceFS live acceptance deliberately fails before apply because AppSpec/API required-mount semantics remain absent.
+- The prepared guarded live wrapper requires explicit live/cost/destructive authorization, account and region allowlists, unique token-owned workspace/bucket/ECR names, reviewed saved-plan digest, clean source, pre-ownership zero inventory, traps before execution, default `KEEP_INFRA=0`, bounded evidence, and exact post-cleanup zero inventory. The POC runbook now refuses direct unguarded live execution.
+- Cold-cache ECR mode removes one exact token-owned image, requires actual ECR credentials and digest lookup, verifies the exact pull digest, and redacts the account from publishable evidence. Failure drills now require the restarted replica to return to normal, all replicas to converge on commit/state digest, and every queue/in-flight gauge to equal zero.
+- E1 executed deterministic shell fixtures and offline checks only. Containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted for the current commit. Product limits below are unchanged.
+
 **Current local verification (2026-07-24, tested commit `dc0dc633aa8bbdd94d86713f4b0669b648b0d715`; no live infrastructure touched):**
 - Environment: Linux x86_64, Zig `0.16.0`, Rust `1.95.0`, and Go `1.26.3-X:nodwarf5`.
 - Exact aggregate command: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `149s`, with `21` invoked phases passed and containerd explicitly skipped. Every aggregate phase also had its own 900-second TERM/KILL deadline.

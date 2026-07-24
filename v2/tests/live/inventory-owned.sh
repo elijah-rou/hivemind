@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION="${AWS_REGION:?}"
+RUN_TOKEN="${HIVEMIND_RUN_TOKEN:?}"
+BUCKET="${HIVEMIND_LIVE_BUCKET:?}"
+ECR_NAME="${HIVEMIND_LIVE_ECR:?}"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+PHASE="${1:-post}"
+[[ "$PHASE" == pre || "$PHASE" == post ]] || { echo "usage: inventory-owned.sh [pre|post]" >&2; exit 2; }
+[[ "$RUN_TOKEN" =~ ^[a-z][a-z0-9]{11,31}$ ]]
+[[ "$BUCKET" =~ ^[a-z0-9][a-z0-9-]{7,62}$ && "$ECR_NAME" =~ ^[a-z0-9][a-z0-9-]{7,62}$ ]]
+[[ "$BUCKET" == *"$RUN_TOKEN"* && "$ECR_NAME" == *"$RUN_TOKEN"* ]]
+
+aws_count() {
+    timeout --foreground --kill-after=2s 30s aws "$@"
+}
+instances="$(aws_count ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'length(Reservations[].Instances[])' --output text)"
+volumes="$(aws_count ec2 describe-volumes --region "$REGION" \
+    --filters "Name=tag:HivemindRunToken,Values=$RUN_TOKEN" \
+    --query 'length(Volumes)' --output text)"
+buckets="$(aws_count s3api list-buckets --query "length(Buckets[?Name=='$BUCKET'])" --output text)"
+ecr_error="$(mktemp)"
+trap 'rm -f "$ecr_error"' EXIT
+if aws_count ecr describe-repositories --region "$REGION" --repository-names "$ECR_NAME" >/dev/null 2>"$ecr_error"; then
+    repositories=1
+elif grep -q 'RepositoryNotFoundException' "$ecr_error"; then
+    repositories=0
+else
+    cat "$ecr_error" >&2
+    exit 1
+fi
+locks=0
+[[ ! -e "$ROOT_DIR/infra/poc/.terraform.tfstate.lock.info" ]] || locks=1
+if [[ "$PHASE" == pre ]]; then
+    selected_workspace="$(terraform -chdir="$ROOT_DIR/infra/poc" workspace show 2>/dev/null || true)"
+    state_count="$(terraform -chdir="$ROOT_DIR/infra/poc" state list 2>/dev/null | awk 'END {print NR + 0}')"
+    [[ "$selected_workspace" == "${TF_WORKSPACE:?}" && "$state_count" == 0 ]] || locks=$((locks + 1))
+fi
+units="$({ systemctl list-units --all --no-legend "*$RUN_TOKEN*" 2>/dev/null || true; } | awk 'END {print NR + 0}')"
+processes="$(ps -eo args= | awk -v token="$RUN_TOKEN" -v self="$0" 'index($0, token) && !index($0, self) {count++} END {print count + 0}')"
+for value in "$instances" "$volumes" "$buckets" "$repositories" "$locks" "$units" "$processes"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || { echo "invalid inventory count" >&2; exit 1; }
+done
+printf 'instances=%s\nvolumes=%s\nbuckets=%s\nrepositories=%s\nlocks=%s\nunits=%s\nprocesses=%s\n' \
+    "$instances" "$volumes" "$buckets" "$repositories" "$locks" "$units" "$processes"
