@@ -11,7 +11,7 @@ extern "C" fn handle_signal(_: libc::c_int) {
 }
 
 const MAX_REPLICA_ADDRS: usize = 64;
-const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 30;
+const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 1;
 
 struct RuntimeOwner {
     runtime: Box<dyn runtime::Runtime>,
