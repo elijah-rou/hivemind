@@ -7,7 +7,7 @@ Purpose: keep a running record of what changed, why it matters, how close the pr
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Current local evidence: tested commit `736002af51a4075e96fe834a64b285c953193c5f` passed `./tests/run-all.sh --skip-containerd` on 2026-07-25; containerd and all live capabilities were skipped or unexecuted.
+- Current local evidence: tested commit `9ca2a9c39229be3bfa362836401b2667cb7bf2af` passed `./tests/run-all.sh --skip-containerd` on 2026-07-25; containerd and all live capabilities were skipped or unexecuted.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
@@ -45,7 +45,7 @@ What changed:
 
 Evidence and limits:
 - RED: Zig Debug initially failed the paused-worker and non-tip convergence regressions; the variable-delay worker FIFO regression failed before queue ordering changed; live/evidence fixtures failed before the guard and manifest contracts were expanded
-- GREEN tested commit: `736002af51a4075e96fe834a64b285c953193c5f`; `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `175s` with `26` invoked phases passed
+- GREEN tested commit: `9ca2a9c39229be3bfa362836401b2667cb7bf2af`; `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `140s` with `26` invoked phases passed
 - focused Zig Debug, Rust all-targets (`174 + 3 + 7 + 5`), live guardrail, evidence-manifest, and shell syntax checks passed
 - containerd feature tests, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted; live resource state was not inventoried and is unknown
 
