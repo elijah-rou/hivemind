@@ -1,5 +1,8 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -10,6 +13,21 @@ use super::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE
 const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
 const DEFAULT_NAMESPACE: &str = "hivemind";
 const CTR_TIMEOUT_SECS: u64 = 30;
+const AUTH_CONFIG_MAX_BYTES: usize = 4096;
+static AUTH_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct RegistryHosts {
+    root: PathBuf,
+    redactions: Vec<String>,
+}
+
+impl Drop for RegistryHosts {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root) {
+            eprintln!("containerd: protected registry configuration cleanup failed: {error}");
+        }
+    }
+}
 
 pub struct ContainerdRuntime {
     socket_path: String,
@@ -75,10 +93,105 @@ impl ContainerdRuntime {
         }
     }
 
+    fn base64(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
+        for chunk in input.chunks(3) {
+            let value = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            encoded.push(ALPHABET[((value >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHABET[((value >> 12) & 0x3f) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                ALPHABET[((value >> 6) & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                ALPHABET[(value & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    fn registry_hosts_toml(auth: &super::ImagePullAuth) -> Result<String, RuntimeError> {
+        if auth.registry.is_empty()
+            || !auth.registry.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+            })
+        {
+            return Err(RuntimeError::ImagePull(
+                "registry host contains unsupported characters".into(),
+            ));
+        }
+        let credentials = format!("{}:{}", auth.username, auth.password);
+        let authorization = Self::base64(credentials.as_bytes());
+        let config = format!(
+            "server = \"https://{0}\"\n\n[host.\"https://{0}\"]\n  capabilities = [\"pull\", \"resolve\"]\n  [host.\"https://{0}\".header]\n    authorization = \"Basic {1}\"\n",
+            auth.registry, authorization
+        );
+        if config.len() > AUTH_CONFIG_MAX_BYTES {
+            return Err(RuntimeError::ImagePull(
+                "registry authentication configuration exceeds size limit".into(),
+            ));
+        }
+        Ok(config)
+    }
+
+    fn prepare_registry_hosts(auth: &super::ImagePullAuth) -> Result<RegistryHosts, RuntimeError> {
+        let config = Self::registry_hosts_toml(auth)?;
+        let sequence = AUTH_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "hivemind-registry-auth-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).map_err(|error| {
+            RuntimeError::ImagePull(format!("create protected registry config: {error}"))
+        })?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            let _ = fs::remove_dir_all(&root);
+            RuntimeError::ImagePull(format!("protect registry config directory: {error}"))
+        })?;
+        let host_dir = root.join(&auth.registry);
+        fs::create_dir(&host_dir).map_err(|error| {
+            let _ = fs::remove_dir_all(&root);
+            RuntimeError::ImagePull(format!("create registry host config: {error}"))
+        })?;
+        let config_path = host_dir.join("hosts.toml");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)
+            .map_err(|error| {
+                let _ = fs::remove_dir_all(&root);
+                RuntimeError::ImagePull(format!("create registry hosts config: {error}"))
+            })?;
+        file.write_all(config.as_bytes()).map_err(|error| {
+            let _ = fs::remove_dir_all(&root);
+            RuntimeError::ImagePull(format!("write registry hosts config: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            let _ = fs::remove_dir_all(&root);
+            RuntimeError::ImagePull(format!("sync registry hosts config: {error}"))
+        })?;
+        Ok(RegistryHosts {
+            root,
+            redactions: vec![
+                auth.username.clone(),
+                auth.password.clone(),
+                Self::base64(format!("{}:{}", auth.username, auth.password).as_bytes()),
+            ],
+        })
+    }
+
     fn pull_image_args(
         &self,
         image: &str,
-        auth: Option<&super::ImagePullAuth>,
+        hosts_dir: Option<&str>,
         platform: Option<&str>,
     ) -> Vec<String> {
         let mut parts: Vec<String> = vec![
@@ -93,11 +206,9 @@ impl ContainerdRuntime {
             parts.push(platform.to_string());
         }
 
-        if let Some(a) = auth {
-            if !a.username.is_empty() || !a.password.is_empty() {
-                parts.push("--user".into());
-                parts.push(format!("{}:{}", a.username, a.password));
-            }
+        if let Some(hosts_dir) = hosts_dir {
+            parts.push("--hosts-dir".into());
+            parts.push(hosts_dir.to_string());
         }
 
         parts.push(image.to_string());
@@ -109,9 +220,28 @@ impl ContainerdRuntime {
     }
 
     fn run_ctr_timeout(&self, args: &[&str], timeout_secs: u64) -> Result<String, String> {
-        // Use timeout(1) to prevent indefinite hangs (e.g. gVisor shim issues)
+        self.run_ctr_duration(args, Duration::from_secs(timeout_secs), &[])
+    }
+
+    fn run_ctr_until(&self, args: &[&str], deadline: Instant) -> Result<String, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("ctr shutdown deadline reached".into());
+        }
+        self.run_ctr_duration(args, remaining, &[])
+    }
+
+    fn run_ctr_duration(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+        redactions: &[String],
+    ) -> Result<String, String> {
+        assert!(!timeout.is_zero(), "ctr timeout must be positive");
+        let timeout_ms = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
+        // Use timeout(1) to prevent indefinite hangs (e.g. gVisor shim issues).
         let output = Command::new("timeout")
-            .arg(timeout_secs.to_string())
+            .arg(format!("{timeout_ms}ms"))
             .arg("ctr")
             .args(["-n", &self.namespace, "-a", &self.socket_path])
             .args(args)
@@ -123,11 +253,7 @@ impl ContainerdRuntime {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Self::format_ctr_error(
-                args,
-                code,
-                timeout_secs,
-                &stdout,
-                &stderr,
+                args, code, timeout_ms, &stdout, &stderr, redactions,
             ));
         }
 
@@ -137,17 +263,27 @@ impl ContainerdRuntime {
     fn format_ctr_error(
         args: &[&str],
         code: i32,
-        timeout_secs: u64,
+        timeout_ms: u64,
         stdout: &str,
         stderr: &str,
+        redactions: &[String],
     ) -> String {
-        let command = args.join(" ");
+        let redact = |value: &str| {
+            redactions.iter().fold(value.to_string(), |text, secret| {
+                if secret.is_empty() {
+                    text
+                } else {
+                    text.replace(secret, "[REDACTED]")
+                }
+            })
+        };
+        let command = redact(&args.join(" "));
         if code == 124 {
-            return format!("ctr {command}: timed out after {timeout_secs}s");
+            return format!("ctr {command}: timed out after {timeout_ms}ms");
         }
 
-        let stdout = stdout.trim();
-        let stderr = stderr.trim();
+        let stdout = redact(stdout.trim());
+        let stderr = redact(stderr.trim());
         match (stdout.is_empty(), stderr.is_empty()) {
             (true, true) => format!("ctr {command}: exit code {code}"),
             (true, false) => format!("ctr {command}: exit code {code}: stderr: {stderr}"),
@@ -201,13 +337,26 @@ impl ContainerdRuntime {
     }
 
     fn cleanup_task_state(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.cleanup_task_state_until(
+            container_id,
+            Instant::now() + Duration::from_secs(CTR_TIMEOUT_SECS * 5),
+        )
+    }
+
+    fn cleanup_task_state_until(
+        &self,
+        container_id: &str,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
         let kill_error = self
-            .run_ctr(&["tasks", "kill", "--signal", "9", container_id])
+            .run_ctr_until(&["tasks", "kill", "--signal", "9", container_id], deadline)
             .err();
         let task_delete_error = self
-            .run_ctr(&["tasks", "delete", "--force", container_id])
+            .run_ctr_until(&["tasks", "delete", "--force", container_id], deadline)
             .err();
-        let container_delete_error = self.run_ctr(&["containers", "delete", container_id]).err();
+        let container_delete_error = self
+            .run_ctr_until(&["containers", "delete", container_id], deadline)
+            .err();
         let shim_dir = self.task_shim_dir(container_id);
         let shim_remove_error = match fs::remove_dir_all(&shim_dir) {
             Ok(()) => None,
@@ -215,19 +364,23 @@ impl ContainerdRuntime {
             Err(error) => Some(error.to_string()),
         };
 
-        let tasks = self.run_ctr(&["tasks", "list"]).map_err(|error| {
-            RuntimeError::ContainerStop(format!(
-                "{container_id} cleanup task verification failed: {error}"
-            ))
-        })?;
-        let containers = self.run_ctr(&["containers", "list"]).map_err(|error| {
-            RuntimeError::ContainerStop(format!(
-                "{container_id} cleanup container verification failed: {error}"
-            ))
-        })?;
+        let tasks = self
+            .run_ctr_until(&["tasks", "list"], deadline)
+            .map_err(|error| {
+                RuntimeError::ContainerStop(format!(
+                    "{container_id} cleanup task verification failed: {error}"
+                ))
+            })?;
+        let containers = self
+            .run_ctr_until(&["containers", "list"], deadline)
+            .map_err(|error| {
+                RuntimeError::ContainerStop(format!(
+                    "{container_id} cleanup container verification failed: {error}"
+                ))
+            })?;
         let task_remains = Self::listing_contains_exact_id(&tasks, container_id);
         let container_remains = Self::listing_contains_exact_id(&containers, container_id);
-        let shim_remains = std::path::Path::new(&shim_dir).exists();
+        let shim_remains = Path::new(&shim_dir).exists();
         if task_remains || container_remains || shim_remains {
             return Err(RuntimeError::ContainerStop(format!(
                 "{container_id} cleanup remains unverified: task_remains={task_remains} container_remains={container_remains} shim_remains={shim_remains}; kill={}; task_delete={}; container_delete={}; shim_remove={}",
@@ -426,20 +579,31 @@ impl Runtime for ContainerdRuntime {
             return Ok(());
         }
 
-        let parts = self.pull_image_args(image, auth, None);
+        let registry_hosts = auth.map(Self::prepare_registry_hosts).transpose()?;
+        let hosts_dir = match registry_hosts.as_ref() {
+            Some(hosts) => Some(hosts.root.to_str().ok_or_else(|| {
+                RuntimeError::ImagePull("registry hosts path is not UTF-8".into())
+            })?),
+            None => None,
+        };
+        let parts = self.pull_image_args(image, hosts_dir, None);
         let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+        let redactions = registry_hosts
+            .as_ref()
+            .map(|hosts| hosts.redactions.as_slice())
+            .unwrap_or(&[]);
 
-        // Image pulls can be slow, use a longer timeout
-        match self.run_ctr_timeout(&refs, 300) {
+        // Image pulls can be slow, use a longer timeout.
+        match self.run_ctr_duration(&refs, Duration::from_secs(300), redactions) {
             Ok(_) => {}
             Err(e) if e.contains("no unpack platforms defined") => {
                 let platform = Self::default_platform();
                 eprintln!(
                     "containerd: retrying image pull for {image} with explicit platform {platform}"
                 );
-                let retry_parts = self.pull_image_args(image, auth, Some(platform));
+                let retry_parts = self.pull_image_args(image, hosts_dir, Some(platform));
                 let retry_refs: Vec<&str> = retry_parts.iter().map(|s| s.as_str()).collect();
-                match self.run_ctr_timeout(&retry_refs, 300) {
+                match self.run_ctr_duration(&retry_refs, Duration::from_secs(300), redactions) {
                     Ok(_) => {}
                     Err(retry_err) => {
                         if self.image_present(image).unwrap_or(false) {
@@ -572,26 +736,64 @@ impl Runtime for ContainerdRuntime {
     }
 
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
+        self.stop_pod_until(
+            handle,
+            grace_period_ms,
+            Instant::now()
+                + Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS))
+                + Duration::from_secs(CTR_TIMEOUT_SECS * 4),
+        )
+    }
+
+    fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
+        let output = self.run_ctr(&["tasks", "list"]).map_err(|e| {
+            RuntimeError::ContainerNotFound(format!("{}: {e}", handle.container_id))
+        })?;
+
+        Self::task_status_from_listing(&output, &handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))
+    }
+
+    fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
+        self.cleanup_task_state(&handle.container_id)
+    }
+
+    fn stop_pod_until(
+        &self,
+        handle: &PodHandle,
+        grace_period_ms: u64,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
         let terminate_error = self
-            .run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id])
+            .run_ctr_until(
+                &["tasks", "kill", "--signal", "15", &handle.container_id],
+                deadline,
+            )
             .err();
-        let grace_ms = grace_period_ms.min(MAX_STOP_GRACE_MS);
-        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        let grace_deadline = (Instant::now()
+            + Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS)))
+        .min(deadline);
         loop {
-            if matches!(self.pod_status(handle), Ok(PodStatus::Stopped { .. })) {
+            if matches!(
+                self.pod_status_until(handle, deadline),
+                Ok(PodStatus::Stopped { .. })
+            ) {
                 return Ok(());
             }
             let now = Instant::now();
-            if now >= deadline {
+            if now >= grace_deadline {
                 break;
             }
-            thread::sleep((deadline - now).min(Duration::from_millis(100)));
+            thread::sleep((grace_deadline - now).min(Duration::from_millis(100)));
         }
 
         let kill_error = self
-            .run_ctr(&["tasks", "kill", "--signal", "9", &handle.container_id])
+            .run_ctr_until(
+                &["tasks", "kill", "--signal", "9", &handle.container_id],
+                deadline,
+            )
             .err();
-        match self.pod_status(handle) {
+        match self.pod_status_until(handle, deadline) {
             Ok(PodStatus::Stopped { .. }) => Ok(()),
             Ok(status) => Err(RuntimeError::ContainerStop(format!(
                 "{} remains {status:?} after TERM/KILL; TERM={}; KILL={}",
@@ -608,17 +810,22 @@ impl Runtime for ContainerdRuntime {
         }
     }
 
-    fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
-        let output = self.run_ctr(&["tasks", "list"]).map_err(|e| {
-            RuntimeError::ContainerNotFound(format!("{}: {e}", handle.container_id))
-        })?;
-
+    fn pod_status_until(
+        &self,
+        handle: &PodHandle,
+        deadline: Instant,
+    ) -> Result<PodStatus, RuntimeError> {
+        let output = self
+            .run_ctr_until(&["tasks", "list"], deadline)
+            .map_err(|e| {
+                RuntimeError::ContainerNotFound(format!("{}: {e}", handle.container_id))
+            })?;
         Self::task_status_from_listing(&output, &handle.container_id)
             .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))
     }
 
-    fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
-        self.cleanup_task_state(&handle.container_id)
+    fn remove_pod_until(&self, handle: &PodHandle, deadline: Instant) -> Result<(), RuntimeError> {
+        self.cleanup_task_state_until(&handle.container_id, deadline)
     }
 }
 
@@ -659,32 +866,36 @@ mod tests {
     }
 
     #[test]
-    fn pull_image_args_include_platform_and_auth_when_requested() {
+    fn pull_image_credentials_are_not_exposed_in_argv_or_config_errors() {
         let runtime = ContainerdRuntime::new(None, None, None, Some("overlayfs")).unwrap();
         let auth = super::super::ImagePullAuth {
             registry: "docker.io".into(),
-            username: "user".into(),
-            password: "pass".into(),
+            username: "private-user".into(),
+            password: "private-password".into(),
         };
         let args = runtime.pull_image_args(
             "docker.io/library/alpine:latest",
-            Some(&auth),
+            Some("/tmp/protected-hosts"),
             Some("linux/amd64"),
         );
-        assert_eq!(
-            args,
-            vec![
-                "images",
-                "pull",
-                "--snapshotter",
-                "overlayfs",
-                "--platform",
-                "linux/amd64",
-                "--user",
-                "user:pass",
-                "docker.io/library/alpine:latest",
-            ]
+        let command = args.join(" ");
+        assert!(command.contains("--hosts-dir /tmp/protected-hosts"));
+        assert!(!command.contains("private-user"));
+        assert!(!command.contains("private-password"));
+
+        let config = ContainerdRuntime::registry_hosts_toml(&auth).unwrap();
+        assert!(!config.contains("private-user"));
+        assert!(!config.contains("private-password"));
+        let error = ContainerdRuntime::format_ctr_error(
+            &["images", "pull", "--hosts-dir", "/tmp/protected-hosts"],
+            1,
+            30_000,
+            "authentication failed for private-user",
+            "bad password private-password",
+            &["private-user".into(), "private-password".into()],
         );
+        assert!(!error.contains("private-user"));
+        assert!(!error.contains("private-password"));
     }
 
     #[test]
@@ -846,9 +1057,10 @@ hivemind-pod-42-2 image runtime\n";
         let error = ContainerdRuntime::format_ctr_error(
             &["tasks", "start", "--detach", "hivemind-pod-1"],
             1,
-            30,
+            30_000,
             "actual stdout",
             "warning plus failure",
+            &[],
         );
         assert!(error.contains("ctr tasks start --detach hivemind-pod-1"));
         assert!(error.contains("exit code 1"));
@@ -858,8 +1070,9 @@ hivemind-pod-42-2 image runtime\n";
 
     #[test]
     fn format_ctr_error_identifies_timeout() {
-        let error = ContainerdRuntime::format_ctr_error(&["tasks", "start"], 124, 30, "", "");
-        assert_eq!(error, "ctr tasks start: timed out after 30s");
+        let error =
+            ContainerdRuntime::format_ctr_error(&["tasks", "start"], 124, 30_000, "", "", &[]);
+        assert_eq!(error, "ctr tasks start: timed out after 30000ms");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const MOUNT_BASE: &str = "/tmp/hivemind/mounts";
 
@@ -53,16 +54,30 @@ pub fn mount_juicefs(pod_id: u64, juicefs_subpath: &str) -> Result<VolumeMount, 
 
 /// Unmount and clean up a JuiceFS volume for a pod.
 pub fn unmount_juicefs(pod_id: u64) -> Result<(), String> {
-    const UNMOUNT_TIMEOUT_SECS: &str = "10";
+    unmount_juicefs_until(pod_id, Instant::now() + Duration::from_secs(20))
+}
+
+pub fn unmount_juicefs_until(pod_id: u64, deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("shutdown deadline reached before volume cleanup".into());
+    }
+    let command_timeout = || -> Result<String, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("shutdown deadline reached before volume cleanup".into());
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, u64::MAX as u128) as u64;
+        Ok(format!("{timeout_ms}ms"))
+    };
 
     let mount_dir = format!("{MOUNT_BASE}/{pod_id}/juicefs");
     if mount_is_active(&mount_dir)? {
         let _ = Command::new("timeout")
-            .args([UNMOUNT_TIMEOUT_SECS, "juicefs", "umount", &mount_dir])
+            .args([&command_timeout()?, "juicefs", "umount", &mount_dir])
             .output();
         if mount_is_active(&mount_dir)? {
             let _ = Command::new("timeout")
-                .args([UNMOUNT_TIMEOUT_SECS, "fusermount", "-uz", &mount_dir])
+                .args([&command_timeout()?, "fusermount", "-uz", &mount_dir])
                 .output();
         }
         if mount_is_active(&mount_dir)? {
@@ -120,5 +135,11 @@ mod tests {
     #[test]
     fn unmount_nonexistent_is_safe() {
         unmount_juicefs(999999).unwrap();
+    }
+
+    #[test]
+    fn expired_shutdown_deadline_rejects_volume_cleanup() {
+        let error = unmount_juicefs_until(999998, Instant::now()).unwrap_err();
+        assert!(error.contains("shutdown deadline"));
     }
 }

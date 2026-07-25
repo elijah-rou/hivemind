@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::io::Io;
 use crate::message::*;
@@ -1040,13 +1040,29 @@ impl Worker {
     }
 
     pub fn shutdown(&mut self, io: &mut dyn Io, runtime: &dyn Runtime) -> bool {
-        const SHUTDOWN_DEADLINE_MS: u64 = 20_000;
+        self.shutdown_with_deadline(io, runtime, Duration::from_secs(20))
+    }
+
+    fn shutdown_with_deadline(
+        &mut self,
+        io: &mut dyn Io,
+        runtime: &dyn Runtime,
+        shutdown_budget: Duration,
+    ) -> bool {
         const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 15_000;
 
-        let shutdown_started = Instant::now();
-        let pod_ids: Vec<u64> = self.pods.keys().copied().collect();
+        assert!(
+            !shutdown_budget.is_zero(),
+            "shutdown budget must be positive"
+        );
+        let shutdown_deadline = Instant::now() + shutdown_budget;
+        let mut pod_ids: Vec<u64> = self.pods.keys().copied().collect();
+        pod_ids.sort_unstable();
 
         for pod_id in pod_ids {
+            if Instant::now() >= shutdown_deadline {
+                break;
+            }
             let snapshot = self.pods.get(&pod_id).map(|pod| {
                 (
                     pod.handle.clone(),
@@ -1080,14 +1096,19 @@ impl Worker {
                 };
                 let stop_attempts = STOP_ATTEMPT_MAX.saturating_sub(lifecycle_failures);
                 for _ in 0..stop_attempts {
-                    let elapsed_ms =
-                        shutdown_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    let remaining_ms = SHUTDOWN_DEADLINE_MS.saturating_sub(elapsed_ms);
+                    let remaining_ms = shutdown_deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
                     if remaining_ms == 0 {
                         break;
                     }
-                    let stop_result = runtime.stop_pod(handle, requested_grace.min(remaining_ms));
-                    match runtime.pod_status(handle) {
+                    let stop_result = runtime.stop_pod_until(
+                        handle,
+                        requested_grace.min(remaining_ms),
+                        shutdown_deadline,
+                    );
+                    match runtime.pod_status_until(handle, shutdown_deadline) {
                         Ok(PodStatus::Stopped { exit_code }) => {
                             verified_exit_code = Some(exit_code);
                             break;
@@ -1112,7 +1133,9 @@ impl Worker {
                     }
                 }
                 if stop_attempts == 0 {
-                    if let Ok(PodStatus::Stopped { exit_code }) = runtime.pod_status(handle) {
+                    if let Ok(PodStatus::Stopped { exit_code }) =
+                        runtime.pod_status_until(handle, shutdown_deadline)
+                    {
                         verified_exit_code = Some(exit_code);
                     }
                 }
@@ -1135,7 +1158,7 @@ impl Worker {
             };
 
             if let Some(ref handle) = handle_opt {
-                if let Err(remove_error) = runtime.remove_pod(handle) {
+                if let Err(remove_error) = runtime.remove_pod_until(handle, shutdown_deadline) {
                     let pod = self
                         .pods
                         .get_mut(&pod_id)
@@ -1153,7 +1176,7 @@ impl Worker {
                     .expect("shutdown pod must remain tracked")
                     .handle = None;
             }
-            if let Err(unmount_error) = volumes::unmount_juicefs(pod_id) {
+            if let Err(unmount_error) = volumes::unmount_juicefs_until(pod_id, shutdown_deadline) {
                 let pod = self
                     .pods
                     .get_mut(&pod_id)
@@ -2264,6 +2287,138 @@ mod tests {
         assert_eq!(worker.cpu_allocated_millicores(), 0);
         assert_eq!(worker.memory_allocated_megabytes(), 0);
         assert!(!std::path::Path::new(mount_marker).exists());
+    }
+
+    struct DeadlineBlockingRuntime {
+        deadline_calls: Mutex<u32>,
+    }
+
+    impl Runtime for DeadlineBlockingRuntime {
+        fn pull_image(
+            &self,
+            _image: &str,
+            _auth: Option<&ImagePullAuth>,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn create_pod(&self, _spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+            unreachable!("not used in shutdown deadline test")
+        }
+
+        fn start_pod(&self, _handle: &PodHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn forward_run(
+            &self,
+            _handle: &PodHandle,
+            _port: u16,
+            _payload: &[u8],
+        ) -> Result<Vec<u8>, RuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_pod(&self, _handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Err(RuntimeError::ContainerStop("unbounded stop called".into()))
+        }
+
+        fn pod_status(&self, _handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(PodStatus::Running)
+        }
+
+        fn remove_pod(&self, _handle: &PodHandle) -> Result<(), RuntimeError> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(())
+        }
+
+        fn stop_pod_until(
+            &self,
+            _handle: &PodHandle,
+            _grace_period_ms: u64,
+            deadline: Instant,
+        ) -> Result<(), RuntimeError> {
+            *self.deadline_calls.lock().unwrap() += 1;
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ))
+        }
+
+        fn pod_status_until(
+            &self,
+            _handle: &PodHandle,
+            _deadline: Instant,
+        ) -> Result<PodStatus, RuntimeError> {
+            Err(RuntimeError::ContainerNotFound(
+                "shutdown deadline reached".into(),
+            ))
+        }
+
+        fn remove_pod_until(
+            &self,
+            _handle: &PodHandle,
+            _deadline: Instant,
+        ) -> Result<(), RuntimeError> {
+            panic!("unverified runtime must not be removed")
+        }
+    }
+
+    #[test]
+    fn shutdown_propagates_one_deadline_to_blocking_runtime_calls() {
+        let mut worker = Worker::new("node-shutdown-deadline".into(), GpuType::None, 0, 1000, 512);
+        worker.pods.insert(
+            45,
+            TrackedPod {
+                pod_id: 45,
+                deployment_id: 9,
+                image: "demo".into(),
+                entrypoint: String::new(),
+                state: TrackedPodState::Running,
+                handle: Some(PodHandle {
+                    pod_id: 45,
+                    container_id: "blocking-45".into(),
+                }),
+                state_changed_at: 0,
+                gpu_count: 0,
+                cpu_millicores: 1,
+                memory_megabytes: 1,
+                grace_period_ms: 1_000,
+                port: 8080,
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                probe_interval_ms: 10_000,
+                last_probe_tick: 0,
+                consecutive_failures: 0,
+                env_vars: Vec::new(),
+                juicefs_path: String::new(),
+                image_pull_auth: None,
+                lifecycle_failures: 0,
+                lifecycle_retry_after_tick: 0,
+            },
+        );
+        worker.cpu_allocated_millicores = 1;
+        worker.memory_allocated_megabytes = 1;
+        let runtime = DeadlineBlockingRuntime {
+            deadline_calls: Mutex::new(0),
+        };
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+
+        let started = Instant::now();
+        assert!(!worker.shutdown_with_deadline(
+            &mut io,
+            &runtime,
+            std::time::Duration::from_millis(25),
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+        assert_eq!(*runtime.deadline_calls.lock().unwrap(), 1);
+        assert!(worker.tracked_pods().contains_key(&45));
     }
 
     #[test]

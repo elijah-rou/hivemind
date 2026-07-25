@@ -229,8 +229,28 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
+        self.stop_pod_until(
+            handle,
+            grace_period_ms,
+            Instant::now()
+                + Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS))
+                + POST_KILL_WAIT,
+        )
+    }
+
+    fn stop_pod_until(
+        &self,
+        handle: &PodHandle,
+        grace_period_ms: u64,
+        shutdown_deadline: Instant,
+    ) -> Result<(), RuntimeError> {
         const TERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+        if Instant::now() >= shutdown_deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
+        }
         let mut processes = self.processes.lock().unwrap();
         let proc = processes
             .get_mut(&handle.container_id)
@@ -258,7 +278,7 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         }
 
         let grace = Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS));
-        let deadline = Instant::now() + grace;
+        let deadline = (Instant::now() + grace).min(shutdown_deadline);
         loop {
             match proc.child.try_wait() {
                 Ok(Some(_)) => return Ok(()),
@@ -280,7 +300,7 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         proc.child.kill().map_err(|error| {
             RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
         })?;
-        let deadline = Instant::now() + POST_KILL_WAIT;
+        let deadline = (Instant::now() + POST_KILL_WAIT).min(shutdown_deadline);
         match wait_for_child_exit_until(deadline, || proc.child.try_wait()) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(RuntimeError::ContainerStop(format!(
@@ -311,7 +331,29 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
-        self.stop_pod(handle, 0)?;
+        self.remove_pod_until(handle, Instant::now() + POST_KILL_WAIT)
+    }
+
+    fn pod_status_until(
+        &self,
+        handle: &PodHandle,
+        deadline: Instant,
+    ) -> Result<PodStatus, RuntimeError> {
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerNotFound(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        self.pod_status(handle)
+    }
+
+    fn remove_pod_until(&self, handle: &PodHandle, deadline: Instant) -> Result<(), RuntimeError> {
+        self.stop_pod_until(handle, 0, deadline)?;
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
+        }
         let removed = self.processes.lock().unwrap().remove(&handle.container_id);
         assert!(
             removed.is_some(),

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::types::GpuType;
 
 pub const MAX_STOP_GRACE_MS: u64 = 30_000;
@@ -12,7 +14,7 @@ pub struct BindMount {
     pub container_path: String,
 }
 
-/// Optional credentials for `ctr images pull --user user:pass`.
+/// Optional private-registry credentials passed through a protected hosts configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ImagePullAuth {
     pub registry: String,
@@ -100,6 +102,44 @@ pub trait Runtime: Sync {
     fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError>;
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError>;
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError>;
+
+    /// Shutdown-only variants share one caller-owned absolute deadline. Production runtimes
+    /// override these methods so no individual blocking operation can outlive that deadline.
+    fn stop_pod_until(
+        &self,
+        handle: &PodHandle,
+        grace_period_ms: u64,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        self.stop_pod(handle, grace_period_ms)
+    }
+
+    fn pod_status_until(
+        &self,
+        handle: &PodHandle,
+        deadline: Instant,
+    ) -> Result<PodStatus, RuntimeError> {
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerNotFound(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        self.pod_status(handle)
+    }
+
+    fn remove_pod_until(&self, handle: &PodHandle, deadline: Instant) -> Result<(), RuntimeError> {
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        self.remove_pod(handle)
+    }
 }
 
 #[cfg(test)]
