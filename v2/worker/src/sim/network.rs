@@ -11,12 +11,14 @@ const QUEUE_CAPACITY: usize = 256;
 struct PendingControl {
     msg: ControlMessage,
     deliver_at_tick: u64,
+    epoch: u64,
     replayed: bool,
 }
 
 struct PendingAgent {
     msg: WorkerMessage,
     deliver_at_tick: u64,
+    epoch: u64,
     replayed: bool,
 }
 
@@ -43,6 +45,7 @@ pub struct SimulatedNetwork {
     inbound: Vec<VecDeque<PendingControl>>,
     outbound: Vec<VecDeque<PendingAgent>>,
     partitioned: Vec<bool>,
+    session_epochs: Vec<u64>,
     prng: Prng,
     pub min_delay: u64,
     pub max_delay: u64,
@@ -81,6 +84,7 @@ impl SimulatedNetwork {
             inbound,
             outbound,
             partitioned,
+            session_epochs: vec![0; agent_count],
             prng: Prng::init(seed.wrapping_add(0xBEEF)),
             min_delay: 1,
             max_delay: 5,
@@ -111,6 +115,7 @@ impl SimulatedNetwork {
         queue.push_back(PendingControl {
             msg,
             deliver_at_tick: current_tick + delay,
+            epoch: self.session_epochs[agent_id],
             replayed: false,
         });
         self.stats.control_sent += 1;
@@ -145,6 +150,7 @@ impl SimulatedNetwork {
         queue.push_back(PendingAgent {
             msg,
             deliver_at_tick: current_tick + delay,
+            epoch: self.session_epochs[agent_id],
             replayed: false,
         });
         self.stats.worker_sent += 1;
@@ -158,12 +164,13 @@ impl SimulatedNetwork {
         }
 
         let queue = &mut self.inbound[agent_id];
-        let pos = queue
-            .iter()
-            .position(|message| message.deliver_at_tick <= now)?;
-        let pending = queue
-            .remove(pos)
-            .expect("located inbound message must exist");
+        while queue.front().is_some_and(|pending| pending.epoch != self.session_epochs[agent_id]) {
+            queue.pop_front();
+        }
+        if queue.front()?.deliver_at_tick > now {
+            return None;
+        }
+        let pending = queue.pop_front().expect("ready inbound message must exist");
         if !pending.replayed
             && self.prng.chance_ratio(self.replay_rate)
             && queue.len() < Self::queue_capacity(self.path_max_capacity)
@@ -171,6 +178,7 @@ impl SimulatedNetwork {
             queue.push_back(PendingControl {
                 msg: pending.msg.clone(),
                 deliver_at_tick: now + self.min_delay.max(1),
+                epoch: pending.epoch,
                 replayed: true,
             });
         }
@@ -184,12 +192,13 @@ impl SimulatedNetwork {
         }
 
         let queue = &mut self.outbound[agent_id];
-        let pos = queue
-            .iter()
-            .position(|message| message.deliver_at_tick <= now)?;
-        let pending = queue
-            .remove(pos)
-            .expect("located outbound message must exist");
+        while queue.front().is_some_and(|pending| pending.epoch != self.session_epochs[agent_id]) {
+            queue.pop_front();
+        }
+        if queue.front()?.deliver_at_tick > now {
+            return None;
+        }
+        let pending = queue.pop_front().expect("ready outbound message must exist");
         if !pending.replayed
             && self.prng.chance_ratio(self.replay_rate)
             && queue.len() < Self::queue_capacity(self.path_max_capacity)
@@ -197,6 +206,7 @@ impl SimulatedNetwork {
             queue.push_back(PendingAgent {
                 msg: pending.msg.clone(),
                 deliver_at_tick: now + self.min_delay.max(1),
+                epoch: pending.epoch,
                 replayed: true,
             });
         }
@@ -227,6 +237,9 @@ impl SimulatedNetwork {
     pub fn discard_session_queues(&mut self, agent_id: usize) {
         assert!(agent_id < self.inbound.len());
         assert!(agent_id < self.outbound.len());
+        self.session_epochs[agent_id] = self.session_epochs[agent_id]
+            .checked_add(1)
+            .expect("simulation session epoch must not overflow");
         self.inbound[agent_id].clear();
         self.outbound[agent_id].clear();
     }
@@ -351,6 +364,32 @@ mod tests {
         assert_eq!(net.stats.control_sent, 1);
         assert_eq!(net.stats.worker_sent, 1);
         assert!(net.stats.worker_bytes > 0);
+    }
+
+    #[test]
+    fn outbound_preserves_registration_first_with_variable_delay() {
+        for seed in 0..128 {
+            let mut net = SimulatedNetwork::new(1, seed);
+            net.send_from_agent(
+                0,
+                WorkerMessage::NodeRegister(NodeRegisterMsg {
+                    node_name: "worker".into(),
+                    cpu_millicores: 1,
+                    memory_megabytes: 1,
+                    gpu_type: GpuType::None,
+                    gpu_count: 0,
+                }),
+                0,
+            );
+            net.send_from_agent(0, test_heartbeat(0), 0);
+
+            let first = (1..=5).find_map(|tick| net.pop_outbound(0, tick));
+            assert!(matches!(first, Some(WorkerMessage::NodeRegister(_))));
+            assert!(matches!(
+                net.pop_outbound(0, 5),
+                Some(WorkerMessage::NodeHeartbeat(_))
+            ));
+        }
     }
 
     #[test]

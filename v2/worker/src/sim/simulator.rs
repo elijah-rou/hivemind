@@ -449,9 +449,7 @@ mod tests {
     #[test]
     fn session_loss_discards_old_epoch_and_reregisters_before_new_traffic() {
         let mut sim = WorkerSimulator::new(1, 0xB1_05);
-        sim.network.min_delay = 1;
-        sim.network.max_delay = 1;
-        sim.run(2);
+        sim.run(6);
         let received_before_loss = sim.control_plane.received_messages().len();
 
         sim.network.send_from_agent(
@@ -482,7 +480,7 @@ mod tests {
         );
         sim.lose_agent_session(0);
         assert!(!sim.workers[0].is_registered());
-        sim.run(2);
+        sim.run(6);
 
         sim.network.send_from_agent(
             0,
@@ -510,7 +508,7 @@ mod tests {
             }),
             sim.current_tick,
         );
-        sim.tick();
+        sim.run(6);
 
         let after_loss = &sim.control_plane.received_messages()[received_before_loss..];
         assert_eq!(after_loss.len(), 4);
