@@ -33,6 +33,27 @@ mod tests {
         }
     }
 
+    fn task_pid(container_id: &str) -> u32 {
+        let output = std::process::Command::new("ctr")
+            .args(["-n", "hivemind", "tasks", "list"])
+            .output()
+            .expect("list containerd tasks");
+        assert!(output.status.success(), "ctr tasks list failed");
+        String::from_utf8(output.stdout)
+            .expect("task listing must be UTF-8")
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let mut columns = line.split_whitespace();
+                if columns.next() == Some(container_id) {
+                    columns.next()?.parse().ok()
+                } else {
+                    None
+                }
+            })
+            .expect("owned task PID must be present")
+    }
+
     fn unique_pod_id(offset: u64) -> u64 {
         let pid = std::process::id() as u64;
         let nanos = std::time::SystemTime::now()
@@ -154,6 +175,7 @@ mod tests {
             first_runtime.pod_status(&first_handle).expect("status"),
             PodStatus::Running
         ));
+        let pid_before_restart = task_pid(&first_handle.container_id);
 
         let restarted_runtime =
             ContainerdRuntime::new(None, None, None, None).expect("containerd reconnect");
@@ -161,6 +183,7 @@ mod tests {
             .create_pod(&spec)
             .expect("create adopts existing task");
         assert_eq!(adopted_handle.container_id, first_handle.container_id);
+        assert_eq!(task_pid(&adopted_handle.container_id), pid_before_restart);
         restarted_runtime
             .start_pod(&adopted_handle)
             .expect("start is idempotent for adopted task");
@@ -238,40 +261,16 @@ mod tests {
     }
 
     #[test]
-    fn gpu_container_starts() {
-        // GPU containers need the nvidia-container-runtime.
-        // Use io.containerd.runc.v2 with NVIDIA env vars - the NVIDIA Container
-        // Toolkit hook will inject GPU devices if installed.
+    fn gpu_container_fails_closed_without_physical_device_reservation() {
         let rt = ContainerdRuntime::new(None, None, None, None).expect("containerd connect");
-
-        rt.pull_image("docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04", None)
-            .expect("pull cuda image");
-
         let mut spec = base_spec(10006);
-        spec.image = "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04".into();
-        // nvidia-smi is in /usr/bin on CUDA images
-        spec.entrypoint = "/usr/bin/nvidia-smi".into();
         spec.gpu_count = 1;
         spec.gpu_type = GpuType::T4;
 
-        match rt.create_pod(&spec) {
-            Ok(handle) => {
-                match rt.start_pod(&handle) {
-                    Ok(()) => {
-                        std::thread::sleep(Duration::from_secs(5));
-                        let status = rt.pod_status(&handle).unwrap_or(PodStatus::Unknown);
-                        eprintln!("gpu pod status: {status:?}");
-                    }
-                    Err(e) => {
-                        eprintln!("gpu start failed (nvidia runtime may not be configured): {e}");
-                    }
-                }
-                rt.remove_pod(&handle).ok();
-            }
-            Err(e) => {
-                eprintln!("gpu create failed: {e}");
-            }
-        }
+        let error = rt
+            .create_pod(&spec)
+            .expect_err("GPU workload must not share an unreserved CDI index");
+        assert!(error.to_string().contains("physical device reservation"));
     }
 
     #[test]

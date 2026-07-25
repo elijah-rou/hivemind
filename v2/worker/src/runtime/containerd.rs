@@ -264,6 +264,45 @@ impl ContainerdRuntime {
         ids
     }
 
+    fn adoptable_container_id_from_listings(
+        pod_id: u64,
+        task_listing: &str,
+        container_listing: &str,
+    ) -> Result<Option<String>, RuntimeError> {
+        const MAX_FAMILY_IDS: usize = 64;
+        let prefix = Self::container_id_prefix(pod_id);
+        let task_ids = Self::ids_with_prefix(task_listing, &prefix, MAX_FAMILY_IDS + 1);
+        let container_ids = Self::ids_with_prefix(container_listing, &prefix, MAX_FAMILY_IDS + 1);
+        if task_ids.len() > MAX_FAMILY_IDS || container_ids.len() > MAX_FAMILY_IDS {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "{prefix} runtime family exceeds {MAX_FAMILY_IDS} entries"
+            )));
+        }
+        let mut adoptable = task_ids.into_iter().filter(|id| {
+            container_ids.contains(id)
+                && Self::task_status_from_listing(task_listing, id)
+                    .is_some_and(|status| Self::task_adoptable(&status))
+        });
+        let candidate = adoptable.next();
+        if adoptable.next().is_some() {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "{prefix} has multiple adoptable owned tasks"
+            )));
+        }
+        Ok(candidate)
+    }
+
+    fn find_adoptable_container(&self, pod_id: u64) -> Result<Option<String>, RuntimeError> {
+        let prefix = Self::container_id_prefix(pod_id);
+        let tasks = self.run_ctr(&["tasks", "list"]).map_err(|error| {
+            RuntimeError::ContainerCreate(format!("{prefix} task inventory failed: {error}"))
+        })?;
+        let containers = self.run_ctr(&["containers", "list"]).map_err(|error| {
+            RuntimeError::ContainerCreate(format!("{prefix} container inventory failed: {error}"))
+        })?;
+        Self::adoptable_container_id_from_listings(pod_id, &tasks, &containers)
+    }
+
     fn cleanup_container_family(&self, pod_id: u64) -> Result<(), RuntimeError> {
         const MAX_STALE_IDS: usize = 64;
         let prefix = Self::container_id_prefix(pod_id);
@@ -416,17 +455,19 @@ impl Runtime for ContainerdRuntime {
     }
 
     fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+        if spec.gpu_count > 0 {
+            return Err(RuntimeError::ContainerCreate(
+                "GPU workload rejected: physical device reservation is not implemented".into(),
+            ));
+        }
+        if let Some(container_id) = self.find_adoptable_container(spec.pod_id)? {
+            return Ok(PodHandle {
+                pod_id: spec.pod_id,
+                container_id,
+            });
+        }
         self.cleanup_container_family(spec.pod_id)?;
         let container_id = self.container_id(spec.pod_id);
-
-        if let Some(status) = self.task_status_by_id(&container_id)? {
-            if Self::task_adoptable(&status) {
-                return Ok(PodHandle {
-                    pod_id: spec.pod_id,
-                    container_id,
-                });
-            }
-        }
 
         // Build env vars
         let mut env = self.gpu_env(spec);
@@ -761,6 +802,33 @@ other docker.io/library/nginx io.containerd.runc.v2\n";
     }
 
     #[test]
+    fn adoption_selects_one_live_task_before_stale_cleanup() {
+        let tasks = "TASK PID STATUS\n\
+hivemind-pod-42-1 123 RUNNING\n\
+hivemind-pod-42-2 0 STOPPED\n";
+        let containers = "CONTAINER IMAGE RUNTIME\n\
+hivemind-pod-42-1 image runtime\n\
+hivemind-pod-42-2 image runtime\n";
+        assert_eq!(
+            ContainerdRuntime::adoptable_container_id_from_listings(42, tasks, containers).unwrap(),
+            Some("hivemind-pod-42-1".to_string())
+        );
+    }
+
+    #[test]
+    fn adoption_rejects_ambiguous_live_task_family() {
+        let tasks = "TASK PID STATUS\n\
+hivemind-pod-42-1 123 RUNNING\n\
+hivemind-pod-42-2 456 RUNNING\n";
+        let containers = "CONTAINER IMAGE RUNTIME\n\
+hivemind-pod-42-1 image runtime\n\
+hivemind-pod-42-2 image runtime\n";
+        assert!(
+            ContainerdRuntime::adoptable_container_id_from_listings(42, tasks, containers).is_err()
+        );
+    }
+
+    #[test]
     fn task_already_exists_error_matches_ctr_output() {
         assert!(ContainerdRuntime::task_already_exists_error(
             "ctr: task hivemind-pod-1: already exists"
@@ -792,7 +860,7 @@ other docker.io/library/nginx io.containerd.runc.v2\n";
     }
 
     #[test]
-    fn gpu_device_args_use_cdi_devices_per_requested_gpu() {
+    fn gpu_workload_is_rejected_without_physical_device_reservation() {
         let runtime = ContainerdRuntime::new(None, None, None, Some("overlayfs")).unwrap();
         let spec = PodSpec {
             pod_id: 7,
@@ -808,15 +876,9 @@ other docker.io/library/nginx io.containerd.runc.v2\n";
             gpu_type: crate::types::GpuType::T4,
         };
 
-        assert_eq!(runtime.runtime_name, "io.containerd.runc.v2");
-        assert_eq!(
-            runtime.gpu_device_args(&spec),
-            vec![
-                "--device",
-                "nvidia.com/gpu=0",
-                "--device",
-                "nvidia.com/gpu=1",
-            ]
-        );
+        let error = runtime
+            .create_pod(&spec)
+            .expect_err("GPU create must fail closed");
+        assert!(error.to_string().contains("physical device reservation"));
     }
 }

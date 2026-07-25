@@ -164,7 +164,10 @@ impl SimulatedNetwork {
         }
 
         let queue = &mut self.inbound[agent_id];
-        while queue.front().is_some_and(|pending| pending.epoch != self.session_epochs[agent_id]) {
+        while queue
+            .front()
+            .is_some_and(|pending| pending.epoch != self.session_epochs[agent_id])
+        {
             queue.pop_front();
         }
         if queue.front()?.deliver_at_tick > now {
@@ -192,13 +195,18 @@ impl SimulatedNetwork {
         }
 
         let queue = &mut self.outbound[agent_id];
-        while queue.front().is_some_and(|pending| pending.epoch != self.session_epochs[agent_id]) {
+        while queue
+            .front()
+            .is_some_and(|pending| pending.epoch != self.session_epochs[agent_id])
+        {
             queue.pop_front();
         }
         if queue.front()?.deliver_at_tick > now {
             return None;
         }
-        let pending = queue.pop_front().expect("ready outbound message must exist");
+        let pending = queue
+            .pop_front()
+            .expect("ready outbound message must exist");
         if !pending.replayed
             && self.prng.chance_ratio(self.replay_rate)
             && queue.len() < Self::queue_capacity(self.path_max_capacity)

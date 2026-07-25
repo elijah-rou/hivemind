@@ -78,6 +78,11 @@ impl Runtime for ProcessRuntime {
     }
 
     fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+        if spec.gpu_count > 0 {
+            return Err(RuntimeError::ContainerCreate(
+                "GPU workload rejected: process runtime cannot isolate physical devices".into(),
+            ));
+        }
         let mut next = self.next_port.lock().unwrap();
         let port = *next;
         if self.port_end_exclusive == Some(port) {
@@ -493,6 +498,29 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_runtime_rejects_gpu_without_device_isolation() {
+        let runtime = ProcessRuntime::with_base_port(24_400);
+        let error = runtime
+            .create_pod(&PodSpec {
+                pod_id: 77,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 0,
+                gpu_count: 1,
+                gpu_type: crate::types::GpuType::T4,
+                cpu_millicores: 1,
+                memory_megabytes: 1,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .expect_err("GPU process workload must fail closed");
+        assert!(error
+            .to_string()
+            .contains("cannot isolate physical devices"));
+    }
 
     #[test]
     fn process_runtime_probe_uses_owned_process_port() {
