@@ -1,6 +1,6 @@
 # Hivemind Status Report
 
-*Last updated: 2026-07-24*
+*Last updated: 2026-07-25*
 
 
 ## Current Presentation Gate (2026-05-05)
@@ -283,16 +283,15 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - E1 review remediation makes production hooks canonical-only, guards private helpers, binds GPU proof to the exact deployment task, removes ECR credentials from `ctr` argv, gives the live executor a killable process group, validates bounded timeouts, requires quota/offering preflight and a reviewed workspace-creation record, scans every bounded evidence file for raw ownership data, and records redaction only after success. Live acceptance now requires every capability and forbids deployment/preload/operator/drill skips; it refuses before ownership while required JuiceFS AppSpec semantics are absent.
 - E1 executed deterministic shell fixtures and offline checks only. Containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted for the current commit. Product limits below are unchanged.
 
-**Current local verification (2026-07-25, tested commit `9ca2a9c39229be3bfa362836401b2667cb7bf2af`; no live infrastructure touched):**
+**Current local verification (2026-07-25T00:35:04Z, tested source commit `3b45927e35a059c51413fd4827b1f9951b2f3cb5`; no live infrastructure touched):**
 - Environment: Linux x86_64, Zig `0.16.0`, Rust `1.95.0`, and Go `1.26.3-X:nodwarf5`.
-- Exact aggregate command: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `140s`, with `26` invoked phases passed and containerd explicitly skipped. Every aggregate phase also had its own 900-second TERM/KILL deadline.
-- Zig Debug and ReleaseFast suites pass. VOPR pause coverage freezes simulated worker registration, heartbeat, and pod-status delivery; convergence validates every active entry checksum and parent link.
-- Rust passes `174` library, `3` fuzz-harness utility, `7` main, and `5` integration tests; containerd feature integration was not enabled. Simulation session queues carry epochs and preserve registration-first FIFO under variable delay. Process and containerd runtimes reject GPU workloads without concrete physical device reservation.
-- The reusable cluster uses three retained journals, real Go API, real Rust process worker, and real Go bench. The relay forwards the API request to the restarted old leader only after that exact replica is a normal follower, records its real status 9, and then observes one aggregate dispatch delta after the gateway reprobe. Abandonment requires exact enqueue and dispatch counter deltas before queue/in-flight gauges return to zero.
-- Failover waits for worker and pod readiness, sends the post-failover workload once without ambiguous retry, and requires test-only `execution_count == 1`. The process runtime keeps only one bounded last-payload counter slot when explicit test controls are enabled and exposes no counter field by default.
-- Cleanup records leader PID start identity, inventories every non-zombie member of each owned process group, resumes stopped groups before TERM, uses bounded KILL fallback, requires `ss` for exact listener inventory, releases only token-owned locks, and verifies zero owned process/listener/lock residue without broad process-name killing. The cleanup regression requires graceful TERM delivery and descendant removal.
-- Shell: all `v2/tests/*.sh` pass `bash -n`; changed shell files pass ShellCheck at style severity.
-- The only post-test changes are this status/changelog evidence record and acceptance wording. Residual validation remains containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider execution, AWS, and all live/cloud boundaries. Historical live-infrastructure state was not inventoried or changed.
+- Final mutated VOPR sweep: `cd v2/core && zig build fuzz -- sequential --seeds 10000 --threads 0 --mutate`; exit `0` in `100.9s`; sequential seeds `0..9999`, `10,000` tested, `0` failures. The harness reported its bounded effective worker count (`12`) while preserving sequential seed assignment.
+- Final mutated worker sweep: `cd v2/worker && cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate`; exit `0` in `9.1s`; sequential seeds `0..999`, `1,000` tested, `0` failures.
+- Focused worker gate: `cd v2/worker && cargo fmt --check && cargo test --all-targets`; exit `0`; `176` library, `3` fuzz-harness utility, `7` main, and `5` integration tests passed. New regressions prove private-registry credentials stay out of `ctr` argv and are redacted from errors, and one absolute shutdown deadline reaches stop, status, runtime removal, and volume cleanup. Containerd feature integration was not enabled.
+- The earlier non-live aggregate ran at `9ca2a9c39229be3bfa362836401b2667cb7bf2af`: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `140s`, with `26` invoked phases passed and containerd explicitly skipped. It is retained as parent evidence, not promoted to the current source commit.
+- Exact scope audit: `git diff --name-only 9ca2a9c39229be3bfa362836401b2667cb7bf2af..3b45927e35a059c51413fd4827b1f9951b2f3cb5` lists `v2/docs/ENGINEERING.md`, `v2/docs/POC_CHANGELOG.md`, `v2/docs/STATUS.md`, `v2/docs/TESTING.md`, and five worker files: `runtime.rs`, `runtime/containerd.rs`, `runtime/process.rs`, `volumes.rs`, and `worker.rs`. Because worker behavior changed, only the fresh affected worker gate and both final sweeps attest `3b45927`; the older aggregate attests only its named parent.
+- This evidence record is a docs-only descendant of the tested source commit. At its final commit, `git diff --name-only 3b45927e35a059c51413fd4827b1f9951b2f3cb5..HEAD` lists only `v2/docs/POC_CHANGELOG.md` and `v2/docs/STATUS.md`; no executable behavior or harness changed after the sweeps.
+- Residual validation remains privileged containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR execution, S3/SSM/systemd, Terraform provider execution, AWS, and all live/cloud boundaries. Historical live-infrastructure state was not inventoried or changed.
 
 **VOPR simulation coverage:**
 - VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state

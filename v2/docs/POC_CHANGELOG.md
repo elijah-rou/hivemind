@@ -7,13 +7,13 @@ Purpose: keep a running record of what changed, why it matters, how close the pr
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Current local evidence: tested commit `9ca2a9c39229be3bfa362836401b2667cb7bf2af` passed `./tests/run-all.sh --skip-containerd` on 2026-07-25; containerd and all live capabilities were skipped or unexecuted.
+- Current local evidence: tested source commit `3b45927e35a059c51413fd4827b1f9951b2f3cb5` passed final mutated VOPR seeds `0..9999`, final mutated worker seeds `0..999`, and the focused worker all-target gate on 2026-07-25. The earlier aggregate at `9ca2a9c39229be3bfa362836401b2667cb7bf2af` remains parent evidence only; containerd and all live capabilities were skipped or unexecuted.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The continuation's deterministic and local real-process gates are implemented and current local aggregate evidence is green. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry, privileged containerd, and guarded live evidence are incomplete.
+The continuation's deterministic and local real-process gates are implemented. The final deterministic sweeps and affected worker gate are green at the post-review source commit; the broader aggregate remains green only at its explicitly named parent. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
 Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
@@ -33,6 +33,22 @@ Historical AWS functional/resilience and benchmark results remain useful context
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-07-25 — Post-fix review closure and final deterministic sweeps
+
+What changed:
+- moved private-registry authentication out of `ctr` argv into a protected temporary containerd hosts configuration, removed it after each pull, and redacted username, password, and encoded authorization material from command errors
+- propagated one absolute shutdown deadline through process/containerd stop, status verification, runtime removal, and JuiceFS cleanup; deterministic pod ordering now decides which pods consume the shared budget
+- corrected the evidence-parent scope statement instead of promoting the older aggregate across worker behavior changes
+
+Evidence and limits:
+- RED: focused Rust tests failed to compile because protected hosts configuration, deadline-aware runtime methods, and the bounded shutdown entry point did not exist
+- GREEN tested source commit: `3b45927e35a059c51413fd4827b1f9951b2f3cb5`
+- `cd v2/worker && cargo fmt --check && cargo test --all-targets` exited `0`: `176` library, `3` fuzz utility, `7` main, and `5` integration tests passed
+- `cd v2/core && zig build fuzz -- sequential --seeds 10000 --threads 0 --mutate` exited `0` after seeds `0..9999`, with `10,000` tested and `0` failures
+- `cd v2/worker && cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` exited `0` after seeds `0..999`, with `1,000` tested and `0` failures
+- `git diff --name-only 9ca2a9c39229be3bfa362836401b2667cb7bf2af..3b45927e35a059c51413fd4827b1f9951b2f3cb5` lists four docs and five worker files, so the earlier aggregate attests only its named parent
+- privileged containerd, actual private-registry authentication, JuiceFS mounts, GPU/CDI, Nydus, Doppler, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted; live resource state was not inventoried and remains unknown
 
 ### 2026-07-25 — Final review safety remediation
 
