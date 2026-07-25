@@ -13,6 +13,16 @@ This is the authoritative testing architecture and evidence-semantics document f
 
 Protocol version 6 gates client, worker, and replica peer envelopes. A peer body is `[2B little-endian protocol_version][1B from_id][VRR payload]`, inside the same plaintext or encrypted outer frame used by other TCP roles. Peers reject any version mismatch before sender identity binding, connection replacement/disconnect decisions, or VRR dispatch. Mixed-version rolling upgrades are unsupported: stop every replica, worker, API gateway, and bench client; replace all components; then restart the cluster.
 
+## Current accepted local evidence
+
+The accepted non-live matrix ran from `2026-07-25T01:06:39Z` through `01:14:01Z` against code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`. It passed `25 / 25` bounded gates with `0` failures, `433s` summed gate duration, and `442s` wall time.
+
+Core Debug/ReleaseFast and 29 regression replays passed. The mutated core sweep used `--seeds 10000 --threads 4 --mutate` and tested exact seeds `0..9999`, with `10,000` tested, `0` failures, in `164.9s`. Worker formatting/all-targets and 27 regression replays passed; all-target counts were `176` library, `3` fuzz utility, `7` main, and `5` integration tests, while the containerd-feature binary ran `0`. The mutated worker sweep used `--seeds 1000 --threads 4 --mutate` and tested exact seeds `0..999`, with `1,000` tested, `0` failures, in `6.6s`. The `--skip-containerd` aggregate passed `26 / 26` invoked phases in `139s`, including local real-process cleanup, failover, retained-storage recovery, and `/run` contracts.
+
+Go API/bench formatting, race tests, and builds; active Bash syntax and default ShellCheck; protocol-v6 wire checks under `PYTHONOPTIMIZE=2`; docs/layout; Terraform recursive formatting; and backend-disabled lockfile-readonly init/static validation for `poc`, `poc-eks`, `bench`, and `gpu-test` passed. Credential checks passed a bounded value-redacting self-test with `12` safe, `6` unsafe, and `2` redacted-output fixtures, followed by a clean changed-line scan. Final residue was zero branch-owned processes, branch-attributable listener deltas, port locks, and lock owners.
+
+The run explicitly skipped or did not execute containerd component/full stack, Docker, privileged namespace/cgroup behavior, GPU/CDI, Nydus, JuiceFS, Doppler, private registry/image pulls, AWS/ECR/EKS/S3/SSM/systemd, Terraform plan/apply/destroy/provider operations, `tests/live/run.sh`, `scripts/poc-runbook.sh`, and all live/cost/destructive work. Prepared E1 harnesses remain preparation, not execution evidence. Live-resource state was not inventoried and remains unknown. Historical results attest only their named commits.
+
 ## Test layers and authoritative commands
 
 Commands are run from the repository root unless the command changes directory. None of these commands creates current-head evidence unless its SHA, exit, environment, and skips are recorded.

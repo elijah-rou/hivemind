@@ -7,13 +7,13 @@ Purpose: keep a running record of what changed, why it matters, how close the pr
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Current local evidence: tested source commit `3b45927e35a059c51413fd4827b1f9951b2f3cb5` passed final mutated VOPR seeds `0..9999`, final mutated worker seeds `0..999`, and the focused worker all-target gate on 2026-07-25. The earlier aggregate at `9ca2a9c39229be3bfa362836401b2667cb7bf2af` remains parent evidence only; containerd and all live capabilities were skipped or unexecuted.
+- Current accepted local evidence: code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, passed `25 / 25` final gates on 2026-07-25. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `26` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. Containerd and every privileged/live capability were explicitly skipped or unexecuted.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The continuation's deterministic and local real-process gates are implemented. The final deterministic sweeps and affected worker gate are green at the post-review source commit; the broader aggregate remains green only at its explicitly named parent. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
+The continuation's deterministic and local real-process gates are implemented. The complete accepted local matrix is green at `bc9f5f63fcf4f030177ceae321342d92b79ab613`; prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
 Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
@@ -33,6 +33,25 @@ Historical AWS functional/resilience and benchmark results remain useful context
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-07-25 — Fresh complete accepted local gate
+
+Evidence:
+- tested code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, exact tree `78f4c95c28fca5233a25e57ec8179e969120779c`; run window `2026-07-25T01:06:39Z` through `01:14:01Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `433s`, complete wall time `442s`
+- Zig Debug (`39s`), ReleaseFast (`7s`), and 29 regression replays passed; mutated four-thread core seeds `0..9999` tested `10,000`, found `0` failures, and completed in `164.9s`
+- worker format/all-targets passed (`176` library, `3` fuzz utility, `7` main, `5` integration; containerd-feature binary `0`); 27 worker regression replays passed; mutated four-thread worker seeds `0..999` tested `1,000`, found `0` failures, and completed in `6.6s`
+- `./tests/run-all.sh --skip-containerd` passed all `26` invoked phases in `139s`, including local cleanup, three-replica failover, retained-storage recovery, and real-process `/run`; containerd component/full-stack remained explicitly skipped
+- Go API and bench formatting/race/build, active Bash syntax, default ShellCheck, protocol-v6 wire consumers under `PYTHONOPTIMIZE=2`, docs/layout, Terraform recursive formatting, and backend-disabled readonly init/static validation for all four roots passed
+- bounded value-redacting credential scanner self-tests passed `12` safe, `6` unsafe, and `2` redacted-output fixtures; the changed-line scan found no reportable credential
+- final residue inventory found zero branch-owned processes, branch-attributable listener deltas, port locks, and lock owners; unrelated pre-existing host listeners remained outside run ownership, and the residue gate terminated no processes
+
+Explicit skips and limits:
+- no containerd/full-stack, Docker, privileged runtime or host namespace/cgroup operation, GPU/CDI, Nydus, JuiceFS, Doppler, private registry, or real image pull executed
+- no AWS, ECR, EKS, S3, SSM, systemd remote work, cloud/provider operation, Terraform plan/apply/destroy, cost-bearing action, or destructive action executed
+- `tests/live/run.sh` and `scripts/poc-runbook.sh` did not run; no live authorization was supplied or requested
+- prepared E1 containerd/GPU/JuiceFS/private-registry/live harnesses remain preparation, not execution evidence
+- live-resource state remains unknown pending fresh authorized inventory; existing product/runtime limitations and POC v2 blockers are unchanged
 
 ### 2026-07-25 — Post-fix review closure and final deterministic sweeps
 

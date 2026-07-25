@@ -43,6 +43,14 @@ See [STATUS.md](STATUS.md) for current implementation architecture and [frozen/A
 
 This section describes executable topology separately from future acceptance topology. Mutable limits, ports, and wire constants remain source-owned; follow the linked files instead of copying values from this document into automation. [TESTING.md](TESTING.md) defines evidence semantics, and the [harness catalog](../tests/README.md) defines script operation.
 
+### Current accepted local evidence
+
+The fresh accepted run on 2026-07-25 tested code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, from `2026-07-25T01:06:39Z` through `01:14:01Z`. All `25 / 25` bounded gates passed (`0` failed), with `433s` summed gate time and `442s` wall time.
+
+The matrix included Zig Debug and ReleaseFast, 29 core regression replays, a four-thread mutated core sweep of exact seeds `0..9999` (`10,000`, `0` failures, `164.9s`), Rust formatting and all targets (`176 + 3 + 7 + 5` tests; containerd-feature binary `0`), 27 worker regression replays, and a four-thread mutated worker sweep of exact seeds `0..999` (`1,000`, `0` failures, `6.6s`). Go API/bench formatting, race tests, and builds passed. The `--skip-containerd` aggregate passed all `26` invoked phases in `139s`, including real local process/socket/filesystem failover, recovery, and `/run` contracts. The shared protocol-v6 gate passed under `PYTHONOPTIMIZE=2`; active Bash syntax, default ShellCheck, docs/layout, Terraform formatting, and backend-disabled readonly init/static validation of all four roots passed.
+
+The bounded value-redacting credential scanner passed self-tests with 12 safe, 6 unsafe, and 2 redacted-output fixtures, then found no reportable changed-line credential. Residue self-tests and the final inventory found zero branch-owned processes, branch-attributable listener deltas, port locks, or lock owners; unrelated pre-existing host listeners were not owned by the run. Containerd/full-stack and privileged namespace/cgroup execution, Docker, GPU/CDI, Nydus, JuiceFS, Doppler, private registry/image pulls, AWS/ECR/EKS/S3/SSM/systemd, Terraform plan/apply/destroy/provider operations, `tests/live/run.sh`, `scripts/poc-runbook.sh`, and every live/cost/destructive action were explicitly skipped or unexecuted. Prepared E1 harnesses are not execution evidence. Current live-resource state remains unknown pending authorized inventory, and no product/runtime limitation changed.
+
 ### Component and boundary map
 
 | Layer | Current, implemented components | Boundary actually crossed | Source of truth |
