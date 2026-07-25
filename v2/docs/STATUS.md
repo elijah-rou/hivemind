@@ -24,9 +24,11 @@ Canonical docs:
 - POC v2 gate: `docs/POC_V2_ACCEPTANCE.md`
 - Hivemind-native platform model: `docs/design/HIVEMIND_NATIVE_PLATFORM.md`
 
-## POC Status Update (2026-05-02)
+## Historical POC Status Update (2026-05-02)
 
-Latest state after the fresh AWS redeploy, corrected smoke pass, POC acceptance rewrite, 10k local fuzz gate, local federated selector proof, Thalamus POC branch locality tests, localhost multi-origin smoke, workload prep, failure-drill/EKS prep, runbook hardening, focused fresh-AWS real workload validation, operator workflow proof, targeted cloud failure-drill proof, Section 6 repeatability pass, initial isolated EKS benchmark collection, warm-cache Hivemind/EKS latency rerun, granular span attribution, flamegraph artifacts, and refreshed final evidence pack/verdict:
+The following section records historical AWS and benchmark evidence only. Current live resource state is unknown because no fresh inventory was authorized or run. Nothing in this section attests the current branch or authorizes reuse of historical resources.
+
+Historical state after the fresh AWS redeploy, corrected smoke pass, POC acceptance rewrite, 10k local fuzz gate, local federated selector proof, Thalamus POC branch locality tests, localhost multi-origin smoke, workload prep, failure-drill/EKS prep, runbook hardening, focused fresh-AWS real workload validation, operator workflow proof, targeted cloud failure-drill proof, Section 6 repeatability pass, initial isolated EKS benchmark collection, warm-cache Hivemind/EKS latency rerun, granular span attribution, flamegraph artifacts, and refreshed final evidence pack/verdict:
 
 - Live AWS validation reached the real POC loop: encrypted 5-replica cluster healthy, CPU worker + GPU worker registered, CPU and GPU deployments both scheduled, dashboard reflected running pods, and `/v1/deployments/{name}/run` returned successful responses on both CPU and GPU paths.
 - The earlier POC blockers were fixed and pushed on `master`:
@@ -39,8 +41,8 @@ Latest state after the fresh AWS redeploy, corrected smoke pass, POC acceptance 
 - Historical validation for that POC milestone included 10,000-seed core and worker fuzz sweeps plus a 16/16 local smoke pass. The single current branch verification record is maintained in **Test Coverage** below.
 - Fresh AWS redeploy/smoke gate is now closed. Corrected live smoke passed end-to-end on fresh infra, including remote GPU checks and CPU/GPU `/run` paths.
 - POC progress is `6 / 8` acceptance sections complete with Sections 7-8 provisional, and `16 / 16` execution checklist items complete for the warm-cache evidence pack. Functional/resilience gates through Section 6 are complete; Section 7 benchmark/economic acceptance still needs a clean EKS rerun after GPU-node sandbox failures are resolved.
-- Latest repeatability run `poc-20260428195031` passed smoke, real workloads, operator workflow, placement-asserted failure drills, final log capture, and teardown. Latest latency reruns left Hivemind infra and EKS nodegroups up for reuse. EKS control-plane deletion still requires elevated IAM or an exception for explicit `eks:DeleteCluster` deny.
-- The POC finish line is now defined in `docs/POC_ACCEPTANCE.md`.
+- Latest repeatability run `poc-20260428195031` passed smoke, real workloads, operator workflow, placement-asserted failure drills, final log capture, and teardown. Historical latency reruns reported retained Hivemind/EKS resources, but their current state is unknown and blocked pending fresh inventory.
+- The current POC finish line is defined in `docs/POC_V2_ACCEPTANCE.md`.
 - Local deterministic federation modeling and localhost locality smoke have landed:
   - origin-aware gossip and metrics expose the peer advisory surface, including queue depth
   - VOPR models federated origins across localities
@@ -143,7 +145,7 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
               │   Agent (Rust)    │  per-node binary
               │                   │
               │  Containerd (ctr) │  pull, create, start, stop
-              │  GPU allocation   │  CDI devices via `nvidia.com/gpu=*`
+              │  GPU admission    │  fail-closed until physical device reservation
               │  Secret resolver  │  Doppler API, 5min cache
               │  JuiceFS mounts   │  juicefs mount subprocess
               │  Nydus snapshotter│  lazy image loading
@@ -224,7 +226,7 @@ ImagePulling → Creating → Starting → Running → Stopping → Stopped
 ```
 
 - containerd via `ctr` CLI (no gRPC, avoids tokio deadlock)
-- GPU pods: `--runtime io.containerd.runc.v2` + CDI `--device nvidia.com/gpu=<idx>`
+- GPU pods currently fail closed in process and containerd runtimes because concrete physical device reservation per pod is not implemented. Count-only admission remains simulation evidence, not device-isolation support.
 - CPU pods: `--runtime io.containerd.runc.v2`
 - 30s timeout on ctr calls, 300s for image pulls
 - cgroup v2 resource limits (CPU quota, memory)
@@ -275,30 +277,29 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 **Lane E1 prepared harnesses (2026-07-24; not live evidence):**
 - `run-all.sh` accepts `--require-containerd`; the required mode preflights before aggregate phases and runs both component and full-stack gates. Missing/incompatible containerd is nonzero. Optional developer mode records an explicit skip.
 - The prepared full-stack privileged image runs three real Zig replicas, Go API, Rust worker/containerd, traffic, worker restart/adoption, and exact baseline task/container cleanup. It was not built or run for E1.
-- Strict containerd, GPU, Nydus, and JuiceFS decisions are fixture-tested. Required GPU evidence is one CDI-selected task plus successful in-container `nvidia-smi`. Required JuiceFS live acceptance deliberately fails before apply because AppSpec/API required-mount semantics remain absent.
+- Strict capability decisions are fixture-tested. GPU execution is blocked because process and containerd runtimes now reject nonzero GPU specs until concrete per-pod physical device reservation exists. Required JuiceFS live acceptance deliberately fails before apply because AppSpec/API required-mount semantics remain absent.
 - The prepared guarded live wrapper requires explicit live/cost/destructive authorization, account and region allowlists, unique token-owned workspace/bucket/ECR names, reviewed saved-plan digest, clean source, pre-ownership zero inventory, traps before execution, default `KEEP_INFRA=0`, bounded evidence, and exact post-cleanup zero inventory. The POC runbook now refuses direct unguarded live execution.
 - Cold-cache ECR mode removes one exact token-owned image, requires actual ECR credentials and digest lookup, verifies the exact pull digest, and redacts the account from publishable evidence. Failure drills now require the restarted replica to return to normal, all replicas to converge on commit/state digest, and every queue/in-flight gauge to equal zero.
 - E1 review remediation makes production hooks canonical-only, guards private helpers, binds GPU proof to the exact deployment task, removes ECR credentials from `ctr` argv, gives the live executor a killable process group, validates bounded timeouts, requires quota/offering preflight and a reviewed workspace-creation record, scans every bounded evidence file for raw ownership data, and records redaction only after success. Live acceptance now requires every capability and forbids deployment/preload/operator/drill skips; it refuses before ownership while required JuiceFS AppSpec semantics are absent.
 - E1 executed deterministic shell fixtures and offline checks only. Containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted for the current commit. Product limits below are unchanged.
 
-**Current local verification (2026-07-24, tested commit `dc0dc633aa8bbdd94d86713f4b0669b648b0d715`; no live infrastructure touched):**
+**Current local verification (2026-07-25, tested commit `736002af51a4075e96fe834a64b285c953193c5f`; no live infrastructure touched):**
 - Environment: Linux x86_64, Zig `0.16.0`, Rust `1.95.0`, and Go `1.26.3-X:nodwarf5`.
-- Exact aggregate command: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `149s`, with `21` invoked phases passed and containerd explicitly skipped. Every aggregate phase also had its own 900-second TERM/KILL deadline.
-- A prior aggregate at `2527c4e9667dcf110cda094d24cded2a5f2e39dd` exited `1` in `131s`: `20` phases passed and the run contract exposed a leader-rotation race in its exact dispatch-delta assertion. The bounded restarted-replica follower acquisition was then fixed; three consecutive focused run contracts passed in `37s` total before the final aggregate.
-- Zig Debug and ReleaseFast suites pass. The committed-state digest regression mutates state, computes `StateMachine.committedDigest()`, and requires the exact rendered metric value.
-- Rust passes `168` library, `3` fuzz-harness utility, `7` main, and `5` integration tests; containerd feature integration was not enabled. Deterministic coverage requires one runtime owner across connection loss and default process responses omit test-only execution counts.
+- Exact aggregate command: `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd`; exit `0` in `175s`, with `26` invoked phases passed and containerd explicitly skipped. Every aggregate phase also had its own 900-second TERM/KILL deadline.
+- Zig Debug and ReleaseFast suites pass. VOPR pause coverage freezes simulated worker registration, heartbeat, and pod-status delivery; convergence validates every active entry checksum and parent link.
+- Rust passes `174` library, `3` fuzz-harness utility, `7` main, and `5` integration tests; containerd feature integration was not enabled. Simulation session queues carry epochs and preserve registration-first FIFO under variable delay. Process and containerd runtimes reject GPU workloads without concrete physical device reservation.
 - The reusable cluster uses three retained journals, real Go API, real Rust process worker, and real Go bench. The relay forwards the API request to the restarted old leader only after that exact replica is a normal follower, records its real status 9, and then observes one aggregate dispatch delta after the gateway reprobe. Abandonment requires exact enqueue and dispatch counter deltas before queue/in-flight gauges return to zero.
 - Failover waits for worker and pod readiness, sends the post-failover workload once without ambiguous retry, and requires test-only `execution_count == 1`. The process runtime keeps only one bounded last-payload counter slot when explicit test controls are enabled and exposes no counter field by default.
 - Cleanup records leader PID start identity, inventories every non-zombie member of each owned process group, resumes stopped groups before TERM, uses bounded KILL fallback, requires `ss` for exact listener inventory, releases only token-owned locks, and verifies zero owned process/listener/lock residue without broad process-name killing. The cleanup regression requires graceful TERM delivery and descendant removal.
 - Shell: all `v2/tests/*.sh` pass `bash -n`; changed shell files pass ShellCheck at style severity.
-- This evidence manifest is the only post-test documentation change: it does not alter the tested runtime or harness. Residual validation remains containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider execution, AWS, and all live/cloud boundaries. Historical live-infrastructure state was not inventoried or changed.
+- The only post-test changes are this status/changelog evidence record and acceptance wording. Residual validation remains containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider execution, AWS, and all live/cloud boundaries. Historical live-infrastructure state was not inventoried or changed.
 
 **VOPR simulation coverage:**
 - VRR consensus under distinct faults (partitions, true process pauses, crashes, restarts); pauses freeze inbound/outbound delivery, replica ticks, and disk progress while preserving memory and durable state
 - Write/sync-before-publication storage barriers, group commit, and fail-stop on whole disk I/O errors (torn writes / power loss not modeled); explicit coalesced barrier causes let deterministic cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication, with consumed scheduled cuts emitted once in JSONL traces after safety- and liveness-phase ticks
 - Fail-closed retained-log saturation (`log_full`) without committed-slot overwrite
 - Canonical recovered-prefix validation (`observeRecovery`) and immutable committed-prefix enforcement (StartView / DVC conflict rejection); deterministic sender/receiver/tag drop-next faults exercise bounded gapped-candidate fallback through real RequestPrepare/SendPrepare traffic
-- Checker compares full committed entry checksums; strict convergence additionally requires equal active op/tip/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
+- Checker compares full committed entry checksums; strict convergence additionally validates every active entry checksum and parent link, compares every active checksum across replicas, and requires equal active op/log high, contiguous retained occupancy, healthy storage, and a bounded deterministic committed state-machine digest that excludes local timestamps
 - Seeded ConnectionManager socketpair/fake-clock transition coverage: leader probe, fragmented client frame, client and three worker connections, dispatch, client abandonment, foreign worker response isolation, tombstone expiry, worker disconnect, leader change, and slot reconnect; every transition checks RequestQueue accounting plus exact queue/occupied/client-active/worker-busy/live-connection/counter values
 - Named peer-envelope socketpair coverage checks protocol-v6 plaintext and fixed-nonce encrypted frames, current-1, malformed, and plaintext-on-keyed-connection rejection; rejected frames remain unbound and cannot reach replica VRR counters
 - Connection metrics count currently connected sockets rather than high-water allocated slots; the deterministic harness checks exact agent/client/peer gauges and queue/in-flight/lifetime counters at queued, dispatched, abandoned/client-disconnected, and final states
@@ -310,7 +311,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 **Worker simulation coverage:**
 - Worker output is enqueued through `SimulatedNetwork::send_from_agent` and delivered to `ControlPlaneStub` only by `pop_outbound` at the beginning of a later deterministic tick; direct worker-to-recorder delivery is removed.
 - Named seeds `0xB101` through `0xB104` partition before registration, heartbeat delivery, pod status, and run response. The recorder remains unchanged while partitioned, then receives the exact queued identities and counts after healing.
-- Delayed partitions retain the current session and queued traffic. Explicit session loss discards both old-session queues, calls `Worker::on_connection_lost`, and proves re-registration precedes exact new-session heartbeat, pod-status, and run-response traffic.
+- Delayed partitions retain the current session and FIFO queued traffic. Every queue entry carries a session epoch; explicit session loss advances the epoch, discards old-session queues, calls `Worker::on_connection_lost`, and proves re-registration precedes exact new-session heartbeat, pod-status, and run-response traffic under variable delay.
 - Partition blocks queued traffic in both directions; ratio-based drop, one-shot replay, and per-path capacity apply symmetrically. Accepted worker messages and encoded payload bytes contribute to network accounting.
 - Runner convergence requires control-plane-observed registration from every worker after the most recent explicit session loss and a terminal status for every generated start command; permanent total loss fails liveness. Network and per-tick I/O staging paths retain at most 256 messages per worker, optionally reduced by configured path capacity; control-plane schedule and recorder growth is fail-loud bounded.
 - Named worker scenarios `liveness_probe_two_failures_then_success_resets_counter` and `liveness_probe_three_failures_transition_pod_to_failed` consume bounded scripted runtime outcomes and prove liveness hysteresis, retained runtime/resource ownership after a failed stop, replacement GPU denial, and final `Failed` publication only after verified removal.
@@ -344,7 +345,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - [x] Secret resolution (Doppler, 5min cache)
 - [x] JuiceFS volume mounts
 - [x] Nydus snapshotter support
-- [x] GPU pod support (CDI devices with `io.containerd.runc.v2`)
+- [ ] GPU pod device isolation: runtimes reject GPU workloads until concrete physical device reservation is implemented
 - [x] Prometheus metrics (replica + agent)
 - [x] Protocol versioning (2-byte version field) with one bounded canonical cross-language fixture corpus
 - [x] Peer connection retry (2s interval)
@@ -415,7 +416,7 @@ Auto-provision compute from cloud providers.
 Active source of truth:
 - `core/` + `worker/` + `api/` for implementation
 - `docs/STATUS.md` for current state
-- `docs/POC_ACCEPTANCE.md` for POC pass/fail
+- `docs/POC_V2_ACCEPTANCE.md` for the current POC pass/fail gate
 - `docs/POC_CHANGELOG.md` for dated POC history
 - `docs/FINDINGS_AND_ISSUES.md` for production gaps/backlog
 

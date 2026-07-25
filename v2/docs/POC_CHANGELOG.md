@@ -1,48 +1,53 @@
 # Hivemind POC Changelog
 
-_Last updated: 2026-07-24_
+_Last updated: 2026-07-25_
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
 ## Progress Snapshot
 
-- Acceptance sections complete: `6 / 8`
-  - Complete: `1. Fresh AWS Redeploy`, `2. Locality Federation Proof`, `3. Real Workload Validation`, `4. Operator Workflow Proof`, `5. Failure Drill Proof`, `6. Repeatability / No-Heroics Gate`
-  - Reopened: `7. Kubernetes Baseline Comparison`, `8. Final Evidence Pack`
-- Execution checklist complete: `16 / 16` for warm-cache evidence pack
-  - Complete: fresh redeploy, corrected smoke, origin -> locality map, Hivemind origin metadata + gossip visibility patch, local federated-origin proof surface, Thalamus POC branch locality/residency selector tests, localhost locality/failover smoke, CPU workload selection, GPU workload selection, real CPU/GPU workload validation, operator workflow proof, failure drills, repeatability / second fresh redeploy, initial EKS baseline collection, warm-cache Hivemind/EKS benchmark, final evidence pack/verdict refresh
-  - Remaining for economic confidence: clean EKS rerun after GPU-node sandbox failures, cold-cache rerun after Hivemind private ECR auth fix
-- Infra status: `up`: Hivemind live for reuse; EKS control plane and nodegroups left up after warm-cache rerun
-- Current phase: `Final benchmark docs refreshed; benchmark/economic verdict still provisional pending clean EKS rerun`
+- Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
+- Current local evidence: tested commit `736002af51a4075e96fe834a64b285c953193c5f` passed `./tests/run-all.sh --skip-containerd` on 2026-07-25; containerd and all live capabilities were skipped or unexecuted.
+- Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
+- Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The functional/resilience POC is complete.
+The continuation's deterministic and local real-process gates are implemented and current local aggregate evidence is green. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry, privileged containerd, and guarded live evidence are incomplete.
 
-The basic live AWS plumbing gate is closed.
-
-The broad Hivemind-core deterministic blocker is also closed again: fresh mutated core sweep is clean at `10000/10000` after landing regression fixes.
-
-The local deterministic federated proof surface, localhost Thalamus/Hivemind smoke, focused fresh-AWS real workload run, operator workflow proof, live failure drills, and repeatability gate are complete.
-
-The benchmark/economic verdict remains provisional. Latest warm-cache nginx matrix favors Hivemind with granular phase attribution, but the EKS rerun was degraded by GPU-node sandbox failures, so broad speedup/economic claims still need a clean EKS rerun.
+Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
 ## Next 3 Concrete Steps
 
-1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
-2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
-3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+1. Implement concrete per-pod physical GPU reservation before enabling GPU runtimes or strict GPU acceptance.
+2. Run the privileged containerd component/full-stack gates on a suitable host and verify adoption PID continuity and cleanup.
+3. Inventory live resources only under explicit authorization before any AWS reuse, mutation, benchmark, or cleanup decision.
 
 ## Open Unknowns
 
 - Exact Nebius Europe region still needs confirmation for future live multi-provider work.
-- Temporary EKS baseline is intentionally isolated under `infra/poc-eks/`; EKS control plane and nodegroups are currently left up for follow-up artifact refresh.
-- Warm-cache Hivemind-vs-EKS reruns are collected and final benchmark docs refreshed, but benchmark/economic verdict remains provisional until clean EKS rerun.
+- Current AWS/EKS resource state is unknown; historical retained-resource records were not revalidated.
+- Warm-cache Hivemind-vs-EKS reruns are historical; benchmark/economic evidence requires a current feature-complete rerun.
 - Old Drill A timeout was partly a test/deploy bug: `hivemind-api.service` required local `hivemind.service`, so stopping the leader also killed the public API gateway.
 - Local live failover smoke is green for 3 and 5 replicas after fixing VRR frame sizing and API stale-reply handling.
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-07-25 — Final review safety remediation
+
+What changed:
+- froze all simulated worker-to-replica delivery while a replica is paused and made convergence validate every active entry, checksum, and parent link
+- added explicit worker simulation session epochs and FIFO delivery under variable delay, with registration required before later same-session traffic
+- adopted one verified live containerd task before stale-family cleanup and added stable task PID continuity evidence to the privileged test
+- rejected process/containerd GPU workloads until concrete physical device reservation exists, bounded aggregate shutdown grace, polled containerd for early exit, and separated start concurrency from mixed lifecycle chunks
+- bound the live runbook to the guarded parent/nonce, expanded cleanup categories, and hashed reviewed-plan, apply/destroy, Terraform-output, and bounded runbook artifact evidence
+
+Evidence and limits:
+- RED: Zig Debug initially failed the paused-worker and non-tip convergence regressions; the variable-delay worker FIFO regression failed before queue ordering changed; live/evidence fixtures failed before the guard and manifest contracts were expanded
+- GREEN tested commit: `736002af51a4075e96fe834a64b285c953193c5f`; `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `175s` with `26` invoked phases passed
+- focused Zig Debug, Rust all-targets (`174 + 3 + 7 + 5`), live guardrail, evidence-manifest, and shell syntax checks passed
+- containerd feature tests, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted; live resource state was not inventoried and is unknown
 
 ### 2026-07-24 — Lane E1 review remediation
 
