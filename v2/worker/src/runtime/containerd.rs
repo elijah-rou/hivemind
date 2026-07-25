@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE_MS};
 
@@ -575,14 +575,17 @@ impl Runtime for ContainerdRuntime {
         let terminate_error = self
             .run_ctr(&["tasks", "kill", "--signal", "15", &handle.container_id])
             .err();
-        if grace_period_ms > 0 {
-            thread::sleep(Duration::from_millis(
-                grace_period_ms.min(MAX_STOP_GRACE_MS),
-            ));
-        }
-
-        if matches!(self.pod_status(handle), Ok(PodStatus::Stopped { .. })) {
-            return Ok(());
+        let grace_ms = grace_period_ms.min(MAX_STOP_GRACE_MS);
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        loop {
+            if matches!(self.pod_status(handle), Ok(PodStatus::Stopped { .. })) {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(100)));
         }
 
         let kill_error = self

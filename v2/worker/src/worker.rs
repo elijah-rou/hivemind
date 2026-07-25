@@ -625,6 +625,12 @@ impl Worker {
             }
         }
 
+        lifecycle_ops.sort_by_key(|op| match op {
+            LifecycleOp::Start { pod_id, .. } => (0u8, *pod_id),
+            LifecycleOp::Pull { pod_id, .. }
+            | LifecycleOp::Create { pod_id, .. }
+            | LifecycleOp::Stop { pod_id, .. } => (1u8, *pod_id),
+        });
         let phase_concurrency = |op: &LifecycleOp| -> usize {
             match op {
                 LifecycleOp::Start { .. } => self.lifecycle_concurrency.max(1),
@@ -1034,9 +1040,10 @@ impl Worker {
     }
 
     pub fn shutdown(&mut self, io: &mut dyn Io, runtime: &dyn Runtime) -> bool {
-        /// Default SIGTERM-style drain when the scheduler did not set a pod grace period.
-        const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
+        const SHUTDOWN_DEADLINE_MS: u64 = 20_000;
+        const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 15_000;
 
+        let shutdown_started = Instant::now();
         let pod_ids: Vec<u64> = self.pods.keys().copied().collect();
 
         for pod_id in pod_ids {
@@ -1066,14 +1073,20 @@ impl Worker {
                 let handle = handle_opt
                     .as_ref()
                     .expect("unverified pod must have a handle");
-                let grace = if grace_period_ms > 0 {
+                let requested_grace = if grace_period_ms > 0 {
                     grace_period_ms
                 } else {
                     DEFAULT_SHUTDOWN_GRACE_MS
                 };
                 let stop_attempts = STOP_ATTEMPT_MAX.saturating_sub(lifecycle_failures);
                 for _ in 0..stop_attempts {
-                    let stop_result = runtime.stop_pod(handle, grace);
+                    let elapsed_ms =
+                        shutdown_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    let remaining_ms = SHUTDOWN_DEADLINE_MS.saturating_sub(elapsed_ms);
+                    if remaining_ms == 0 {
+                        break;
+                    }
+                    let stop_result = runtime.stop_pod(handle, requested_grace.min(remaining_ms));
                     match runtime.pod_status(handle) {
                         Ok(PodStatus::Stopped { exit_code }) => {
                             verified_exit_code = Some(exit_code);
