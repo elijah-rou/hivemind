@@ -22,7 +22,7 @@ printf 'destroy complete\n' >"$TMP/terraform-destroy.log"
 printf '{"api_url":"[REDACTED]"}\n' >"$TMP/terraform-outputs.json"
 mkdir "$TMP/runbook-artifacts"
 printf '{"request_id":1,"status":0}\n' >"$TMP/runbook-artifacts/api-identities.jsonl"
-printf 'fault_queue=0\n' >"$TMP/runbook-artifacts/fault-period-metrics.txt"
+printf 'fault=leader-loss queue=0\n' >"$TMP/runbook-artifacts/fault-period-metrics.txt"
 printf 'tasks=1 containers=1 cdi=verified cgroup=verified gpu=verified\n' >"$TMP/runbook-artifacts/runtime-proof.txt"
 printf 'instances=1\n' >"$TMP/runbook-artifacts/intermediate-inventory.txt"
 printf 'cold_pull=verified digest=sha256:%s\n' "$sha" >"$TMP/runbook-artifacts/ecr-proof.txt"
@@ -63,6 +63,25 @@ fi
 if "$BUILDER" --commit dirty "${common_args[@]}" --metrics "$TMP/metrics.txt" --output "$TMP/bad-commit.json" 2>/dev/null; then
   echo "FAIL: malformed digest accepted" >&2; exit 1
 fi
+
+expect_semantic_reject() {
+  local name="$1" path="$2" replacement="$3" saved
+  saved="$(cat "$path")"
+  printf '%s\n' "$replacement" >"$path"
+  if "$BUILDER" --commit "$sha" "${common_args[@]}" --metrics "$TMP/metrics.txt" \
+      --output "$TMP/bad-$name.json" 2>/dev/null; then
+    echo "FAIL: semantically failed $name evidence accepted" >&2; exit 1
+  fi
+  printf '%s\n' "$saved" >"$path"
+}
+expect_semantic_reject runtime-zero "$TMP/runbook-artifacts/runtime-proof.txt" \
+  'tasks=0 containers=0 cdi=false cgroup=false gpu=false'
+expect_semantic_reject malformed-image-digest "$TMP/runbook-artifacts/ecr-proof.txt" \
+  'cold_pull=verified digest=sha256:not-a-digest'
+expect_semantic_reject failed-journal "$TMP/runbook-artifacts/journal-proof.txt" \
+  "mode=0600 checksum=$sha recovery=failed"
+expect_semantic_reject contradictory-journal "$TMP/runbook-artifacts/journal-proof.txt" \
+  "mode=0600 checksum=$sha recovery=verified recovery=failed"
 
 mkdir "$TMP/scan"
 printf 'secret\n' >"$TMP/scan/oversized"

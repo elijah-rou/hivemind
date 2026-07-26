@@ -180,6 +180,7 @@ finish() {
         pre_cleanup_status=$?
         printf 'pre_cleanup_inventory\t%s\n' "$pre_cleanup_status" >>"$STATUS_FILE"
         [[ "$pre_cleanup_status" == 0 ]] || status=1
+        # Reserve time beyond bounded Terraform destroy for S3 reconciliation and workspace cleanup.
         timeout --foreground --kill-after=10s "${HIVEMIND_CLEANUP_TIMEOUT_SECONDS:-1800}s" "$CLEANUP"
         cleanup_status=$?
         printf 'cleanup\t%s\n' "$cleanup_status" >>"$STATUS_FILE"

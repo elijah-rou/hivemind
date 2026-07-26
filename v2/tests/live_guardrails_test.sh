@@ -27,8 +27,8 @@ printf 'reviewed fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/reviewed-plan-record.t
 printf 'apply fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-apply.log"
 printf '{}\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-outputs.json"
 mkdir "$HIVEMIND_LIVE_EVIDENCE_DIR/runbook"
-printf 'request_id=1 status=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/api-identities.jsonl"
-printf 'fault_queue=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/fault-period-metrics.txt"
+printf '{"request_id":1,"status":0}\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/api-identities.jsonl"
+printf 'fault=leader-loss queue=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/fault-period-metrics.txt"
 printf 'instances=1\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/intermediate-inventory.txt"
 printf 'tasks=1 containers=1 cdi=verified cgroup=verified gpu=verified\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/runtime-proof.txt"
 printf 'cold_pull=verified digest=sha256:%s\n' "$sha" >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/ecr-proof.txt"
@@ -57,6 +57,26 @@ EOF
 export PATH="$TMP/bin:/usr/bin:/bin" FIXTURE_LOG="$TMP/calls.log"
 FIXTURE_ACCOUNT="$(printf '1%.0s' {1..12})"
 export FIXTURE_ACCOUNT
+
+validator="$SCRIPT_DIR/live/validate-reviewed-plan.py"
+cat >"$TMP/valid-plan.json" <<'JSON'
+{"resource_changes":[{"address":"aws_instance.replica[0]","mode":"managed","type":"aws_instance","change":{"actions":["create"],"before":null,"after":{"tags":{"HivemindRunToken":"fixture-token"}}}}]}
+JSON
+python3 "$validator" "$TMP/valid-plan.json" fixture-token fixture-ecr
+cat >"$TMP/unknown-plan.json" <<'JSON'
+{"resource_changes":[{"address":"aws_s3_bucket.unreviewed","mode":"managed","type":"aws_s3_bucket","change":{"actions":["create"],"before":null,"after":{"tags":{"HivemindRunToken":"fixture-token"}}}}]}
+JSON
+if python3 "$validator" "$TMP/unknown-plan.json" fixture-token fixture-ecr >"$TMP/unknown-plan.out" 2>&1; then
+  echo "FAIL: unknown managed Terraform resource type accepted" >&2; exit 1
+fi
+grep -q 'unsupported managed resource type' "$TMP/unknown-plan.out"
+cat >"$TMP/action-plan.json" <<'JSON'
+{"resource_changes":[{"address":"aws_instance.replica[0]","mode":"managed","type":"aws_instance","change":{"actions":["forget"],"before":{"tags":{"HivemindRunToken":"fixture-token"}},"after":null}}]}
+JSON
+if python3 "$validator" "$TMP/action-plan.json" fixture-token fixture-ecr >"$TMP/action-plan.out" 2>&1; then
+  echo "FAIL: unknown managed Terraform action accepted" >&2; exit 1
+fi
+grep -q 'unsupported managed action set' "$TMP/action-plan.out"
 
 base_env=(
   HIVEMIND_ALLOW_LIVE=1 HIVEMIND_LIVE_FIXTURE_MODE=1 HIVEMIND_AWS_ACCOUNT_ALLOWLIST="$FIXTURE_ACCOUNT"

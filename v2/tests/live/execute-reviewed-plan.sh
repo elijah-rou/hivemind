@@ -63,38 +63,49 @@ REVIEW_RECORD="$SEALED_REVIEW"
 [[ "$(terraform -chdir="$TF_ROOT" workspace show)" == "$WORKSPACE" ]] || { echo "FAIL: selected Terraform workspace differs from guarded workspace" >&2; exit 1; }
 PLAN_JSON="$EVIDENCE_DIR/.reviewed-plan.json"
 terraform -chdir="$TF_ROOT" show -json "$PLAN" >"$PLAN_JSON"
-python3 - "$PLAN_JSON" "$RUN_TOKEN" "$ECR_NAME" <<'PY'
-import json, sys
-plan_path, token, ecr_name = sys.argv[1:]
-plan = json.load(open(plan_path, encoding="utf-8"))
-changes = plan.get("resource_changes", [])
-if not changes or len(changes) > 128:
-    raise SystemExit("reviewed plan resource count is empty or unbounded")
-owned_types = {"aws_instance", "aws_ebs_volume", "aws_security_group", "aws_key_pair", "aws_ecr_repository"}
-for change in changes:
-    if change.get("mode") != "managed" or change.get("type") not in owned_types:
-        continue
-    values = change.get("change", {})
-    before = values.get("before")
-    after = values.get("after")
-    if before is not None and before.get("tags", {}).get("HivemindRunToken") != token:
-        raise SystemExit(f"plan would mutate unowned resource: {change.get('address')}")
-    if after is not None and after.get("tags", {}).get("HivemindRunToken") != token:
-        raise SystemExit(f"plan lacks ownership tag: {change.get('address')}")
-    if change.get("type") == "aws_ecr_repository" and after is not None and after.get("name") != ecr_name:
-        raise SystemExit("plan ECR repository differs from guarded name")
-PY
+python3 "$ROOT_DIR/tests/live/validate-reviewed-plan.py" "$PLAN_JSON" "$RUN_TOKEN" "$ECR_NAME"
 rm -f "$PLAN_JSON"
 HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh" \
     "$REVIEW_RECORD" "$EVIDENCE_DIR/reviewed-plan-record.txt"
 record_success reviewed_plan_validation
 
 # Ownership starts only after the parent wrapper's cleanup trap and zero inventory.
-aws s3 mb "s3://$BUCKET" --region "$REGION"
-marker_file="$EVIDENCE_DIR/.ownership-marker"
+claim_file="$RAW_DIR/s3-ownership-claim"
+marker_file="$RAW_DIR/s3-ownership-marker"
+install -m 600 /dev/null "$claim_file"
+printf '%s' "$RUN_TOKEN" >"$claim_file"
+install -m 600 /dev/null "$marker_file"
 printf '%s' "$RUN_TOKEN" >"$marker_file"
-aws s3api put-object --bucket "$BUCKET" --key .hivemind-owner --body "$marker_file" --region "$REGION" >/dev/null
-rm -f "$marker_file"
+precreate_check="$RAW_DIR/s3-precreate-check.log"
+set +e
+timeout --foreground --kill-after=2s 30s aws s3api head-bucket --bucket "$BUCKET" \
+    >"$precreate_check" 2>&1
+precreate_status=$?
+set -e
+if [[ "$precreate_status" == 0 ]]; then
+    echo "FAIL: refusing to claim a bucket that existed before this run" >&2
+    exit 1
+fi
+if ! grep -Eq '(404|Not Found|NoSuchBucket)' "$precreate_check"; then
+    echo "FAIL: bucket absence could not be proven before creation" >&2
+    exit 1
+fi
+set +e
+timeout --foreground --kill-after=5s 120s aws s3 mb "s3://$BUCKET" --region "$REGION"
+bucket_create_status=$?
+set -e
+# Reconcile an ambiguous create against the exact pre-recorded claim before any later side effect.
+timeout --foreground --kill-after=2s 30s aws s3api head-bucket --bucket "$BUCKET" >/dev/null
+timeout --foreground --kill-after=2s 30s aws s3api put-object --bucket "$BUCKET" --key .hivemind-owner \
+    --body "$marker_file" --region "$REGION" >/dev/null
+verified_marker="$RAW_DIR/s3-ownership-marker.verified"
+timeout --foreground --kill-after=2s 30s aws s3api get-object --bucket "$BUCKET" \
+    --key .hivemind-owner "$verified_marker" >/dev/null
+[[ "$(cat "$verified_marker")" == "$RUN_TOKEN" ]] || {
+    echo "FAIL: bucket ownership marker reconciliation failed" >&2
+    exit 1
+}
+printf 'bucket_create\t%s\n' "$bucket_create_status" >>"$STATUS_FILE"
 record_success bucket_ownership
 
 set +e

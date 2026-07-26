@@ -138,21 +138,71 @@ for name in ("REQUIRE_CONTAINERD", "REQUIRE_GPU", "REQUIRE_NYDUS", "REQUIRE_JUIC
 runbook_records = artifact_tree(args.runbook_artifacts)
 runbook_by_path = {record["relative_path"]: record for record in runbook_records}
 required_runbook = {
-    "api-identities.jsonl": (b"request_id", b"status"),
-    "fault-period-metrics.txt": (b"fault", b"queue"),
-    "intermediate-inventory.txt": (b"instances=",),
-    "runtime-proof.txt": (b"tasks=", b"containers=", b"cdi=", b"cgroup=", b"gpu="),
-    "ecr-proof.txt": (b"cold_pull=verified", b"digest=sha256:"),
-    "journal-proof.txt": (b"mode=", b"checksum=", b"recovery=verified"),
+    "api-identities.jsonl", "fault-period-metrics.txt", "intermediate-inventory.txt",
+    "runtime-proof.txt", "ecr-proof.txt", "journal-proof.txt",
 }
-missing_runbook = sorted(set(required_runbook) - set(runbook_by_path))
+missing_runbook = sorted(required_runbook - set(runbook_by_path))
 if missing_runbook:
     raise SystemExit(f"runbook evidence contract is incomplete: {', '.join(missing_runbook)}")
-for relative_path, markers in required_runbook.items():
-    with open(runbook_by_path[relative_path]["path"], "rb") as source:
-        content = source.read(MAX_ARTIFACT_BYTES + 1)
-    if any(marker not in content for marker in markers):
-        raise SystemExit(f"runbook evidence is semantically incomplete: {relative_path}")
+
+def runbook_text(relative_path):
+    with open(runbook_by_path[relative_path]["path"], encoding="utf-8") as source:
+        return source.read(MAX_ARTIFACT_BYTES + 1).strip()
+
+def exact_pairs(relative_path, required_keys):
+    text = runbook_text(relative_path)
+    fields = text.split()
+    pairs = {}
+    for field in fields:
+        if "=" not in field:
+            raise SystemExit(f"runbook evidence has malformed field: {relative_path}")
+        key, value = field.split("=", 1)
+        if not re.fullmatch(r"[a-z_]{1,32}", key) or not value or key in pairs:
+            raise SystemExit(f"runbook evidence has invalid or duplicate field: {relative_path}")
+        pairs[key] = value
+    if set(pairs) != set(required_keys):
+        raise SystemExit(f"runbook evidence schema differs: {relative_path}")
+    return pairs
+
+api_ids = set()
+api_lines = runbook_text("api-identities.jsonl").splitlines()
+if not 1 <= len(api_lines) <= 128:
+    raise SystemExit("API identity evidence count is empty or unbounded")
+for line in api_lines:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise SystemExit("API identity evidence is malformed") from error
+    if set(record) != {"request_id", "status"}:
+        raise SystemExit("API identity evidence schema differs")
+    request_id, status = record["request_id"], record["status"]
+    if not isinstance(request_id, int) or isinstance(request_id, bool) or request_id <= 0:
+        raise SystemExit("API request identity must be positive")
+    if request_id in api_ids or not isinstance(status, int) or isinstance(status, bool) or not 0 <= status <= 9:
+        raise SystemExit("API identity evidence is duplicate or has invalid status")
+    api_ids.add(request_id)
+
+fault = exact_pairs("fault-period-metrics.txt", ("fault", "queue"))
+if not re.fullmatch(r"[a-z0-9_-]{1,64}", fault["fault"]) or not fault["queue"].isdigit():
+    raise SystemExit("fault-period evidence lacks a bounded identity or queue count")
+inventory = exact_pairs("intermediate-inventory.txt", ("instances",))
+if not inventory["instances"].isdigit() or int(inventory["instances"]) < 1:
+    raise SystemExit("intermediate inventory does not prove owned instances")
+runtime = exact_pairs("runtime-proof.txt", ("tasks", "containers", "cdi", "cgroup", "gpu"))
+if not runtime["tasks"].isdigit() or int(runtime["tasks"]) < 1:
+    raise SystemExit("runtime evidence does not prove a task")
+if not runtime["containers"].isdigit() or int(runtime["containers"]) < 1:
+    raise SystemExit("runtime evidence does not prove a container")
+if any(runtime[key] != "verified" for key in ("cdi", "cgroup", "gpu")):
+    raise SystemExit("runtime capability evidence is not verified")
+ecr = exact_pairs("ecr-proof.txt", ("cold_pull", "digest"))
+if ecr["cold_pull"] != "verified" or not re.fullmatch(r"sha256:[0-9a-f]{64}", ecr["digest"]):
+    raise SystemExit("ECR cold-pull evidence is invalid")
+journal = exact_pairs("journal-proof.txt", ("mode", "checksum", "recovery"))
+if not re.fullmatch(r"0[0-7]{3}", journal["mode"]):
+    raise SystemExit("journal mode evidence is invalid")
+if not sha256_pattern.fullmatch(journal["checksum"]) or journal["recovery"] != "verified":
+    raise SystemExit("journal checksum or recovery evidence is invalid")
 
 manifest = {
     "commit_sha": args.commit,
