@@ -61,7 +61,7 @@ The bounded value-redacting credential scanner passed self-tests with 12 safe, 6
 | Local failover contract | three journal-backed Zig replicas, Go API, Rust worker/process runtime | Real process/runtime traffic across leader kill, election, retained restart, and convergence | [`tests/local-failover-smoke.sh`](../tests/local-failover-smoke.sh) |
 | Local storage recovery | the same cluster stopped and restarted from three retained journal directories | Committed state survives failover, rejoin, and full restart; a new command commits afterward | [`tests/local-storage-recovery-smoke.sh`](../tests/local-storage-recovery-smoke.sh) |
 | Containerd component integration | privileged Docker test environment, containerd, Rust runtime tests | Real runtime namespace/task/cgroup behavior; not the full stack | [`tests/containerd/`](../tests/containerd/), [`worker/tests/containerd_integration.rs`](../worker/tests/containerd_integration.rs) |
-| Infrastructure tooling | Terraform, ECR, S3/SSM helpers, SSH/systemd deployment, POC CPU/GPU scripts | Historical and operator tooling boundaries; no guarded current live gate | [`infra/`](../infra/) |
+| Infrastructure tooling | Terraform, ECR, S3/SSM helpers, SSH/systemd deployment, POC CPU/GPU scripts | Historical and operator tooling boundaries; the guarded current live gate exists but has not been executed | [`infra/`](../infra/), [`tests/live/run.sh`](../tests/live/run.sh) |
 
 ### Current, implemented: Zig VOPR topology
 

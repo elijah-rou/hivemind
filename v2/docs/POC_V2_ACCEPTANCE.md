@@ -2,7 +2,7 @@
 
 Status: **not accepted**. This is the current product gate, not a parity claim.
 
-POC v1 and continuation-era evidence is historical. Historical evidence can inform work, but cannot set a current criterion to `passed`. No fresh criterion evidence record containing an exact source SHA and UTC timestamp was available at the documentation baseline `068c1561656dc033bd7a3a7134e73b7004c115ba`; therefore no row below is passed.
+POC v1 and continuation-era evidence is historical. Historical evidence can inform work, but cannot set a current criterion to `passed`. No fresh criterion evidence record containing an exact source SHA and UTC timestamp was available when this acceptance baseline was drafted at intermediate mega-PR commit `068c1561656dc033bd7a3a7134e73b7004c115ba` / tree `74cd908b6cf7add7c386907ffc70dcc73bd07e61`. That commit is not part of the reconstructed ten-PR ancestry; the only complete accepted matrix remains historical `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c`. Therefore no row below is passed.
 
 ## Scope
 
@@ -84,7 +84,7 @@ A section becomes passed only when every required criterion in it is passed. The
 
 ### `P-LOCAL`
 
-- **Requirement class:** Current single-replica process-runtime smoke is the nearest real-process harness.
+- **Requirement class:** Current three-replica process-runtime smoke is the nearest real-process harness.
 - **Exact current command or blocker:** `cd v2 && ./tests/local-smoke.sh --build`.
 - **Environment and required capabilities:** Zig, Rust, Go, curl, loopback ports, process runtime; `--skip-smoke` is forbidden for this row.
 - **Observable pass condition:** Harness reaches and asserts the criterion-specific observable without process failure.
@@ -170,15 +170,15 @@ A section becomes passed only when every required criterion in it is passed. The
 
 | Stable ID | Requirement | Evidence profile | Deterministic sufficient | Required boundary | Status | Current evidence |
 |---|---|---|---|---|---|---|
-| `V2-02-field-name` | `name` field. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
-| `V2-02-field-image` | `image` field. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
+| `V2-02-field-name` | `name` field. | `P-MIXED` | no | deterministic only | blocked | Name already crosses the public API and persisted core/worker-facing deployment path, but complete `AppSpec v1` acceptance evidence is not recorded. |
+| `V2-02-field-image` | `image` field. | `P-MIXED` | no | deterministic only | blocked | Image already crosses the public API and persisted core/worker-facing deployment path, but complete `AppSpec v1` acceptance evidence is not recorded. |
 | `V2-02-field-command` | `command`/entrypoint field, or an explicit decision to defer command override. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-02-field-port` | `port` field. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
-| `V2-02-field-replicas` | `replicas`/`min`/`max` fields. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
-| `V2-02-field-resources` | CPU, memory, and GPU resource fields. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
+| `V2-02-field-replicas` | `replicas`/`min`/`max` fields. | `P-MIXED` | no | deterministic only | blocked | Desired replicas exist, but the complete `replicas`/`min`/`max` AppSpec contract and current acceptance evidence are absent. |
+| `V2-02-field-resources` | CPU, memory, and GPU resource fields. | `P-MIXED` | no | deterministic only | blocked | CPU, memory, GPU type, and GPU count fields already cross API/core/worker-facing state, but complete AppSpec acceptance evidence is not recorded. |
 | `V2-02-field-env` | Environment-variable fields. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-02-field-secret` | Secret-reference fields. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
-| `V2-02-field-pull-auth` | Image-pull-auth reference fields. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
+| `V2-02-field-pull-auth` | Image-pull-auth reference fields. | `P-MIXED` | no | deterministic only | blocked | Image-pull credential fields and secret-name resolution exist across API/core/worker, but the complete AppSpec reference model and private-registry execution evidence are absent. |
 | `V2-02-field-juicefs` | JuiceFS volume specification. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-02-field-liveness` | Liveness-probe field. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |
 | `V2-02-field-readiness` | Readiness-probe field. | `P-ABSENT` | no | deterministic only | blocked | Blocker: required product surface or acceptance harness is absent. |

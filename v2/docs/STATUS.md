@@ -5,7 +5,7 @@
 
 ## Thematic stack evidence state (2026-07-26)
 
-The durability/safety work is now organized as a ten-PR local stack. The rewritten `stack/09-guarded-live` parent includes approved review corrections through the guarded-live boundary. Its focused deterministic fixtures, shell checks, and `run-all.sh --skip-containerd` completed during lower-slice reconstruction, but those records do not establish full acceptance of this documentation descendant.
+The durability/safety work is now organized as a ten-PR local stack. The rewritten `stack/09-guarded-live` parent includes approved review corrections through the guarded-live boundary. PR10 is documentation plus the documentation-layout contract and aggregate runner phase, not a production-behavior slice. Its parent’s focused deterministic fixtures, shell checks, and `run-all.sh --skip-containerd` completed during lower-slice reconstruction, but those records do not establish full acceptance of this descendant.
 
 Fresh rewritten-tip full acceptance is pending the final matrix. Until that exact-tip run completes and is recorded externally, the only complete accepted matrix in this document is historical `bc9f5f63` / tree `78f4c95c`. No containerd, Docker privileged mode, GPU/CDI, Nydus, JuiceFS, Doppler, private pull, cloud/provider, Terraform mutation, or live path ran during the restack. Current live-resource state remains unknown because no fresh authorized inventory ran.
 
@@ -327,18 +327,6 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 - Named scenarios `mismatched_nonzero_gpu_type_is_rejected_without_accounting_change` and `deterministic_run_outcomes_preserve_identity_bounds_and_accounting` reject mismatched nonzero GPU types and cover `/run` success, the exact response boundary, boundary-plus-one wire overflow, scripted forwarding/timeout errors, crash-tick forwarding failure, reconciled no-running-pod, and partition-healed delivery through the bidirectional simulated network. They assert statuses 0, 4, 6, and 7, exact request identity, exactly one ordinary response, bounded wire-semantic bodies, and stable nonzero GPU/CPU/memory accounting until the deliberate crash. Matching running pods are selected by lowest pod ID. The scripted timeout proves status mapping, not virtual deadline progression.
 - Simulation does not prove kernel TCP buffering, partial-frame loss, half-close behavior, reconnect timing, real process scheduling, containerd task-network-namespace behavior, GPU/CDI, or cloud behavior.
 
-## Codebase Size
-
-| Component | Language | LOC | Files |
-|-----------|----------|-----|-------|
-| core/src/ | Zig | ~13,658 | 27 |
-| worker/src/ | Rust | ~5,919 | 26 |
-| api/ | Go | ~2,978 | 13 |
-| bench/ | Go | ~808 | 6 |
-| infra/ | Terraform/scripts | ~1,931 | 20 |
-| tests/ | Shell/Docker | ~629 | 8 |
-| **Active source/tooling** | | **~25,923** | |
-
 ## What's Working
 
 - [x] VRR 5-node consensus with view change, log repair, leader election
@@ -365,7 +353,7 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 ### Critical (blocks production use)
 
 1. **TLS/mTLS** - All traffic plaintext. Need TLS for client/agent/peer/gossip.
-2. **Authentication** - No auth on API or agent connections. Need API keys + agent tokens.
+2. **Authentication** - Optional Bearer authentication protects API routes when configured, but secure deployment must require it and agent identity remains unauthenticated.
 3. **Provider adapter** - No auto-provisioning of nodes. Manual VM setup required.
 4. **App spec model** - Current CreateDeployment is basic. Need full app spec (probes, scaling policy, env config, storage).
 5. **Crash-consistent versioned storage + torn-write simulation** - layout v2 single-copy journal has no torn-write/power-loss model; required before any production durability claim (separate from snapshots).
@@ -375,9 +363,9 @@ The fixed client dedup table now has 1,024 entries, matching the complete retain
 
 7. **Thalamus integration** - POC branch now has locality/residency resolver tests and localhost smoke evidence against Hivemind federation JSON; production integration remains future work.
 8. **Axon integration** - CLI/SDK needs to target Hivemind API instead of Knative.
-9. **Image pull secrets** - No registry auth for private images.
+9. **Image pull secrets** - API/core/worker credential propagation and protected containerd hosts configuration exist, but private ECR cold-pull execution remains unverified.
 10. **Readiness probes** - Liveness works, readiness not wired to traffic routing.
-11. **Graceful agent shutdown** - SIGTERM handler, pod draining.
+11. **Graceful agent shutdown** - SIGTERM/SIGINT handling and bounded cleanup exist; complete in-flight request drain semantics remain incomplete.
 12. **Blue-green/canary traffic** - TrafficSplit command exists but not wired to request routing.
 
 ### Nice-to-have (polish)
@@ -394,8 +382,8 @@ Priority: make one region production-ready for internal testing.
 
 1. **Full app spec model** - Replace CreateDeployment with rich app spec in state machine. Probes, scaling config, env refs, storage.
 2. **TLS everywhere** - mTLS for peer/agent, TLS for client/API. Cert rotation.
-3. **API auth** - Bearer tokens or API keys. Agent auth via pre-shared key.
-4. **Graceful shutdown** - Agent pod draining, replica graceful leave.
+3. **Required API and agent auth** - Require the existing Bearer gate for secure deployments and add authenticated agent identity.
+4. **Graceful shutdown completion** - Complete in-flight agent drain semantics and replica graceful leave.
 5. **Log compaction / state snapshots** - Periodic state machine snapshot to avoid unbounded log replay.
 
 ### Phase B: Integration

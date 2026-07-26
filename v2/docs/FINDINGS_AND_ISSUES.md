@@ -18,7 +18,7 @@
 | # | Item | Notes |
 |---|------|--------|
 | C1 | TLS/mTLS | Plaintext on client, agent, peer, gossip paths |
-| C2 | Authentication | API and agent connections previously had no auth |
+| C2 | Authentication | API Bearer authentication is optional; agent identity remains unauthenticated |
 | C3 | Provider adapter | Nodes are manual / out-of-band |
 | C4 | App spec model | CreateDeployment is minimal vs probes, scaling policy, env, storage |
 | C5 | Crash-consistent versioned storage + torn-write simulation | Layout v2 single-copy journal: write/sync-before-publication and I/O fail-stop only; no torn-write/power-loss model or simulation; blocks any production durability claim |
@@ -30,9 +30,9 @@
 |---|------|--------|
 | I1 | Thalamus integration | Router should consume gossip for cross-region routing |
 | I2 | Axon integration | CLI/SDK → Hivemind API |
-| I3 | Image pull secrets | Private registry auth |
+| I3 | Image pull secrets | Credential propagation exists; private ECR execution remains unverified |
 | I4 | Readiness probes | Liveness exists; readiness not tied to routing |
-| I5 | Graceful agent shutdown | SIGTERM, drain in flight |
+| I5 | Graceful agent shutdown | Bounded signal cleanup exists; complete in-flight drain semantics remain incomplete |
 | I6 | Blue-green / canary | TrafficSplit exists; not wired to run routing |
 
 ### Nice-to-have
@@ -123,12 +123,8 @@ This repo’s operational surface is the **Hivemind replica** (Zig), the **Go AP
 | Item | Status |
 |------|--------|
 | Optional API gateway token (`HIVEMIND_API_TOKEN` + `Authorization: Bearer`) | Landed — see `api/main.go`; `GET /v1/health` stays unauthenticated when token is set (load balancer / probe friendly). Trailing slashes are stripped before auth so `/v1/health/` matches the health exemption. |
-<<<<<<< HEAD
 | Agent SIGTERM drain (`I5` slice) | Landed — `Worker::shutdown` verifies stop/status/remove before unmounting JuiceFS, retains ownership and resource accounting when cleanup cannot be proven, and is invoked even when SIGTERM/SIGINT arrives during failed connect or reconnect backoff; see `worker/src/worker.rs` and `worker/src/main.rs` |
-=======
-| Agent SIGTERM drain (`I5` slice) | Landed — worker shutdown now unmounts JuiceFS, uses 30s default stop grace (or pod `grace_period_ms`), calls `remove_pod` after stop for container cleanup, avoids duplicate GPU decrements / status spam for already-terminal pods; see `worker/src/worker.rs` |
->>>>>>> 244ee19 (docs: reconcile aggregate safety evidence)
-| Image pull credentials (`I3` slice) | Landed — `CreateDeployment` wire extension (optional 449 bytes after the 398-byte base) carries `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`; replica appends StartPod trailer (`0x01` + fields); agent resolves secret-named passwords via Doppler like env vars and passes `ctr images pull --user user:pass` in `containerd` runtime. JSON fields on `POST /v1/deployments`: `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`. |
+| Image pull credentials (`I3` slice) | Landed — `CreateDeployment` wire extension (optional 449 bytes after the 398-byte base) carries `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`; replica appends the StartPod auth trailer; agent resolves secret-named passwords via Doppler and writes a per-pull protected hosts hierarchy (`0700` directories, `0600` `hosts.toml`). The `ctr` process receives only `--hosts-dir`, keeping credentials out of argv. JSON fields on `POST /v1/deployments`: `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`. Private-registry and ECR execution remain unverified. |
 | Reconnecting nodes / agents | Landed — `handleRegisterNode` dedupes by active hostname (returns existing `node_id`); `AgentConnection.register_seq` makes each agent (re)registration a fresh VRR `request_id`; `Replica.onAgentDisconnect` + `ConnectionManager` reuse agent TCP slots and sync disconnect; Rust agent calls `on_connection_lost()` so `NodeRegister` is resent after TCP loss. |
 | Simulation coverage for this session | Landed — Zig: `state_machine` tests for hostname dedupe + image-pull fields; VOPR tests for simulated agent reconnect + deployment image-pull retention; `TestCluster.request` now works for single-replica clusters; `disconnectSimAgent` + `getAgentNodeId` sync in harness. Rust: `protocol` trailer test (existing), `sim::runtime` pull with `ImagePullAuth`, `Agent::on_connection_lost` unit test. |
 | Real-node agent fingerprinting | Landed — `agent run` now fingerprints host CPU/memory/GPU and registers real inventory instead of fake `8000m/16Gi/0 GPU` defaults; falls back to conservative `1000m/1Gi/no GPU` only if fingerprinting fails. |
