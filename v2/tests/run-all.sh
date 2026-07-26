@@ -19,6 +19,7 @@ done
 
 PASS=0
 FAIL=0
+RUN_PHASE_TIMEOUT_SECONDS=900
 
 run_phase() {
     local name="$1"
@@ -27,7 +28,7 @@ run_phase() {
     echo "============================================"
     echo "  $name"
     echo "============================================"
-    if "$@"; then
+    if timeout --foreground --kill-after=10s "${RUN_PHASE_TIMEOUT_SECONDS}s" "$@"; then
         echo "  => $name: PASSED"
         PASS=$((PASS + 1))
     else
@@ -68,12 +69,18 @@ else
     echo "  SKIP: containerd tests (--skip-containerd)"
 fi
 
-# --- Phase 6: Local smoke test ---
+# --- Phase 6: Owned local real-process contracts ---
+run_phase "Local cluster cleanup contract" \
+    bash -c "'$SCRIPT_DIR/local_cluster_cleanup_test.sh'"
 if [ "$SKIP_SMOKE" = false ]; then
-    run_phase "Local smoke test" \
-        bash -c "'$SCRIPT_DIR/local-smoke.sh' --build"
+    run_phase "Local failover contract" \
+        bash -c "'$SCRIPT_DIR/local-failover-smoke.sh' --build"
+    run_phase "Local retained-storage recovery contract" \
+        bash -c "'$SCRIPT_DIR/local-storage-recovery-smoke.sh' --build"
+    run_phase "Local run contract" \
+        bash -c "'$SCRIPT_DIR/local-run-contract-smoke.sh' --build"
 else
-    echo "  SKIP: smoke test (--skip-smoke)"
+    echo "  SKIP: local failover, retained-storage recovery, and run contracts (--skip-smoke)"
 fi
 
 echo ""
