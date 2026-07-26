@@ -3054,3 +3054,52 @@ test "committed batch bind dispatches all bound pods to worker" {
     try std.testing.expectEqual(sm.pods[1].id, capture.records[1].pod_id);
     try std.testing.expectEqual(sm.pods[2].id, capture.records[2].pod_id);
 }
+
+test "restart rebuild preserves dedup beyond 64 unique clients" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(1202);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(1202, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(1202);
+    var capture = ClientReplyCapture{};
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+        .client_reply_ctx = &capture,
+        .client_reply_fn = ClientReplyCapture.reply,
+    });
+
+    var parent_checksum: u64 = 0;
+    for (1..97) |op| {
+        var entry = msg.LogEntry{
+            .view_number = 0,
+            .op_number = @intCast(op),
+            .command = .{ .noop = {} },
+            .client_id = @intCast(10_000 + op),
+            .request_id = 1,
+            .parent_checksum = parent_checksum,
+        };
+        entry.checksum = entry.computeChecksum();
+        replica.journalPut(entry);
+        parent_checksum = entry.checksum;
+    }
+    replica.op_number = 96;
+    replica.commit_min = 96;
+    replica.commit_max = 96;
+    try replica.rebuildCommittedState(96);
+    try std.testing.expectEqual(@as(usize, 96), replica.client_count);
+
+    replica.onRequest(0, .{ .client_id = 10_001, .request_id = 1, .command = .{ .noop = {} } });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u128, 1), capture.request_id);
+    try std.testing.expectEqual(@as(u64, 96), replica.op_number);
+}
