@@ -137,7 +137,7 @@ func TestBenchReceiversFailClosedOnReadDeadlineErrors(t *testing.T) {
 		call  func(net.Conn) error
 	}{
 		{name: "command", frame: benchFrame(ClientTagReply, make([]byte, 17)), call: func(c net.Conn) error { return readReply(c, make([]byte, 256), 0) }},
-		{name: "run", frame: benchFrame(ClientTagRunResponse, make([]byte, 13)), call: func(c net.Conn) error { return readRunResponse(c, make([]byte, 256), 0) }},
+		{name: "run", frame: benchFrame(ClientTagRunResponse, make([]byte, 13)), call: func(c net.Conn) error { _, err := readRunResponse(c, make([]byte, 256), 0); return err }},
 		{name: "leader probe", frame: benchFrame(ClientTagLeaderProbeResponse, make([]byte, LeaderProbeResponseBytes)), call: func(c net.Conn) error { _, err := readLeaderProbe(c, make([]byte, 256)); return err }},
 	}
 	for _, tc := range cases {

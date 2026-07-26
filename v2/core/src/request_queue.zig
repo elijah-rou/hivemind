@@ -124,7 +124,11 @@ pub const RequestQueue = struct {
     queue_count: usize,
 
     in_flight: [MAX_IN_FLIGHT]InFlightEntry,
-    next_worker_request_id: u64,
+    /// Direct worker-to-entry index. MAX_IN_FLIGHT is the empty sentinel.
+    worker_entry_slots: [MAX_WORKERS]usize,
+    worker_generations: [MAX_WORKERS]u64,
+    free_slots: [MAX_IN_FLIGHT]usize,
+    free_slot_count: usize,
     /// Occupied correlation slots, including abandoned tombstones.
     occupied_count: usize,
     /// Occupied correlations still attached to a connected client.
@@ -132,8 +136,9 @@ pub const RequestQueue = struct {
     /// Owned correlations per configured worker. Values are currently 0 or 1.
     worker_owned_count: [MAX_WORKERS]u8,
     worker_abandoned_expires_at: [MAX_WORKERS]u64,
-    /// Instrumentation for proving worker-busy selection remains O(1).
+    /// Instrumentation for proving worker-busy and response lookups remain O(1).
     worker_busy_checks: u64,
+    response_lookup_checks: u64,
 
     enqueue_total: u64,
     dispatch_total: u64,
@@ -143,16 +148,22 @@ pub const RequestQueue = struct {
     dispatch_idx: [MAX_QUEUES]usize,
 
     pub fn init() RequestQueue {
+        var free_slots: [MAX_IN_FLIGHT]usize = undefined;
+        for (&free_slots, 0..) |*slot, index| slot.* = MAX_IN_FLIGHT - 1 - index;
         return .{
             .queues = undefined,
             .queue_count = 0,
             .in_flight = [_]InFlightEntry{.{}} ** MAX_IN_FLIGHT,
-            .next_worker_request_id = 1,
+            .worker_entry_slots = [_]usize{MAX_IN_FLIGHT} ** MAX_WORKERS,
+            .worker_generations = std.mem.zeroes([MAX_WORKERS]u64),
+            .free_slots = free_slots,
+            .free_slot_count = MAX_IN_FLIGHT,
             .occupied_count = 0,
             .active_count = 0,
             .worker_owned_count = std.mem.zeroes([MAX_WORKERS]u8),
             .worker_abandoned_expires_at = std.mem.zeroes([MAX_WORKERS]u64),
             .worker_busy_checks = 0,
+            .response_lookup_checks = 0,
             .enqueue_total = 0,
             .dispatch_total = 0,
             .resolve_total = 0,
@@ -186,21 +197,27 @@ pub const RequestQueue = struct {
     /// Resolve only when one active entry atomically matches both the opaque
     /// correlation and the worker connection that owns it.
     pub fn classifyResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ResponseResolution {
-        for (&self.in_flight) |*entry| {
-            if (!entry.active) continue;
-            if (entry.worker_request_id != worker_request_id) continue;
-            if (entry.worker_idx != worker_idx) return .foreign;
-
-            const abandoned = entry.abandoned;
-            const resolved = ResolvedRequest{
-                .client_id = entry.client_id,
-                .client_request_id = entry.client_request_id,
-            };
-            self.removeEntry(entry);
-            self.resolve_total += 1;
-            return if (abandoned) .abandoned else .{ .deliver = resolved };
+        self.response_lookup_checks +%= 1;
+        if (worker_idx >= MAX_WORKERS) return .unknown;
+        const slot = self.worker_entry_slots[worker_idx];
+        if (slot == MAX_IN_FLIGHT) {
+            // Correlation IDs encode their worker owner in the low residue.
+            return if (worker_request_id != 0 and (worker_request_id - 1) % MAX_WORKERS == worker_idx) .unknown else .foreign;
         }
-        return .unknown;
+        std.debug.assert(slot < MAX_IN_FLIGHT);
+        const entry = &self.in_flight[slot];
+        std.debug.assert(entry.active);
+        std.debug.assert(entry.worker_idx == worker_idx);
+        if (entry.worker_request_id != worker_request_id) return .foreign;
+
+        const abandoned = entry.abandoned;
+        const resolved = ResolvedRequest{
+            .client_id = entry.client_id,
+            .client_request_id = entry.client_request_id,
+        };
+        self.removeEntry(slot);
+        self.resolve_total += 1;
+        return if (abandoned) .abandoned else .{ .deliver = resolved };
     }
 
     pub fn resolveResponseForWorker(self: *RequestQueue, worker_request_id: u64, worker_idx: usize) ?ResolvedRequest {
@@ -211,36 +228,32 @@ pub const RequestQueue = struct {
     }
 
     fn releaseInFlight(self: *RequestQueue, worker_request_id: u64) ?ResolvedRequest {
-        for (&self.in_flight) |*entry| {
-            if (!entry.active or entry.worker_request_id != worker_request_id) continue;
-            const resolved = ResolvedRequest{
-                .client_id = entry.client_id,
-                .client_request_id = entry.client_request_id,
-            };
-            self.removeEntry(entry);
-            self.resolve_total += 1;
-            return resolved;
-        }
-        return null;
+        if (worker_request_id == 0) return null;
+        const worker_idx: usize = @intCast((worker_request_id - 1) % MAX_WORKERS);
+        return switch (self.classifyResponseForWorker(worker_request_id, worker_idx)) {
+            .deliver => |resolved| resolved,
+            .abandoned, .foreign, .unknown => null,
+        };
     }
 
     /// Atomically release every correlation owned by one worker connection.
     /// Abandoned tombstones are released silently and omitted from client errors.
     pub fn releaseWorker(self: *RequestQueue, worker_idx: usize, released: *[MAX_IN_FLIGHT]ResolvedRequest) usize {
-        var released_count: usize = 0;
-        for (&self.in_flight) |*entry| {
-            if (!entry.active or entry.worker_idx != worker_idx) continue;
-            if (!entry.abandoned) {
-                std.debug.assert(released_count < released.len);
-                released[released_count] = .{
-                    .client_id = entry.client_id,
-                    .client_request_id = entry.client_request_id,
-                };
-                released_count += 1;
-            }
-            self.removeEntry(entry);
-            self.resolve_total += 1;
+        if (worker_idx >= MAX_WORKERS) return 0;
+        const slot = self.worker_entry_slots[worker_idx];
+        if (slot == MAX_IN_FLIGHT) return 0;
+        const entry = &self.in_flight[slot];
+        std.debug.assert(entry.active);
+        std.debug.assert(entry.worker_idx == worker_idx);
+        const released_count: usize = if (entry.abandoned) 0 else 1;
+        if (released_count == 1) {
+            released[0] = .{
+                .client_id = entry.client_id,
+                .client_request_id = entry.client_request_id,
+            };
         }
+        self.removeEntry(slot);
+        self.resolve_total += 1;
         return released_count;
     }
 
@@ -374,18 +387,35 @@ pub const RequestQueue = struct {
         std.debug.assert(std.mem.eql(u64, &expiries, &self.worker_abandoned_expires_at));
         std.debug.assert(self.active_count <= self.occupied_count);
         std.debug.assert(self.occupied_count <= MAX_IN_FLIGHT);
+        std.debug.assert(self.free_slot_count + self.occupied_count == MAX_IN_FLIGHT);
+        for (self.worker_entry_slots, 0..) |slot, worker_idx| {
+            if (workers[worker_idx] == 0) {
+                std.debug.assert(slot == MAX_IN_FLIGHT);
+            } else {
+                std.debug.assert(slot < MAX_IN_FLIGHT);
+                std.debug.assert(self.in_flight[slot].active);
+                std.debug.assert(self.in_flight[slot].worker_idx == worker_idx);
+            }
+        }
     }
 
     // -- Internal --
 
     fn getOrCreateQueue(self: *RequestQueue, deployment_id: msg.DeploymentId) ?*DeploymentQueue {
-        for (self.queues[0..self.queue_count]) |*q| {
+        var reclaim_slot: ?usize = null;
+        for (self.queues[0..self.queue_count], 0..) |*q, index| {
             if (q.active and q.deployment_id == deployment_id) return q;
+            if (reclaim_slot == null and (!q.active or q.count == 0)) reclaim_slot = index;
         }
-        if (self.queue_count >= MAX_QUEUES) return null;
-        self.queues[self.queue_count] = DeploymentQueue.init(deployment_id);
-        self.queue_count += 1;
-        return &self.queues[self.queue_count - 1];
+        if (self.queue_count < MAX_QUEUES) {
+            self.queues[self.queue_count] = DeploymentQueue.init(deployment_id);
+            self.queue_count += 1;
+            return &self.queues[self.queue_count - 1];
+        }
+        const index = reclaim_slot orelse return null;
+        self.queues[index] = DeploymentQueue.init(deployment_id);
+        self.dispatch_idx[index] = 0;
+        return &self.queues[index];
     }
 
     /// Reserve a unique worker correlation ID. Returns null without mutation when full.
@@ -398,63 +428,60 @@ pub const RequestQueue = struct {
         if (self.workerHasInFlight(worker_idx)) return null;
         if (self.occupied_count >= MAX_IN_FLIGHT) return null;
 
-        for (&self.in_flight) |*entry| {
-            if (entry.active) continue;
+        std.debug.assert(self.free_slot_count > 0);
+        self.free_slot_count -= 1;
+        const slot = self.free_slots[self.free_slot_count];
+        std.debug.assert(slot < MAX_IN_FLIGHT);
+        std.debug.assert(!self.in_flight[slot].active);
 
-            const worker_request_id = self.allocateWorkerRequestId();
-            entry.* = .{
-                .worker_request_id = worker_request_id,
-                .client_request_id = client_request_id,
-                .client_id = client_id,
-                .worker_idx = worker_idx,
-                .abandoned = false,
-                .expires_at_tick = 0,
-                .active = true,
-            };
-            std.debug.assert(self.occupied_count < MAX_IN_FLIGHT);
-            std.debug.assert(self.active_count < MAX_IN_FLIGHT);
-            std.debug.assert(self.worker_owned_count[worker_idx] == 0);
-            self.occupied_count += 1;
-            self.active_count += 1;
-            self.worker_owned_count[worker_idx] += 1;
-            self.dispatch_total += 1;
-            return worker_request_id;
-        }
-        unreachable;
+        const worker_residue: u64 = @intCast(worker_idx + 1);
+        const max_generation = (std.math.maxInt(u64) - worker_residue) / MAX_WORKERS;
+        const generation = self.worker_generations[worker_idx];
+        std.debug.assert(generation <= max_generation);
+        const worker_request_id = generation * MAX_WORKERS + worker_residue;
+        self.worker_generations[worker_idx] = if (generation == max_generation) 0 else generation + 1;
+        std.debug.assert(worker_request_id != 0);
+        self.in_flight[slot] = .{
+            .worker_request_id = worker_request_id,
+            .client_request_id = client_request_id,
+            .client_id = client_id,
+            .worker_idx = worker_idx,
+            .abandoned = false,
+            .expires_at_tick = 0,
+            .active = true,
+        };
+        std.debug.assert(self.occupied_count < MAX_IN_FLIGHT);
+        std.debug.assert(self.active_count < MAX_IN_FLIGHT);
+        std.debug.assert(self.worker_owned_count[worker_idx] == 0);
+        std.debug.assert(self.worker_entry_slots[worker_idx] == MAX_IN_FLIGHT);
+        self.worker_entry_slots[worker_idx] = slot;
+        self.occupied_count += 1;
+        self.active_count += 1;
+        self.worker_owned_count[worker_idx] = 1;
+        self.dispatch_total += 1;
+        return worker_request_id;
     }
 
-    fn removeEntry(self: *RequestQueue, entry: *InFlightEntry) void {
+    fn removeEntry(self: *RequestQueue, slot: usize) void {
+        std.debug.assert(slot < MAX_IN_FLIGHT);
+        const entry = &self.in_flight[slot];
         std.debug.assert(entry.active);
         std.debug.assert(entry.worker_idx < MAX_WORKERS);
         std.debug.assert(self.occupied_count > 0);
-        std.debug.assert(self.worker_owned_count[entry.worker_idx] > 0);
+        std.debug.assert(self.worker_owned_count[entry.worker_idx] == 1);
+        std.debug.assert(self.worker_entry_slots[entry.worker_idx] == slot);
         self.occupied_count -= 1;
-        self.worker_owned_count[entry.worker_idx] -= 1;
+        self.worker_owned_count[entry.worker_idx] = 0;
+        self.worker_entry_slots[entry.worker_idx] = MAX_IN_FLIGHT;
         self.worker_abandoned_expires_at[entry.worker_idx] = 0;
         if (!entry.abandoned) {
             std.debug.assert(self.active_count > 0);
             self.active_count -= 1;
         }
         entry.* = .{};
-    }
-
-    fn allocateWorkerRequestId(self: *RequestQueue) u64 {
-        var attempts: usize = 0;
-        while (attempts <= MAX_IN_FLIGHT) : (attempts += 1) {
-            const candidate = self.next_worker_request_id;
-            self.next_worker_request_id +%= 1;
-            if (self.next_worker_request_id == 0) self.next_worker_request_id = 1;
-
-            var active = false;
-            for (self.in_flight) |entry| {
-                if (entry.active and entry.worker_request_id == candidate) {
-                    active = true;
-                    break;
-                }
-            }
-            if (!active) return candidate;
-        }
-        unreachable;
+        std.debug.assert(self.free_slot_count < MAX_IN_FLIGHT);
+        self.free_slots[self.free_slot_count] = slot;
+        self.free_slot_count += 1;
     }
 };
 
@@ -591,13 +618,14 @@ test "request queue: same client request id receives unique worker correlations"
     try std.testing.expectEqual(@as(u64, 1), first_resolved.client_request_id);
 }
 
-test "request queue: wrapped correlation skips an active id" {
+test "request queue: recycled worker advances its direct correlation generation" {
     var rq = RequestQueue.init();
     const first = rq.trackInFlightForWorker(1, 100, 0).?;
     try std.testing.expectEqual(@as(u64, 1), first);
-    rq.next_worker_request_id = 1;
-    const second = rq.trackInFlightForWorker(2, 200, 1).?;
-    try std.testing.expectEqual(@as(u64, 2), second);
+    _ = rq.resolveResponseForWorker(first, 0).?;
+    const second = rq.trackInFlightForWorker(2, 200, 0).?;
+    try std.testing.expectEqual(@as(u64, MAX_WORKERS + 1), second);
+    try std.testing.expect(first != second);
 }
 
 test "request queue: all worker slots reject without eviction" {
@@ -613,6 +641,31 @@ test "request queue: all worker slots reject without eviction" {
         const resolved = rq.resolveResponseForWorker(@intCast(i + 1), i).?;
         try std.testing.expectEqual(@as(u64, @intCast(i)), resolved.client_request_id);
     }
+}
+
+test "request queue: response correlation lookup is constant time" {
+    var rq = RequestQueue.init();
+    var ids: [MAX_WORKERS]u64 = undefined;
+    for (0..MAX_WORKERS) |worker_idx| {
+        ids[worker_idx] = rq.trackInFlightForWorker(@intCast(worker_idx), @intCast(worker_idx + 1), worker_idx).?;
+    }
+    const checks_before = rq.response_lookup_checks;
+    for (0..MAX_WORKERS) |worker_idx| {
+        _ = rq.resolveResponseForWorker(ids[worker_idx], worker_idx).?;
+    }
+    try std.testing.expectEqual(@as(u64, MAX_WORKERS), rq.response_lookup_checks - checks_before);
+}
+
+test "request queue: empty deployment slots are reclaimed" {
+    var rq = RequestQueue.init();
+    for (0..MAX_QUEUES) |index| {
+        try std.testing.expect(rq.enqueue(@intCast(index + 1), @intCast(index + 1), 100, "x"));
+    }
+    try std.testing.expectEqual(MAX_QUEUES, rq.queue_count);
+    for (&rq.queues) |*queue| _ = queue.dequeue().?;
+    try std.testing.expectEqual(@as(usize, 0), rq.totalDepth());
+    try std.testing.expect(rq.enqueue(MAX_QUEUES + 1, 99, 100, "new"));
+    try std.testing.expectEqual(@as(usize, 1), rq.depthFor(MAX_QUEUES + 1));
 }
 
 test "request queue: per-deployment isolation" {

@@ -72,6 +72,54 @@ func TestWorkloadBenchmarkDiscoversOnceAndReusesLeaderConnection(t *testing.T) {
 	}
 }
 
+func TestWorkloadBenchmarkReprobesOnceAndResendsSameIDOnlyAfterNotLeader(t *testing.T) {
+	firstClient, firstServer := net.Pipe()
+	secondClient, secondServer := net.Pipe()
+	defer firstServer.Close()
+	defer secondServer.Close()
+
+	requestIDs := make(chan uint64, 2)
+	serveOne := func(conn net.Conn, status RunStatus) {
+		buf := make([]byte, MaxFrameBytes)
+		frame, err := readFrame(conn, buf, time.Second)
+		if err != nil || len(frame) < 11 || frame[2] != ClientTagRunRequest {
+			return
+		}
+		requestID := binary.LittleEndian.Uint64(frame[3:11])
+		requestIDs <- requestID
+		payload := make([]byte, 9)
+		binary.LittleEndian.PutUint64(payload[:8], requestID)
+		payload[8] = byte(status)
+		if status == RunStatusOK {
+			payload = append(payload, 0, 0, 0, 0)
+		}
+		_ = writeFrame(conn, ClientTagRunResponse, payload)
+	}
+	go serveOne(firstServer, RunStatusNotLeader)
+	go serveOne(secondServer, RunStatusOK)
+
+	connections := []net.Conn{firstClient, secondClient}
+	finderCalls := 0
+	finder := func([]string) net.Conn {
+		if finderCalls >= len(connections) {
+			t.Fatal("finder called more than twice")
+		}
+		conn := connections[finderCalls]
+		finderCalls++
+		return conn
+	}
+	if err := runWorkloadBenchmarkWithFinder([]string{"replica-a", "replica-b"}, 1, "echo", 0, finder); err != nil {
+		t.Fatalf("workload benchmark did not recover: %v", err)
+	}
+	if finderCalls != 2 {
+		t.Fatalf("finder calls=%d want 2", finderCalls)
+	}
+	firstID, secondID := <-requestIDs, <-requestIDs
+	if firstID != 1 || secondID != firstID {
+		t.Fatalf("request IDs=(%d,%d), want same ID 1", firstID, secondID)
+	}
+}
+
 func TestSendRunRequestRejectsOversizeBeforeWriting(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

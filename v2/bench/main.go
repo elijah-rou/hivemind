@@ -215,11 +215,26 @@ func runWorkloadBenchmarkWithFinder(addrList []string, count int, depName string
 	for i := 0; i < count; i++ {
 		requestID := uint64(i + 1)
 		start := time.Now()
-		if err := sendRunRequest(conn, requestID, depName, payload); err != nil {
-			return fmt.Errorf("send failed at %d (outcome may be ambiguous; not retried): %w", i, err)
-		}
-		if err := readRunResponse(conn, recvBuf, requestID); err != nil {
-			return fmt.Errorf("recv failed at %d (outcome ambiguous; not retried): %w", i, err)
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := sendRunRequest(conn, requestID, depName, payload); err != nil {
+				return fmt.Errorf("send failed at %d (outcome may be ambiguous; not retried): %w", i, err)
+			}
+			status, err := readRunResponse(conn, recvBuf, requestID)
+			if err != nil {
+				return fmt.Errorf("recv failed at %d (outcome ambiguous; not retried): %w", i, err)
+			}
+			if status == RunStatusNotLeader && attempt == 0 {
+				_ = conn.Close()
+				conn = find(addrList)
+				if conn == nil {
+					return fmt.Errorf("leader reprobe failed at %d", i)
+				}
+				continue
+			}
+			if status != RunStatusOK {
+				return fmt.Errorf("run failed at %d: status %s (%d)", i, runStatusName(status), status)
+			}
+			break
 		}
 		latencies = append(latencies, time.Since(start))
 	}
@@ -241,18 +256,18 @@ func sendRunRequest(conn net.Conn, requestID uint64, depName string, payload []b
 	return writeFrame(conn, ClientTagRunRequest, data)
 }
 
-func readRunResponse(conn net.Conn, buf []byte, expectedRequestID uint64) error {
+func readRunResponse(conn net.Conn, buf []byte, expectedRequestID uint64) (RunStatus, error) {
 	frame, err := readFrame(conn, buf, 5*time.Second)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(frame) < 3 || frame[2] != ClientTagRunResponse {
 		if len(frame) < 3 {
-			return fmt.Errorf("short run response frame: %d bytes", len(frame))
+			return 0, fmt.Errorf("short run response frame: %d bytes", len(frame))
 		}
-		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
+		return 0, fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
-	return expectSuccessRunResponse(frame[3:], expectedRequestID)
+	return parseRunResponseStatus(frame[3:], expectedRequestID)
 }
 
 // =================================================================
@@ -475,34 +490,37 @@ func expectSuccessResult(reply []byte, expectedRequestID uint64) error {
 	return nil
 }
 
-func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
+func parseRunResponseStatus(raw []byte, expectedRequestID uint64) (RunStatus, error) {
 	if len(raw) < 9 {
-		return fmt.Errorf("run response too short: %d bytes", len(raw))
+		return 0, fmt.Errorf("run response too short: %d bytes", len(raw))
 	}
 	replyRequestID := binary.LittleEndian.Uint64(raw[0:8])
 	if replyRequestID != expectedRequestID {
-		return fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
+		return 0, fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
 	}
 	status := RunStatus(raw[8])
 	if status > RunStatusNotLeader {
-		return fmt.Errorf("unknown run status %d", status)
+		return 0, fmt.Errorf("unknown run status %d", status)
 	}
 	if status != RunStatusOK {
-		return fmt.Errorf("run status %s (%d)", runStatusName(status), status)
+		if len(raw) != 9 {
+			return 0, fmt.Errorf("run error response length %d, want 9", len(raw))
+		}
+		return status, nil
 	}
 	// Success requires explicit body length: request_id(8)+status(1)+len(4)+body.
 	if len(raw) < 13 {
-		return fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
+		return 0, fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
 	}
 	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
 	if bodyLen > MaxRunResponseBody {
-		return fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
+		return 0, fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
 	}
 	want := 13 + int(bodyLen)
 	if len(raw) != want {
-		return fmt.Errorf("run success length %d, want %d", len(raw), want)
+		return 0, fmt.Errorf("run success length %d, want %d", len(raw), want)
 	}
-	return nil
+	return status, nil
 }
 
 func readReply(conn net.Conn, buf []byte, expectedRequestID uint64) error {

@@ -1106,4 +1106,8 @@ fn test_scheduler_under_network_partition() {
 
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
-Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid.
+Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Response bodies are bounded by `MAX_RUN_RESPONSE_BODY = 16 KiB - 9 bytes`. Zero-length and exactly-512 request bodies are valid.
+
+The shared `/run` status bytes are: `0 ok`, `1 deployment_not_found`, `2 queue_full`, `3 invalid_payload`, `4 response_too_large`, `5 outcome_ambiguous`, `6 forwarding_failed`, `7 no_running_pod`, `8 unavailable`, and `9 not_leader`. Workers may emit only 0-8. Status 9 is core-only and proves rejection before enqueue; a worker-emitted 9 is a protocol violation that disconnects that worker.
+
+Write or read failures can leave execution ambiguous and must never trigger an automatic resend. The sole safe exception is one reprobe and resend of the same request ID after an explicit status-9 response. The Go API and workload bench apply that exception at most once; every other non-success status is returned without an implicit resend.

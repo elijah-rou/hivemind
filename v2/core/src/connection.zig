@@ -755,8 +755,10 @@ pub const ConnectionManager = struct {
             var frame_consumed: usize = 0;
             const frame_payload = self.decodeFrame(client_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break; // incomplete
-                consumed += frame_consumed; // skip bad frame
-                continue;
+                // A complete invalid declaration or body poisons stream framing.
+                // Fail closed instead of interpreting trailing bytes as new headers.
+                self.disconnectClient(client);
+                return;
             };
             consumed += frame_consumed;
 
@@ -2146,6 +2148,44 @@ test "frame decoder leaves trailing frame bytes unconsumed" {
     var consumed: usize = 0;
     try std.testing.expect(cm.decodeFrame(null, stream, &consumed, &decrypt_buf, true) != null);
     try std.testing.expectEqual(first.len, consumed);
+}
+
+test "invalid client declaration disconnects before trailing bytes can be reframed" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(1357);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(1357, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(1357);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+    cm.client_count = 1;
+    cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 77 };
+
+    // Oversized declaration followed by bytes that form a valid minimum frame.
+    std.mem.writeInt(u32, cm.clients[0].frame_buf[0..4], MAX_FRAME_BYTES, .little);
+    cm.clients[0].frame_buf[4] = 0;
+    const valid = try buildTestProtocolFrame(0, PROTOCOL_VERSION, null);
+    defer allocator.free(valid);
+    @memcpy(cm.clients[0].frame_buf[5..][0..valid.len], valid);
+    cm.clients[0].frame_pos = 5 + valid.len;
+
+    cm.processClientFrames(&cm.clients[0]);
+    try std.testing.expect(!cm.clients[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
+    try std.testing.expectEqual(@as(usize, 0), cm.clients[0].frame_pos);
 }
 
 fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Replica) void {

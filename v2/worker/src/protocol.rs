@@ -5,6 +5,7 @@ use crate::types::GpuType;
 
 // -- Message type constants --
 
+#[cfg(test)]
 const MSG_REGISTER_ACK: u8 = 0x01;
 const MSG_START_POD: u8 = 0x02;
 const MSG_STOP_POD: u8 = 0x03;
@@ -26,6 +27,8 @@ pub enum RunStatus {
     ForwardingFailed = 6,
     NoRunningPod = 7,
     Unavailable = 8,
+    /// Core-only. A worker must reject attempts to emit this status.
+    NotLeader = 9,
 }
 
 pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = RunStatus::ResponseTooLarge as u8;
@@ -94,7 +97,7 @@ struct WirePodStatusEvent {
 // len = 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 5;
 const FRAME_FLAGS_LEN: usize = 1;
 const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
 const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;
@@ -394,6 +397,12 @@ pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(
                 ));
             }
             buf[0..8].copy_from_slice(&m.request_id.to_le_bytes());
+            if m.status >= RunStatus::NotLeader as u8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker RunResponse status must be in 0..=8",
+                ));
+            }
             if m.payload.len() > MAX_RUN_RESPONSE_BODY {
                 buf[8] = RUN_STATUS_RESPONSE_TOO_LARGE;
                 return Ok((MSG_RUN_RESPONSE, HEADER));
@@ -708,9 +717,24 @@ mod tests {
             (RunStatus::ForwardingFailed, 6),
             (RunStatus::NoRunningPod, 7),
             (RunStatus::Unavailable, 8),
+            (RunStatus::NotLeader, 9),
         ];
         for (status, wire) in statuses {
             assert_eq!(status as u8, wire);
+        }
+    }
+
+    #[test]
+    fn worker_rejects_core_only_and_unknown_run_statuses() {
+        let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+        for status in [RunStatus::NotLeader as u8, 10, u8::MAX] {
+            let response = WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 7,
+                status,
+                payload: Vec::new(),
+            });
+            let error = encode_agent_message(&response, &mut buf).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
     }
 
