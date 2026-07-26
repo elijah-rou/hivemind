@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+ARG ZIG_VERSION=0.16.0
+ARG GO_VERSION=1.26.3
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates containerd curl iproute2 jq python3 xz-utils build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/zig.tar.xz \
+      "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+    && tar -C /opt -xf /tmp/zig.tar.xz \
+    && ln -s "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tar.gz \
+      "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:/usr/local/go/bin:${PATH}"
+
+WORKDIR /hivemind
+COPY . /hivemind/
+RUN cd core && zig build -Doptimize=ReleaseFast \
+    && cd ../worker && cargo build --release \
+    && cd ../api && go build -o hivemind-api . \
+    && cd ../bench && go build -o hivemind-bench .
+ENTRYPOINT ["/hivemind/tests/containerd/full-stack.sh"]
