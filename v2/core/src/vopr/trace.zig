@@ -19,7 +19,7 @@ pub const EventKind = union(enum) {
     drop_next: struct { count: u64, id: u64, from: u8, to: u8, tag: u8 },
     barrier_cut: struct { replica: u8, id: u64, kind: replica_mod.BarrierKind, point: replica_mod.BarrierCutPoint },
     request: struct { leader: u8, request_num: u32 },
-    state: [8]ReplicaSnapshot,
+    state: [msg.REPLICA_COUNT_MAX]ReplicaSnapshot,
     violation: struct { message_buf: [256]u8, message_len: usize, replica: u8 },
     journal: JournalSnapshot,
     converged: struct { tick: u64 },
@@ -56,6 +56,8 @@ pub const TraceCollector = struct {
     replica_count: u8,
 
     pub fn initInPlace(self: *TraceCollector, replica_count: u8) void {
+        std.debug.assert(replica_count > 0);
+        std.debug.assert(replica_count <= msg.REPLICA_COUNT_MAX);
         self.count = 0;
         self.replica_count = replica_count;
     }
@@ -115,7 +117,11 @@ pub const TraceCollector = struct {
     }
 
     pub fn addState(self: *TraceCollector, tick: u64, replicas: []const *replica_mod.Replica, paused: []const bool, count: u8) void {
-        var snap: [8]ReplicaSnapshot = std.mem.zeroes([8]ReplicaSnapshot);
+        std.debug.assert(count > 0);
+        std.debug.assert(count <= msg.REPLICA_COUNT_MAX);
+        std.debug.assert(count <= replicas.len);
+        std.debug.assert(count <= paused.len);
+        var snap: [msg.REPLICA_COUNT_MAX]ReplicaSnapshot = std.mem.zeroes([msg.REPLICA_COUNT_MAX]ReplicaSnapshot);
         for (0..count) |i| {
             const r = replicas[i];
             snap[i] = .{
@@ -125,7 +131,7 @@ pub const TraceCollector = struct {
                 .op = r.op_number,
                 .commit = r.commit_min,
                 .is_leader = r.isLeader() and r.status == .normal,
-                .paused = i < paused.len and paused[i],
+                .paused = paused[i],
                 .barrier_cut_count = r.barrier_cut_count,
                 .last_barrier_cut_id = r.last_barrier_cut_id,
                 .active = true,
@@ -193,11 +199,21 @@ test "multi-MiB trace collector supports explicit heap lifetime" {
 }
 
 test "state trace exposes paused replicas" {
-    var snapshots = std.mem.zeroes([8]ReplicaSnapshot);
+    var snapshots = std.mem.zeroes([msg.REPLICA_COUNT_MAX]ReplicaSnapshot);
     snapshots[0] = .{ .id = 0, .active = true, .paused = true };
     var buf: [2048]u8 = undefined;
     const line = formatEvent(&buf, .{ .tick = 7, .kind = .{ .state = snapshots } }).?;
     try std.testing.expect(std.mem.indexOf(u8, line, "\"paused\":true") != null);
+}
+
+test "state trace supports the maximum replica topology" {
+    var snapshots = std.mem.zeroes([msg.REPLICA_COUNT_MAX]ReplicaSnapshot);
+    snapshots[msg.REPLICA_COUNT_MAX - 1] = .{
+        .id = msg.REPLICA_COUNT_MAX - 1,
+        .active = true,
+    };
+    try std.testing.expect(snapshots[msg.REPLICA_COUNT_MAX - 1].active);
+    try std.testing.expectEqual(@as(u8, msg.REPLICA_COUNT_MAX - 1), snapshots[msg.REPLICA_COUNT_MAX - 1].id);
 }
 
 fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {

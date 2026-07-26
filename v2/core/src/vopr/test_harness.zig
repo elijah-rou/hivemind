@@ -1150,76 +1150,6 @@ test "paused replica rejects simulated worker registration heartbeat and pod sta
     try std.testing.expectEqual(tc.current_tick - TestCluster.AGENT_HEARTBEAT_INTERVAL, tc.sim_agents[0].last_heartbeat_tick);
 }
 
-test "paused follower defers pending Prepare barrier and acknowledgement" {
-    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A001);
-    defer tc.deinit();
-    const follower = tc.replicas[1];
-    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
-    entry.checksum = entry.computeChecksum();
-
-    tc.deliver(1, 0, .{ .prepare = .{
-        .view_number = 0,
-        .op_number = 1,
-        .commit_min = 0,
-        .retention_floor = 0,
-        .entry = entry,
-    } });
-    const slot = replica_mod.journalSlot(1);
-    try std.testing.expect(follower.journal_dirty[slot]);
-    try std.testing.expect(follower.pending_prepare_ok[slot]);
-    const syncs_before = tc.disks[1].syncs;
-
-    tc.pauseReplica(1);
-    tc.advance(100);
-    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
-    try std.testing.expect(follower.journal_dirty[slot]);
-    try std.testing.expect(follower.pending_prepare_ok[slot]);
-    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
-
-    tc.resumeReplica(1);
-    tc.tick();
-    try std.testing.expect(tc.disks[1].syncs > syncs_before);
-    try std.testing.expect(!follower.journal_dirty[slot]);
-    try std.testing.expect(!follower.pending_prepare_ok[slot]);
-}
-
-test "paused follower defers pending StartView barrier and publication" {
-    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A002);
-    defer tc.deinit();
-    const follower = tc.replicas[1];
-    follower.status = .view_change;
-    follower.view_number = 3;
-    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
-    entry.checksum = entry.computeChecksum();
-    var sv = msg.StartViewMsg{
-        .view_number = 3,
-        .selected_last_normal_view = 2,
-        .op_number = 1,
-        .tip_checksum = entry.checksum,
-        .commit_min = 0,
-        .log_entry_count = 1,
-    };
-    sv.log_entries[0] = entry;
-    tc.deliver(1, 0, .{ .start_view = sv });
-    try std.testing.expect(follower.pending_start_view.active);
-    const syncs_before = tc.disks[1].syncs;
-
-    tc.pauseReplica(1);
-    tc.current_tick = @intCast(follower.view_change_candidate.metadata.deadline_tick + 1);
-    tc.tick();
-    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
-    try std.testing.expect(follower.pending_start_view.active);
-    try std.testing.expectEqual(msg.Status.view_change, follower.status);
-    try std.testing.expectEqual(@as(msg.ViewNumber, 3), follower.view_number);
-
-    tc.resumeReplica(1);
-    tc.tick();
-    try std.testing.expect(tc.disks[1].syncs > syncs_before);
-    try std.testing.expect(!follower.pending_start_view.active);
-    try std.testing.expectEqual(msg.Status.normal, follower.status);
-    try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
-}
-
 test "durable storage: follower slot-write failure emits no PrepareOk" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0xD001);
     defer tc.deinit();
@@ -1559,6 +1489,188 @@ test "durable storage: duplicate reply waits for commit barrier" {
     tc.requestWithIdentity(0, client_id, request_id, .{ .noop = {} });
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expect(capture.last_ok);
+}
+
+test "durable storage: replaced op cannot re-ack on stale durable watermark" {
+    // Follower durably holds uncommitted op 1 (checksum A). StartView replaces
+    // that op with checksum B. A duplicate Prepare must not PrepareOk before the
+    // replacement syncs — a monotonic op watermark is not enough.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD10A);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var original = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    original.checksum = original.computeChecksum();
+
+    // Install a durable-but-uncommitted prepare on follower 1.
+    tc.replicas[1].journalPut(original);
+    tc.replicas[1].op_number = 1;
+    tc.replicas[1].commit_min = 0;
+    tc.replicas[1].commit_max = 0;
+    tc.tick(); // durability barrier for the staged journal write
+    try std.testing.expect(!tc.replicas[1].journal_dirty[replica_mod.journalSlot(1)]);
+    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
+    try std.testing.expect(tc.disks[1].readSlot(replica_mod.journalSlot(1)) != null);
+
+    var replacement = msg.LogEntry{
+        .view_number = 3, // view % 3 == 0 keeps replica 0 as leader
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 99,
+        .request_id = 99,
+        .parent_checksum = 0,
+    };
+    replacement.checksum = replacement.computeChecksum();
+    try std.testing.expect(replacement.checksum != original.checksum);
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 0,
+        .op_number = 1,
+        .tip_checksum = replacement.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = replacement;
+
+    // Leader must be able to accept a PrepareOk for op 1 if one is wrongly sent.
+    tc.replicas[0].view_number = 3;
+    tc.replicas[0].last_normal_view = 3;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].commit_min = 0;
+    tc.replicas[0].commit_max = 0;
+    tc.replicas[0].journalPut(replacement);
+    tc.replicas[0].journal_dirty[replica_mod.journalSlot(1)] = false;
+    const slot = replica_mod.journalSlot(1);
+    tc.replicas[0].prepare_ok_from[slot] = 0;
+    tc.replicas[0].prepare_ok_counts[slot] = 0;
+
+    tc.deliver(1, 0, .{ .start_view = sv });
+    try std.testing.expectEqual(replacement.checksum, tc.replicas[1].journalGet(1).?.checksum);
+    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
+    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
+
+    // Fail sync for the replacement, then inject a duplicate Prepare.
+    tc.disks[1].fail_next_sync = true;
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = replacement,
+    } });
+    tc.tick(); // deliverAll then flush (sync fails)
+
+    try std.testing.expect(tc.replicas[1].storage_failed);
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
+    try std.testing.expectEqual(@as(u8, 0), tc.replicas[0].prepare_ok_counts[slot]);
+}
+
+test "recovery rejects metadata commit_max above op_number" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA17A);
+    defer tc.deinit();
+
+    try tc.disks[0].writeMetadata(.{
+        .view_number = 1,
+        .last_normal_view = 1,
+        .op_number = 2,
+        .commit_min = 2,
+        .commit_max = 5,
+    });
+    try tc.disks[0].sync();
+
+    tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
+    tc.replicas[0].resetInPlace(.{
+        .allocator = tc.allocator,
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+    try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
+}
+
+test "paused follower defers pending Prepare barrier and acknowledgement" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A001);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 0,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.advance(100);
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.journal_dirty[slot]);
+    try std.testing.expect(!follower.pending_prepare_ok[slot]);
+}
+
+test "paused follower defers pending StartView barrier and publication" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A002);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+    tc.deliver(1, 0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_start_view.active);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.current_tick = @intCast(follower.view_change_candidate.metadata.deadline_tick + 1);
+    tc.tick();
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
 }
 
 test "durable storage: StartView PrepareOk waits for barrier" {
@@ -1901,118 +2013,6 @@ test "follower StartView crash before barrier keeps old state and after barrier 
     tc.crashReplica(1);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
     try std.testing.expectEqual(entry.checksum, tc.replicas[1].journalGet(1).?.checksum);
-}
-
-test "durable storage: replaced op cannot re-ack on stale durable watermark" {
-    // Follower durably holds uncommitted op 1 (checksum A). StartView replaces
-    // that op with checksum B. A duplicate Prepare must not PrepareOk before the
-    // replacement syncs — a monotonic op watermark is not enough.
-    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD10A);
-    defer tc.deinit();
-    tc.network.min_delay = 0;
-    tc.network.max_delay = 0;
-    tc.advance(50);
-    try std.testing.expect(tc.replicas[0].isLeader());
-
-    var original = msg.LogEntry{
-        .view_number = 0,
-        .op_number = 1,
-        .command = .{ .noop = {} },
-        .client_id = 1,
-        .request_id = 1,
-        .parent_checksum = 0,
-    };
-    original.checksum = original.computeChecksum();
-
-    // Install a durable-but-uncommitted prepare on follower 1.
-    tc.replicas[1].journalPut(original);
-    tc.replicas[1].op_number = 1;
-    tc.replicas[1].commit_min = 0;
-    tc.replicas[1].commit_max = 0;
-    tc.tick(); // durability barrier for the staged journal write
-    try std.testing.expect(!tc.replicas[1].journal_dirty[replica_mod.journalSlot(1)]);
-    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
-    try std.testing.expect(tc.disks[1].readSlot(replica_mod.journalSlot(1)) != null);
-
-    var replacement = msg.LogEntry{
-        .view_number = 3, // view % 3 == 0 keeps replica 0 as leader
-        .op_number = 1,
-        .command = .{ .noop = {} },
-        .client_id = 99,
-        .request_id = 99,
-        .parent_checksum = 0,
-    };
-    replacement.checksum = replacement.computeChecksum();
-    try std.testing.expect(replacement.checksum != original.checksum);
-
-    var sv = msg.StartViewMsg{
-        .view_number = 3,
-        .selected_last_normal_view = 0,
-        .op_number = 1,
-        .tip_checksum = replacement.checksum,
-        .commit_min = 0,
-        .retention_floor = 0,
-        .log_entry_count = 1,
-    };
-    sv.log_entries[0] = replacement;
-
-    // Leader must be able to accept a PrepareOk for op 1 if one is wrongly sent.
-    tc.replicas[0].view_number = 3;
-    tc.replicas[0].last_normal_view = 3;
-    tc.replicas[0].op_number = 1;
-    tc.replicas[0].commit_min = 0;
-    tc.replicas[0].commit_max = 0;
-    tc.replicas[0].journalPut(replacement);
-    tc.replicas[0].journal_dirty[replica_mod.journalSlot(1)] = false;
-    const slot = replica_mod.journalSlot(1);
-    tc.replicas[0].prepare_ok_from[slot] = 0;
-    tc.replicas[0].prepare_ok_counts[slot] = 0;
-
-    tc.deliver(1, 0, .{ .start_view = sv });
-    try std.testing.expectEqual(replacement.checksum, tc.replicas[1].journalGet(1).?.checksum);
-    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
-    try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
-
-    // Fail sync for the replacement, then inject a duplicate Prepare.
-    tc.disks[1].fail_next_sync = true;
-    tc.deliver(1, 0, .{ .prepare = .{
-        .view_number = 3,
-        .op_number = 1,
-        .commit_min = 0,
-        .retention_floor = 0,
-        .entry = replacement,
-    } });
-    tc.tick(); // deliverAll then flush (sync fails)
-
-    try std.testing.expect(tc.replicas[1].storage_failed);
-    const from_bit = @as(u16, 1) << 1;
-    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
-    try std.testing.expectEqual(@as(u8, 0), tc.replicas[0].prepare_ok_counts[slot]);
-}
-
-test "recovery rejects metadata commit_max above op_number" {
-    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA17A);
-    defer tc.deinit();
-
-    try tc.disks[0].writeMetadata(.{
-        .view_number = 1,
-        .last_normal_view = 1,
-        .op_number = 2,
-        .commit_min = 2,
-        .commit_max = 5,
-    });
-    try tc.disks[0].sync();
-
-    tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
-    tc.replicas[0].resetInPlace(.{
-        .allocator = tc.allocator,
-        .replica_id = 0,
-        .replica_count = 1,
-        .io = tc.sim_ios[0].io(),
-        .state_machine = tc.state_machines[0],
-        .disk = tc.disks[0].diskInterface(),
-    });
-    try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
 }
 
 test "StartView rejects conflicting committed prefix" {
