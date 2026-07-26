@@ -266,13 +266,16 @@ Legacy deploy-mode benchmark, retained for historical context only:
 
 ## Test Coverage
 
-**Current local verification:**
-- 132 Zig tests passing in Debug (`zig test src/unit_tests.zig`)
-- 132 Zig tests passing in ReleaseFast (`zig test src/unit_tests.zig -OReleaseFast`)
-- `zig build test` passing
-- 94 Rust tests passing (`cargo test`)
-- 10000 mutated core fuzz seeds passing
-- 10000 mutated worker fuzz seeds passing
+**Historical project-wide verification:**
+- The counts below predate the thematic restack and are not evidence for this branch tip.
+- 132 Zig tests passed in Debug and ReleaseFast.
+- 94 Rust tests passed.
+- 10,000 mutated core fuzz seeds and 10,000 mutated worker fuzz seeds passed.
+
+**PR 2 branch verification:**
+- Zig Debug and ReleaseFast build-test gates pass.
+- All 29 recorded core regression seeds replay with `--mutate`.
+- This evidence covers deterministic VRR safety only; it does not claim real process recovery.
 
 **VOPR simulation coverage:**
 - VRR consensus under faults (partitions, crashes, restarts)
