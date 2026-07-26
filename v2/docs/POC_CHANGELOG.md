@@ -43,6 +43,18 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+### 2026-07-24 — D1 reusable local failover, recovery, and `/run` contracts
+
+What changed:
+- added one reusable isolated three-journal replica harness with real Go API, Rust process worker, process workload, and Go bench
+- cleanup inventories PID start identity and one process group per owned component, resumes stopped groups before TERM, uses bounded TERM/KILL polling, removes only token-owned port locks, and fails on owned process/listener/lock residue without broad process-name killing
+- made data-plane failover, full retained-storage recovery, and `/run` contract phases mandatory in `run-all.sh` unless `--skip-smoke` is explicit
+- added explicit default-disabled process-runtime test controls for overflow, forwarding failure, trickle deadline, execution count, and isolated process ports
+
+Why it matters:
+- local evidence now crosses real processes, TCP sockets, retained journal directories, process runtime, and OS deadlines instead of treating startup text or API-only failover as recovery evidence
+- the leader is actually killed, followers elect, and the old replica restarts from its same journal; a real surviving follower returns status 9, then a bounded frame relay delivers that proven pre-enqueue outcome to the Go gateway and exercises its one safe reprobe without duplicate workload execution
+
 ### 2026-07-23 — Lane C2 canonical shared wire corpus
 
 What changed:
