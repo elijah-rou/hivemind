@@ -199,6 +199,41 @@ mod tests {
     }
 
     #[test]
+    fn containerd_rejects_adoption_when_requested_workload_identity_changes() {
+        let pod_id = unique_pod_id(15);
+        let mut original_spec = base_spec(pod_id);
+        original_spec.entrypoint = "sleep 300".into();
+        original_spec.env_vars = vec![("MODE".into(), "original".into())];
+
+        let first_runtime =
+            ContainerdRuntime::new(None, None, None, None).expect("containerd connect");
+        first_runtime
+            .pull_image("docker.io/library/alpine:latest", None)
+            .expect("pull");
+        let first_handle = first_runtime
+            .create_pod(&original_spec)
+            .expect("initial create");
+        first_runtime
+            .start_pod(&first_handle)
+            .expect("initial start");
+        std::thread::sleep(Duration::from_millis(500));
+        let original_pid = task_pid(&first_handle.container_id);
+
+        let mut changed_spec = original_spec.clone();
+        changed_spec.env_vars[0].1 = "changed".into();
+        let restarted_runtime =
+            ContainerdRuntime::new(None, None, None, None).expect("containerd reconnect");
+        let error = restarted_runtime
+            .create_pod(&changed_spec)
+            .expect_err("changed workload must not adopt stale running task");
+        assert!(error.to_string().contains("workload identity mismatch"));
+        assert_eq!(task_pid(&first_handle.container_id), original_pid);
+
+        first_runtime.stop_pod(&first_handle, 500).ok();
+        first_runtime.remove_pod(&first_handle).ok();
+    }
+
+    #[test]
     fn containerd_recreates_container_after_stopped_task() {
         let pod_id = unique_pod_id(20);
         let mut spec = base_spec(pod_id);

@@ -8,12 +8,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use super::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE_MS};
 
 const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
 const DEFAULT_NAMESPACE: &str = "hivemind";
 const CTR_TIMEOUT_SECS: u64 = 30;
 const AUTH_CONFIG_MAX_BYTES: usize = 4096;
+const WORKLOAD_IDENTITY_LABEL: &str = "hivemind.workload.identity";
 static AUTH_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct RegistryHosts {
@@ -60,6 +63,61 @@ impl ContainerdRuntime {
     fn container_id(&self, pod_id: u64) -> String {
         let sequence = self.container_sequence.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{}-{sequence}", Self::container_id_prefix(pod_id))
+    }
+
+    fn hash_identity_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    fn workload_identity(&self, spec: &PodSpec) -> String {
+        let mut hasher = Sha256::new();
+        Self::hash_identity_bytes(&mut hasher, b"hivemind-containerd-workload-v1");
+        hasher.update(spec.pod_id.to_be_bytes());
+        hasher.update(spec.deployment_id.to_be_bytes());
+        Self::hash_identity_bytes(&mut hasher, spec.image.as_bytes());
+        Self::hash_identity_bytes(&mut hasher, spec.entrypoint.as_bytes());
+        hasher.update(spec.port.to_be_bytes());
+        hasher.update([spec.gpu_count]);
+        hasher.update([spec.gpu_type as u8]);
+        hasher.update(spec.cpu_millicores.to_be_bytes());
+        hasher.update(spec.memory_megabytes.to_be_bytes());
+        hasher.update((spec.env_vars.len() as u64).to_be_bytes());
+        for (name, value) in &spec.env_vars {
+            Self::hash_identity_bytes(&mut hasher, name.as_bytes());
+            Self::hash_identity_bytes(&mut hasher, value.as_bytes());
+        }
+        hasher.update((spec.mounts.len() as u64).to_be_bytes());
+        for mount in &spec.mounts {
+            Self::hash_identity_bytes(&mut hasher, mount.host_path.as_bytes());
+            Self::hash_identity_bytes(&mut hasher, mount.container_path.as_bytes());
+        }
+        Self::hash_identity_bytes(&mut hasher, self.runtime_name.as_bytes());
+        Self::hash_identity_bytes(&mut hasher, self.snapshotter.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn workload_identity_from_container_info(info: &str) -> Result<String, RuntimeError> {
+        let parsed: serde_json::Value = serde_json::from_str(info).map_err(|error| {
+            RuntimeError::ContainerCreate(format!(
+                "container identity metadata is invalid: {error}"
+            ))
+        })?;
+        let identity = parsed
+            .get("labels")
+            .and_then(|labels| labels.get(WORKLOAD_IDENTITY_LABEL))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RuntimeError::ContainerCreate(
+                    "container lacks immutable workload identity metadata".into(),
+                )
+            })?;
+        if identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(RuntimeError::ContainerCreate(
+                "container workload identity metadata is malformed".into(),
+            ));
+        }
+        Ok(identity.to_ascii_lowercase())
     }
 
     fn gpu_env(&self, spec: &PodSpec) -> Vec<String> {
@@ -445,15 +503,34 @@ impl ContainerdRuntime {
         Ok(candidate)
     }
 
-    fn find_adoptable_container(&self, pod_id: u64) -> Result<Option<String>, RuntimeError> {
-        let prefix = Self::container_id_prefix(pod_id);
+    fn find_adoptable_container(&self, spec: &PodSpec) -> Result<Option<String>, RuntimeError> {
+        let prefix = Self::container_id_prefix(spec.pod_id);
         let tasks = self.run_ctr(&["tasks", "list"]).map_err(|error| {
             RuntimeError::ContainerCreate(format!("{prefix} task inventory failed: {error}"))
         })?;
         let containers = self.run_ctr(&["containers", "list"]).map_err(|error| {
             RuntimeError::ContainerCreate(format!("{prefix} container inventory failed: {error}"))
         })?;
-        Self::adoptable_container_id_from_listings(pod_id, &tasks, &containers)
+        let candidate =
+            Self::adoptable_container_id_from_listings(spec.pod_id, &tasks, &containers)?;
+        let Some(container_id) = candidate else {
+            return Ok(None);
+        };
+        let info = self
+            .run_ctr(&["containers", "info", &container_id])
+            .map_err(|error| {
+                RuntimeError::ContainerCreate(format!(
+                    "{container_id} workload identity inspection failed: {error}"
+                ))
+            })?;
+        let actual_identity = Self::workload_identity_from_container_info(&info)?;
+        let expected_identity = self.workload_identity(spec);
+        if actual_identity != expected_identity {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "{container_id} workload identity mismatch; refusing stale task adoption"
+            )));
+        }
+        Ok(Some(container_id))
     }
 
     fn cleanup_container_family(&self, pod_id: u64) -> Result<(), RuntimeError> {
@@ -621,7 +698,7 @@ impl Runtime for ContainerdRuntime {
                 "GPU workload rejected: physical device reservation is not implemented".into(),
             ));
         }
-        if let Some(container_id) = self.find_adoptable_container(spec.pod_id)? {
+        if let Some(container_id) = self.find_adoptable_container(spec)? {
             return Ok(PodHandle {
                 pod_id: spec.pod_id,
                 container_id,
@@ -649,6 +726,11 @@ impl Runtime for ContainerdRuntime {
         ];
 
         args.extend(self.gpu_device_args(spec));
+        args.push("--label".into());
+        args.push(format!(
+            "{WORKLOAD_IDENTITY_LABEL}={}",
+            self.workload_identity(spec)
+        ));
 
         for e in &env {
             args.push("--env".into());
@@ -1010,6 +1092,91 @@ other docker.io/library/nginx io.containerd.runc.v2\n";
                 "hivemind-pod-42".to_string(),
                 "hivemind-pod-42-1".to_string()
             ]
+        );
+    }
+
+    fn adoption_spec() -> PodSpec {
+        PodSpec {
+            pod_id: 42,
+            deployment_id: 9,
+            image: "docker.io/library/alpine:3.20".into(),
+            entrypoint: "sleep 300".into(),
+            port: 8080,
+            gpu_count: 0,
+            gpu_type: crate::types::GpuType::None,
+            cpu_millicores: 500,
+            memory_megabytes: 256,
+            env_vars: vec![("MODE".into(), "test".into())],
+            mounts: vec![super::super::BindMount {
+                host_path: "/tmp/source".into(),
+                container_path: "/data".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn workload_identity_changes_for_every_adoption_relevant_field() {
+        let runtime = ContainerdRuntime::new(None, None, None, None).unwrap();
+        let spec = adoption_spec();
+        let identity = runtime.workload_identity(&spec);
+        assert_eq!(identity.len(), 64);
+
+        let mut variants = Vec::new();
+        let mut changed = spec.clone();
+        changed.image.push_str("-other");
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.entrypoint.push_str(" --verbose");
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.port += 1;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.gpu_count = 1;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.gpu_type = crate::types::GpuType::T4;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.cpu_millicores += 1;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.memory_megabytes += 1;
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.env_vars[0].1.push_str("-other");
+        variants.push(changed);
+        let mut changed = spec.clone();
+        changed.mounts[0].container_path.push_str("-other");
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(runtime.workload_identity(&changed), identity);
+        }
+    }
+
+    #[test]
+    fn adoption_identity_parser_fails_closed_on_missing_malformed_or_mismatched_labels() {
+        let runtime = ContainerdRuntime::new(None, None, None, None).unwrap();
+        let expected = runtime.workload_identity(&adoption_spec());
+        let matching = format!(r#"{{"labels":{{"hivemind.workload.identity":"{expected}"}}}}"#);
+        assert_eq!(
+            ContainerdRuntime::workload_identity_from_container_info(&matching).unwrap(),
+            expected
+        );
+        assert!(
+            ContainerdRuntime::workload_identity_from_container_info(r#"{"labels":{}}"#).is_err()
+        );
+        assert!(ContainerdRuntime::workload_identity_from_container_info(
+            r#"{"labels":{"hivemind.workload.identity":"not-a-digest"}}"#
+        )
+        .is_err());
+        assert_ne!(
+            ContainerdRuntime::workload_identity_from_container_info(&matching).unwrap(),
+            runtime.workload_identity(&PodSpec {
+                image: "docker.io/library/busybox:1.36".into(),
+                ..adoption_spec()
+            })
         );
     }
 
