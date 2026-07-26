@@ -88,17 +88,52 @@ pub fn main(init: std.process.Init) !void {
         node_id, replica_count, worker_port, client_port, peer_port, data_dir,
     });
 
+    // Storage-mode contract (POC, not production durability):
+    // - absent --data-dir: volatile in-memory journal (explicit POC mode)
+    // - present --data-dir: experimental single-copy file journal; torn writes /
+    //   power loss are not validated as production-safe
+    if (data_dir.len == 0) {
+        std.debug.print("hivemind core: storage mode: volatile POC (no --data-dir; in-memory only, not durable across restart)\n", .{});
+    } else {
+        std.debug.print("hivemind core: storage mode: experimental single-copy journal (--data-dir); torn writes and power loss are not validated\n", .{});
+    }
+
     const sm = try allocator.create(StateMachine);
     sm.initInPlace(0);
 
     // Open file-backed disk if --data-dir is set
     var file_disk: ?*disk_mod.FileDisk = null;
     if (data_dir.len > 0) {
+        // Restrict data-dir permissions; journal contents may include secrets.
+        const dir_perms: std.Io.Dir.Permissions = @enumFromInt(@as(std.posix.mode_t, 0o700));
+        _ = std.Io.Dir.cwd().createDirPathStatus(init.io, data_dir, dir_perms) catch |err| {
+            std.debug.print("failed to create data-dir: {}\n", .{err});
+            return err;
+        };
+        var dir_z_buf: [4096]u8 = undefined;
+        if (data_dir.len >= dir_z_buf.len) return error.PathTooLong;
+        @memcpy(dir_z_buf[0..data_dir.len], data_dir);
+        dir_z_buf[data_dir.len] = 0;
+        if (std.c.chmod(@ptrCast(&dir_z_buf), @as(std.c.mode_t, 0o700)) != 0) {
+            std.debug.print("failed to chmod data-dir 0700\n", .{});
+            return error.PermissionDenied;
+        }
+
         var path_buf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/journal.bin", .{data_dir}) catch @panic("data-dir path too long");
         const fd_ptr = try allocator.create(disk_mod.FileDisk);
         fd_ptr.openInPlace(path) catch |err| {
-            std.debug.print("failed to open journal: {}\n", .{err});
+            switch (err) {
+                error.LegacyJournalVersion => std.debug.print(
+                    "failed to open journal: legacy layout v1 is unsupported after the command codec change; delete journal.bin or use a fresh --data-dir (no migration)\n",
+                    .{},
+                ),
+                error.UnsupportedJournalVersion => std.debug.print(
+                    "failed to open journal: unsupported journal layout version (want v{d})\n",
+                    .{disk_mod.FileDisk.VERSION},
+                ),
+                else => std.debug.print("failed to open journal: {}\n", .{err}),
+            }
             return err;
         };
         file_disk = fd_ptr;
@@ -115,7 +150,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Recover from disk if we have one
     if (file_disk != null) {
-        if (replica.recoverFromDisk()) {
+        const recovered = replica.recoverFromDisk() catch |err| {
+            std.debug.print("hivemind core: fatal storage recovery error: {}\n", .{err});
+            std.process.exit(1);
+        };
+        if (recovered) {
             std.debug.print("hivemind core: recovered from disk (view={d} op={d} commit={d})\n", .{
                 replica.view_number, replica.op_number, replica.commit_min,
             });
@@ -227,6 +266,10 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         conn_mgr.poll();
         replica.tick();
+        if (replica.storage_failed) {
+            std.debug.print("hivemind core: fatal storage failure; exiting nonzero\n", .{});
+            std.process.exit(1);
+        }
         conn_mgr.dispatchRun();
         if (metrics) |*m| m.poll();
         if (s3_backup) |*b| b.maybeTrigger(io_mod.nowTick(init.io));

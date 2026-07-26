@@ -31,6 +31,10 @@ pub const RECOVERED_VIEW_CHANGE_TIMEOUT: i64 = 50;
 pub const REPAIR_BATCH_MAX: usize = 8;
 const DEFAULT_STOP_GRACE_MS: u64 = 30_000;
 const WORKER_DISPATCH_RETRY_INTERVAL: i64 = 5000;
+/// Bound on deferred stop-pod side effects waiting for a durability barrier.
+const MAX_PENDING_STOPS: usize = sm_mod.MAX_PODS;
+/// Max flush loop iterations per tick (prepare barrier + commit barrier).
+const FLUSH_BARRIER_MAX: u8 = 4;
 
 pub fn journalSlot(op: msg.OpNumber) usize {
     std.debug.assert(op > 0);
@@ -162,6 +166,27 @@ pub const Replica = struct {
     journal_dirty: [LOG_SIZE_MAX]bool,
     metadata_dirty: bool,
     disk: ?DiskInterface,
+    /// Fail-stop: disk write/sync failed; no further consensus/client/worker traffic.
+    storage_failed: bool,
+
+    // Deferred protocol/client publication until covering durability barrier
+    pending_prepare_broadcast: [LOG_SIZE_MAX]bool,
+    pending_prepare_ok: [LOG_SIZE_MAX]bool,
+    pending_prepare_ok_to: [LOG_SIZE_MAX]u8,
+    pending_reply: [LOG_SIZE_MAX]bool,
+    pending_reply_client_id: [LOG_SIZE_MAX]u128,
+    pending_reply_request_id: [LOG_SIZE_MAX]msg.RequestId,
+    pending_reply_result: [LOG_SIZE_MAX]msg.Result,
+    pending_effect: [LOG_SIZE_MAX]bool,
+    pending_stops: [MAX_PENDING_STOPS]StopDispatch,
+    pending_stop_ops: [MAX_PENDING_STOPS]msg.OpNumber,
+    pending_stop_count: usize,
+    /// Highest op whose Prepare was acknowledged locally after a barrier.
+    /// Not sufficient alone: same-op replacements require identity checks.
+    durable_prepare_through: msg.OpNumber,
+    /// Per-slot durable prepare identity after a successful barrier.
+    durable_prepare_op: [LOG_SIZE_MAX]msg.OpNumber,
+    durable_prepare_checksum: [LOG_SIZE_MAX]u64,
 
     // Tick-based timers
     last_heartbeat: i64,
@@ -180,7 +205,11 @@ pub const Replica = struct {
     // Agent connections (out-of-band from VRR)
     workers: [MAX_WORKERS]WorkerConnection,
     worker_count: usize,
+    /// Retained-log saturation: requests rejected with log_full.
+    log_full_rejections: u64,
+    /// Legacy alias used by metrics/tests; same counter as log_full_rejections.
     pipeline_guard_drops: u64,
+    storage_failures: u64,
 
     // Optional production callbacks
     peer_send_ctx: ?*anyopaque,
@@ -229,6 +258,21 @@ pub const Replica = struct {
             .journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool),
             .metadata_dirty = false,
             .disk = config.disk,
+            .storage_failed = false,
+            .pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool),
+            .pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool),
+            .pending_prepare_ok_to = std.mem.zeroes([LOG_SIZE_MAX]u8),
+            .pending_reply = std.mem.zeroes([LOG_SIZE_MAX]bool),
+            .pending_reply_client_id = std.mem.zeroes([LOG_SIZE_MAX]u128),
+            .pending_reply_request_id = std.mem.zeroes([LOG_SIZE_MAX]msg.RequestId),
+            .pending_reply_result = undefined,
+            .pending_effect = std.mem.zeroes([LOG_SIZE_MAX]bool),
+            .pending_stops = undefined,
+            .pending_stop_ops = undefined,
+            .pending_stop_count = 0,
+            .durable_prepare_through = 0,
+            .durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber),
+            .durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64),
             .io = config.io,
             .state_machine = config.state_machine,
             .scheduler = sched.Scheduler.init(@as(u64, config.replica_id) +% 0x5C4ED),
@@ -239,7 +283,9 @@ pub const Replica = struct {
             .peer_handles = defaultPeerHandles(),
             .workers = [_]WorkerConnection{.{}} ** MAX_WORKERS,
             .worker_count = 0,
+            .log_full_rejections = 0,
             .pipeline_guard_drops = 0,
+            .storage_failures = 0,
             .peer_send_ctx = config.peer_send_ctx,
             .peer_send_fn = config.peer_send_fn,
             .client_reply_ctx = config.client_reply_ctx,
@@ -284,6 +330,18 @@ pub const Replica = struct {
         self.journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.metadata_dirty = false;
         self.disk = config.disk;
+        self.storage_failed = false;
+        self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_prepare_ok_to = std.mem.zeroes([LOG_SIZE_MAX]u8);
+        self.pending_reply = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_reply_client_id = std.mem.zeroes([LOG_SIZE_MAX]u128);
+        self.pending_reply_request_id = std.mem.zeroes([LOG_SIZE_MAX]msg.RequestId);
+        self.pending_effect = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_stop_count = 0;
+        self.durable_prepare_through = 0;
+        self.durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
+        self.durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
         self.io = config.io;
         self.state_machine = config.state_machine;
         self.scheduler = sched.Scheduler.init(@as(u64, config.replica_id) +% 0x5C4ED);
@@ -293,7 +351,9 @@ pub const Replica = struct {
         self.peer_handles = defaultPeerHandles();
         self.workers = [_]WorkerConnection{.{}} ** MAX_WORKERS;
         self.worker_count = 0;
+        self.log_full_rejections = 0;
         self.pipeline_guard_drops = 0;
+        self.storage_failures = 0;
         self.peer_send_ctx = config.peer_send_ctx;
         self.peer_send_fn = config.peer_send_fn;
         self.client_reply_ctx = config.client_reply_ctx;
@@ -306,18 +366,28 @@ pub const Replica = struct {
 
     /// Recover state from disk after a crash. Restores metadata and journal
     /// entries, then sets status to view_change to rejoin the cluster.
-    pub fn recoverFromDisk(self: *Replica) bool {
+    /// Returns false when no durable metadata exists. Returns error on
+    /// corrupt/missing committed prefix.
+    pub fn recoverFromDisk(self: *Replica) !bool {
         var disk = self.disk orelse return false;
 
         const meta = disk.readMetadata() orelse return false;
+        if (meta.commit_min > meta.commit_max) return error.CorruptMetadata;
+        if (meta.commit_max > meta.op_number) return error.CorruptMetadata;
+        if (meta.op_number > LOG_SIZE_MAX) return error.CorruptMetadata;
+        if (meta.last_normal_view > meta.view_number) return error.CorruptMetadata;
+
         self.view_number = meta.view_number;
         self.last_normal_view = meta.last_normal_view;
         self.op_number = meta.op_number;
         self.commit_min = meta.commit_min;
         self.commit_max = meta.commit_max;
-        self.retention_floor = self.commit_min;
+        self.retention_floor = 0;
         self.replica_commit_min = std.mem.zeroes([msg.REPLICA_COUNT_MAX]msg.OpNumber);
         self.replica_commit_min[self.replica_id] = self.commit_min;
+        self.durable_prepare_through = self.op_number;
+        self.durable_prepare_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
+        self.durable_prepare_checksum = std.mem.zeroes([LOG_SIZE_MAX]u64);
 
         // Restore journal entries from disk
         self.journal_occupied = std.mem.zeroes([LOG_SIZE_MAX]bool);
@@ -326,6 +396,10 @@ pub const Replica = struct {
                 if (entry.op_number > 0 and entry.valid()) {
                     self.journal[i] = entry;
                     self.journal_occupied[i] = true;
+                    if (entry.op_number <= self.op_number) {
+                        self.durable_prepare_op[i] = entry.op_number;
+                        self.durable_prepare_checksum[i] = entry.checksum;
+                    }
                 }
             }
         }
@@ -338,7 +412,7 @@ pub const Replica = struct {
             }
         }
 
-        self.rebuildCommittedState(self.commit_min);
+        try self.rebuildCommittedState(self.commit_min);
         self.recovered_from_disk = true;
 
         // Multi-node: enter view_change to rejoin cluster safely.
@@ -353,6 +427,11 @@ pub const Replica = struct {
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
         self.journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.metadata_dirty = false;
+        self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_reply = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_effect = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_stop_count = 0;
         self.repair_pending = false;
         self.transfer_pending = false;
         self.transfer_target_op = 0;
@@ -360,7 +439,6 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
-        self.client_count = 0;
 
         return true;
     }
@@ -381,44 +459,15 @@ pub const Replica = struct {
         return self.leader() == self.replica_id;
     }
 
-    /// Cluster-wide safe-to-prune floor for gossip/DVC metadata.
+    /// Snapshots are not implemented. Every retained op remains repairable for
+    /// the full fail-closed LOG_SIZE_MAX lifetime.
     fn effectiveRetentionFloor(self: *const Replica) msg.OpNumber {
-        return @min(self.retention_floor, self.commit_min);
-    }
-
-    /// Highest floor retained by a quorum. A silent replica must not pin the
-    /// leader forever, but the leader also must not wrap past entries that only
-    /// it has retained. Any future quorum intersects this retained quorum.
-    fn pipelineRetentionFloor(self: *const Replica) msg.OpNumber {
-        var floors = std.mem.zeroes([msg.REPLICA_COUNT_MAX]msg.OpNumber);
-        var count: usize = 0;
-        while (count < self.replica_count) : (count += 1) {
-            floors[count] = self.replica_commit_min[count];
-        }
-        floors[self.replica_id] = self.commit_min;
-
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            var best = i;
-            var j = i + 1;
-            while (j < count) : (j += 1) {
-                if (floors[j] > floors[best]) best = j;
-            }
-            const tmp = floors[i];
-            floors[i] = floors[best];
-            floors[best] = tmp;
-        }
-
-        return floors[self.quorum_size - 1];
+        _ = self;
+        return 0;
     }
 
     fn recomputeRetentionFloor(self: *Replica) void {
-        var floor = self.replica_commit_min[0];
-        var i: usize = 1;
-        while (i < self.replica_count) : (i += 1) {
-            floor = @min(floor, self.replica_commit_min[i]);
-        }
-        self.retention_floor = floor;
+        self.retention_floor = 0;
     }
 
     fn noteReplicaCommitMin(self: *Replica, replica_id: u8, their_commit_min: msg.OpNumber) void {
@@ -454,6 +503,8 @@ pub const Replica = struct {
     // -----------------------------------------------------------------------
 
     pub fn tick(self: *Replica) void {
+        if (self.storage_failed) return;
+
         const now_tick = io_mod.nowTick(self.io);
 
         // Initialize timestamps on first tick (production uses wall-clock ms,
@@ -512,7 +563,7 @@ pub const Replica = struct {
             .recovering => {},
         }
 
-        self.persistIfNeeded();
+        self.flushDurableState();
     }
 
     // -----------------------------------------------------------------------
@@ -520,6 +571,7 @@ pub const Replica = struct {
     // -----------------------------------------------------------------------
 
     pub fn onMessage(self: *Replica, from: u8, message: msg.Message) void {
+        if (self.storage_failed) return;
         switch (message) {
             .request => |m| self.onRequest(from, m),
             .prepare => |m| self.onPrepare(from, m),
@@ -544,10 +596,20 @@ pub const Replica = struct {
         if (self.status != .normal) return;
         if (!self.isLeader()) return;
         if (self.repair_pending) return;
+        if (self.storage_failed) return;
 
-        // Client table dedup
+        // Client table dedup — only replay results that have already passed
+        // the commit durability barrier. Unpublished pending replies must not
+        // be acknowledged from the in-memory client table.
+        if (self.hasPendingClientReply(request.client_id, request.request_id)) return;
         if (self.findClient(request.client_id)) |entry| {
-            if (entry.request_id >= request.request_id) return;
+            if (entry.request_id >= request.request_id) {
+                // Replay committed result without mutating the journal.
+                if (self.client_reply_fn) |cb| {
+                    cb(self.client_reply_ctx.?, request.client_id, request.request_id, entry.result);
+                }
+                return;
+            }
         }
 
         // In-flight dedup: the scheduler can propose the same bind repeatedly
@@ -556,12 +618,14 @@ pub const Replica = struct {
         // pod cannot be rebound and dispatched to multiple workers.
         if (self.hasPendingRequest(request.client_id, request.request_id)) return;
 
-        // Pipeline depth guard: without snapshots, the cluster must retain a
-        // quorum-intersecting prefix so view-change repair can recover wrapped
-        // entries. Dropped requests are counted because worker status updates
-        // are edge-triggered and silent loss pins readiness.
-        if (self.op_number + 1 - self.pipelineRetentionFloor() >= LOG_SIZE_MAX) {
-            self.pipeline_guard_drops += 1;
+        // Lifetime retained-log guard: without snapshots, never append past
+        // LOG_SIZE_MAX committed/accepted operations (no circular overwrite).
+        if (self.op_number + 1 > LOG_SIZE_MAX) {
+            self.log_full_rejections += 1;
+            self.pipeline_guard_drops = self.log_full_rejections;
+            if (self.client_reply_fn) |cb| {
+                cb(self.client_reply_ctx.?, request.client_id, request.request_id, .{ .err = .log_full });
+            }
             return;
         }
 
@@ -578,22 +642,13 @@ pub const Replica = struct {
         };
         entry.checksum = entry.computeChecksum();
         self.journalPut(entry);
+        self.metadata_dirty = true;
 
-        self.prepare_ok_counts[journalSlot(self.op_number)] = 1;
-        self.prepare_ok_from[journalSlot(self.op_number)] = @as(u16, 1) << @intCast(self.replica_id);
-
-        const prepare = msg.Message{ .prepare = .{
-            .view_number = self.view_number,
-            .op_number = self.op_number,
-            .commit_min = self.commit_min,
-            .retention_floor = self.retention_floor,
-            .entry = entry,
-        } };
-        self.sendToAllOthers(prepare);
-
-        if (self.replica_count == 1) {
-            self.advanceCommit();
-        }
+        const slot = journalSlot(self.op_number);
+        self.pending_prepare_broadcast[slot] = true;
+        // Self vote and Prepare broadcast wait for the durability barrier.
+        self.prepare_ok_counts[slot] = 0;
+        self.prepare_ok_from[slot] = 0;
     }
 
     fn onPrepare(self: *Replica, from: u8, prepare: msg.PrepareMsg) void {
@@ -627,7 +682,8 @@ pub const Replica = struct {
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, prepare.commit_min);
-        self.retention_floor = prepare.retention_floor;
+        std.debug.assert(prepare.retention_floor == 0);
+        self.retention_floor = 0;
 
         if (!prepare.entry.valid()) return;
 
@@ -644,19 +700,16 @@ pub const Replica = struct {
         if (!self.entryFitsLog(prepare.entry)) return;
 
         if (prepare.op_number == self.op_number + 1) {
-            // Pipeline depth guard: reject prepare that would wrap past the
-            // leader-advertised retained floor.
-            if (prepare.op_number - prepare.retention_floor >= LOG_SIZE_MAX) return;
+            // Lifetime cap: never accept an op beyond LOG_SIZE_MAX without snapshots.
+            if (prepare.op_number > LOG_SIZE_MAX) return;
 
             self.op_number = prepare.op_number;
             self.journalPut(prepare.entry);
+            self.metadata_dirty = true;
 
-            self.sendTo(from, .{ .prepare_ok = .{
-                .view_number = self.view_number,
-                .op_number = prepare.op_number,
-                .replica_id = self.replica_id,
-                .commit_min = self.commit_min,
-            } });
+            const slot = journalSlot(prepare.op_number);
+            self.pending_prepare_ok[slot] = true;
+            self.pending_prepare_ok_to[slot] = from;
 
             if (self.transfer_pending and self.op_number >= self.transfer_target_op) {
                 self.transfer_pending = false;
@@ -664,12 +717,19 @@ pub const Replica = struct {
         } else if (prepare.op_number <= self.op_number and prepare.op_number > self.commit_min) {
             if (self.journalGet(prepare.op_number)) |existing| {
                 if (existing.checksum == prepare.entry.checksum) {
-                    self.sendTo(from, .{ .prepare_ok = .{
-                        .view_number = self.view_number,
-                        .op_number = prepare.op_number,
-                        .replica_id = self.replica_id,
-                        .commit_min = self.commit_min,
-                    } });
+                    const slot = journalSlot(prepare.op_number);
+                    // Re-ack only when the current entry identity is durable.
+                    if (self.isDurablePrepare(prepare.op_number)) {
+                        self.sendTo(from, .{ .prepare_ok = .{
+                            .view_number = self.view_number,
+                            .op_number = prepare.op_number,
+                            .replica_id = self.replica_id,
+                            .commit_min = self.commit_min,
+                        } });
+                    } else {
+                        self.pending_prepare_ok[slot] = true;
+                        self.pending_prepare_ok_to[slot] = from;
+                    }
                 }
             }
         } else if (prepare.op_number > self.op_number + 1) {
@@ -737,7 +797,8 @@ pub const Replica = struct {
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, commit_msg.commit_min);
-        self.retention_floor = commit_msg.retention_floor;
+        std.debug.assert(commit_msg.retention_floor == 0);
+        self.retention_floor = 0;
 
         const target = @max(commit_msg.commit_min, commit_msg.commit_max);
         if (target > self.commit_min) {
@@ -1016,10 +1077,13 @@ pub const Replica = struct {
         if (highest_kept > max_commit) {
             var ack_op = max_commit + 1;
             while (ack_op <= highest_kept) : (ack_op += 1) {
-                if (self.journalHas(ack_op)) {
-                    const slot = journalSlot(ack_op);
+                if (!self.journalHas(ack_op)) continue;
+                const slot = journalSlot(ack_op);
+                if (self.isDurablePrepare(ack_op)) {
                     self.prepare_ok_counts[slot] = 1;
                     self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+                } else {
+                    self.pending_prepare_broadcast[slot] = true;
                 }
             }
         }
@@ -1053,13 +1117,16 @@ pub const Replica = struct {
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
 
-        // Count self as having acked all locally-present uncommitted entries.
+        // Self-ack only durable matching identities; otherwise queue Prepare publish.
         var ack_op = self.commit_min + 1;
         while (ack_op <= self.op_number) : (ack_op += 1) {
-            if (self.journalHas(ack_op)) {
-                const slot = journalSlot(ack_op);
+            if (!self.journalHas(ack_op)) continue;
+            const slot = journalSlot(ack_op);
+            if (self.isDurablePrepare(ack_op)) {
                 self.prepare_ok_counts[slot] = 1;
                 self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+            } else {
+                self.pending_prepare_broadcast[slot] = true;
             }
         }
 
@@ -1640,19 +1707,13 @@ pub const Replica = struct {
 
             self.journalPut(entry);
             const slot = journalSlot(entry.op_number);
-            const self_bit = @as(u16, 1) << @intCast(self.replica_id);
             const from_bit = @as(u16, 1) << @intCast(from);
-            self.prepare_ok_from[slot] = self_bit | from_bit;
-            self.prepare_ok_counts[slot] = if (from == self.replica_id) 1 else 2;
-
-            self.sendToAllOthers(.{ .prepare = .{
-                .view_number = self.view_number,
-                .op_number = entry.op_number,
-                .commit_min = self.commit_min,
-                .retention_floor = self.retention_floor,
-                .entry = entry,
-            } });
-            self.advanceCommit();
+            // Remote repair source already holds the entry; self-vote and Prepare
+            // broadcast wait for the local durability barrier.
+            self.prepare_ok_from[slot] = if (from == self.replica_id) 0 else from_bit;
+            self.prepare_ok_counts[slot] = if (from == self.replica_id) 0 else 1;
+            self.pending_prepare_broadcast[slot] = true;
+            self.metadata_dirty = true;
 
             if (!self.hasLogGaps()) {
                 self.repair_pending = false;
@@ -1663,25 +1724,19 @@ pub const Replica = struct {
             if (entry.op_number <= self.op_number) {
                 if (self.journalHas(entry.op_number)) return;
                 self.journalPut(entry);
-                // Send prepare_ok for gap fill to accelerate commit progress
+                // PrepareOk for gap fill waits for the durability barrier.
                 if (entry.op_number > self.commit_min) {
-                    self.sendTo(self.leader(), .{ .prepare_ok = .{
-                        .view_number = self.view_number,
-                        .op_number = entry.op_number,
-                        .replica_id = self.replica_id,
-                        .commit_min = self.commit_min,
-                    } });
+                    const slot = journalSlot(entry.op_number);
+                    self.pending_prepare_ok[slot] = true;
+                    self.pending_prepare_ok_to[slot] = self.leader();
                 }
             } else if (entry.op_number == self.op_number + 1) {
                 self.op_number = entry.op_number;
                 self.journalPut(entry);
 
-                self.sendTo(self.leader(), .{ .prepare_ok = .{
-                    .view_number = self.view_number,
-                    .op_number = entry.op_number,
-                    .replica_id = self.replica_id,
-                    .commit_min = self.commit_min,
-                } });
+                const slot = journalSlot(entry.op_number);
+                self.pending_prepare_ok[slot] = true;
+                self.pending_prepare_ok_to[slot] = self.leader();
             } else {
                 return;
             }
@@ -1709,7 +1764,8 @@ pub const Replica = struct {
         if (sv.view_number < self.view_number) return;
 
         self.view_number = sv.view_number;
-        self.retention_floor = sv.retention_floor;
+        std.debug.assert(sv.retention_floor == 0);
+        self.retention_floor = 0;
 
         // StartView is the new leader's selected log suffix. Local uncommitted
         // entries above commit_min may be from an abandoned view and must not be
@@ -1753,13 +1809,11 @@ pub const Replica = struct {
         while (ack_op <= self.op_number) : (ack_op += 1) {
             const e = self.journalGet(ack_op) orelse break;
             if (!e.valid()) break;
-            self.sendTo(new_leader, .{ .prepare_ok = .{
-                .view_number = self.view_number,
-                .op_number = ack_op,
-                .replica_id = self.replica_id,
-                .commit_min = self.commit_min,
-            } });
+            const slot = journalSlot(ack_op);
+            self.pending_prepare_ok[slot] = true;
+            self.pending_prepare_ok_to[slot] = new_leader;
         }
+        self.metadata_dirty = true;
 
         if (self.hasLogGaps()) {
             self.transfer_pending = true;
@@ -1783,7 +1837,7 @@ pub const Replica = struct {
             .last_normal_view = self.last_normal_view,
             .op_number = self.op_number,
             .commit_min = self.commit_min,
-            .retention_floor = self.effectiveRetentionFloor(),
+            .retention_floor = 0,
         };
 
         for (&dvc.log_entries) |*e| {
@@ -1820,7 +1874,7 @@ pub const Replica = struct {
             .view_number = self.view_number,
             .op_number = self.op_number,
             .commit_min = self.commit_min,
-            .retention_floor = self.retention_floor,
+            .retention_floor = 0,
         };
 
         for (&sv.log_entries) |*e| {
@@ -1885,64 +1939,106 @@ pub const Replica = struct {
         const apply_end = io_mod.nowTick(self.io);
         const applied_deployment_id = if (entry.command == .create_deployment and result == .ok) result.ok.entity_id else latency.deploymentId(entry.command);
         latency.record(.{ .phase = "commit_apply", .op = latency.commandName(entry.command), .deployment_id = applied_deployment_id, .pod_id = latency.podId(entry.command), .name = latency.commandNameField(entry.command), .start_ms = apply_start, .end_ms = apply_end, .source = "core/src/replica.zig" });
-        self.updateClientTable(entry.client_id, entry.request_id, result);
+        // Client-table publication waits for the commit durability barrier.
         self.commit_min = op;
         self.replica_commit_min[self.replica_id] = self.commit_min;
         if (self.isLeader()) self.recomputeRetentionFloor();
         self.metadata_dirty = true;
 
-        if (result == .ok) {
+        const slot = journalSlot(op);
+        self.pending_reply[slot] = true;
+        self.pending_reply_client_id[slot] = entry.client_id;
+        self.pending_reply_request_id[slot] = entry.request_id;
+        self.pending_reply_result[slot] = result;
+        self.pending_effect[slot] = true;
+
+        if (result == .ok and stop_dispatch_count > 0) {
+            std.debug.assert(self.pending_stop_count + stop_dispatch_count <= MAX_PENDING_STOPS);
             for (stop_dispatches[0..stop_dispatch_count]) |dispatch| {
-                self.dispatchStopPodToWorker(dispatch.worker_idx, dispatch.pod_id, dispatch.grace_period_ms);
+                self.pending_stops[self.pending_stop_count] = dispatch;
+                self.pending_stop_ops[self.pending_stop_count] = op;
+                self.pending_stop_count += 1;
             }
         }
+    }
 
-        // If this was an agent registration, assign the node_id and auto-ready
-        if (entry.command == .register_node and result == .ok) {
-            const node_id = result.ok.entity_id;
-            const agent_marker: u128 = 0xA6E0_0000_0000_0000;
-            if (entry.client_id & agent_marker == agent_marker) {
-                const worker_idx: usize = @intCast(entry.client_id & 0xFFFF);
-                if (worker_idx < self.worker_count) {
-                    self.workers[worker_idx].node_id = node_id;
-                    self.workers[worker_idx].pending_register = false;
-                    debugLog(
-                        "hivemind replica: worker_idx={d} hostname={s} assigned node_id={d}\n",
-                        .{ worker_idx, msg.fixedToSlice(&self.workers[worker_idx].hostname), node_id },
-                    );
-                    self.dispatchPodsForWorker(worker_idx);
+    fn publishCommittedEffect(self: *Replica, op: msg.OpNumber) void {
+        const slot = journalSlot(op);
+        std.debug.assert(self.pending_effect[slot] or self.pending_reply[slot]);
+        const entry = self.journalGet(op) orelse unreachable;
+        const result = self.pending_reply_result[slot];
+
+        if (self.pending_effect[slot] and result == .ok) {
+            var i: usize = 0;
+            while (i < self.pending_stop_count) {
+                if (self.pending_stop_ops[i] == op) {
+                    const dispatch = self.pending_stops[i];
+                    self.dispatchStopPodToWorker(dispatch.worker_idx, dispatch.pod_id, dispatch.grace_period_ms);
+                    self.pending_stop_count -= 1;
+                    self.pending_stops[i] = self.pending_stops[self.pending_stop_count];
+                    self.pending_stop_ops[i] = self.pending_stop_ops[self.pending_stop_count];
+                    continue;
                 }
-                // Nodes register as .ready directly, no auto-ready transitions needed
+                i += 1;
             }
+
+            if (entry.command == .register_node) {
+                const node_id = result.ok.entity_id;
+                const agent_marker: u128 = 0xA6E0_0000_0000_0000;
+                if (entry.client_id & agent_marker == agent_marker) {
+                    const worker_idx: usize = @intCast(entry.client_id & 0xFFFF);
+                    if (worker_idx < self.worker_count) {
+                        self.workers[worker_idx].node_id = node_id;
+                        self.workers[worker_idx].pending_register = false;
+                        debugLog(
+                            "hivemind replica: worker_idx={d} hostname={s} assigned node_id={d}\n",
+                            .{ worker_idx, msg.fixedToSlice(&self.workers[worker_idx].hostname), node_id },
+                        );
+                        self.dispatchPodsForWorker(worker_idx);
+                    }
+                }
+            }
+
+            if (entry.command == .bind_pod_to_node) {
+                const cmd = entry.command.bind_pod_to_node;
+                self.dispatchCommittedBind(cmd.pod_id, cmd.node_id, "bind_pod_to_node");
+            }
+            if (entry.command == .bind_pods_to_nodes) {
+                const cmd = entry.command.bind_pods_to_nodes;
+                const batch_ms = io_mod.nowTick(self.io);
+                latency.record(.{ .phase = "bind_batch_commit", .op = "bind_pods_to_nodes", .deployment_id = 0, .pod_id = if (cmd.count > 0) cmd.bindings[0].pod_id else 0, .name = "", .start_ms = batch_ms, .end_ms = batch_ms, .count = cmd.count, .source = "core/src/replica.zig" });
+                for (cmd.bindings[0..cmd.count]) |binding| {
+                    self.dispatchCommittedBind(binding.pod_id, binding.node_id, "bind_pods_to_nodes");
+                }
+            }
+
+            if (entry.command == .update_pod_status) {
+                const status_cmd = entry.command.update_pod_status;
+                const status_ms = io_mod.nowTick(self.io);
+                const status_pod = self.state_machine.findPod(status_cmd.pod_id);
+                latency.record(.{ .phase = "core_status_committed", .op = "update_pod_status", .deployment_id = if (status_pod) |p| p.deployment_id else 0, .pod_id = status_cmd.pod_id, .name = if (status_pod) |p| msg.fixedToSlice(&p.name) else "", .start_ms = status_ms, .end_ms = status_ms, .source = "core/src/replica.zig" });
+                if (status_cmd.new_phase == .running) {
+                    latency.record(.{ .phase = "readiness_observation", .op = "update_pod_status", .deployment_id = if (status_pod) |p| p.deployment_id else 0, .pod_id = status_cmd.pod_id, .name = if (status_pod) |p| msg.fixedToSlice(&p.name) else "", .start_ms = status_ms, .end_ms = status_ms, .source = "core/src/replica.zig" });
+                }
+            }
+            self.pending_effect[slot] = false;
         }
 
-        // Dispatch pods to agents after bind commands commit.
-        if (entry.command == .bind_pod_to_node and result == .ok) {
-            const cmd = entry.command.bind_pod_to_node;
-            self.dispatchCommittedBind(cmd.pod_id, cmd.node_id, "bind_pod_to_node");
-        }
-        if (entry.command == .bind_pods_to_nodes and result == .ok) {
-            const cmd = entry.command.bind_pods_to_nodes;
-            const batch_ms = io_mod.nowTick(self.io);
-            latency.record(.{ .phase = "bind_batch_commit", .op = "bind_pods_to_nodes", .deployment_id = 0, .pod_id = if (cmd.count > 0) cmd.bindings[0].pod_id else 0, .name = "", .start_ms = batch_ms, .end_ms = batch_ms, .count = cmd.count, .source = "core/src/replica.zig" });
-            for (cmd.bindings[0..cmd.count]) |binding| {
-                self.dispatchCommittedBind(binding.pod_id, binding.node_id, "bind_pods_to_nodes");
+        if (self.pending_reply[slot]) {
+            self.updateClientTable(
+                self.pending_reply_client_id[slot],
+                self.pending_reply_request_id[slot],
+                self.pending_reply_result[slot],
+            );
+            if (self.client_reply_fn) |cb| {
+                cb(
+                    self.client_reply_ctx.?,
+                    self.pending_reply_client_id[slot],
+                    self.pending_reply_request_id[slot],
+                    self.pending_reply_result[slot],
+                );
             }
-        }
-
-        if (entry.command == .update_pod_status and result == .ok) {
-            const status_cmd = entry.command.update_pod_status;
-            const status_ms = io_mod.nowTick(self.io);
-            const status_pod = self.state_machine.findPod(status_cmd.pod_id);
-            latency.record(.{ .phase = "core_status_committed", .op = "update_pod_status", .deployment_id = if (status_pod) |p| p.deployment_id else 0, .pod_id = status_cmd.pod_id, .name = if (status_pod) |p| msg.fixedToSlice(&p.name) else "", .start_ms = status_ms, .end_ms = status_ms, .source = "core/src/replica.zig" });
-            if (status_cmd.new_phase == .running) {
-                latency.record(.{ .phase = "readiness_observation", .op = "update_pod_status", .deployment_id = if (status_pod) |p| p.deployment_id else 0, .pod_id = status_cmd.pod_id, .name = if (status_pod) |p| msg.fixedToSlice(&p.name) else "", .start_ms = status_ms, .end_ms = status_ms, .source = "core/src/replica.zig" });
-            }
-        }
-
-        // Send reply to connected client
-        if (self.client_reply_fn) |cb| {
-            cb(self.client_reply_ctx.?, entry.client_id, entry.request_id, result);
+            self.pending_reply[slot] = false;
         }
     }
 
@@ -1950,35 +2046,156 @@ pub const Replica = struct {
     // Persistence
     // -----------------------------------------------------------------------
 
-    fn persistIfNeeded(self: *Replica) void {
-        var disk = self.disk orelse return;
+    fn markStorageFailed(self: *Replica) void {
+        if (self.storage_failed) return;
+        self.storage_failed = true;
+        self.storage_failures += 1;
+    }
 
-        var any_journal_dirty = false;
-        for (0..LOG_SIZE_MAX) |i| {
-            if (!self.journal_dirty[i]) continue;
-            any_journal_dirty = true;
-            if (self.journal_occupied[i]) {
-                disk.writeSlot(i, &self.journal[i]);
-            } else {
-                disk.clearSlot(i);
-            }
-            self.journal_dirty[i] = false;
-        }
-
-        const meta = disk_mod.Metadata{
-            .view_number = self.view_number,
-            .last_normal_view = self.last_normal_view,
-            .op_number = self.op_number,
-            .commit_min = self.commit_min,
-            .commit_max = self.commit_max,
+    /// Group-commit flush: stage all dirty journal/metadata, one durability
+    /// barrier, then publish pending Prepare/PrepareOk/client/worker traffic.
+    fn flushDurableState(self: *Replica) void {
+        if (self.storage_failed) return;
+        var disk = self.disk orelse {
+            // No disk backend: treat memory as durable and publish immediately.
+            for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
+            const before = self.durable_prepare_through;
+            self.metadata_dirty = false;
+            self.publishPendingAfterBarrier(before, self.op_number);
+            self.metadata_dirty = false;
+            self.publishCommitEffects();
+            return;
         };
-        if (any_journal_dirty or !disk.metadataEquals(meta)) {
-            disk.writeMetadata(meta);
+
+        var barriers: u8 = 0;
+        while (barriers < FLUSH_BARRIER_MAX) : (barriers += 1) {
+            var any_journal_dirty = false;
+            const prepare_through_before = self.durable_prepare_through;
+
+            for (0..LOG_SIZE_MAX) |i| {
+                if (!self.journal_dirty[i]) continue;
+                any_journal_dirty = true;
+                if (self.journal_occupied[i]) {
+                    disk.writeSlot(i, &self.journal[i]) catch {
+                        self.markStorageFailed();
+                        return;
+                    };
+                } else {
+                    disk.clearSlot(i) catch {
+                        self.markStorageFailed();
+                        return;
+                    };
+                }
+            }
+
+            const meta = disk_mod.Metadata{
+                .view_number = self.view_number,
+                .last_normal_view = self.last_normal_view,
+                .op_number = self.op_number,
+                .commit_min = self.commit_min,
+                .commit_max = self.commit_max,
+            };
+            const need_meta = self.metadata_dirty or any_journal_dirty or !disk.metadataEquals(meta);
+            if (need_meta) {
+                disk.writeMetadata(meta) catch {
+                    self.markStorageFailed();
+                    return;
+                };
+                self.metadata_dirty = true;
+            }
+
+            if (!any_journal_dirty and !self.metadata_dirty) {
+                self.publishPendingAfterBarrier(prepare_through_before, self.durable_prepare_through);
+                return;
+            }
+
+            disk.sync() catch {
+                self.markStorageFailed();
+                return;
+            };
+
+            for (0..LOG_SIZE_MAX) |i| {
+                self.journal_dirty[i] = false;
+            }
+            self.metadata_dirty = false;
+
+            self.publishPendingAfterBarrier(prepare_through_before, self.op_number);
+
+            if (!self.metadata_dirty and !anyJournalDirty(self)) break;
+        }
+        std.debug.assert(barriers < FLUSH_BARRIER_MAX or (!self.metadata_dirty and !anyJournalDirty(self)));
+    }
+
+    fn anyJournalDirty(self: *const Replica) bool {
+        for (self.journal_dirty) |d| {
+            if (d) return true;
+        }
+        return false;
+    }
+
+    fn publishCommitEffects(self: *Replica) void {
+        var op: msg.OpNumber = 1;
+        while (op <= self.commit_min) : (op += 1) {
+            const slot = journalSlot(op);
+            if (self.pending_reply[slot] or self.pending_effect[slot]) {
+                if (self.journalHas(op)) {
+                    self.publishCommittedEffect(op);
+                }
+            }
+        }
+    }
+
+    fn publishPendingAfterBarrier(self: *Replica, prepare_through_before: msg.OpNumber, prepare_through_after: msg.OpNumber) void {
+        _ = prepare_through_before;
+
+        var op: msg.OpNumber = 1;
+        while (op <= prepare_through_after) : (op += 1) {
+            const slot = journalSlot(op);
+            if (!self.journalHas(op)) continue;
+
+            if (self.pending_prepare_broadcast[slot] and self.journal[slot].op_number == op) {
+                const entry = self.journal[slot];
+                self.sendToAllOthers(.{ .prepare = .{
+                    .view_number = self.view_number,
+                    .op_number = op,
+                    .commit_min = self.commit_min,
+                    .retention_floor = 0,
+                    .entry = entry,
+                } });
+                const self_bit = @as(u16, 1) << @intCast(self.replica_id);
+                if (self.prepare_ok_from[slot] & self_bit == 0) {
+                    self.prepare_ok_from[slot] |= self_bit;
+                    self.prepare_ok_counts[slot] += 1;
+                }
+                self.pending_prepare_broadcast[slot] = false;
+            }
+
+            if (self.pending_prepare_ok[slot] and self.journal[slot].op_number == op) {
+                const to = self.pending_prepare_ok_to[slot];
+                self.sendTo(to, .{ .prepare_ok = .{
+                    .view_number = self.view_number,
+                    .op_number = op,
+                    .replica_id = self.replica_id,
+                    .commit_min = self.commit_min,
+                } });
+                self.pending_prepare_ok[slot] = false;
+            }
+
+            if (self.journalHas(op)) {
+                self.durable_prepare_op[slot] = op;
+                self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
+            }
+        }
+        self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
+
+        if (self.isLeader() and self.status == .normal) {
+            self.advanceCommit();
         }
 
-        if (any_journal_dirty) {
-            disk.sync();
-        }
+        // Client/worker publication waits until commit metadata is not dirty
+        // (covered by the barrier that just succeeded, or a subsequent one).
+        if (self.metadata_dirty) return;
+        self.publishCommitEffects();
     }
 
     // -----------------------------------------------------------------------
@@ -2011,15 +2228,20 @@ pub const Replica = struct {
 
     pub fn journalPut(self: *Replica, entry: msg.LogEntry) void {
         std.debug.assert(entry.op_number > 0);
+        // Without a snapshot floor, never replace an occupied slot with a different op.
+        std.debug.assert(entry.op_number <= LOG_SIZE_MAX);
         const slot = journalSlot(entry.op_number);
         if (self.journal_occupied[slot] and
             (self.journal[slot].op_number != entry.op_number or
                 self.journal[slot].checksum != entry.checksum))
         {
             // Reject stale overwrites (older op landing on a slot already
-            // holding a newer one). A newer op reusing the slot is a normal
-            // circular-journal wrap and is permitted even if the old op was
-            // committed -- the state machine has already applied it.
+            // holding a newer one). Different-op replacement is forbidden
+            // until snapshots exist.
+            if (entry.op_number != self.journal[slot].op_number) {
+                std.debug.assert(false);
+                return;
+            }
             if (entry.op_number < self.journal[slot].op_number) return;
             self.prepare_ok_counts[slot] = 0;
             self.prepare_ok_from[slot] = 0;
@@ -2036,9 +2258,21 @@ pub const Replica = struct {
                 self.journal_occupied[i] = false;
                 self.prepare_ok_counts[i] = 0;
                 self.prepare_ok_from[i] = 0;
+                self.durable_prepare_op[i] = 0;
+                self.durable_prepare_checksum[i] = 0;
                 self.journal_dirty[i] = true;
             }
         }
+    }
+
+    /// True when op is present and its current checksum was covered by a barrier.
+    pub fn isDurablePrepare(self: *const Replica, op: msg.OpNumber) bool {
+        if (op == 0) return false;
+        const slot = journalSlot(op);
+        if (!self.journal_occupied[slot]) return false;
+        if (self.journal[slot].op_number != op) return false;
+        return self.durable_prepare_op[slot] == op and
+            self.durable_prepare_checksum[slot] == self.journal[slot].checksum;
     }
 
     pub fn logHighOp(self: *const Replica) msg.OpNumber {
@@ -2085,14 +2319,23 @@ pub const Replica = struct {
         return true;
     }
 
-    fn rebuildCommittedState(self: *Replica, target_commit: msg.OpNumber) void {
+    fn rebuildCommittedState(self: *Replica, target_commit: msg.OpNumber) !void {
         self.state_machine.initInPlace(self.state_machine.seed);
+        self.client_count = 0;
 
         var op: msg.OpNumber = 1;
+        var parent: u64 = 0;
         while (op <= target_commit) : (op += 1) {
-            if (self.journalGet(op)) |entry| {
-                _ = self.state_machine.apply(entry.command);
+            const entry = self.journalGet(op) orelse return error.CorruptJournal;
+            if (!entry.valid()) return error.CorruptJournal;
+            if (op == 1) {
+                if (entry.parent_checksum != 0) return error.CorruptJournal;
+            } else if (entry.parent_checksum != parent) {
+                return error.CorruptJournal;
             }
+            const result = self.state_machine.apply(entry.command);
+            self.updateClientTable(entry.client_id, entry.request_id, result);
+            parent = entry.checksum;
         }
     }
 
@@ -2101,6 +2344,18 @@ pub const Replica = struct {
             if (entry.client_id == client_id and entry.active) return entry;
         }
         return null;
+    }
+
+    fn hasPendingClientReply(self: *const Replica, client_id: u128, request_id: msg.RequestId) bool {
+        for (0..LOG_SIZE_MAX) |i| {
+            if (!self.pending_reply[i]) continue;
+            if (self.pending_reply_client_id[i] == client_id and
+                self.pending_reply_request_id[i] == request_id)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn hasPendingRequest(self: *const Replica, client_id: u128, request_id: msg.RequestId) bool {
@@ -2141,6 +2396,8 @@ pub const Replica = struct {
     fn resendUncommittedPrepares(self: *Replica) void {
         var resend_op = self.commit_min + 1;
         while (resend_op <= self.op_number) : (resend_op += 1) {
+            // Never re-broadcast until the current entry identity is durable.
+            if (!self.isDurablePrepare(resend_op)) continue;
             if (self.journalGet(resend_op)) |entry| {
                 const slot = journalSlot(resend_op);
                 if (self.prepare_ok_counts[slot] < self.quorum_size) {
@@ -2148,7 +2405,7 @@ pub const Replica = struct {
                         .view_number = self.view_number,
                         .op_number = resend_op,
                         .commit_min = self.commit_min,
-                        .retention_floor = self.retention_floor,
+                        .retention_floor = 0,
                         .entry = entry.*,
                     } });
                 }
@@ -2167,7 +2424,7 @@ pub const Replica = struct {
             .commit_min = self.commit_min,
             .commit_max = self.commit_max,
             .op_number = self.op_number,
-            .retention_floor = self.retention_floor,
+            .retention_floor = 0,
             .commit_checksum = commit_checksum,
         } });
     }
@@ -2187,6 +2444,7 @@ pub const Replica = struct {
     }
 
     fn sendTo(self: *Replica, to: u8, message: msg.Message) void {
+        if (self.storage_failed) return;
         // Frame format: [4-byte LE len][1-byte from_id][VRR message bytes]
         const vrr_len = msg.serialize(message, self.send_buf[5..]);
         const frame_len: u32 = @intCast(1 + vrr_len);
@@ -2325,6 +2583,7 @@ test "worker re-registration bypasses prior agent client-table entry" {
         .cpu_millicores = 1000,
         .memory_megabytes = 1024,
     });
+    replica.tick();
 
     try std.testing.expectEqual(@as(u64, 1), replica.op_number);
     try std.testing.expect(replica.workers[worker_idx].node_id != 0);
@@ -2625,6 +2884,7 @@ test "commitEntry delete_deployment emits stop_pod for bound worker" {
 
     replica.journalPut(makeCommittedEntry(1, .{ .delete_deployment = .{ .deployment_id = dep_id } }));
     replica.commitEntry(1);
+    replica.tick();
 
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(@intFromEnum(msg.WorkerTag.stop_pod), capture.records[0].tag);
@@ -2687,6 +2947,7 @@ test "commitEntry scale down emits stop_pod for removed bound pod" {
         .desired_replicas = 1,
     } }));
     replica.commitEntry(1);
+    replica.tick();
 
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(@intFromEnum(msg.WorkerTag.stop_pod), capture.records[0].tag);
@@ -2789,6 +3050,7 @@ test "committed batch bind dispatches all bound pods to worker" {
     var cmd = msg.BindPodsToNodesCmd{ .count = 3 };
     for (sm.pods[0..3], 0..) |pod, i| cmd.bindings[i] = .{ .pod_id = pod.id, .node_id = node_id };
     replica.onRequest(0, .{ .client_id = 0xB17D, .request_id = 1, .command = .{ .bind_pods_to_nodes = cmd } });
+    replica.tick();
 
     try std.testing.expectEqual(@as(usize, 3), capture.count);
     try std.testing.expectEqual(@intFromEnum(msg.WorkerTag.start_pod), capture.records[0].tag);

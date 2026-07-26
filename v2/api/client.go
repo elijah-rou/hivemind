@@ -49,6 +49,7 @@ const (
 	ErrCodeCapacityExceeded  byte = 3
 	ErrCodeInvalidTransition byte = 4
 	ErrCodeNotLeader         byte = 5
+	ErrCodeLogFull           byte = 6
 )
 
 // GPU types matching Zig enum

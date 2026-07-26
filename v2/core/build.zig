@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -37,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true,
     });
     const unit_tests_release = b.addTest(.{ .root_module = test_mod_release });
     const run_unit_tests_release = b.addRunArtifact(unit_tests_release);
