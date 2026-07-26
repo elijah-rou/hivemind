@@ -85,8 +85,8 @@ pub fn run(config: &SimConfig) -> SimResult {
     let mut sim = WorkerSimulator::new(config.agent_count, config.seed);
 
     // Configure network
-    sim.network.drop_rate_percent = 0; // legacy, unused with ratio
-    sim.network.replay_percent = 0;
+    sim.network.drop_rate = config.drop_rate;
+    sim.network.replay_rate = config.replay_rate;
     sim.network.path_max_capacity = config.path_max_capacity;
     sim.network.partition_stability = config.partition_stability;
     sim.network.heal_stability = config.heal_stability;
@@ -96,6 +96,7 @@ pub fn run(config: &SimConfig) -> SimResult {
         container_crash_rate: config.container_crash_rate,
         gpu_failure_rate: config.gpu_failure_rate,
         create_failure_rate: Ratio::zero(),
+        stop_failure_rate: Ratio::zero(),
     };
     for i in 0..config.agent_count {
         sim.set_runtime_faults(i, fault_config.clone());
@@ -160,14 +161,25 @@ pub fn run(config: &SimConfig) -> SimResult {
 
     // -- Phase 2: Liveness --
 
-    sim.heal_all();
+    sim.force_heal_all();
     for i in 0..config.agent_count {
         sim.set_runtime_faults(i, FaultConfig::default());
+        sim.lose_agent_session(i);
     }
 
+    let phase2_received_start = sim.control_plane.received_messages().len();
     let mut phase2_ticks: u64 = 0;
 
     for tick in 0..config.liveness_ticks {
+        for agent_id in 0..config.agent_count {
+            if !registered_since(&sim, agent_id, phase2_received_start) {
+                sim.retry_agent_registration(agent_id);
+            }
+        }
+        for (agent_id, command) in sim.control_plane.unresolved_start_recovery_commands() {
+            sim.network
+                .send_to_agent(agent_id, command, sim.current_tick);
+        }
         sim.tick();
         phase2_ticks = tick + 1;
 
@@ -184,7 +196,7 @@ pub fn run(config: &SimConfig) -> SimResult {
             };
         }
 
-        if check_convergence(&sim) {
+        if check_convergence(&sim, phase2_received_start) {
             return SimResult {
                 seed: config.seed,
                 phase1_ticks,
@@ -196,6 +208,49 @@ pub fn run(config: &SimConfig) -> SimResult {
             };
         }
     }
+
+    let unresolved: Vec<_> = sim
+        .control_plane
+        .unresolved_start_recovery_commands()
+        .into_iter()
+        .filter_map(|(agent_id, command)| match command {
+            crate::message::ControlMessage::StartPod(start) => Some((agent_id, start.pod_id)),
+            _ => None,
+        })
+        .collect();
+    let nonterminal: Vec<_> = sim
+        .workers
+        .iter()
+        .enumerate()
+        .flat_map(|(agent_id, worker)| {
+            worker
+                .tracked_pods()
+                .iter()
+                .filter_map(move |(pod_id, pod)| match pod.state {
+                    TrackedPodState::Running
+                    | TrackedPodState::Stopped { .. }
+                    | TrackedPodState::Failed { .. } => None,
+                    _ => Some((agent_id, *pod_id, pod.state.clone())),
+                })
+        })
+        .collect();
+    let unresolved_statuses: Vec<_> = sim
+        .control_plane
+        .received_messages()
+        .iter()
+        .filter_map(|(_, agent_id, message)| match message {
+            crate::message::WorkerMessage::PodStatusEvent(event)
+                if unresolved.iter().any(|(_, pod_id)| *pod_id == event.pod_id) =>
+            {
+                Some((*agent_id, event.pod_id, event.status.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "worker simulation liveness failure: seed={} unresolved={unresolved:?} unresolved_statuses={unresolved_statuses:?} nonterminal={nonterminal:?}",
+        config.seed
+    );
 
     let msgs = sim.network.stats.control_sent + sim.network.stats.worker_sent;
     SimResult {
@@ -209,9 +264,46 @@ pub fn run(config: &SimConfig) -> SimResult {
     }
 }
 
-fn check_convergence(sim: &WorkerSimulator) -> bool {
-    for wk in &sim.workers {
-        for pod in wk.tracked_pods().values() {
+fn registered_since(sim: &WorkerSimulator, agent_id: usize, received_start: usize) -> bool {
+    let received = sim.control_plane.received_messages();
+    assert!(received_start <= received.len());
+    received[received_start..]
+        .iter()
+        .any(|(_, received_agent_id, message)| {
+            *received_agent_id == agent_id
+                && matches!(message, crate::message::WorkerMessage::NodeRegister(_))
+        })
+}
+
+fn check_convergence(sim: &WorkerSimulator, phase2_received_start: usize) -> bool {
+    let received = sim.control_plane.received_messages();
+    for agent_id in 0..sim.workers.len() {
+        if !registered_since(sim, agent_id, phase2_received_start) {
+            return false;
+        }
+    }
+
+    for &(agent_id, pod_id) in sim.control_plane.expected_starts() {
+        if !received.iter().any(|(_, received_agent_id, message)| {
+            *received_agent_id == agent_id
+                && matches!(
+                    message,
+                    crate::message::WorkerMessage::PodStatusEvent(event)
+                        if event.pod_id == pod_id
+                            && matches!(
+                                event.status,
+                                crate::message::PodStatusReport::Running
+                                    | crate::message::PodStatusReport::Stopped { .. }
+                                    | crate::message::PodStatusReport::Failed { .. }
+                            )
+                )
+        }) {
+            return false;
+        }
+    }
+
+    for worker in &sim.workers {
+        for pod in worker.tracked_pods().values() {
             match pod.state {
                 TrackedPodState::Running
                 | TrackedPodState::Stopped { .. }
@@ -226,6 +318,27 @@ fn check_convergence(sim: &WorkerSimulator) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convergence_requires_registration_after_session_loss() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_21);
+        for _ in 0..4 {
+            sim.tick();
+            if !sim.control_plane.received_messages().is_empty() {
+                break;
+            }
+        }
+        let phase2_received_start = sim.control_plane.received_messages().len();
+        assert!(
+            phase2_received_start > 0,
+            "phase 1 must deliver registration"
+        );
+
+        sim.lose_agent_session(0);
+
+        assert!(!registered_since(&sim, 0, phase2_received_start));
+        assert!(!check_convergence(&sim, phase2_received_start));
+    }
 
     #[test]
     fn sim_default_seed_passes() {
@@ -258,6 +371,28 @@ mod tests {
     }
 
     #[test]
+    fn sim_total_message_loss_fails_liveness() {
+        let result = run(&SimConfig {
+            seed: 0xB1_20,
+            agent_count: 1,
+            safety_ticks: 10,
+            liveness_ticks: 1,
+            pod_count: 1,
+            partition_probability: Ratio::zero(),
+            heal_probability: Ratio::zero(),
+            pause_probability: Ratio::zero(),
+            image_pull_failure_rate: Ratio::zero(),
+            container_crash_rate: Ratio::zero(),
+            gpu_failure_rate: Ratio::zero(),
+            drop_rate: Ratio::new(1, 1),
+            ..Default::default()
+        });
+
+        assert_eq!(result.outcome, Outcome::LivenessFailure);
+        assert_eq!(result.messages_sent, 0);
+    }
+
+    #[test]
     fn sim_heavy_faults_no_safety_violations() {
         let config = SimConfig {
             seed: 456,
@@ -275,6 +410,17 @@ mod tests {
             "safety violations with seed {}: {:?}",
             config.seed, result
         );
+    }
+
+    #[test]
+    fn liveness_phase_force_heals_recent_stable_partition() {
+        let result = run(&SimConfig {
+            seed: 901,
+            partition_probability: Ratio::new(10, 100),
+            heal_probability: Ratio::new(5, 100),
+            ..Default::default()
+        });
+        assert_eq!(result.outcome, Outcome::Passed, "seed 901: {result:?}");
     }
 
     #[test]

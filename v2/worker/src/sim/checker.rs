@@ -179,9 +179,14 @@ fn is_legal_transition(from: &TrackedPodState, to: &TrackedPodState) -> bool {
         (TrackedPodState::ImagePulling, TrackedPodState::Creating)
             | (
                 TrackedPodState::ImagePulling,
+                TrackedPodState::Stopped { .. }
+            )
+            | (
+                TrackedPodState::ImagePulling,
                 TrackedPodState::Failed { .. }
             )
             | (TrackedPodState::Creating, TrackedPodState::Starting)
+            | (TrackedPodState::Creating, TrackedPodState::Stopped { .. })
             | (TrackedPodState::Creating, TrackedPodState::Failed { .. })
             | (TrackedPodState::Starting, TrackedPodState::Creating)
             | (TrackedPodState::Starting, TrackedPodState::Running)
@@ -205,9 +210,17 @@ mod tests {
             (TrackedPodState::ImagePulling, TrackedPodState::Creating),
             (
                 TrackedPodState::ImagePulling,
+                TrackedPodState::Stopped { exit_code: 0 },
+            ),
+            (
+                TrackedPodState::ImagePulling,
                 TrackedPodState::Failed { reason: "x".into() },
             ),
             (TrackedPodState::Creating, TrackedPodState::Starting),
+            (
+                TrackedPodState::Creating,
+                TrackedPodState::Stopped { exit_code: 0 },
+            ),
             (TrackedPodState::Starting, TrackedPodState::Creating),
             (TrackedPodState::Starting, TrackedPodState::Running),
             (

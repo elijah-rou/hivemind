@@ -10,8 +10,8 @@ const STAGING_CAPACITY: usize = 256;
 /// and drains `outbound` around each agent tick call.
 pub struct SimulatedIo {
     pub current_tick: u64,
-    pub inbound: VecDeque<ControlMessage>,
-    pub outbound: Vec<WorkerMessage>,
+    inbound: VecDeque<ControlMessage>,
+    outbound: Vec<WorkerMessage>,
     prng: Prng,
 }
 
@@ -61,5 +61,36 @@ impl Io for SimulatedIo {
 
     fn random_u64(&mut self) -> u64 {
         self.prng.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{NodeHeartbeatMsg, WorkerMessage};
+
+    #[test]
+    #[should_panic(expected = "simulated I/O inbound staging capacity exceeded")]
+    fn inbound_staging_is_fail_loud_bounded() {
+        let mut io = SimulatedIo::new(0xB1_30);
+        for pod_id in 0..=256 {
+            io.push_inbound(ControlMessage::StopPod(crate::message::StopPodCmd {
+                pod_id,
+                grace_period_ms: 0,
+            }));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "simulated I/O outbound staging capacity exceeded")]
+    fn outbound_staging_is_fail_loud_bounded() {
+        let mut io = SimulatedIo::new(0xB1_30);
+        for tick in 0..=256 {
+            io.send(WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+                tick,
+                active_pods: 0,
+                gpu_free: 0,
+            }));
+        }
     }
 }
