@@ -4,7 +4,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const MOUNT_BASE: &str = "/tmp/hivemind/mounts";
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[derive(Debug)]
 pub struct VolumeMount {
     pub pod_id: u64,
     pub host_path: PathBuf,
@@ -18,6 +20,9 @@ pub struct VolumeMount {
 ///   JUICEFS_META_URL - metadata engine URL (e.g. redis://...)
 ///   JUICEFS_NAME     - filesystem name
 pub fn mount_juicefs(pod_id: u64, juicefs_subpath: &str) -> Result<VolumeMount, String> {
+    if !juicefs_subpath.starts_with('/') || juicefs_subpath.contains('\0') {
+        return Err("juicefs subpath must be a valid absolute path".into());
+    }
     let mount_dir = PathBuf::from(format!("{MOUNT_BASE}/{pod_id}/juicefs"));
     fs::create_dir_all(&mount_dir).map_err(|e| format!("mkdir {}: {e}", mount_dir.display()))?;
 
@@ -25,23 +30,31 @@ pub fn mount_juicefs(pod_id: u64, juicefs_subpath: &str) -> Result<VolumeMount, 
         std::env::var("JUICEFS_META_URL").map_err(|_| "JUICEFS_META_URL not set".to_string())?;
     let fs_name = std::env::var("JUICEFS_NAME").unwrap_or_else(|_| "hivemind".to_string());
 
-    let mut cmd = Command::new("juicefs");
-    cmd.args([
-        "mount",
-        &meta_url,
-        &mount_dir.to_string_lossy(),
-        "--name",
-        &fs_name,
-        "--subdir",
-        juicefs_subpath,
-        "-d", // daemonize
-    ]);
-
-    let output = cmd
+    let timeout = format!("{}s", MOUNT_TIMEOUT.as_secs());
+    let output = Command::new("timeout")
+        .args([
+            "--signal=KILL",
+            &timeout,
+            "juicefs",
+            "mount",
+            &meta_url,
+            &mount_dir.to_string_lossy(),
+            "--name",
+            &fs_name,
+            "--subdir",
+            juicefs_subpath,
+            "-d",
+        ])
         .output()
-        .map_err(|e| format!("juicefs mount exec: {e}"))?;
+        .map_err(|e| format!("bounded juicefs mount exec: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(124) || output.status.code() == Some(137) {
+            return Err(format!(
+                "juicefs mount timed out after {}s: {stderr}",
+                MOUNT_TIMEOUT.as_secs()
+            ));
+        }
         return Err(format!("juicefs mount failed: {stderr}"));
     }
 
@@ -141,5 +154,12 @@ mod tests {
     fn expired_shutdown_deadline_rejects_volume_cleanup() {
         let error = unmount_juicefs_until(999998, Instant::now()).unwrap_err();
         assert!(error.contains("shutdown deadline"));
+    }
+
+    #[test]
+    fn mount_rejects_relative_subpath_before_host_side_effects() {
+        let error = mount_juicefs(999997, "relative/path").unwrap_err();
+        assert!(error.contains("absolute path"));
+        assert!(!PathBuf::from(format!("{MOUNT_BASE}/999997")).exists());
     }
 }

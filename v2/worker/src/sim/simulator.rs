@@ -1033,6 +1033,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_runtime_pod_fails_closed_and_retains_cleanup_ownership() {
+        let mut sim = WorkerSimulator::new(1, 0x51_01);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.sim_ios[0].push_inbound(start_cmd(910, 9_100));
+        sim.run(3);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&910].state,
+            TrackedPodState::Running
+        );
+
+        sim.sim_runtimes[0].lose_pod(910);
+        sim.tick();
+
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&910].state,
+            TrackedPodState::Stopping
+        );
+        assert!(sim.workers[0].tracked_pods()[&910].handle.is_some());
+        assert_eq!(sim.checker.safety_violations, 0);
+    }
+
+    #[test]
+    fn unknown_runtime_status_fails_closed() {
+        let mut sim = WorkerSimulator::new(1, 0x51_02);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.sim_ios[0].push_inbound(start_cmd(911, 9_110));
+        sim.run(3);
+        sim.sim_runtimes[0].make_pod_status_unknown(911);
+
+        sim.tick();
+
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&911].state,
+            TrackedPodState::Stopping
+        );
+        assert!(sim.workers[0].tracked_pods()[&911].handle.is_some());
+        assert_eq!(sim.checker.safety_violations, 0);
+    }
+
+    #[test]
     fn post_churn_burst_50x1_reaches_running_with_stopped_pods_retained() {
         let mut sim = WorkerSimulator::new(1, 0x50_50);
         sim.network.min_delay = 1;

@@ -181,68 +181,90 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
                 "shutdown deadline reached".into(),
             ));
         }
-        let mut processes = self.processes.lock().unwrap();
-        let proc = processes
-            .get_mut(&handle.container_id)
+        let mut process = self
+            .processes
+            .lock()
+            .unwrap()
+            .remove(&handle.container_id)
             .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
-        match proc.child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(RuntimeError::ContainerStop(format!(
-                    "{} status before TERM: {error}",
-                    handle.container_id
-                )))
-            }
-        }
 
-        let pid = i32::try_from(proc.child.id()).map_err(|error| {
-            RuntimeError::ContainerStop(format!("{} pid conversion: {error}", handle.container_id))
-        })?;
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return Err(RuntimeError::ContainerStop(format!(
-                "{} TERM: {}",
-                handle.container_id,
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        let grace = Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS));
-        let deadline = (Instant::now() + grace).min(shutdown_deadline);
-        loop {
-            match proc.child.try_wait() {
+        // The map lock protects ownership transfer only. Waiting while holding it
+        // would serialize unrelated lifecycle, status, and forwarding operations.
+        let result = (|| {
+            match process.child.try_wait() {
                 Ok(Some(_)) => return Ok(()),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(
-                        TERM_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Ok(None) => break,
+                Ok(None) => {}
                 Err(error) => {
                     return Err(RuntimeError::ContainerStop(format!(
-                        "{} status after TERM: {error}",
+                        "{} status before TERM: {error}",
                         handle.container_id
                     )))
                 }
             }
-        }
 
-        proc.child.kill().map_err(|error| {
-            RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
-        })?;
-        let deadline = (Instant::now() + POST_KILL_WAIT).min(shutdown_deadline);
-        match wait_for_child_exit_until(deadline, || proc.child.try_wait()) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(RuntimeError::ContainerStop(format!(
-                "{} did not exit within {}ms after KILL",
-                handle.container_id,
-                POST_KILL_WAIT.as_millis()
-            ))),
-            Err(error) => Err(RuntimeError::ContainerStop(format!(
-                "{} status after KILL: {error}",
-                handle.container_id
-            ))),
-        }
+            let pid = i32::try_from(process.child.id()).map_err(|error| {
+                RuntimeError::ContainerStop(format!(
+                    "{} pid conversion: {error}",
+                    handle.container_id
+                ))
+            })?;
+            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                return Err(RuntimeError::ContainerStop(format!(
+                    "{} TERM: {}",
+                    handle.container_id,
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            let grace = Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS));
+            let deadline = (Instant::now() + grace).min(shutdown_deadline);
+            loop {
+                match process.child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(
+                            TERM_POLL_INTERVAL
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(RuntimeError::ContainerStop(format!(
+                            "{} status after TERM: {error}",
+                            handle.container_id
+                        )))
+                    }
+                }
+            }
+
+            process.child.kill().map_err(|error| {
+                RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
+            })?;
+            let deadline = (Instant::now() + POST_KILL_WAIT).min(shutdown_deadline);
+            match wait_for_child_exit_until(deadline, || process.child.try_wait()) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(RuntimeError::ContainerStop(format!(
+                    "{} did not exit within {}ms after KILL",
+                    handle.container_id,
+                    POST_KILL_WAIT.as_millis()
+                ))),
+                Err(error) => Err(RuntimeError::ContainerStop(format!(
+                    "{} status after KILL: {error}",
+                    handle.container_id
+                ))),
+            }
+        })();
+
+        let previous = self
+            .processes
+            .lock()
+            .unwrap()
+            .insert(handle.container_id.clone(), process);
+        assert!(
+            previous.is_none(),
+            "stopped process ownership must be unique"
+        );
+        result
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
@@ -468,6 +490,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -550,6 +573,61 @@ mod tests {
             "cooperative process must exit from SIGTERM before SIGKILL"
         );
         runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn stop_wait_does_not_hold_global_process_map_lock() {
+        let runtime = Arc::new(ProcessRuntime::with_base_port(24_100));
+        let slow_id = "proc-slow-stop".to_string();
+        let slow_child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            ])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            slow_id.clone(),
+            RunningProcess {
+                child: slow_child,
+                port: 24_100,
+            },
+        );
+        let other_id = "proc-other".to_string();
+        let other_child = Command::new("python3")
+            .args(["-c", "import time; time.sleep(60)"])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            other_id.clone(),
+            RunningProcess {
+                child: other_child,
+                port: 24_101,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        let stop_runtime = Arc::clone(&runtime);
+        let slow_handle = PodHandle {
+            pod_id: 80,
+            container_id: slow_id,
+        };
+        let stop_handle = slow_handle.clone();
+        let stop = thread::spawn(move || stop_runtime.stop_pod(&stop_handle, 300));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        assert_eq!(runtime.get_port(&other_id), Some(24_101));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        stop.join().unwrap().unwrap();
+        runtime.remove_pod(&slow_handle).unwrap();
+        runtime
+            .remove_pod(&PodHandle {
+                pod_id: 81,
+                container_id: other_id,
+            })
+            .unwrap();
     }
 
     #[test]

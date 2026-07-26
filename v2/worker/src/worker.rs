@@ -16,6 +16,9 @@ pub const LIFECYCLE_RETRY_DELAY_TICKS: u64 = 25;
 pub const LIFECYCLE_FIRST_RETRY_DELAY_TICKS: u64 = LIFECYCLE_RETRY_DELAY_TICKS * 2;
 const STOP_ATTEMPT_MAX: u8 = 3;
 pub(crate) const STOP_RETRY_DELAY_TICKS: u64 = 25;
+const MAX_TRACKED_PODS: usize = 4096;
+const MAX_TERMINAL_TOMBSTONES: usize = 1024;
+const _: () = assert!(MAX_TERMINAL_TOMBSTONES < MAX_TRACKED_PODS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackedPodState {
@@ -266,6 +269,11 @@ impl Worker {
         if self.pods.contains_key(&cmd.pod_id) {
             return;
         }
+        self.prune_terminal_pods_to(MAX_TERMINAL_TOMBSTONES);
+        if self.pods.len() >= MAX_TRACKED_PODS {
+            self.reject_start(io, cmd.pod_id, "worker tracked-pod capacity exhausted");
+            return;
+        }
 
         eprintln!(
             "worker: start pod pod_id={} deployment_id={} image={} port={} gpu_count={}",
@@ -365,6 +373,44 @@ impl Worker {
             pod_id,
             status: PodStatusReport::ImagePulling,
         }));
+    }
+
+    fn prune_terminal_pods_to(&mut self, limit: usize) {
+        assert!(limit <= MAX_TERMINAL_TOMBSTONES);
+        let mut terminal: Vec<(u64, u64)> = self
+            .pods
+            .values()
+            .filter(|pod| {
+                matches!(
+                    pod.state,
+                    TrackedPodState::Stopped { .. } | TrackedPodState::Failed { .. }
+                )
+            })
+            .map(|pod| (pod.state_changed_at, pod.pod_id))
+            .collect();
+        terminal.sort_unstable();
+        let remove_count = terminal.len().saturating_sub(limit);
+        for (_, pod_id) in terminal.into_iter().take(remove_count) {
+            let pod = self.pods.remove(&pod_id).expect("terminal pod must exist");
+            assert!(
+                pod.handle.is_none(),
+                "terminal tombstone cannot own a runtime"
+            );
+            assert!(!self.pending_failure_reasons.contains_key(&pod_id));
+        }
+    }
+
+    fn scrub_terminal_pod_data(&mut self, pod_id: u64) {
+        let pod = self.pods.get_mut(&pod_id).expect("terminal pod must exist");
+        assert!(matches!(
+            pod.state,
+            TrackedPodState::Stopped { .. } | TrackedPodState::Failed { .. }
+        ));
+        assert!(pod.handle.is_none());
+        pod.entrypoint.clear();
+        pod.env_vars.clear();
+        pod.juicefs_path.clear();
+        pod.image_pull_auth = None;
     }
 
     fn reject_start(&self, io: &mut dyn Io, pod_id: u64, reason: &str) {
@@ -498,25 +544,20 @@ impl Worker {
                     let spec = {
                         let pod = &self.pods[&pod_id];
 
-                        // Mount JuiceFS if a path is specified. This remains on the main
-                        // worker thread because mount setup mutates host state; containerd
-                        // create/start/pull work below is the expensive bounded-concurrent path.
-                        let mut mounts = Vec::new();
-                        if !pod.juicefs_path.is_empty() {
-                            match volumes::mount_juicefs(pod_id, &pod.juicefs_path) {
-                                Ok(vol) => {
-                                    mounts.push(BindMount {
-                                        host_path: vol.host_path.to_string_lossy().to_string(),
-                                        container_path: vol.container_path,
-                                    });
-                                }
-                                Err(e) => {
-                                    eprintln!("juicefs mount failed for pod {pod_id}: {e}");
-                                }
-                            }
-                        }
+                        // Mount setup mutates host state and must complete before runtime
+                        // creation so a requested mount can never fail open.
+                        let mounts = if pod.juicefs_path.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            volumes::mount_juicefs(pod_id, &pod.juicefs_path).map(|vol| {
+                                vec![BindMount {
+                                    host_path: vol.host_path.to_string_lossy().to_string(),
+                                    container_path: vol.container_path,
+                                }]
+                            })
+                        };
 
-                        PodSpec {
+                        mounts.map(|mounts| PodSpec {
                             pod_id,
                             deployment_id: pod.deployment_id,
                             image: pod.image.clone(),
@@ -528,13 +569,23 @@ impl Worker {
                             memory_megabytes: pod.memory_megabytes,
                             env_vars: pod.env_vars.clone(),
                             mounts,
-                        }
+                        })
                     };
-                    lifecycle_ops.push(LifecycleOp::Create {
-                        pod_id,
-                        deployment_id: spec.deployment_id,
-                        spec,
-                    });
+                    match spec {
+                        Ok(spec) => lifecycle_ops.push(LifecycleOp::Create {
+                            pod_id,
+                            deployment_id: spec.deployment_id,
+                            spec,
+                        }),
+                        Err(error) => {
+                            self.fail_pod(
+                                io,
+                                pod_id,
+                                format!("juicefs mount failed: {error}"),
+                                now,
+                            );
+                        }
+                    }
                 }
 
                 TrackedPodState::Starting => {
@@ -551,25 +602,45 @@ impl Worker {
                 }
 
                 TrackedPodState::Running => {
-                    // Check for spontaneous crashes via runtime
-                    let mut crashed = false;
-                    if let Some(ref handle) = self.pods[&pod_id].handle {
-                        if let Ok(status) = runtime.pod_status(handle) {
-                            if let PodStatus::Stopped { exit_code } = status {
-                                let pod = self.pods.get_mut(&pod_id).unwrap();
-                                pod.state = TrackedPodState::Stopping;
-                                pod.state_changed_at = now;
-                                pod.grace_period_ms = 0;
-                                pod.lifecycle_failures = STOP_ATTEMPT_MAX;
-                                pod.lifecycle_retry_after_tick = 0;
-                                self.complete_pod_stop(io, runtime, pod_id, exit_code, now);
-                                crashed = true;
-                            }
+                    // A tracked running pod remains routable only while the runtime
+                    // independently proves it is running.
+                    let handle = self.pods[&pod_id]
+                        .handle
+                        .clone()
+                        .expect("running pod must retain its runtime handle");
+                    let runtime_verified = match runtime.pod_status(&handle) {
+                        Ok(PodStatus::Running) => true,
+                        Ok(PodStatus::Stopped { exit_code }) => {
+                            let pod = self.pods.get_mut(&pod_id).unwrap();
+                            pod.state = TrackedPodState::Stopping;
+                            pod.state_changed_at = now;
+                            pod.grace_period_ms = 0;
+                            pod.lifecycle_failures = STOP_ATTEMPT_MAX;
+                            pod.lifecycle_retry_after_tick = 0;
+                            self.complete_pod_stop(io, runtime, pod_id, exit_code, now);
+                            false
                         }
-                    }
+                        Ok(PodStatus::Created | PodStatus::Unknown) => {
+                            self.fail_pod(
+                                io,
+                                pod_id,
+                                "runtime no longer proves pod is running".into(),
+                                now,
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            self.fail_pod(
+                                io,
+                                pod_id,
+                                format!("runtime status verification failed: {error}"),
+                                now,
+                            );
+                            false
+                        }
+                    };
 
-                    // Health probe check (only if pod didn't just crash)
-                    if !crashed {
+                    if runtime_verified {
                         let should_probe = {
                             let pod = &self.pods[&pod_id];
                             !pod.liveness_path.is_empty()
@@ -961,6 +1032,8 @@ impl Worker {
         pod.state_changed_at = now;
         pod.lifecycle_retry_after_tick = 0;
         self.release_pod_resources(pod_id);
+        self.scrub_terminal_pod_data(pod_id);
+        self.prune_terminal_pods_to(MAX_TERMINAL_TOMBSTONES);
         let status = match failure_reason {
             Some(reason) => PodStatusReport::Failed { reason },
             None => PodStatusReport::Stopped { exit_code },
@@ -1033,6 +1106,8 @@ impl Worker {
         };
         pod.state_changed_at = now;
         self.release_pod_resources(pod_id);
+        self.scrub_terminal_pod_data(pod_id);
+        self.prune_terminal_pods_to(MAX_TERMINAL_TOMBSTONES);
         io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
             pod_id,
             status: PodStatusReport::Failed { reason },
@@ -1398,6 +1473,101 @@ mod tests {
             captured[0].memory_megabytes, 2048,
             "must reflect cmd, not node total 262144"
         );
+    }
+
+    #[test]
+    fn requested_juicefs_mount_failure_never_creates_runtime_pod() {
+        let mut worker = Worker::new("mount-node".into(), GpuType::None, 0, 1000, 1024);
+        let runtime = CapturingRuntime::new();
+        let mut io = TestIo {
+            sent: Vec::new(),
+            inbox: VecDeque::new(),
+            tick: 0,
+        };
+        worker.handle_start_pod(
+            &mut io,
+            StartPodCmd {
+                pod_id: 8,
+                deployment_id: 1,
+                image: "demo:v1".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                juicefs_path: "relative/path".into(),
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                env_vars: vec![EnvEntry {
+                    name: "TOKEN".into(),
+                    value: "secret-value".into(),
+                    is_secret_ref: false,
+                }],
+                image_pull_registry: "registry.example".into(),
+                image_pull_username: "user".into(),
+                image_pull_password: "password".into(),
+                image_pull_password_is_secret: false,
+            },
+            0,
+        );
+
+        worker.drive_pods(&mut io, &runtime, 1);
+        worker.drive_pods(&mut io, &runtime, 2);
+
+        assert!(runtime.specs.lock().unwrap().is_empty());
+        let pod = &worker.tracked_pods()[&8];
+        assert!(matches!(pod.state, TrackedPodState::Failed { .. }));
+        assert!(pod.env_vars.is_empty());
+        assert!(pod.image_pull_auth.is_none());
+        assert!(pod.juicefs_path.is_empty());
+        assert!(io.sent.iter().any(|message| matches!(
+            message,
+            WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                pod_id: 8,
+                status: PodStatusReport::Failed { .. }
+            })
+        )));
+    }
+
+    fn terminal_pod(pod_id: u64, state_changed_at: u64) -> TrackedPod {
+        TrackedPod {
+            pod_id,
+            deployment_id: 1,
+            image: "demo".into(),
+            entrypoint: String::new(),
+            state: TrackedPodState::Stopped { exit_code: 0 },
+            handle: None,
+            state_changed_at,
+            gpu_count: 0,
+            cpu_millicores: 0,
+            memory_megabytes: 0,
+            grace_period_ms: 0,
+            port: 0,
+            liveness_path: String::new(),
+            readiness_path: String::new(),
+            probe_interval_ms: 10_000,
+            last_probe_tick: 0,
+            consecutive_failures: 0,
+            env_vars: Vec::new(),
+            juicefs_path: String::new(),
+            image_pull_auth: None,
+            lifecycle_failures: 0,
+            lifecycle_retry_after_tick: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_tombstones_are_bounded_and_oldest_first() {
+        let mut worker = Worker::new("bounded-node".into(), GpuType::None, 0, 1000, 1024);
+        for (pod_id, tick) in [(3, 30), (1, 10), (2, 20)] {
+            worker.pods.insert(pod_id, terminal_pod(pod_id, tick));
+        }
+
+        worker.prune_terminal_pods_to(1);
+
+        assert_eq!(worker.pods.len(), 1);
+        assert!(worker.pods.contains_key(&3));
     }
 
     fn is_legal_transition(from: &TrackedPodState, to: &TrackedPodState) -> bool {

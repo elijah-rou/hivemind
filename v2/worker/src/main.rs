@@ -13,6 +13,23 @@ extern "C" fn handle_signal(_: libc::c_int) {
 const MAX_REPLICA_ADDRS: usize = 64;
 const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 1;
 
+struct RuntimeOwner {
+    runtime: Box<dyn runtime::Runtime>,
+}
+
+impl RuntimeOwner {
+    fn new<F>(build: F) -> Self
+    where
+        F: FnOnce() -> Box<dyn runtime::Runtime>,
+    {
+        Self { runtime: build() }
+    }
+
+    fn runtime(&self) -> &dyn runtime::Runtime {
+        self.runtime.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunConfig {
     replica_addr: String,
@@ -231,6 +248,29 @@ fn cmd_run(args: &[String]) {
         );
     }
 
+    // Runtime ownership spans control-plane sessions. Reconnects reset transport
+    // registration only; recreating the runtime would orphan retained pod handles.
+    let runtime_owner = RuntimeOwner::new(|| match runtime_mode.as_str() {
+        "process" => Box::new(runtime::process::ProcessRuntime::new()),
+        "simulated" => Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())),
+        #[cfg(target_os = "linux")]
+        "containerd" => {
+            let snap = if snapshotter == "overlayfs" {
+                None
+            } else {
+                Some(snapshotter.as_str())
+            };
+            Box::new(
+                runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
+                    .expect("failed to init containerd runtime"),
+            )
+        }
+        other => {
+            eprintln!("unknown runtime: {other}");
+            std::process::exit(1);
+        }
+    });
+
     let mut backoff_ms: u64 = 100;
     let max_backoff_ms: u64 = 10_000;
     let mut replica_idx: usize = 0;
@@ -246,32 +286,12 @@ fn cmd_run(args: &[String]) {
                 eprintln!("worker {node_name}: connected to {current_replica_addr}");
                 backoff_ms = 100;
 
-                match runtime_mode.as_str() {
-                    "process" => {
-                        let rt = runtime::process::ProcessRuntime::new();
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    "simulated" => {
-                        let rt = sim::runtime::SimulatedRuntime::new(0, Default::default());
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    #[cfg(target_os = "linux")]
-                    "containerd" => {
-                        let snap = if snapshotter == "overlayfs" {
-                            None
-                        } else {
-                            Some(snapshotter.as_str())
-                        };
-                        let rt =
-                            runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
-                                .expect("failed to init containerd runtime");
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    other => {
-                        eprintln!("unknown runtime: {other}");
-                        std::process::exit(1);
-                    }
-                }
+                run_worker_loop(
+                    &mut node_worker,
+                    &mut rio,
+                    runtime_owner.runtime(),
+                    &metrics_server,
+                );
 
                 if SHUTDOWN.load(Ordering::SeqCst) {
                     eprintln!("worker {node_name}: shutdown complete");
@@ -299,9 +319,12 @@ fn cmd_run(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_replica_addrs, parse_run_config, reconcile_shutdown, RunConfig, MAX_REPLICA_ADDRS,
-        MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
+        parse_replica_addrs, parse_run_config, reconcile_shutdown, RunConfig, RuntimeOwner,
+        MAX_REPLICA_ADDRS, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
     };
+    use hivemind_worker::runtime::Runtime;
+    use hivemind_worker::sim;
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     fn parse(args: &[&str], env_pairs: &[(&str, &str)]) -> RunConfig {
@@ -370,6 +393,20 @@ mod tests {
             &[("HIVEMIND_AGENT_METRICS_PORT", "8081")],
         );
         assert_eq!(cfg.metrics_port, Some(8081));
+    }
+
+    #[test]
+    fn runtime_owner_is_constructed_once_across_sessions() {
+        let constructions = Cell::new(0);
+        let owner = RuntimeOwner::new(|| {
+            constructions.set(constructions.get() + 1);
+            Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())) as Box<dyn Runtime>
+        });
+        let first = owner.runtime() as *const dyn Runtime as *const ();
+        let second = owner.runtime() as *const dyn Runtime as *const ();
+
+        assert_eq!(constructions.get(), 1);
+        assert_eq!(first, second);
     }
 }
 

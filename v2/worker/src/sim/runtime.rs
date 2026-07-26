@@ -140,6 +140,25 @@ impl SimulatedRuntime {
         *status = PodStatus::Stopped { exit_code };
     }
 
+    pub fn lose_pod(&self, pod_id: u64) {
+        let removed = self
+            .inner
+            .lock()
+            .unwrap()
+            .pods
+            .remove(&format!("sim-pod-{pod_id}"));
+        assert!(removed.is_some(), "scripted loss requires an existing pod");
+    }
+
+    pub fn make_pod_status_unknown(&self, pod_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let status = inner
+            .pods
+            .get_mut(&format!("sim-pod-{pod_id}"))
+            .expect("scripted unknown status requires an existing pod");
+        *status = PodStatus::Unknown;
+    }
+
     /// Simulate spontaneous container crashes. Called by the simulator each tick.
     pub fn maybe_crash_pods(&self) {
         if self.fault_config.container_crash_rate.is_zero() {

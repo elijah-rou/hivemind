@@ -489,10 +489,7 @@ impl ContainerdRuntime {
     }
 
     fn task_adoptable(status: &PodStatus) -> bool {
-        matches!(
-            status,
-            PodStatus::Running | PodStatus::Created | PodStatus::Unknown
-        )
+        matches!(status, PodStatus::Running | PodStatus::Created)
     }
 
     fn task_already_exists_error(error: &str) -> bool {
@@ -692,13 +689,14 @@ impl Runtime for ContainerdRuntime {
         match self.run_ctr(&["tasks", "start", "--detach", &handle.container_id]) {
             Ok(_) => Ok(()),
             Err(error) if Self::task_already_exists_error(&error) => {
-                if let Some(status) = self.task_status_by_id(&handle.container_id)? {
-                    if Self::task_adoptable(&status) {
-                        return Ok(());
-                    }
+                if matches!(
+                    self.task_status_by_id(&handle.container_id)?,
+                    Some(PodStatus::Running)
+                ) {
+                    return Ok(());
                 }
                 Err(RuntimeError::ContainerStart(format!(
-                    "{}: {error}",
+                    "{}: {error}; existing task is not proven running",
                     handle.container_id
                 )))
             }
@@ -970,10 +968,10 @@ hivemind-pod-9 0 STOPPED
     }
 
     #[test]
-    fn task_adoptable_accepts_live_or_unknown_tasks_only() {
+    fn task_adoption_requires_proven_live_or_created_state() {
         assert!(ContainerdRuntime::task_adoptable(&PodStatus::Running));
         assert!(ContainerdRuntime::task_adoptable(&PodStatus::Created));
-        assert!(ContainerdRuntime::task_adoptable(&PodStatus::Unknown));
+        assert!(!ContainerdRuntime::task_adoptable(&PodStatus::Unknown));
         assert!(!ContainerdRuntime::task_adoptable(&PodStatus::Stopped {
             exit_code: 0
         }));
@@ -1026,6 +1024,18 @@ hivemind-pod-42-2 image runtime\n";
         assert_eq!(
             ContainerdRuntime::adoptable_container_id_from_listings(42, tasks, containers).unwrap(),
             Some("hivemind-pod-42-1".to_string())
+        );
+    }
+
+    #[test]
+    fn adoption_rejects_unknown_task_state() {
+        let tasks = "TASK PID STATUS\n\
+hivemind-pod-42-1 123 PAUSED\n";
+        let containers = "CONTAINER IMAGE RUNTIME\n\
+hivemind-pod-42-1 image runtime\n";
+        assert_eq!(
+            ContainerdRuntime::adoptable_container_id_from_listings(42, tasks, containers).unwrap(),
+            None
         );
     }
 

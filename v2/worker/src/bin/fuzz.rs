@@ -116,12 +116,7 @@ fn run_fuzzer(
     }
     let random_seeds = Arc::new(random_seeds);
 
-    let corpus = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("fuzz_failures.jsonl")
-        .ok();
-    let corpus = Arc::new(Mutex::new(corpus));
+    let corpus = Arc::new(Mutex::new(None));
 
     eprintln!(
         "[fuzz] mode={} seeds={seed_count} threads={thread_count} budget={budget_secs}s mutate={mutate}",
@@ -330,9 +325,16 @@ fn record_failure(
     config: &SimConfig,
     result: &runner::SimResult,
 ) {
-    let f = match file.as_mut() {
-        Some(f) => f,
-        None => return,
+    if file.is_none() {
+        *file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("fuzz_failures.jsonl")
+            .ok();
+    }
+    let Some(file) = file.as_mut() else {
+        eprintln!("[fuzz] failed to open failure corpus for seed {seed}");
+        return;
     };
     let line = format!(
         "{{\"engine\":\"rust\",\"seed\":{seed},\"outcome\":\"{:?}\",\"config\":{{\"agents\":{},\"pods\":{},\"partition\":\"{}/{}\",\"heal\":\"{}/{}\",\"pull_fail\":\"{}/{}\",\"crash\":\"{}/{}\",\"drop\":\"{}/{}\",\"replay\":\"{}/{}\",\"path_capacity\":{}}},\"result\":{{\"p1\":{},\"p2\":{},\"violations\":{},\"messages\":{}}}}}\n",
@@ -346,7 +348,9 @@ fn record_failure(
         config.path_max_capacity,
         result.phase1_ticks, result.phase2_ticks, result.safety_violations, result.messages_sent
     );
-    let _ = f.write_all(line.as_bytes());
+    if let Err(error) = file.write_all(line.as_bytes()) {
+        eprintln!("[fuzz] failed to record seed {seed}: {error}");
+    }
 }
 
 #[cfg(test)]
