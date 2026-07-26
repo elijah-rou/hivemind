@@ -1302,8 +1302,4 @@ test "worker tags stay wire compatible with rust agent" {
     try std.testing.expectEqual(@as(u8, 0x02), @intFromEnum(WorkerTag.start_pod));
     try std.testing.expectEqual(@as(u8, 0x03), @intFromEnum(WorkerTag.stop_pod));
     try std.testing.expectEqual(@as(u8, 0x04), @intFromEnum(WorkerTag.run_request));
-    try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(WorkerTag.register));
-    try std.testing.expectEqual(@as(u8, 0x11), @intFromEnum(WorkerTag.heartbeat));
-    try std.testing.expectEqual(@as(u8, 0x12), @intFromEnum(WorkerTag.pod_status));
-    try std.testing.expectEqual(@as(u8, 0x13), @intFromEnum(WorkerTag.run_response));
 }

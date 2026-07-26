@@ -1470,6 +1470,39 @@ test "recovery rejects metadata commit_max above op_number" {
     try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
 }
 
+test "paused follower defers pending Prepare barrier and acknowledgement" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A001);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 0,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.advance(100);
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.journal_dirty[slot]);
+    try std.testing.expect(!follower.pending_prepare_ok[slot]);
+}
+
 test "paused follower defers pending StartView barrier and publication" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A002);
     defer tc.deinit();
@@ -1505,6 +1538,53 @@ test "paused follower defers pending StartView barrier and publication" {
     try std.testing.expect(!follower.pending_start_view.active);
     try std.testing.expectEqual(msg.Status.normal, follower.status);
     try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
+}
+
+test "durable storage: StartView PrepareOk waits for barrier" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x57A1);
+    defer tc.deinit();
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var entry = msg.LogEntry{
+        .view_number = tc.replicas[0].view_number,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+
+    var sv = msg.StartViewMsg{
+        .view_number = tc.replicas[0].view_number,
+        .selected_last_normal_view = tc.replicas[0].last_normal_view,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+
+    // Install via StartView without ticking (no durability barrier yet).
+    tc.replicas[1].status = .view_change;
+    tc.deliver(1, 0, .{ .start_view = sv });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(tc.replicas[1].journalHas(1));
+    try std.testing.expect(tc.replicas[1].pending_start_view.active);
+    try std.testing.expect(tc.replicas[1].status == .view_change);
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
+
+    // PrepareOk must not reach the leader until the follower flushes.
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
+
+    tc.tick();
+    tc.deliverAll();
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(!tc.replicas[1].journal_dirty[slot]);
 }
 
 test "follower StartView durable watermark relation table installs only after barrier" {
