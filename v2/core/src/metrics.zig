@@ -10,23 +10,81 @@ const libc = struct {
     extern "c" fn close(fd: c_int) c_int;
 };
 
-const BUF_SIZE = 65536;
+const InitSyscalls = struct {
+    context: ?*anyopaque = null,
+    socket_fn: *const fn (?*anyopaque) c_int,
+    fcntl_fn: *const fn (?*anyopaque, c_int, c_int, c_int) c_int,
+    close_fn: *const fn (?*anyopaque, c_int) void,
 
-/// Non-blocking Prometheus metrics server. Call poll() from the main loop.
+    fn productionSocket(_: ?*anyopaque) c_int {
+        return libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    }
+
+    fn productionFcntl(_: ?*anyopaque, fd: c_int, command: c_int, argument: c_int) c_int {
+        return std.c.fcntl(fd, command, argument);
+    }
+
+    fn productionClose(_: ?*anyopaque, fd: c_int) void {
+        _ = libc.close(fd);
+    }
+
+    const production = InitSyscalls{
+        .socket_fn = productionSocket,
+        .fcntl_fn = productionFcntl,
+        .close_fn = productionClose,
+    };
+};
+
+const BUF_SIZE = 65536;
+pub const BUF_SIZE_FOR_TESTING = BUF_SIZE;
+const REQUEST_SIZE_MAX = 1024;
+const RESPONSE_SIZE_MAX = BUF_SIZE + 256;
+const CLIENT_COUNT_MAX = 8;
+const CLIENT_DEADLINE_TICKS = 5_000;
+
+const ClientPhase = enum { reading, writing };
+
+const MetricsClient = struct {
+    fd: c_int = -1,
+    phase: ClientPhase = .reading,
+    deadline_tick: i64 = 0,
+    request: [REQUEST_SIZE_MAX]u8 = undefined,
+    request_len: usize = 0,
+    response: [RESPONSE_SIZE_MAX]u8 = undefined,
+    response_len: usize = 0,
+    response_sent: usize = 0,
+
+    fn active(self: *const MetricsClient) bool {
+        return self.fd >= 0;
+    }
+};
+
+/// Bounded non-blocking Prometheus metrics server. Call poll() from the main loop.
 pub const MetricsServer = struct {
     listen_fd: c_int,
     replica: *replica_mod.Replica,
     gossip: ?*gossip_mod.GossipState,
     connection_mgr: ?*conn_mod.ConnectionManager,
+    clients: [CLIENT_COUNT_MAX]MetricsClient = [_]MetricsClient{.{}} ** CLIENT_COUNT_MAX,
 
     pub fn init(port: u16, replica: *replica_mod.Replica) !MetricsServer {
-        const fd = libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        return initWithSyscalls(port, replica, InitSyscalls.production);
+    }
+
+    fn initWithSyscalls(port: u16, replica: *replica_mod.Replica, syscalls: InitSyscalls) !MetricsServer {
+        const fd = syscalls.socket_fn(syscalls.context);
         if (fd < 0) return error.SocketCreateFailed;
 
-        // Set non-blocking
-        const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+        const flags = syscalls.fcntl_fn(syscalls.context, fd, std.posix.F.GETFL, 0);
+        if (flags < 0) {
+            syscalls.close_fn(syscalls.context, fd);
+            return error.GetFlagsFailed;
+        }
         const O_NONBLOCK: c_int = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
-        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
+        if (syscalls.fcntl_fn(syscalls.context, fd, std.posix.F.SETFL, flags | O_NONBLOCK) < 0) {
+            syscalls.close_fn(syscalls.context, fd);
+            return error.SetFlagsFailed;
+        }
 
         const optval: u32 = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&optval), @sizeOf(u32));
@@ -48,37 +106,126 @@ pub const MetricsServer = struct {
     }
 
     pub fn deinit(self: *MetricsServer) void {
-        _ = libc.close(self.listen_fd);
+        if (self.listen_fd >= 0) _ = libc.close(self.listen_fd);
+        for (&self.clients) |*client| self.closeClient(client);
     }
 
-    /// Accept one connection, write metrics, close. Non-blocking.
-    pub fn poll(self: *MetricsServer) void {
+    /// Accepts at most one client and performs at most one non-blocking I/O operation per client.
+    pub fn poll(self: *MetricsServer, now_tick: i64) void {
         const client_fd = std.c.accept(self.listen_fd, null, null);
-        if (client_fd < 0) return;
-        defer _ = libc.close(client_fd);
+        if (client_fd >= 0) self.adoptClient(client_fd, now_tick);
+        self.pollClients(now_tick);
+    }
 
-        var req_buf: [1024]u8 = undefined;
-        const req_len_raw = std.c.read(client_fd, &req_buf, req_buf.len);
-        const req_len: usize = if (req_len_raw > 0) @intCast(req_len_raw) else 0;
-        const path = requestPath(req_buf[0..req_len]);
+    fn adoptClient(self: *MetricsServer, client_fd: c_int, now_tick: i64) void {
+        const flags = std.c.fcntl(client_fd, std.posix.F.GETFL);
+        const O_NONBLOCK: c_int = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
+        if (flags < 0 or std.c.fcntl(client_fd, std.posix.F.SETFL, flags | O_NONBLOCK) < 0) {
+            _ = libc.close(client_fd);
+            return;
+        }
+        for (&self.clients) |*client| {
+            if (client.active()) continue;
+            client.* = .{ .fd = client_fd, .deadline_tick = now_tick + CLIENT_DEADLINE_TICKS };
+            return;
+        }
+        _ = libc.close(client_fd);
+    }
 
+    fn pollClients(self: *MetricsServer, now_tick: i64) void {
+        for (&self.clients) |*client| {
+            if (!client.active()) continue;
+            if (now_tick >= client.deadline_tick) {
+                self.closeClient(client);
+                continue;
+            }
+            switch (client.phase) {
+                .reading => self.pollRead(client, now_tick),
+                .writing => self.pollWrite(client),
+            }
+        }
+    }
+
+    fn pollRead(self: *MetricsServer, client: *MetricsClient, now_tick: i64) void {
+        std.debug.assert(client.active());
+        std.debug.assert(client.request_len <= client.request.len);
+        const remaining = client.request[client.request_len..];
+        if (remaining.len == 0) {
+            self.closeClient(client);
+            return;
+        }
+        const rc = std.c.read(client.fd, remaining.ptr, remaining.len);
+        if (rc == 0) {
+            self.closeClient(client);
+            return;
+        }
+        if (rc < 0) {
+            switch (std.posix.errno(rc)) {
+                .INTR, .AGAIN => return,
+                else => self.closeClient(client),
+            }
+            return;
+        }
+        client.request_len += @intCast(rc);
+        std.debug.assert(client.request_len <= client.request.len);
+        if (std.mem.indexOf(u8, client.request[0..client.request_len], "\r\n\r\n") != null) {
+            self.prepareResponse(client, now_tick);
+        } else if (client.request_len == client.request.len) {
+            self.closeClient(client);
+        }
+    }
+
+    fn prepareResponse(self: *MetricsServer, client: *MetricsClient, now_tick: i64) void {
         var body: [BUF_SIZE]u8 = undefined;
         var content_type: []const u8 = "text/plain; version=0.0.4";
-        var body_len: usize = 0;
-
-        if (std.mem.eql(u8, path, "/v1/internal/federation")) {
+        const path = requestPath(client.request[0..client.request_len]);
+        const body_len = if (std.mem.eql(u8, path, "/v1/internal/federation")) blk: {
             content_type = "application/json";
-            const io_inst = self.replica.io;
-            const now = @import("vopr/simulated_io.zig").nowTick(io_inst);
-            body_len = self.formatFederationJson(&body, now);
-        } else {
-            body_len = self.formatMetrics(&body);
+            break :blk self.formatFederationJson(&body, now_tick);
+        } else self.formatMetrics(&body);
+        const header = std.fmt.bufPrint(&client.response, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ content_type, body_len }) catch {
+            self.closeClient(client);
+            return;
+        };
+        if (body_len > client.response.len - header.len) {
+            self.closeClient(client);
+            return;
         }
+        @memcpy(client.response[header.len..][0..body_len], body[0..body_len]);
+        client.response_len = header.len + body_len;
+        client.response_sent = 0;
+        client.phase = .writing;
+        self.pollWrite(client);
+    }
 
-        var resp: [BUF_SIZE + 256]u8 = undefined;
-        const header = std.fmt.bufPrint(&resp, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ content_type, body_len }) catch return;
-        writeAll(client_fd, header);
-        writeAll(client_fd, body[0..body_len]);
+    fn pollWrite(self: *MetricsServer, client: *MetricsClient) void {
+        std.debug.assert(client.active());
+        std.debug.assert(client.response_sent <= client.response_len);
+        const remaining = client.response[client.response_sent..client.response_len];
+        if (remaining.len == 0) {
+            self.closeClient(client);
+            return;
+        }
+        const rc = std.c.write(client.fd, remaining.ptr, remaining.len);
+        if (rc == 0) {
+            self.closeClient(client);
+            return;
+        }
+        if (rc < 0) {
+            switch (std.posix.errno(rc)) {
+                .INTR, .AGAIN => return,
+                else => self.closeClient(client),
+            }
+            return;
+        }
+        client.response_sent += @intCast(rc);
+        std.debug.assert(client.response_sent <= client.response_len);
+        if (client.response_sent == client.response_len) self.closeClient(client);
+    }
+
+    fn closeClient(_: *MetricsServer, client: *MetricsClient) void {
+        if (client.active()) _ = libc.close(client.fd);
+        client.* = .{};
     }
 
     fn formatMetrics(self: *MetricsServer, buf: *[BUF_SIZE]u8) usize {
@@ -178,9 +325,9 @@ pub const MetricsServer = struct {
         if (self.connection_mgr) |cm| {
             pos += write(buf, pos, "# HELP hivemind_connections Connected sockets by type\n");
             pos += write(buf, pos, "# TYPE hivemind_connections gauge\n");
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"agents\"}} {d}\n", .{cm.worker_count});
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"clients\"}} {d}\n", .{cm.client_count});
-            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"peers\"}} {d}\n", .{cm.peer_count});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"agents\"}} {d}\n", .{cm.connectedWorkerCount()});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"clients\"}} {d}\n", .{cm.connectedClientCount()});
+            pos += writeFmt(buf, pos, "hivemind_connections{{type=\"peers\"}} {d}\n", .{cm.connectedPeerCount()});
             var identified_peers: usize = 0;
             for (cm.peers[0..cm.peer_count]) |peer| {
                 if (peer.connected and peer.peer_id_known) identified_peers += 1;
@@ -271,6 +418,10 @@ pub const MetricsServer = struct {
         }
 
         return pos;
+    }
+
+    pub fn formatMetricsForTesting(self: *MetricsServer, buf: *[BUF_SIZE]u8) usize {
+        return self.formatMetrics(buf);
     }
 
     const CapacitySummary = struct {
@@ -465,20 +616,60 @@ pub const MetricsServer = struct {
         const result = std.fmt.bufPrint(remaining, fmt, args) catch return 0;
         return result.len;
     }
-
-    fn writeAll(fd: c_int, data: []const u8) void {
-        var written: usize = 0;
-        while (written < data.len) {
-            const rc = std.c.write(fd, data[written..].ptr, data.len - written);
-            if (rc <= 0) return;
-            written += @intCast(rc);
-        }
-    }
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+const FcntlFailureFixture = struct {
+    fail_command: c_int,
+    close_count: usize = 0,
+    closed_fd: c_int = -1,
+
+    fn socket(context: ?*anyopaque) c_int {
+        _ = context;
+        return 41;
+    }
+
+    fn fcntl(context: ?*anyopaque, _: c_int, command: c_int, _: c_int) c_int {
+        const self: *FcntlFailureFixture = @ptrCast(@alignCast(context.?));
+        if (command == self.fail_command) return -1;
+        return 0;
+    }
+
+    fn close(context: ?*anyopaque, fd: c_int) void {
+        const self: *FcntlFailureFixture = @ptrCast(@alignCast(context.?));
+        self.close_count += 1;
+        self.closed_fd = fd;
+    }
+
+    fn syscalls(self: *FcntlFailureFixture) InitSyscalls {
+        return .{ .context = self, .socket_fn = socket, .fcntl_fn = fcntl, .close_fn = close };
+    }
+};
+
+test "metrics init closes listener when F_GETFL fails" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 37);
+    defer tc.deinit();
+    var fixture = FcntlFailureFixture{ .fail_command = std.posix.F.GETFL };
+
+    try std.testing.expectError(error.GetFlagsFailed, MetricsServer.initWithSyscalls(9200, tc.replicas[0], fixture.syscalls()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.close_count);
+    try std.testing.expectEqual(@as(c_int, 41), fixture.closed_fd);
+}
+
+test "metrics init closes listener when F_SETFL fails" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 41);
+    defer tc.deinit();
+    var fixture = FcntlFailureFixture{ .fail_command = std.posix.F.SETFL };
+
+    try std.testing.expectError(error.SetFlagsFailed, MetricsServer.initWithSyscalls(9200, tc.replicas[0], fixture.syscalls()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.close_count);
+    try std.testing.expectEqual(@as(c_int, 41), fixture.closed_fd);
+}
 
 test "metrics write helper" {
     var buf: [BUF_SIZE]u8 = undefined;
@@ -493,6 +684,88 @@ test "metrics writeFmt helper" {
     try std.testing.expect(len > 0);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..len], "foo") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..len], "42") != null);
+}
+
+test "metrics clients are bounded and expire without sending" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 19);
+    defer tc.deinit();
+    var server = MetricsServer{ .listen_fd = -1, .replica = tc.replicas[0], .gossip = null, .connection_mgr = null };
+    defer server.deinit();
+
+    var peers: [CLIENT_COUNT_MAX + 1]c_int = undefined;
+    for (0..CLIENT_COUNT_MAX + 1) |index| {
+        var fds: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+        server.adoptClient(fds[0], 10);
+        peers[index] = fds[1];
+    }
+    defer {
+        for (peers) |fd| _ = libc.close(fd);
+    }
+
+    var active: usize = 0;
+    for (&server.clients) |*client| active += @intFromBool(client.active());
+    try std.testing.expectEqual(@as(usize, CLIENT_COUNT_MAX), active);
+
+    server.pollClients(10 + CLIENT_DEADLINE_TICKS);
+    for (&server.clients) |*client| try std.testing.expect(!client.active());
+}
+
+test "metrics stalled writer and reader remain nonblocking" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 23);
+    defer tc.deinit();
+    var server = MetricsServer{ .listen_fd = -1, .replica = tc.replicas[0], .gossip = null, .connection_mgr = null };
+    defer server.deinit();
+
+    var no_send: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &no_send));
+    defer _ = libc.close(no_send[1]);
+    server.adoptClient(no_send[0], 0);
+    server.pollClients(1);
+    try std.testing.expect(server.clients[0].active());
+    try std.testing.expectEqual(@as(usize, 0), server.clients[0].request_len);
+
+    var no_read: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &no_read));
+    defer _ = libc.close(no_read[1]);
+    server.adoptClient(no_read[0], 0);
+    const client = &server.clients[1];
+    client.phase = .writing;
+    client.response_len = client.response.len;
+    @memset(&client.response, 0x5a);
+    while (true) {
+        const rc = std.c.write(client.fd, client.response[0..].ptr, client.response.len);
+        if (rc < 0 and std.posix.errno(rc) == .AGAIN) break;
+        try std.testing.expect(rc > 0);
+    }
+    server.pollClients(2);
+    try std.testing.expect(client.active());
+    try std.testing.expectEqual(@as(usize, 0), client.response_sent);
+}
+
+test "metrics valid HTTP request completes across polls" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+    const tc = try TestCluster.init(std.testing.allocator, 1, 29);
+    defer tc.deinit();
+    var server = MetricsServer{ .listen_fd = -1, .replica = tc.replicas[0], .gossip = null, .connection_mgr = null };
+    defer server.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+    server.adoptClient(fds[0], 100);
+    const request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expectEqual(@as(isize, request.len), std.c.write(fds[1], request.ptr, request.len));
+    server.pollClients(101);
+
+    var response: [RESPONSE_SIZE_MAX]u8 = undefined;
+    const response_len = std.c.read(fds[1], &response, response.len);
+    try std.testing.expect(response_len > 0);
+    const bytes = response[0..@intCast(response_len)];
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "hivemind_consensus_view") != null);
 }
 
 test "metrics include origin-aware gossip labels and cpu summaries" {

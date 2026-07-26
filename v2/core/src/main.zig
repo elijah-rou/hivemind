@@ -140,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
         .state_machine = sm,
         .disk = if (file_disk) |fd| fd.diskInterface() else null,
     });
+
     defer replica.deinit();
 
     // Recover from disk if we have one
@@ -265,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         conn_mgr.dispatchRun();
-        if (metrics) |*m| m.poll();
+        if (metrics) |*m| m.poll(io_mod.nowTick(init.io));
         if (s3_backup) |*b| b.maybeTrigger(io_mod.nowTick(init.io));
         if (gossip) |*g| {
             const now = io_mod.nowTick(init.io);
@@ -292,19 +293,7 @@ fn clientReplyCallback(ctx: ?*anyopaque, client_id: u128, request_id: u128, resu
 
 fn workerSendCallback(ctx: ?*anyopaque, worker_idx: usize, data: []const u8) void {
     const cm: *ConnectionManager = @ptrCast(@alignCast(ctx.?));
-    if (worker_idx >= cm.worker_count or !cm.workers[worker_idx].connected) return;
-
-    // data = [4B len][2B version][1B tag][payload...] (old frame format from replica)
-    // Extract inner content (version+tag+payload) and re-frame through sendFrame
-    // which handles flags byte and encryption.
-    const frame_header = 4; // skip the 4-byte length prefix
-    if (data.len <= frame_header) return;
-    const inner = data[frame_header..]; // version+tag+payload
-
-    const key = if (cm.encryption != null and cm.encryption.?.enabled) &cm.encryption.?.worker_key else null;
-    cm.sendFrame(cm.workers[worker_idx].fd, key, inner) catch {
-        cm.workers[worker_idx].connected = false;
-    };
+    cm.sendReplicaWorkerFrame(worker_idx, data);
 }
 
 /// Parse peer list format "1@127.0.0.1:9102,2@127.0.0.1:9202" and connect.

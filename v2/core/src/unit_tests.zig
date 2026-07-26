@@ -7,11 +7,14 @@ comptime {
     _ = @import("state_machine.zig");
     _ = @import("scheduler.zig");
     _ = @import("replica.zig");
+    _ = @import("view_change_candidate.zig");
     _ = @import("disk.zig");
     _ = @import("vopr/simulated_net.zig");
     _ = @import("vopr/simulated_io.zig");
     _ = @import("vopr/checker.zig");
     _ = @import("vopr/test_harness.zig");
+    _ = @import("vopr/connection_harness.zig");
+    _ = @import("vopr/trace.zig");
     _ = @import("vopr/vopr.zig");
     _ = @import("request_queue.zig");
     _ = @import("gossip.zig");
@@ -20,8 +23,4 @@ comptime {
     _ = @import("encryption.zig");
     _ = @import("connection.zig");
     _ = @import("latency.zig");
-}
-
-comptime {
-    _ = @import("view_change_candidate.zig");
 }

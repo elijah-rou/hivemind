@@ -8,30 +8,65 @@ const enc = @import("encryption.zig");
 const latency = @import("latency.zig");
 
 const MAX_WORKERS: usize = replica_mod.MAX_WORKERS;
+comptime {
+    std.debug.assert(MAX_WORKERS == rq.MAX_WORKERS);
+}
 const MAX_CLIENTS: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Worker frame payload is bounded at 16 KiB; run metadata consumes 9 bytes.
+pub const MAX_RUN_RESPONSE_BODY: usize = 16 * 1024 - 9;
+const RunStatus = rq.RunStatus;
 const MAX_PEER_CONNECTIONS: usize = @as(usize, msg.REPLICA_COUNT_MAX) * 2;
+const PEER_CONNECT_TIMEOUT_TICKS: u64 = 2_000;
+const PEER_IDENTITY_TIMEOUT_TICKS: u64 = 2_000;
+const PEER_RETRY_INTERVAL_TICKS: u64 = 2_000;
 
 // Wire protocol version. Included in every client and agent frame.
 // Frame format: [4B LE len][2B LE version][1B tag][payload...]
 // len = 2 (version) + 1 (tag) + payload_len
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const FRAME_HEADER: usize = 4 + 2 + 1; // len + version + tag
 
 const libc = struct {
     extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
     extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn pipe(pipe_fds: *[2]c_int) c_int;
+};
+
+const FcntlOps = struct {
+    get_flags: *const fn (c_int) c_int,
+    set_flags: *const fn (c_int, c_int) c_int,
+
+    fn systemGetFlags(fd: c_int) c_int {
+        return std.c.fcntl(fd, std.posix.F.GETFL);
+    }
+
+    fn systemSetFlags(fd: c_int, flags: c_int) c_int {
+        return std.c.fcntl(fd, std.posix.F.SETFL, flags);
+    }
+
+    const system = FcntlOps{
+        .get_flags = systemGetFlags,
+        .set_flags = systemSetFlags,
+    };
 };
 
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
 
+const PeerDirection = enum { inbound, outbound };
+
 const Conn = struct {
     fd: c_int = -1,
     frame_buf: [MAX_FRAME_BYTES]u8 = undefined,
     frame_pos: usize = 0,
     connected: bool = false,
+    peer_direction: PeerDirection = .inbound,
+    connect_pending: bool = false,
+    peer_deadline_tick: u64 = 0,
+    configured_peer_id: u8 = 0,
+    configured_peer_id_known: bool = false,
 
     // For workers: the agent index in the replica's agent table
     worker_idx: usize = 0,
@@ -85,6 +120,7 @@ pub const ConnectionManager = struct {
 
     // Frame encryption (optional, PSK-based)
     encryption: ?*enc.EncryptionState,
+    fcntl_ops: FcntlOps,
 
     pub fn init(replica: *replica_mod.Replica, worker_port: u16, client_port: u16, peer_port: u16) !ConnectionManager {
         const agent_fd = try listenOn(worker_port);
@@ -115,6 +151,8 @@ pub const ConnectionManager = struct {
             .peer_target_count = 0,
             .last_retry_tick = 0,
             .poll_count = 0,
+            .encryption = null,
+            .fcntl_ops = FcntlOps.system,
         };
     }
 
@@ -149,40 +187,111 @@ pub const ConnectionManager = struct {
         self.poll_count = 0;
         self.state_response_buf = std.mem.zeroes([131072]u8);
         self.encryption = null;
+        self.fcntl_ops = FcntlOps.system;
     }
 
     pub fn deinit(self: *ConnectionManager) void {
-        for (&self.workers) |*c| {
-            if (c.connected) {
-                self.replica.onWorkerDisconnect(c.worker_idx);
-                _ = libc.close(c.fd);
-                c.fd = -1;
-                c.connected = false;
-            }
-        }
-        for (&self.clients) |*c| {
-            if (c.connected) {
-                _ = libc.close(c.fd);
-                c.connected = false;
-            }
-        }
-        for (&self.peers) |*c| {
-            if (c.connected) {
-                _ = libc.close(c.fd);
-                c.connected = false;
-            }
-        }
+        for (&self.workers) |*worker| self.disconnectWorker(worker);
+        for (&self.clients) |*client| self.disconnectClient(client);
+        for (&self.peers) |*peer| disconnectPeer(peer);
         _ = libc.close(self.worker_listen_fd);
         _ = libc.close(self.client_listen_fd);
         if (self.peer_listen_fd >= 0) _ = libc.close(self.peer_listen_fd);
     }
 
+    /// Initialize without listeners for deterministic socketpair tests.
+    pub fn initForTesting(self: *ConnectionManager, replica: *replica_mod.Replica) void {
+        initTestConnectionManager(self, replica);
+    }
+
+    pub fn deinitForTesting(self: *ConnectionManager) void {
+        for (&self.workers) |*worker| self.disconnectWorker(worker);
+        for (&self.clients) |*client| self.disconnectClient(client);
+        for (&self.peers) |*peer| disconnectPeer(peer);
+    }
+
+    pub fn attachClientForTesting(self: *ConnectionManager, fd: c_int, client_id: u128) !usize {
+        std.debug.assert(fd >= 0);
+        try setNonBlocking(fd);
+        for (0..self.client_count) |index| {
+            if (self.clients[index].connected or self.clients[index].fd >= 0) continue;
+            self.clients[index] = .{ .fd = fd, .connected = true, .client_id = client_id };
+            return index;
+        }
+        if (self.client_count >= MAX_CLIENTS) return error.NoClientSlots;
+        const index = self.client_count;
+        self.client_count += 1;
+        self.clients[index] = .{ .fd = fd, .connected = true, .client_id = client_id };
+        return index;
+    }
+
+    pub fn attachWorkerForTesting(self: *ConnectionManager, fd: c_int) !usize {
+        std.debug.assert(fd >= 0);
+        try setNonBlocking(fd);
+        for (0..self.worker_count) |index| {
+            if (self.workers[index].connected or self.workers[index].fd >= 0) continue;
+            self.workers[index] = .{ .fd = fd, .connected = true, .worker_idx = index };
+            return index;
+        }
+        if (self.worker_count >= MAX_WORKERS) return error.NoWorkerSlots;
+        const index = self.worker_count;
+        self.worker_count += 1;
+        self.workers[index] = .{ .fd = fd, .connected = true, .worker_idx = index };
+        return index;
+    }
+
+    pub fn readClientsForTesting(self: *ConnectionManager) void {
+        self.readClients();
+    }
+
+    pub fn readWorkersForTesting(self: *ConnectionManager) void {
+        self.readWorkers();
+    }
+
+    pub fn disconnectClientForTesting(self: *ConnectionManager, client_index: usize) void {
+        std.debug.assert(client_index < self.client_count);
+        self.disconnectClient(&self.clients[client_index]);
+    }
+
+    pub fn disconnectWorkerForTesting(self: *ConnectionManager, worker_index: usize) void {
+        std.debug.assert(worker_index < self.worker_count);
+        self.disconnectWorker(&self.workers[worker_index]);
+    }
+
+    pub fn expireAbandonedForTesting(self: *ConnectionManager) void {
+        self.disconnectExpiredAbandonedWorkers();
+    }
+
+    pub fn connectedWorkerCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.workers[0..self.worker_count]) |worker| count += @intFromBool(worker.connected);
+        return count;
+    }
+
+    pub fn connectedClientCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.clients[0..self.client_count]) |client| count += @intFromBool(client.connected);
+        return count;
+    }
+
+    pub fn connectedPeerCount(self: *const ConnectionManager) usize {
+        var count: usize = 0;
+        for (self.peers[0..self.peer_count]) |peer| count += @intFromBool(peer.connected);
+        return count;
+    }
+
+    pub fn setNonBlockingForTesting(fd: c_int) !void {
+        try setNonBlocking(fd);
+    }
+
     /// Poll all connections: accept new, read messages, dispatch.
     pub fn poll(self: *ConnectionManager) void {
         self.poll_count += 1;
+        self.disconnectExpiredAbandonedWorkers();
         self.acceptWorkers();
         self.acceptClients();
         self.acceptPeers();
+        self.completePeerConnections(self.poll_count);
         self.readWorkers();
         self.readClients();
         self.readPeers();
@@ -191,11 +300,27 @@ pub const ConnectionManager = struct {
 
     // -- Worker connections --
 
+    fn disconnectExpiredAbandonedWorkers(self: *ConnectionManager) void {
+        var expired_workers: [rq.MAX_IN_FLIGHT]usize = undefined;
+        const count = self.request_queue.expiredAbandonedWorkers(self.poll_count, &expired_workers);
+        for (expired_workers[0..count]) |worker_idx| {
+            if (worker_idx < self.worker_count and self.workers[worker_idx].connected) {
+                self.disconnectWorker(&self.workers[worker_idx]);
+            } else {
+                var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
+                _ = self.request_queue.releaseWorker(worker_idx, &released);
+            }
+        }
+    }
+
     fn acceptWorkers(self: *ConnectionManager) void {
         while (true) {
             const fd = std.c.accept(self.worker_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             var slot: ?usize = null;
             for (0..self.worker_count) |i| {
@@ -252,17 +377,21 @@ pub const ConnectionManager = struct {
 
         while (consumed + 5 <= data.len) {
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(worker_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(worker_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break;
-                consumed += frame_consumed;
-                continue;
+                self.disconnectWorker(worker);
+                return;
             };
             consumed += frame_consumed;
 
-            if (frame_payload.len < 3) continue;
+            if (frame_payload.len < 3) {
+                self.disconnectWorker(worker);
+                return;
+            }
             const tag_byte = frame_payload[2]; // version(2) + tag(1)
             const payload = frame_payload[3..];
             self.dispatchWorkerMessage(worker, tag_byte, payload);
+            if (!worker.connected) break;
         }
 
         shiftBuffer(&worker.frame_buf, &worker.frame_pos, consumed);
@@ -271,72 +400,86 @@ pub const ConnectionManager = struct {
     fn dispatchWorkerMessage(self: *ConnectionManager, worker: *Conn, tag_byte: u8, payload: []const u8) void {
         switch (tag_byte) {
             @intFromEnum(msg.WorkerTag.register) => {
-                // Wire size is 138 (packed), not @sizeOf which includes alignment padding
-                if (payload.len < 138) return;
-                var register = msg.WorkerRegisterMsg{};
-                register.hostname = payload[0..64].*;
-                register.cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[64..68]));
-                register.memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[68..72]));
-                register.gpu_type = @enumFromInt(payload[72]);
-                register.gpu_count = payload[73];
-                register.provider = payload[74..106].*;
-                register.region = payload[106..138].*;
+                const register = parseWorkerRegister(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerRegister(worker.worker_idx, register);
             },
             @intFromEnum(msg.WorkerTag.heartbeat) => {
-                if (payload.len < 23) return;
-                var heartbeat = msg.WorkerHeartbeatMsg{};
-                heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-                heartbeat.cpu_usage_pct = payload[8];
-                heartbeat.memory_used_mb = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[9..13]));
-                heartbeat.gpu_utilization = payload[13..21].*;
-                heartbeat.pods_running = std.mem.littleToNative(u16, std.mem.bytesToValue(u16, payload[21..23]));
+                const heartbeat = parseWorkerHeartbeat(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerHeartbeat(worker.worker_idx, heartbeat);
             },
             @intFromEnum(msg.WorkerTag.pod_status) => {
-                if (payload.len < 150) return;
-                var status = msg.WorkerPodStatusMsg{};
-                status.pod_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-                status.old_phase = @enumFromInt(payload[8]);
-                status.new_phase = @enumFromInt(payload[9]);
-                status.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[10..18]));
-                status.exit_code = std.mem.littleToNative(i32, std.mem.bytesToValue(i32, payload[18..22]));
-                status.message = payload[22..150].*;
+                const status = parseWorkerPodStatus(payload) orelse {
+                    self.disconnectWorker(worker);
+                    return;
+                };
                 self.replica.onWorkerPodStatus(worker.worker_idx, status);
             },
             @intFromEnum(msg.WorkerTag.run_response) => {
-                self.handleRunResponse(payload);
+                self.handleRunResponse(worker, payload);
             },
             else => {},
         }
     }
 
-    fn handleRunResponse(self: *ConnectionManager, payload: []const u8) void {
-        // Payload: request_id(u64) + status(u8) + response data
-        if (payload.len < 9) return;
-        const request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
-        const status = payload[8];
-        const response_data = payload[9..];
+    fn handleRunResponse(self: *ConnectionManager, worker: *Conn, payload: []const u8) void {
+        std.debug.assert(worker.worker_idx < self.worker_count);
+        std.debug.assert(worker.connected);
 
-        const client_id = self.request_queue.resolveResponse(request_id) orelse return;
+        // Payload: request_id(u64) + status(u8) + response data. Any malformed,
+        // unknown, or foreign correlation is a worker protocol failure. Closing
+        // only the sender deterministically releases all correlations it owns.
+        if (payload.len < 9) {
+            self.disconnectWorker(worker);
+            return;
+        }
+        const worker_request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        const status = msg.enumFromIntChecked(RunStatus, payload[8]) catch {
+            self.disconnectWorker(worker);
+            return;
+        };
+        // not_leader is emitted only by core before enqueue; a worker claiming
+        // it is faulty and must never induce a client retry.
+        if (status == .not_leader) {
+            self.disconnectWorker(worker);
+            return;
+        }
+        const response_data = payload[9..];
+        if (response_data.len > MAX_RUN_RESPONSE_BODY) {
+            self.disconnectWorker(worker);
+            return;
+        }
+
+        const resolved = switch (self.request_queue.classifyResponseForWorker(worker_request_id, worker.worker_idx)) {
+            .deliver => |request| request,
+            .abandoned => return,
+            .foreign, .unknown => {
+                self.disconnectWorker(worker);
+                return;
+            },
+        };
 
         for (self.clients[0..self.client_count]) |*client| {
-            if (!client.connected or client.client_id != client_id) continue;
+            if (!client.connected or client.client_id != resolved.client_id) continue;
 
             // Build inner payload: [version(2)][tag(1)][request_id(8)][status(1)][len(4)][data...]
-            var inner: [8192]u8 = undefined;
+            var inner: [3 + 8 + 1 + 4 + MAX_RUN_RESPONSE_BODY]u8 = undefined;
             @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
             inner[2] = 0x23; // ClientTag.run_response
             var pos: usize = 3;
-            @memcpy(inner[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+            @memcpy(inner[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, resolved.client_request_id)));
             pos += 8;
-            inner[pos] = status;
+            inner[pos] = @intFromEnum(status);
             pos += 1;
-            const copy_len = @min(response_data.len, inner.len - pos - 4);
-            @memcpy(inner[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(copy_len)))));
+            @memcpy(inner[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(response_data.len)))));
             pos += 4;
-            @memcpy(inner[pos..][0..copy_len], response_data[0..copy_len]);
-            pos += copy_len;
+            @memcpy(inner[pos..][0..response_data.len], response_data);
+            pos += response_data.len;
 
             const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
             self.sendFrame(client.fd, key, inner[0..pos]) catch {
@@ -348,38 +491,50 @@ pub const ConnectionManager = struct {
 
     fn handleRunRequest(self: *ConnectionManager, client: *Conn, payload: []const u8) void {
         // Payload: request_id(u64) + deployment_name(64 bytes) + payload_len(u32) + payload_data
+        // Contract: declared length must exactly match trailing body bytes (no clamp/truncation),
+        // and body must be <= rq.MAX_PAYLOAD. Overflow-safe via body.len comparison.
         if (payload.len < 76) return;
 
         const now = @import("vopr/simulated_io.zig").nowTick(self.replica.io);
         const request_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
         const dep_name = msg.fixedToSlice(payload[8..72]);
-        const payload_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[72..76]));
-        const req_payload = payload[76..@min(76 + payload_len, payload.len)];
+        const declared_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[72..76]));
+        const body = payload[76..];
+        if (declared_len > rq.MAX_PAYLOAD or body.len != @as(usize, declared_len)) {
+            self.sendRunError(client, request_id, .invalid_payload);
+            return;
+        }
+        if (!self.acceptsWorkerTraffic()) {
+            self.sendRunError(client, request_id, .not_leader);
+            return;
+        }
+        const req_payload = body;
         latency.record(.{ .phase = "core_run_request_receive", .op = "run_request", .name = dep_name, .start_ms = now, .end_ms = now, .source = "core/src/connection.zig" });
 
         // Look up deployment by name
         const dep = self.replica.state_machine.findDeploymentByName(dep_name) orelse {
             // Deployment not found -- send error response
-            self.sendRunError(client, request_id, 1);
+            self.sendRunError(client, request_id, .deployment_not_found);
             return;
         };
 
         // Enqueue for dispatch
         if (!self.request_queue.enqueue(dep.id, request_id, client.client_id, req_payload)) {
-            self.sendRunError(client, request_id, 2); // queue full
+            self.sendRunError(client, request_id, .queue_full);
         }
     }
 
-    fn sendRunError(self: *ConnectionManager, client: *Conn, request_id: u64, status: u8) void {
-        _ = self;
-        var frame: [32]u8 = undefined;
-        const payload_size: u32 = 9; // request_id(8) + status(1)
-        @memcpy(frame[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, 2 + 1 + payload_size))); // version + tag + payload
-        @memcpy(frame[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
-        frame[6] = 0x23; // ClientTag.run_response
-        @memcpy(frame[FRAME_HEADER..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
-        frame[FRAME_HEADER + 8] = status;
-        writeAll(client.fd, frame[0 .. FRAME_HEADER + 9]) catch {};
+    fn sendRunError(self: *ConnectionManager, client: *Conn, request_id: u64, status: RunStatus) void {
+        // Same framing as successful run replies: flags byte via sendFrame.
+        var inner: [12]u8 = undefined;
+        @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
+        inner[2] = 0x23; // ClientTag.run_response
+        @memcpy(inner[3..11], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+        inner[11] = @intFromEnum(status);
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
+        self.sendFrame(client.fd, key, inner[0..12]) catch {
+            self.disconnectClient(client);
+        };
     }
 
     /// Dispatch queued run requests to agents. Called every tick from main.
@@ -425,6 +580,10 @@ pub const ConnectionManager = struct {
 
             var batch: usize = 0;
             while (batch < 16) : (batch += 1) {
+                // Never dequeue work unless a connected worker can accept it and
+                // the correlation table can track the accepted dispatch.
+                if (self.request_queue.activeInFlightCount() >= rq.MAX_IN_FLIGHT) break;
+                const worker_idx = self.selectConnectedWorker(qi, backends_buf[0..backend_count]) orelse break;
                 const req_opt = self.request_queue.queues[qi].dequeue();
                 const req = req_opt orelse break;
 
@@ -435,14 +594,8 @@ pub const ConnectionManager = struct {
                     dep_mut.last_request_tick = now;
                 }
 
-                // Round-robin backend
-                const idx = self.request_queue.dispatch_idx[qi] % backend_count;
-                self.request_queue.dispatch_idx[qi] += 1;
-
-                const worker_idx = self.replica.findWorkerForNode(backends_buf[idx].node_id) orelse continue;
-
-                // Track for response routing
-                self.request_queue.trackInFlight(req.request_id, req.client_id);
+                // Translate the client-supplied ID to a gateway-unique worker correlation.
+                const worker_request_id = self.request_queue.trackInFlightForWorker(req.request_id, req.client_id, worker_idx) orelse unreachable;
 
                 const dispatch_now = @import("vopr/simulated_io.zig").nowTick(self.replica.io);
                 latency.record(.{ .phase = "dispatch_send", .op = "run_request", .deployment_id = req.deployment_id, .start_ms = dispatch_now, .end_ms = dispatch_now, .source = "core/src/connection.zig" });
@@ -451,7 +604,7 @@ pub const ConnectionManager = struct {
                 // Payload: request_id(u64) + deployment_id(u64) + payload_len(u32) + payload
                 var agent_payload: [rq.MAX_PAYLOAD + 20]u8 = undefined;
                 var pos: usize = 0;
-                @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, req.request_id)));
+                @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, worker_request_id)));
                 pos += 8;
                 @memcpy(agent_payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, req.deployment_id)));
                 pos += 8;
@@ -460,16 +613,50 @@ pub const ConnectionManager = struct {
                 @memcpy(agent_payload[pos..][0..req.payload_len], req.payload[0..req.payload_len]);
                 pos += req.payload_len;
 
-                self.sendToWorker(worker_idx, .run_request, agent_payload[0..pos]);
+                self.sendToWorker(worker_idx, .run_request, agent_payload[0..pos]) catch {
+                    // The write outcome is known failed. Do not requeue because a
+                    // partial write could have been accepted by the worker.
+                    self.disconnectWorker(&self.workers[worker_idx]);
+                };
             }
         }
     }
 
-    /// Send a framed message to a connected worker.
-    pub fn sendToWorker(self: *ConnectionManager, worker_idx: usize, tag: msg.WorkerTag, payload: []const u8) void {
+    fn selectConnectedWorker(self: *ConnectionManager, queue_idx: usize, backends: []const sm_mod.Backend) ?usize {
+        std.debug.assert(queue_idx < self.request_queue.queue_count);
+        if (backends.len == 0) return null;
+        const start = self.request_queue.dispatch_idx[queue_idx] % backends.len;
+        for (0..backends.len) |offset| {
+            const backend_idx = (start + offset) % backends.len;
+            const worker_idx = self.replica.findWorkerForNode(backends[backend_idx].node_id) orelse continue;
+            if (worker_idx >= self.worker_count) continue;
+            if (!self.workers[worker_idx].connected) continue;
+            if (self.request_queue.workerHasInFlight(worker_idx)) continue;
+            self.request_queue.dispatch_idx[queue_idx] = backend_idx + 1;
+            return worker_idx;
+        }
+        return null;
+    }
+
+    /// Send a replica-owned StartPod/StopPod frame. The callback retains no
+    /// connection ownership; a failed synchronous write disconnects exactly once.
+    pub fn sendReplicaWorkerFrame(self: *ConnectionManager, worker_idx: usize, data: []const u8) void {
         if (worker_idx >= self.worker_count) return;
         const worker = &self.workers[worker_idx];
         if (!worker.connected) return;
+
+        const frame_header: usize = 4;
+        if (data.len <= frame_header) return;
+        const inner = data[frame_header..];
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.worker_key else null;
+        self.sendFrame(worker.fd, key, inner) catch self.disconnectWorker(worker);
+    }
+
+    /// Send a framed message to a connected worker with explicit outcome.
+    pub fn sendToWorker(self: *ConnectionManager, worker_idx: usize, tag: msg.WorkerTag, payload: []const u8) !void {
+        if (worker_idx >= self.worker_count) return error.WorkerUnavailable;
+        const worker = &self.workers[worker_idx];
+        if (!worker.connected) return error.WorkerUnavailable;
 
         // Build inner payload: [version(2)][tag(1)][payload...]
         var inner: [8192]u8 = undefined;
@@ -479,21 +666,33 @@ pub const ConnectionManager = struct {
         const inner_len = 3 + payload.len;
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.worker_key else null;
-        self.sendFrame(worker.fd, key, inner[0..inner_len]) catch {
-            std.debug.print(
-                "hivemind conn: sendToWorker failed worker_idx={d} tag={s}\n",
-                .{ worker_idx, @tagName(tag) },
-            );
-            self.disconnectWorker(worker);
-        };
+        try self.sendFrame(worker.fd, key, inner[0..inner_len]);
     }
 
     fn disconnectWorker(self: *ConnectionManager, worker: *Conn) void {
-        _ = libc.close(worker.fd);
+        if (!worker.connected) return;
+        const worker_idx = worker.worker_idx;
+        std.debug.assert(worker_idx < self.worker_count);
+        const fd = worker.fd;
         worker.fd = -1;
         worker.connected = false;
         worker.frame_pos = 0;
-        self.replica.onWorkerDisconnect(worker.worker_idx);
+        if (fd >= 0) _ = libc.close(fd);
+        self.replica.onWorkerDisconnect(worker_idx);
+
+        var released: [rq.MAX_IN_FLIGHT]rq.ResolvedRequest = undefined;
+        const released_count = self.request_queue.releaseWorker(worker_idx, &released);
+        for (released[0..released_count]) |request| {
+            self.sendRunErrorToClientId(request.client_id, request.client_request_id, .outcome_ambiguous);
+        }
+    }
+
+    fn sendRunErrorToClientId(self: *ConnectionManager, client_id: u128, request_id: u64, status: RunStatus) void {
+        for (self.clients[0..self.client_count]) |*client| {
+            if (!client.connected or client.client_id != client_id) continue;
+            self.sendRunError(client, request_id, status);
+            return;
+        }
     }
 
     // -- Client connections --
@@ -502,7 +701,10 @@ pub const ConnectionManager = struct {
         while (true) {
             const fd = std.c.accept(self.client_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             var slot: ?usize = null;
             for (0..self.client_count) |i| {
@@ -551,7 +753,7 @@ pub const ConnectionManager = struct {
 
         while (consumed + 5 <= data.len) { // min: len(4) + flags(1)
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(client_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(client_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break; // incomplete
                 consumed += frame_consumed; // skip bad frame
                 continue;
@@ -569,6 +771,8 @@ pub const ConnectionManager = struct {
                 self.handleRunRequest(client, payload);
             } else if (tag_byte == 0x24) { // ClientTag.cluster_state_request (read-only)
                 self.handleClusterStateRequest(client);
+            } else if (tag_byte == 0x26) { // ClientTag.leader_probe_request (fixed-size)
+                if (payload.len == msg.LEADER_PROBE_REQUEST_BYTES) self.handleLeaderProbe(client);
             }
         }
 
@@ -636,7 +840,7 @@ pub const ConnectionManager = struct {
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
         self.sendFrame(client.fd, key, payload[0..pos]) catch {
-            client.connected = false;
+            self.disconnectClient(client);
         };
     }
 
@@ -652,8 +856,24 @@ pub const ConnectionManager = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Cluster state query (read-only, no consensus)
+    // Read-only client queries
     // -----------------------------------------------------------------------
+
+    fn handleLeaderProbe(self: *ConnectionManager, client: *Conn) void {
+        const response = (msg.LeaderProbeResponse{
+            .status = self.replica.status,
+            .is_leader = self.replica.isLeader() and self.replica.status == .normal,
+            .replica_id = self.replica.replica_id,
+            .leader_id = self.replica.leader(),
+            .view_number = self.replica.view_number,
+        }).encode();
+        var inner: [3 + msg.LEADER_PROBE_RESPONSE_BYTES]u8 = undefined;
+        @memcpy(inner[0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, PROTOCOL_VERSION)));
+        inner[2] = @intFromEnum(msg.ClientTag.leader_probe_response);
+        @memcpy(inner[3..], &response);
+        const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
+        self.sendFrame(client.fd, key, &inner) catch self.disconnectClient(client);
+    }
 
     fn handleClusterStateRequest(self: *ConnectionManager, client: *Conn) void {
         var buf = &self.state_response_buf;
@@ -771,7 +991,7 @@ pub const ConnectionManager = struct {
 
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.client_key else null;
         self.sendFrame(client.fd, key, inner[0 .. 3 + pos]) catch {
-            client.connected = false;
+            self.disconnectClient(client);
         };
     }
 
@@ -829,44 +1049,66 @@ pub const ConnectionManager = struct {
         }
     }
 
-    /// Decode a frame from buffer, decrypting if flags indicate encryption.
-    /// Returns the plaintext payload slice within the provided decrypt_buf,
-    /// or the original payload slice from data if plaintext.
-    /// Returns null if frame is incomplete or decryption fails.
-    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8) ?[]const u8 {
-        if (data.len < 5) return null; // need at least len(4) + flags(1)
+    /// Decode one bounded frame. Client/worker payloads are versioned; peer payloads are not.
+    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
+        if (data.len < 5) return null;
 
         const frame_len = std.mem.readInt(u32, data[0..4], .little);
-        const total = 4 + @as(usize, frame_len);
-        if (data.len < total) return null; // incomplete frame
-
-        if (frame_len < 1) {
-            consumed.* = total;
+        if (frame_len > MAX_FRAME_BYTES - 4) {
+            consumed.* = data.len;
             return null;
-        } // too short
+        }
 
         const flags = data[4];
+        if (flags != 0x00 and flags != 0x01) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+        const key_configured = self.encryption != null and self.encryption.?.enabled;
+        if ((flags == 0x01) != key_configured) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+        if (flags == 0x01 and key == null) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+
+        const inner_min: usize = if (versioned) 3 else 1;
+        const payload_min = if (flags == 0x01) enc.NONCE_LEN + enc.TAG_LEN + inner_min else inner_min;
+        if (frame_len < 1 + payload_min) {
+            consumed.* = @min(data.len, 4 + @as(usize, frame_len));
+            return null;
+        }
+
+        const total = 4 + @as(usize, frame_len);
+        if (data.len < total) return null;
         consumed.* = total;
 
-        if (flags & 0x01 != 0) {
-            // Encrypted
-            if (key == null or self.encryption == null or !self.encryption.?.enabled) return null;
+        const plaintext = if (flags == 0x01) blk: {
             const encrypted_data = data[5..total];
-            const aad = data[0..5]; // len + flags
-            const pt_len = enc.decryptFrame(key.?, encrypted_data, aad, decrypt_buf) catch return null;
-            return decrypt_buf[0..pt_len];
-        } else {
-            // Plaintext: payload starts after flags byte
-            return data[5..total];
+            const pt_len = enc.decryptFrame(key.?, encrypted_data, data[0..5], decrypt_buf) catch return null;
+            if (pt_len < inner_min) return null;
+            break :blk decrypt_buf[0..pt_len];
+        } else data[5..total];
+
+        if (versioned) {
+            if (plaintext.len < 3) return null;
+            const version = std.mem.readInt(u16, plaintext[0..2], .little);
+            if (version != PROTOCOL_VERSION) return null;
         }
+        return plaintext;
     }
 
     fn disconnectClient(self: *ConnectionManager, client: *Conn) void {
-        self.request_queue.cancelClient(client.client_id);
-        _ = libc.close(client.fd);
+        if (!client.connected) return;
+        const client_id = client.client_id;
+        const fd = client.fd;
         client.fd = -1;
         client.connected = false;
         client.frame_pos = 0;
+        self.request_queue.cancelClient(client_id, self.poll_count);
+        if (fd >= 0) _ = libc.close(fd);
     }
 
     // -- Peer connections (VRR inter-replica TCP) --
@@ -876,7 +1118,10 @@ pub const ConnectionManager = struct {
         while (true) {
             const fd = std.c.accept(self.peer_listen_fd, null, null);
             if (fd < 0) return;
-            setNonBlocking(fd);
+            setNonBlockingWith(fd, self.fcntl_ops) catch {
+                _ = libc.close(fd);
+                continue;
+            };
 
             const slot = self.acquirePeerSlot() orelse {
                 _ = libc.close(fd);
@@ -888,6 +1133,7 @@ pub const ConnectionManager = struct {
                 .frame_pos = 0,
                 .connected = true,
                 .peer_id_known = false,
+                .peer_deadline_tick = self.poll_count +| PEER_IDENTITY_TIMEOUT_TICKS,
             };
         }
     }
@@ -895,7 +1141,7 @@ pub const ConnectionManager = struct {
     fn readPeers(self: *ConnectionManager) void {
         for (0..self.peer_count) |peer_idx| {
             const peer = &self.peers[peer_idx];
-            if (!peer.connected) continue;
+            if (!peer.connected or peer.connect_pending) continue;
             readConn(peer) catch {
                 disconnectPeer(peer);
                 continue;
@@ -916,7 +1162,7 @@ pub const ConnectionManager = struct {
         // Frame format (encrypted): [4B len][1B flags=0x01][24B nonce][encrypted(from_id + VRR)][16B tag]
         while (consumed + 5 <= data.len) {
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf) orelse {
+            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf, false) orelse {
                 if (frame_consumed == 0) break;
                 consumed += frame_consumed;
                 continue;
@@ -925,15 +1171,33 @@ pub const ConnectionManager = struct {
 
             if (frame_payload.len < 2) continue;
             const from_id = frame_payload[0];
+            if (from_id >= self.replica.replica_count) continue;
             const vrr_data = frame_payload[1..];
-            if (!self.identifyPeerConnection(peer_idx, from_id)) continue;
 
-            if (msg.deserialize(vrr_data)) |message| {
-                self.replica.onMessage(from_id, message);
-            } else |_| {}
+            // Deserialize and identity-check before any peer bind/replace so a
+            // malformed spoof frame cannot evict a healthy bound socket.
+            const message = msg.deserialize(vrr_data) catch continue;
+            if (!peerFrameIdentityValid(from_id, message)) continue;
+            if (!replica_mod.peerMessageSemanticsValid(message)) continue;
+            if (!self.identifyPeerConnection(peer_idx, from_id)) {
+                if (!peer.connected) break;
+                continue;
+            }
+
+            self.replica.onMessage(from_id, message);
         }
 
         shiftBuffer(&peer.frame_buf, &peer.frame_pos, consumed);
+    }
+
+    /// Messages that carry replica_id must agree with the frame from_id before bind.
+    fn peerFrameIdentityValid(from_id: u8, message: msg.Message) bool {
+        return switch (message) {
+            .prepare_ok => |m| m.replica_id == from_id,
+            .start_view_change => |m| m.replica_id == from_id,
+            .do_view_change => |m| m.replica_id == from_id,
+            else => true,
+        };
     }
 
     /// Send a framed VRR message to a peer. `data` is pre-framed:
@@ -947,8 +1211,13 @@ pub const ConnectionManager = struct {
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.peer_key else null;
 
         for (self.peers[0..self.peer_count]) |*peer| {
-            if (!peer.connected) continue;
-            if (peer.peer_id_known and peer.worker_idx == to) {
+            if (!peer.connected or peer.connect_pending) continue;
+            const validated_match = peer.peer_id_known and peer.worker_idx == to;
+            const configured_match = !peer.peer_id_known and
+                peer.peer_direction == .outbound and
+                peer.configured_peer_id_known and
+                peer.configured_peer_id == to;
+            if (validated_match or configured_match) {
                 self.sendFrame(peer.fd, key, inner) catch {
                     disconnectPeer(peer);
                 };
@@ -962,10 +1231,16 @@ pub const ConnectionManager = struct {
     pub fn connectToPeer(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
         if (peer_id == self.replica_id) return;
 
-        // Record target for retry
+        // Retain configured membership for observability/validation, but only
+        // the lower replica ID initiates. The higher side accepts inbound.
         self.recordPeerTarget(peer_id, host, port);
+        if (!self.shouldInitiatePeerConnection(peer_id)) return;
 
         self.connectToPeerInner(peer_id, host, port);
+    }
+
+    fn shouldInitiatePeerConnection(self: *const ConnectionManager, peer_id: u8) bool {
+        return self.replica_id < peer_id;
     }
 
     fn recordPeerTarget(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
@@ -987,7 +1262,7 @@ pub const ConnectionManager = struct {
         }
     }
 
-    fn hasPeerConnection(self: *ConnectionManager, peer_id: u8) bool {
+    fn hasPeerConnection(self: *const ConnectionManager, peer_id: u8) bool {
         for (self.peers[0..self.peer_count]) |*peer| {
             if (peer.connected and peer.peer_id_known and peer.worker_idx == peer_id) return true;
         }
@@ -1000,22 +1275,33 @@ pub const ConnectionManager = struct {
         const peer = &self.peers[peer_idx];
         if (!peer.connected) return false;
 
-        if (peer.peer_id_known and peer.worker_idx == from_id) return true;
+        // Bound socket identity is immutable: reject spoof/rebind attempts.
+        if (peer.peer_id_known) return peer.worker_idx == from_id;
+        if (peer.configured_peer_id_known and peer.configured_peer_id != from_id) {
+            disconnectPeer(peer);
+            return false;
+        }
+
+        const preferred_direction: PeerDirection = if (self.replica_id < from_id) .outbound else .inbound;
+        if (peer.peer_direction != preferred_direction) {
+            disconnectPeer(peer);
+            return false;
+        }
 
         for (0..self.peer_count) |other_idx| {
             if (other_idx == peer_idx) continue;
             const other = &self.peers[other_idx];
-            if (!other.connected) continue;
-            if (!other.peer_id_known) continue;
+            if (!other.connected or !other.peer_id_known) continue;
             if (other.worker_idx != from_id) continue;
 
-            // The connection that just delivered a frame is provably live.
-            // Drop the older duplicate so routing converges on one socket.
-            disconnectPeer(other);
+            // A validated binding is never evicted by a later candidate.
+            disconnectPeer(peer);
+            return false;
         }
 
         peer.worker_idx = from_id;
         peer.peer_id_known = true;
+        peer.peer_deadline_tick = 0;
         return true;
     }
 
@@ -1023,36 +1309,84 @@ pub const ConnectionManager = struct {
     pub fn retryPeerConnections(self: *ConnectionManager, now_tick: u64) void {
         if (self.peer_target_count == 0) return;
 
-        // Retry every 2 seconds
-        if (now_tick > 0 and now_tick - self.last_retry_tick < 2000) return;
+        self.completePeerConnections(now_tick);
+
+        if (now_tick > 0 and now_tick - self.last_retry_tick < PEER_RETRY_INTERVAL_TICKS) return;
         self.last_retry_tick = now_tick;
 
         for (self.peer_targets[0..self.peer_target_count]) |target| {
-            if (!self.hasPeerConnection(target.peer_id)) {
+            if (self.peerNeedsRetry(target.peer_id)) {
                 self.connectToPeerInner(target.peer_id, target.host, target.port);
             }
+        }
+    }
+
+    fn hasPeerCandidate(self: *const ConnectionManager, peer_id: u8) bool {
+        for (self.peers[0..self.peer_count]) |peer| {
+            if (!peer.connected or peer.peer_id_known) continue;
+            if (peer.configured_peer_id_known and peer.configured_peer_id == peer_id) return true;
+        }
+        return false;
+    }
+
+    fn peerNeedsRetry(self: *const ConnectionManager, peer_id: u8) bool {
+        return self.shouldInitiatePeerConnection(peer_id) and
+            !self.hasPeerConnection(peer_id) and
+            !self.hasPeerCandidate(peer_id);
+    }
+
+    fn completePeerConnections(self: *ConnectionManager, now_tick: u64) void {
+        for (self.peers[0..self.peer_count]) |*peer| {
+            if (!peer.connected or peer.peer_id_known) continue;
+            if (now_tick >= peer.peer_deadline_tick) {
+                disconnectPeer(peer);
+                continue;
+            }
+            if (!peer.connect_pending) continue;
+
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = peer.fd,
+                .events = std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&poll_fds, 0) catch {
+                disconnectPeer(peer);
+                continue;
+            };
+            if (ready == 0) continue;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.posix.socklen_t = @sizeOf(c_int);
+            if (std.c.getsockopt(peer.fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&socket_error), &socket_error_len) != 0 or socket_error != 0) {
+                disconnectPeer(peer);
+                continue;
+            }
+            peer.connect_pending = false;
+            peer.peer_deadline_tick = now_tick +| PEER_IDENTITY_TIMEOUT_TICKS;
+            std.debug.print("hivemind core: peer {d} TCP connected, awaiting identity\n", .{peer.configured_peer_id});
         }
     }
 
     fn connectToPeerInner(self: *ConnectionManager, peer_id: u8, host: u32, port: u16) void {
         const fd = libc.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         if (fd < 0) return;
+        setNonBlockingWith(fd, self.fcntl_ops) catch {
+            _ = libc.close(fd);
+            return;
+        };
 
-        // Blocking connect: completes in <1ms on LAN/localhost.
-        // Non-blocking connect returns EINPROGRESS, causing the first write
-        // to fail and permanently kill the peer connection.
         var addr: std.posix.sockaddr.in = .{
             .port = std.mem.nativeToBig(u16, port),
             .addr = host,
         };
         const rc = std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-        if (rc != 0) {
-            _ = libc.close(fd);
-            return;
-        }
-        std.debug.print("hivemind core: peer {d} connected\n", .{peer_id});
-
-        setNonBlocking(fd);
+        const pending = if (rc == 0) false else switch (std.posix.errno(rc)) {
+            .INPROGRESS => true,
+            else => {
+                _ = libc.close(fd);
+                return;
+            },
+        };
 
         const slot = self.acquirePeerSlot() orelse {
             _ = libc.close(fd);
@@ -1062,9 +1396,16 @@ pub const ConnectionManager = struct {
             .fd = fd,
             .frame_pos = 0,
             .connected = true,
-            .worker_idx = peer_id,
-            .peer_id_known = true,
+            .peer_direction = .outbound,
+            .connect_pending = pending,
+            .peer_deadline_tick = self.poll_count +| PEER_CONNECT_TIMEOUT_TICKS,
+            .configured_peer_id = peer_id,
+            .configured_peer_id_known = true,
+            .peer_id_known = false,
         };
+        if (!pending) {
+            self.peers[slot].peer_deadline_tick = self.poll_count +| PEER_IDENTITY_TIMEOUT_TICKS;
+        }
     }
 
     // -- Helpers --
@@ -1074,7 +1415,7 @@ pub const ConnectionManager = struct {
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = libc.close(fd);
 
-        setNonBlocking(fd);
+        try setNonBlockingWith(fd, FcntlOps.system);
 
         const optval: u32 = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&optval), @sizeOf(u32));
@@ -1089,10 +1430,16 @@ pub const ConnectionManager = struct {
         return fd;
     }
 
-    fn setNonBlocking(fd: c_int) void {
-        const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    fn setNonBlocking(fd: c_int) !void {
+        return setNonBlockingWith(fd, FcntlOps.system);
+    }
+
+    fn setNonBlockingWith(fd: c_int, ops: FcntlOps) !void {
+        std.debug.assert(fd >= 0);
+        const flags = ops.get_flags(fd);
+        if (flags < 0) return error.GetFlagsFailed;
         const O_NONBLOCK: c_int = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
-        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
+        if (ops.set_flags(fd, flags | O_NONBLOCK) != 0) return error.SetFlagsFailed;
     }
 
     fn acquirePeerSlot(self: *ConnectionManager) ?usize {
@@ -1157,22 +1504,63 @@ pub const ConnectionManager = struct {
         }
     }
 
+    fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
+        // Wire size is 138 (packed), not @sizeOf which includes alignment padding
+        if (payload.len != 138) return null;
+        const gpu_type = msg.enumFromIntChecked(msg.GpuType, payload[72]) catch return null;
+        var register = msg.WorkerRegisterMsg{};
+        register.hostname = payload[0..64].*;
+        register.cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[64..68]));
+        register.memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[68..72]));
+        register.gpu_type = gpu_type;
+        register.gpu_count = payload[73];
+        register.provider = payload[74..106].*;
+        register.region = payload[106..138].*;
+        return register;
+    }
+
+    fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
+        if (payload.len != 23) return null;
+        var heartbeat = msg.WorkerHeartbeatMsg{};
+        heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        heartbeat.cpu_usage_pct = payload[8];
+        heartbeat.memory_used_mb = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, payload[9..13]));
+        heartbeat.gpu_utilization = payload[13..21].*;
+        heartbeat.pods_running = std.mem.littleToNative(u16, std.mem.bytesToValue(u16, payload[21..23]));
+        return heartbeat;
+    }
+
+    fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
+        if (payload.len != 150) return null;
+        const old_phase = msg.enumFromIntChecked(msg.PodPhase, payload[8]) catch return null;
+        const new_phase = msg.enumFromIntChecked(msg.PodPhase, payload[9]) catch return null;
+        var status = msg.WorkerPodStatusMsg{};
+        status.pod_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
+        status.old_phase = old_phase;
+        status.new_phase = new_phase;
+        status.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[10..18]));
+        status.exit_code = std.mem.littleToNative(i32, std.mem.bytesToValue(i32, payload[18..22]));
+        status.message = payload[22..150].*;
+        return status;
+    }
+
     fn parseClientCommand(tag: u8, fields: []const u8) ?msg.Command {
-        return switch (tag) {
+        const command: msg.Command = switch (tag) {
             0 => blk: { // register_node
-                if (fields.len < 138) break :blk null;
+                if (fields.len < 138) return null;
+                const gpu_type = msg.enumFromIntChecked(msg.GpuType, fields[72]) catch return null;
                 break :blk .{ .register_node = .{
                     .node_name = fields[0..64].*,
                     .cpu_millicores = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[64..68])),
                     .memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[68..72])),
-                    .gpu_type = @enumFromInt(fields[72]),
+                    .gpu_type = gpu_type,
                     .gpu_count = fields[73],
                     .provider = fields[74..106].*,
                     .region = fields[106..138].*,
                 } };
             },
             3 => blk: { // create_deployment
-                if (fields.len < 398) break :blk null;
+                if (fields.len < 398) return null;
                 var p: usize = 0;
                 var cmd: msg.CreateDeploymentCmd = .{
                     .name = fields[p..][0..64].*,
@@ -1198,7 +1586,7 @@ pub const ConnectionManager = struct {
                     },
                     .gpu_type = blk7: {
                         p += 4;
-                        break :blk7 @enumFromInt(fields[p]);
+                        break :blk7 msg.enumFromIntChecked(msg.GpuType, fields[p]) catch return null;
                     },
                     .gpu_count = blk8: {
                         p += 1;
@@ -1220,14 +1608,14 @@ pub const ConnectionManager = struct {
                 break :blk .{ .create_deployment = cmd };
             },
             6 => blk: { // scale_deployment
-                if (fields.len < 12) break :blk null;
+                if (fields.len < 12) return null;
                 break :blk .{ .scale_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                     .desired_replicas = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[8..12])),
                 } };
             },
             10 => blk: { // update_deployment
-                if (fields.len < 532) break :blk null;
+                if (fields.len < 532) return null;
                 var p: usize = 0;
                 const deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[p..][0..8]));
                 p += 8;
@@ -1241,7 +1629,7 @@ pub const ConnectionManager = struct {
                 p += 4;
                 const memory_megabytes = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, fields[p..][0..4]));
                 p += 4;
-                const gpu_type: msg.GpuType = @enumFromInt(fields[p]);
+                const gpu_type = msg.enumFromIntChecked(msg.GpuType, fields[p]) catch return null;
                 p += 1;
                 const gpu_count = fields[p];
                 break :blk .{ .update_deployment = .{
@@ -1256,7 +1644,7 @@ pub const ConnectionManager = struct {
                 } };
             },
             11 => blk: { // set_traffic_split
-                if (fields.len < 29) break :blk null;
+                if (fields.len < 29) return null;
                 var rules: [4]msg.TrafficRule = [_]msg.TrafficRule{.{}} ** 4;
                 var off: usize = 8;
                 for (0..4) |i| {
@@ -1273,31 +1661,33 @@ pub const ConnectionManager = struct {
                 } };
             },
             12 => blk: { // rollback_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .rollback_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             13 => blk: { // delete_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .delete_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             14 => blk: { // pause_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .pause_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
             15 => blk: { // resume_deployment
-                if (fields.len < 8) break :blk null;
+                if (fields.len < 8) return null;
                 break :blk .{ .resume_deployment = .{
                     .deployment_id = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, fields[0..8])),
                 } };
             },
-            else => null,
+            else => return null,
         };
+        msg.validateCommand(command) catch return null;
+        return command;
     }
 };
 
@@ -1306,6 +1696,10 @@ fn disconnectPeer(peer: *Conn) void {
     peer.fd = -1;
     peer.connected = false;
     peer.frame_pos = 0;
+    peer.connect_pending = false;
+    peer.peer_deadline_tick = 0;
+    peer.configured_peer_id = 0;
+    peer.configured_peer_id_known = false;
     peer.worker_idx = 0;
     peer.peer_id_known = false;
 }
@@ -1371,13 +1765,74 @@ test "parse update deployment client command" {
     }
 }
 
+test "parseClientCommand rejects invalid GpuType on register_node" {
+    var fields: [138]u8 = std.mem.zeroes([138]u8);
+    fields[72] = 0xFF; // invalid GpuType
+    try std.testing.expect(ConnectionManager.parseClientCommand(0, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid GpuType on create_deployment" {
+    var fields: [398]u8 = std.mem.zeroes([398]u8);
+    // gpu_type is at offset 64+64+256+4+4+4 = 396
+    fields[396] = 0xFE;
+    try std.testing.expect(ConnectionManager.parseClientCommand(3, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid GpuType on update_deployment" {
+    var fields: [532]u8 = std.mem.zeroes([532]u8);
+    // gpu_type is at offset 8+256+256+2+4+4 = 530
+    fields[530] = 0xFD;
+    try std.testing.expect(ConnectionManager.parseClientCommand(10, &fields) == null);
+}
+
+test "parseClientCommand rejects invalid traffic rule_count" {
+    var fields: [29]u8 = std.mem.zeroes([29]u8);
+    fields[28] = 5; // > rules.len (4)
+    try std.testing.expect(ConnectionManager.parseClientCommand(11, &fields) == null);
+}
+
+test "parseWorkerRegister rejects invalid GpuType" {
+    var payload: [138]u8 = std.mem.zeroes([138]u8);
+    payload[72] = 0xFF;
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&payload) == null);
+}
+
+test "parseWorkerRegister accepts valid GpuType" {
+    var payload: [138]u8 = std.mem.zeroes([138]u8);
+    payload[72] = @intFromEnum(msg.GpuType.t4);
+    payload[73] = 2;
+    const register = ConnectionManager.parseWorkerRegister(&payload) orelse return error.ExpectedRegister;
+    try std.testing.expectEqual(msg.GpuType.t4, register.gpu_type);
+    try std.testing.expectEqual(@as(u8, 2), register.gpu_count);
+}
+
+test "parseWorkerPodStatus rejects invalid PodPhase" {
+    var payload: [150]u8 = std.mem.zeroes([150]u8);
+    payload[8] = 0xFF; // old_phase
+    payload[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&payload) == null);
+
+    payload[8] = @intFromEnum(msg.PodPhase.pending);
+    payload[9] = 0xFE; // new_phase
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&payload) == null);
+}
+
+test "parseWorkerPodStatus accepts valid PodPhase" {
+    var payload: [150]u8 = std.mem.zeroes([150]u8);
+    payload[8] = @intFromEnum(msg.PodPhase.pending);
+    payload[9] = @intFromEnum(msg.PodPhase.running);
+    const status = ConnectionManager.parseWorkerPodStatus(&payload) orelse return error.ExpectedStatus;
+    try std.testing.expectEqual(msg.PodPhase.pending, status.old_phase);
+    try std.testing.expectEqual(msg.PodPhase.running, status.new_phase);
+}
+
 test "writeAll retries when nonblocking peer writes hit EAGAIN" {
     var fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     const send_buf: c_int = 4096;
     _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&send_buf), @sizeOf(c_int));
@@ -1398,7 +1853,7 @@ test "writeAll returns WouldBlock after bounded EAGAIN retries" {
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     const send_buf: c_int = 4096;
     _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&send_buf), @sizeOf(c_int));
@@ -1416,7 +1871,7 @@ test "readConn ignores EAGAIN on nonblocking sockets" {
     defer _ = libc.close(fds[0]);
     defer _ = libc.close(fds[1]);
 
-    ConnectionManager.setNonBlocking(fds[0]);
+    try ConnectionManager.setNonBlocking(fds[0]);
 
     var conn = Conn{
         .fd = fds[0],
@@ -1474,6 +1929,22 @@ test "hasPeerConnection recognizes identified inbound peers" {
     try std.testing.expect(!cm.hasPeerConnection(3));
 }
 
+test "only lower replica records and initiates configured peer target" {
+    const higher = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(higher);
+    higher.replica_id = 4;
+    higher.peer_targets = [_]PeerTarget{.{}} ** msg.REPLICA_COUNT_MAX;
+    higher.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    higher.peer_target_count = 0;
+    higher.peer_count = 0;
+
+    higher.connectToPeer(2, 0, 9102);
+
+    try std.testing.expectEqual(@as(usize, 1), higher.peer_target_count);
+    try std.testing.expect(!higher.shouldInitiatePeerConnection(2));
+    try std.testing.expectEqual(@as(usize, 0), higher.peer_count);
+}
+
 test "connectToPeer ignores self target" {
     const cm = try std.testing.allocator.create(ConnectionManager);
     defer std.testing.allocator.destroy(cm);
@@ -1487,6 +1958,194 @@ test "connectToPeer ignores self target" {
 
     try std.testing.expectEqual(@as(usize, 0), cm.peer_target_count);
     try std.testing.expectEqual(@as(usize, 0), cm.peer_count);
+}
+
+test "pending peer connect and silent endpoint expire then become retryable" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 0;
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+
+    var black_hole_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &black_hole_fds));
+    defer _ = libc.close(black_hole_fds[1]);
+    cm.peers[0] = .{
+        .fd = black_hole_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .connect_pending = true,
+        .peer_deadline_tick = PEER_CONNECT_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+    try std.testing.expect(!cm.peerNeedsRetry(1));
+    cm.completePeerConnections(PEER_CONNECT_TIMEOUT_TICKS);
+    try std.testing.expect(!cm.peers[0].connected);
+    try std.testing.expect(cm.peerNeedsRetry(1));
+
+    var silent_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &silent_fds));
+    defer _ = libc.close(silent_fds[1]);
+    cm.peers[0] = .{
+        .fd = silent_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+    try std.testing.expect(!cm.hasPeerConnection(1));
+    try std.testing.expect(!cm.peerNeedsRetry(1));
+    cm.completePeerConnections(PEER_IDENTITY_TIMEOUT_TICKS);
+    try std.testing.expect(!cm.peers[0].connected);
+    try std.testing.expect(cm.peerNeedsRetry(1));
+}
+
+test "valid peer handshake separates configured target from validated identity" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 0;
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .fd = fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+        .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        .configured_peer_id = 1,
+        .configured_peer_id_known = true,
+    };
+
+    try std.testing.expect(!cm.hasPeerConnection(1));
+    try std.testing.expect(cm.identifyPeerConnection(0, 1));
+    try std.testing.expect(cm.hasPeerConnection(1));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expectEqual(@as(u64, 0), cm.peers[0].peer_deadline_tick);
+}
+
+fn buildTestProtocolFrame(flags: u8, version: u16, state: ?*const enc.EncryptionState) ![]u8 {
+    var inner = [_]u8{ 0, 0, 0x42 };
+    std.mem.writeInt(u16, inner[0..2], version, .little);
+
+    if (flags == 0x01) {
+        const encryption = state orelse return error.MissingTestKey;
+        const frame_len = 1 + enc.NONCE_LEN + inner.len + enc.TAG_LEN;
+        const frame = try std.testing.allocator.alloc(u8, 4 + frame_len);
+        std.mem.writeInt(u32, frame[0..4], @intCast(frame_len), .little);
+        frame[4] = flags;
+        const encrypted_len = enc.encryptFrame(&encryption.client_key, &inner, frame[0..5], frame[5..]);
+        std.debug.assert(encrypted_len == frame_len - 1);
+        return frame;
+    }
+
+    const frame = try std.testing.allocator.alloc(u8, 5 + inner.len);
+    std.mem.writeInt(u32, frame[0..4], @intCast(1 + inner.len), .little);
+    frame[4] = flags;
+    @memcpy(frame[5..], &inner);
+    return frame;
+}
+
+test "client and worker frame contract table" {
+    var state = try enc.EncryptionState.init("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const Case = struct {
+        name: []const u8,
+        flags: u8,
+        version: u16,
+        encrypted_frame: bool,
+        key_configured: bool,
+        valid: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "unknown flags", .flags = 0x02, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = false, .valid = false },
+        .{ .name = "bad plaintext version", .flags = 0x00, .version = PROTOCOL_VERSION + 1, .encrypted_frame = false, .key_configured = false, .valid = false },
+        .{ .name = "bad encrypted version", .flags = 0x01, .version = PROTOCOL_VERSION + 1, .encrypted_frame = true, .key_configured = true, .valid = false },
+        .{ .name = "plaintext while key configured", .flags = 0x00, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = true, .valid = false },
+        .{ .name = "encrypted without key", .flags = 0x01, .version = PROTOCOL_VERSION, .encrypted_frame = true, .key_configured = false, .valid = false },
+        .{ .name = "valid plaintext minimum", .flags = 0x00, .version = PROTOCOL_VERSION, .encrypted_frame = false, .key_configured = false, .valid = true },
+        .{ .name = "valid encrypted minimum", .flags = 0x01, .version = PROTOCOL_VERSION, .encrypted_frame = true, .key_configured = true, .valid = true },
+    };
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    for (cases) |tc| {
+        const frame = try buildTestProtocolFrame(tc.flags, tc.version, if (tc.encrypted_frame) &state else null);
+        defer std.testing.allocator.free(frame);
+        cm.encryption = if (tc.key_configured) &state else null;
+        const key = if (tc.key_configured) &state.client_key else null;
+        var consumed: usize = 0;
+        const decoded = cm.decodeFrame(key, frame, &consumed, &decrypt_buf, true);
+        try std.testing.expectEqual(tc.valid, decoded != null);
+        try std.testing.expectEqual(frame.len, consumed);
+        if (decoded) |payload| {
+            try std.testing.expectEqual(PROTOCOL_VERSION, std.mem.readInt(u16, payload[0..2], .little));
+            try std.testing.expectEqual(@as(u8, 0x42), payload[2]);
+        } else {
+            _ = tc.name;
+        }
+    }
+}
+
+test "frame contract rejects short and oversize declarations before slicing" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+
+    const cases = [_][]const u8{
+        &[_]u8{ 1, 0, 0, 0, 0x00 },
+        &[_]u8{ 1, 0, 0, 0, 0x01 },
+        &[_]u8{ 0x00, 0x00, 0x01, 0x00, 0x00 },
+    };
+    for (cases) |frame| {
+        var consumed: usize = 0;
+        try std.testing.expect(cm.decodeFrame(null, frame, &consumed, &decrypt_buf, true) == null);
+        try std.testing.expectEqual(frame.len, consumed);
+    }
+}
+
+test "frame decoder accepts exact receive-buffer boundary" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    const frame = try std.testing.allocator.alloc(u8, MAX_FRAME_BYTES);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0x5a);
+    std.mem.writeInt(u32, frame[0..4], MAX_FRAME_BYTES - 4, .little);
+    frame[4] = 0x00;
+    std.mem.writeInt(u16, frame[5..7], PROTOCOL_VERSION, .little);
+    frame[7] = 0x42;
+
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    var consumed: usize = 0;
+    const decoded = cm.decodeFrame(null, frame, &consumed, &decrypt_buf, true) orelse
+        return error.ExpectedBoundaryFrame;
+    try std.testing.expectEqual(MAX_FRAME_BYTES, consumed);
+    try std.testing.expectEqual(MAX_FRAME_BYTES - 8, decoded[3..].len);
+}
+
+test "frame decoder leaves trailing frame bytes unconsumed" {
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.encryption = null;
+    const first = try buildTestProtocolFrame(0x00, PROTOCOL_VERSION, null);
+    defer std.testing.allocator.free(first);
+    const second = try buildTestProtocolFrame(0x00, PROTOCOL_VERSION, null);
+    defer std.testing.allocator.free(second);
+    const stream = try std.testing.allocator.alloc(u8, first.len + second.len);
+    defer std.testing.allocator.free(stream);
+    @memcpy(stream[0..first.len], first);
+    @memcpy(stream[first.len..], second);
+
+    var decrypt_buf: [MAX_FRAME_BYTES]u8 = undefined;
+    var consumed: usize = 0;
+    try std.testing.expect(cm.decodeFrame(null, stream, &consumed, &decrypt_buf, true) != null);
+    try std.testing.expectEqual(first.len, consumed);
 }
 
 fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Replica) void {
@@ -1508,6 +2167,177 @@ fn initTestConnectionManager(cm: *ConnectionManager, replica: *replica_mod.Repli
     cm.poll_count = 0;
     cm.state_response_buf = undefined;
     cm.encryption = null;
+    cm.fcntl_ops = FcntlOps.system;
+}
+
+fn fcntlGetFails(_: c_int) c_int {
+    return -1;
+}
+
+fn fcntlGetSucceeds(_: c_int) c_int {
+    return 0;
+}
+
+fn fcntlSetFails(_: c_int, _: c_int) c_int {
+    return -1;
+}
+
+fn fcntlSetSucceeds(_: c_int, _: c_int) c_int {
+    return 0;
+}
+
+test "setNonBlocking reports both fcntl failure boundaries" {
+    const get_failure = FcntlOps{ .get_flags = fcntlGetFails, .set_flags = fcntlSetSucceeds };
+    try std.testing.expectError(error.GetFlagsFailed, ConnectionManager.setNonBlockingWith(1, get_failure));
+    const set_failure = FcntlOps{ .get_flags = fcntlGetSucceeds, .set_flags = fcntlSetFails };
+    try std.testing.expectError(error.SetFlagsFailed, ConnectionManager.setNonBlockingWith(1, set_failure));
+}
+
+test "peer connect never registers a socket when nonblocking setup fails" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7000);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7000, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7000);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.fcntl_ops = .{ .get_flags = fcntlGetFails, .set_flags = fcntlSetSucceeds };
+
+    cm.connectToPeerInner(1, 0, 1);
+    try std.testing.expectEqual(@as(usize, 0), cm.peer_count);
+}
+
+test "worker side-effect and client error write failures clean all owned state and permit slot reuse" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7001);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7001, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7001);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    replica.workers[0].connected = true;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+    cm.client_count = 1;
+    var failed_worker_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_worker_pipe));
+    defer _ = libc.close(failed_worker_pipe[1]);
+    var failed_client_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_client_pipe));
+    defer _ = libc.close(failed_client_pipe[1]);
+    cm.workers[0] = .{ .fd = failed_worker_pipe[0], .connected = true, .worker_idx = 0 };
+    cm.clients[0] = .{ .fd = failed_client_pipe[0], .connected = true, .client_id = 71 };
+    try std.testing.expect(cm.request_queue.enqueue(1, 10, 71, "queued"));
+    _ = cm.request_queue.trackInFlightForWorker(11, 71, 0).?;
+
+    const start_pod_frame = [_]u8{ 3, 0, 0, 0, 1, 0, @intFromEnum(msg.WorkerTag.start_pod) };
+    cm.sendReplicaWorkerFrame(0, &start_pod_frame);
+
+    try std.testing.expectEqual(@as(c_int, -1), cm.workers[0].fd);
+    try std.testing.expect(!cm.workers[0].connected);
+    try std.testing.expect(!replica.workers[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_worker_pipe[0]));
+    try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
+    try std.testing.expect(!cm.clients[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    var replacement_worker: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &replacement_worker));
+    defer _ = libc.close(replacement_worker[0]);
+    defer _ = libc.close(replacement_worker[1]);
+    cm.workers[0] = .{ .fd = replacement_worker[0], .connected = true, .worker_idx = 0 };
+    replica.workers[0].connected = true;
+    cm.sendReplicaWorkerFrame(0, &start_pod_frame);
+    var worker_buf: [32]u8 = undefined;
+    const worker_bytes = try std.posix.read(replacement_worker[1], &worker_buf);
+    try std.testing.expect(worker_bytes >= 8);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expect(replica.workers[0].connected);
+}
+
+test "consensus reply write failure cleans client-owned run state and permits slot reuse" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7002);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7002, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7002);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.client_count = 1;
+    cm.worker_count = 2;
+    var worker_zero: [2]c_int = undefined;
+    var worker_one: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_zero));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_one));
+    defer _ = libc.close(worker_zero[1]);
+    defer _ = libc.close(worker_one[0]);
+    defer _ = libc.close(worker_one[1]);
+    cm.workers[0] = .{ .fd = worker_zero[0], .connected = true, .worker_idx = 0 };
+    cm.workers[1] = .{ .fd = worker_one[0], .connected = true, .worker_idx = 1 };
+    var failed_client_pipe: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), libc.pipe(&failed_client_pipe));
+    defer _ = libc.close(failed_client_pipe[1]);
+    cm.clients[0] = .{ .fd = failed_client_pipe[0], .connected = true, .client_id = 72 };
+    try std.testing.expect(cm.request_queue.enqueue(1, 20, 72, "queued"));
+    _ = cm.request_queue.trackInFlightForWorker(21, 72, 0).?;
+    const unrelated = cm.request_queue.trackInFlightForWorker(22, 99, 1).?;
+
+    cm.sendClientReply(&cm.clients[0], 22, .{ .ok = .{ .entity_id = 9 } });
+
+    try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
+    try std.testing.expect(!cm.clients[0].connected);
+    try std.testing.expectEqual(@as(c_int, -1), libc.close(failed_client_pipe[0]));
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 2), cm.request_queue.activeInFlightCount());
+    cm.poll_count += rq.ABANDONED_TTL_TICKS;
+    cm.disconnectExpiredAbandonedWorkers();
+    try std.testing.expect(!cm.workers[0].connected);
+    try std.testing.expect(cm.workers[1].connected);
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(@as(u128, 99), cm.request_queue.resolveResponseForWorker(unrelated, 1).?.client_id);
+
+    var replacement_client: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &replacement_client));
+    defer _ = libc.close(replacement_client[0]);
+    defer _ = libc.close(replacement_client[1]);
+    cm.clients[0] = .{ .fd = replacement_client[0], .connected = true, .client_id = 73 };
+    cm.sendClientReply(&cm.clients[0], 23, .{ .ok = .{ .entity_id = 10 } });
+    var client_buf: [32]u8 = undefined;
+    const client_bytes = try std.posix.read(replacement_client[1], &client_buf);
+    try std.testing.expect(client_bytes >= 17);
+    try std.testing.expect(cm.clients[0].connected);
 }
 
 test "readWorkers disconnects agents from non-leader replicas" {
@@ -1576,6 +2406,8 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
     cm.client_count = 1;
+    cm.worker_count = 1;
+    cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
 
     var fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
@@ -1583,13 +2415,13 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     defer _ = libc.close(fds[1]);
 
     cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 1234 };
-    cm.request_queue.trackInFlight(77, 1234);
+    const worker_request_id = cm.request_queue.trackInFlight(77, 1234).?;
 
     var payload: [32]u8 = undefined;
-    @memcpy(payload[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, 77)));
+    @memcpy(payload[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, worker_request_id)));
     payload[8] = 0;
     @memcpy(payload[9..13], "pong");
-    cm.handleRunResponse(payload[0..13]);
+    cm.handleRunResponse(&cm.workers[0], payload[0..13]);
 
     try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
 
@@ -1605,7 +2437,164 @@ test "handleRunResponse resolves in-flight request and replies to client" {
     try std.testing.expect(std.mem.eql(u8, buf[21..25], "pong"));
 }
 
-test "disconnectClient clears abandoned queued and in-flight run requests" {
+test "malformed foreign and worker not_leader responses disconnect only sender" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(2468);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(2468, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(2468);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 2;
+    replica.workers[0].connected = true;
+    replica.workers[1].connected = true;
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 2;
+    cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
+    cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
+
+    const owned_zero = cm.request_queue.trackInFlightForWorker(1, 100, 0).?;
+    const owned_one = cm.request_queue.trackInFlightForWorker(2, 200, 1).?;
+    var foreign = std.mem.zeroes([9]u8);
+    std.mem.writeInt(u64, foreign[0..8], owned_zero, .little);
+    cm.handleRunResponse(&cm.workers[1], &foreign);
+    try std.testing.expect(!cm.workers[1].connected);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    try std.testing.expectEqual(rq.ResponseResolution.unknown, cm.request_queue.classifyResponseForWorker(owned_one, 1));
+
+    cm.workers[1] = .{ .fd = -1, .connected = true, .worker_idx = 1 };
+    replica.workers[1].connected = true;
+    _ = cm.request_queue.trackInFlightForWorker(3, 300, 1).?;
+    var forbidden = std.mem.zeroes([9]u8);
+    std.mem.writeInt(u64, forbidden[0..8], owned_zero, .little);
+    forbidden[8] = @intFromEnum(RunStatus.not_leader);
+    cm.handleRunResponse(&cm.workers[1], &forbidden);
+    try std.testing.expect(!cm.workers[1].connected);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+
+    var exact = std.mem.zeroes([9 + MAX_RUN_RESPONSE_BODY]u8);
+    std.mem.writeInt(u64, exact[0..8], owned_zero, .little);
+    @memset(exact[9..], 0x5a);
+    cm.handleRunResponse(&cm.workers[0], &exact);
+    try std.testing.expect(cm.workers[0].connected);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+}
+
+test "dispatchRun preserves queued work without worker and fails accepted work on send or disconnect" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(9876);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(9876, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(9876);
+    _ = sm.apply(.{ .create_deployment = .{
+        .name = msg.strToFixed(64, "echo"),
+        .image = msg.strToFixed(256, "img:v1"),
+        .replicas = 1,
+        .cpu_millicores = 100,
+        .memory_megabytes = 128,
+    } });
+    const dep_id = sm.deployments[0].id;
+    sm.pods[0].node_id = 99;
+    sm.pods[0].phase = .running;
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    replica.workers[0].node_id = 99;
+    replica.workers[0].connected = true;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+    cm.client_count = 1;
+
+    var client_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &client_fds));
+    defer _ = libc.close(client_fds[1]);
+    cm.clients[0] = .{ .fd = client_fds[0], .connected = true, .client_id = 55 };
+
+    // No connected worker: request remains queued and no correlation is allocated.
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 1, 55, "one"));
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+
+    // A write attempt may have been accepted before failure, so replay is unsafe.
+    cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    var client_buf: [128]u8 = undefined;
+    var n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 17);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.outcome_ambiguous), client_buf[16]);
+
+    // Accepted dispatch followed by disconnect releases its owned correlation.
+    var worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_fds));
+    defer _ = libc.close(worker_fds[1]);
+    replica.workers[0].connected = true;
+    cm.workers[0] = .{ .fd = worker_fds[0], .connected = true, .worker_idx = 0 };
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 2, 55, "two"));
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+    cm.disconnectWorker(&cm.workers[0]);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 17);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.outcome_ambiguous), client_buf[16]);
+
+    // A replacement connection reuses the released slot and completes normally.
+    var success_worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &success_worker_fds));
+    defer _ = libc.close(success_worker_fds[0]);
+    defer _ = libc.close(success_worker_fds[1]);
+    replica.workers[0].connected = true;
+    cm.workers[0] = .{ .fd = success_worker_fds[0], .connected = true, .worker_idx = 0 };
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 3, 55, "three"));
+    try std.testing.expect(cm.request_queue.enqueue(dep_id, 4, 55, "four"));
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
+    var worker_buf: [128]u8 = undefined;
+    const worker_n = try std.posix.read(success_worker_fds[1], &worker_buf);
+    try std.testing.expect(worker_n >= 28);
+    const worker_request_id = std.mem.readInt(u64, worker_buf[8..16], .little);
+    var response: [11]u8 = undefined;
+    std.mem.writeInt(u64, response[0..8], worker_request_id, .little);
+    response[8] = 0;
+    @memcpy(response[9..11], "ok");
+    cm.handleRunResponse(&cm.workers[0], &response);
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    n = try std.posix.read(client_fds[1], &client_buf);
+    try std.testing.expect(n >= 23);
+    try std.testing.expectEqual(@as(u8, 0), client_buf[16]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, client_buf[17..21], .little));
+    try std.testing.expect(std.mem.eql(u8, client_buf[21..23], "ok"));
+
+    cm.dispatchRun();
+    try std.testing.expectEqual(@as(usize, 0), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
+}
+
+test "disconnectClient tombstones sent work and owning late response is silent" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(4321);
     var current_tick: i64 = 0;
@@ -1631,6 +2620,12 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
     defer allocator.destroy(cm);
     initTestConnectionManager(cm, replica);
     cm.client_count = 1;
+    cm.worker_count = 2;
+
+    var worker_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &worker_fds));
+    defer _ = libc.close(worker_fds[1]);
+    cm.workers[0] = .{ .fd = worker_fds[0], .connected = true, .worker_idx = 0 };
 
     var fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
@@ -1638,21 +2633,120 @@ test "disconnectClient clears abandoned queued and in-flight run requests" {
 
     cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 999 };
     try std.testing.expect(cm.request_queue.enqueue(7, 10, 999, "queued"));
-    cm.request_queue.trackInFlight(11, 999);
+    const disconnected_worker_id = cm.request_queue.trackInFlight(11, 999).?;
     try std.testing.expect(cm.request_queue.enqueue(7, 12, 555, "keep"));
-    cm.request_queue.trackInFlight(13, 555);
+    const kept_worker_id = cm.request_queue.trackInFlightForWorker(13, 555, 1).?;
 
     cm.disconnectClient(&cm.clients[0]);
 
     try std.testing.expectEqual(@as(c_int, -1), cm.clients[0].fd);
     try std.testing.expect(!cm.clients[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.totalDepth());
+    try std.testing.expectEqual(@as(usize, 2), cm.request_queue.activeInFlightCount());
+
+    var late: [11]u8 = undefined;
+    std.mem.writeInt(u64, late[0..8], disconnected_worker_id, .little);
+    late[8] = @intFromEnum(RunStatus.ok);
+    @memcpy(late[9..11], "ok");
+    cm.handleRunResponse(&cm.workers[0], &late);
+    try std.testing.expect(cm.workers[0].connected);
     try std.testing.expectEqual(@as(usize, 1), cm.request_queue.activeInFlightCount());
-    try std.testing.expect(cm.request_queue.resolveResponse(11) == null);
-    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponse(13).?);
+    try std.testing.expectEqual(@as(u128, 555), cm.request_queue.resolveResponseForWorker(kept_worker_id, 1).?.client_id);
 }
 
-test "identifyPeerConnection drops older duplicate peer socket" {
+test "identifyPeerConnection rejects rebind to different replica id" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[1]);
+
+    const cm = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(cm);
+    cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .fd = fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+
+    try std.testing.expect(!cm.identifyPeerConnection(0, 2));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expect(cm.peers[0].peer_id_known);
+    try std.testing.expect(cm.peers[0].connected);
+    try std.testing.expectEqual(fds[0], cm.peers[0].fd);
+
+    try std.testing.expect(cm.identifyPeerConnection(0, 1));
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+}
+
+test "identifyPeerConnection enforces direction without evicting established sockets" {
+    var lower_outbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lower_outbound_fds));
+    defer _ = libc.close(lower_outbound_fds[1]);
+
+    var lower_inbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lower_inbound_fds));
+    defer _ = libc.close(lower_inbound_fds[1]);
+
+    const lower = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(lower);
+    lower.replica_id = 1;
+    lower.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    lower.peer_count = 2;
+    lower.peers[0] = .{
+        .fd = lower_outbound_fds[0],
+        .connected = true,
+        .worker_idx = 2,
+        .peer_id_known = true,
+        .peer_direction = .outbound,
+    };
+    lower.peers[1] = .{
+        .fd = lower_inbound_fds[0],
+        .connected = true,
+        .peer_direction = .inbound,
+    };
+
+    try std.testing.expect(!lower.identifyPeerConnection(1, 2));
+    try std.testing.expect(lower.peers[0].connected);
+    try std.testing.expectEqual(lower_outbound_fds[0], lower.peers[0].fd);
+    try std.testing.expect(!lower.peers[1].connected);
+    try std.testing.expectEqual(@as(c_int, -1), lower.peers[1].fd);
+
+    var higher_outbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &higher_outbound_fds));
+    defer _ = libc.close(higher_outbound_fds[1]);
+
+    var higher_inbound_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &higher_inbound_fds));
+    defer _ = libc.close(higher_inbound_fds[1]);
+
+    const higher = try std.testing.allocator.create(ConnectionManager);
+    defer std.testing.allocator.destroy(higher);
+    higher.replica_id = 2;
+    higher.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
+    higher.peer_count = 2;
+    higher.peers[0] = .{
+        .fd = higher_inbound_fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+        .peer_direction = .inbound,
+    };
+    higher.peers[1] = .{
+        .fd = higher_outbound_fds[0],
+        .connected = true,
+        .peer_direction = .outbound,
+    };
+
+    try std.testing.expect(!higher.identifyPeerConnection(1, 1));
+    try std.testing.expect(higher.peers[0].connected);
+    try std.testing.expectEqual(higher_inbound_fds[0], higher.peers[0].fd);
+    try std.testing.expect(!higher.peers[1].connected);
+    try std.testing.expectEqual(@as(c_int, -1), higher.peers[1].fd);
+}
+
+test "identifyPeerConnection preserves established duplicate peer socket" {
     var duplicate_fds: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &duplicate_fds));
     defer _ = libc.close(duplicate_fds[1]);
@@ -1663,6 +2757,7 @@ test "identifyPeerConnection drops older duplicate peer socket" {
 
     const cm = try std.testing.allocator.create(ConnectionManager);
     defer std.testing.allocator.destroy(cm);
+    cm.replica_id = 5;
     cm.peers = [_]Conn{.{}} ** MAX_PEER_CONNECTIONS;
     cm.peer_count = 2;
     cm.peers[0] = .{
@@ -1676,11 +2771,100 @@ test "identifyPeerConnection drops older duplicate peer socket" {
         .connected = true,
     };
 
-    try std.testing.expect(cm.identifyPeerConnection(1, 4));
-    try std.testing.expectEqual(@as(c_int, -1), cm.peers[0].fd);
-    try std.testing.expect(!cm.peers[0].connected);
-    try std.testing.expectEqual(@as(usize, 4), cm.peers[1].worker_idx);
-    try std.testing.expect(cm.peers[1].peer_id_known);
+    try std.testing.expect(!cm.identifyPeerConnection(1, 4));
+    try std.testing.expectEqual(duplicate_fds[0], cm.peers[0].fd);
+    try std.testing.expect(cm.peers[0].connected);
+    try std.testing.expect(!cm.peers[1].peer_id_known);
+}
+
+fn sendTestPeerMessage(cm: *ConnectionManager, to: u8, message: msg.Message) void {
+    var frame: [MAX_FRAME_BYTES]u8 = undefined;
+    const message_len = msg.serialize(message, frame[5..]);
+    std.mem.writeInt(u32, frame[0..4], @intCast(1 + message_len), .little);
+    frame[4] = cm.replica_id;
+    cm.sendToPeer(to, frame[0 .. 5 + message_len]);
+}
+
+fn disconnectTestPeers(cm: *ConnectionManager) void {
+    for (cm.peers[0..cm.peer_count]) |*peer| {
+        if (peer.fd >= 0) disconnectPeer(peer);
+    }
+}
+
+test "simultaneous reciprocal sockets converge and carry bidirectional VRR traffic" {
+    const allocator = std.testing.allocator;
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(9191, 2, &current_tick);
+
+    var lower_prng = @import("prng.zig").Prng.init(9192);
+    var lower_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&lower_prng, &current_tick, network, 0);
+    const lower_sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(lower_sm);
+    lower_sm.initInPlace(9192);
+    const lower_replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(lower_replica);
+    lower_replica.initInPlace(.{ .replica_id = 0, .replica_count = 2, .io = lower_io.io(), .state_machine = lower_sm });
+    lower_replica.status = .normal;
+
+    var higher_prng = @import("prng.zig").Prng.init(9193);
+    var higher_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&higher_prng, &current_tick, network, 1);
+    const higher_sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(higher_sm);
+    higher_sm.initInPlace(9193);
+    const higher_replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(higher_replica);
+    higher_replica.initInPlace(.{ .replica_id = 1, .replica_count = 2, .io = higher_io.io(), .state_machine = higher_sm });
+    higher_replica.status = .normal;
+
+    const lower = try allocator.create(ConnectionManager);
+    defer allocator.destroy(lower);
+    initTestConnectionManager(lower, lower_replica);
+    defer disconnectTestPeers(lower);
+    const higher = try allocator.create(ConnectionManager);
+    defer allocator.destroy(higher);
+    initTestConnectionManager(higher, higher_replica);
+    defer disconnectTestPeers(higher);
+
+    // Socket A is lower outbound / higher inbound. Socket B is the reciprocal.
+    var socket_a: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_a));
+    var socket_b: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &socket_b));
+    try ConnectionManager.setNonBlocking(socket_a[0]);
+    try ConnectionManager.setNonBlocking(socket_a[1]);
+    try ConnectionManager.setNonBlocking(socket_b[0]);
+    try ConnectionManager.setNonBlocking(socket_b[1]);
+
+    lower.peer_count = 2;
+    lower.peers[0] = .{ .fd = socket_a[0], .connected = true, .peer_direction = .outbound, .configured_peer_id = 1, .configured_peer_id_known = true, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+    lower.peers[1] = .{ .fd = socket_b[1], .connected = true, .peer_direction = .inbound, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+    higher.peer_count = 2;
+    higher.peers[0] = .{ .fd = socket_b[0], .connected = true, .peer_direction = .outbound, .configured_peer_id = 0, .configured_peer_id_known = true, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+    higher.peers[1] = .{ .fd = socket_a[1], .connected = true, .peer_direction = .inbound, .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS };
+
+    // Both replicas send before either polls, reproducing symmetric startup.
+    sendTestPeerMessage(lower, 1, .{ .start_view_change = .{ .view_number = 1, .replica_id = 0 } });
+    sendTestPeerMessage(higher, 0, .{ .start_view_change = .{ .view_number = 1, .replica_id = 1 } });
+    lower.readPeers();
+    higher.readPeers();
+
+    try std.testing.expect(lower.peers[0].connected);
+    try std.testing.expect(!lower.peers[1].connected);
+    try std.testing.expect(!higher.peers[0].connected);
+    try std.testing.expect(higher.peers[1].connected);
+    try std.testing.expect(higher_replica.start_vc_total > 0);
+
+    sendTestPeerMessage(lower, 1, .{ .start_view_change = .{ .view_number = 2, .replica_id = 0 } });
+    sendTestPeerMessage(higher, 0, .{ .start_view_change = .{ .view_number = 2, .replica_id = 1 } });
+    lower.readPeers();
+    higher.readPeers();
+
+    try std.testing.expectEqual(@as(usize, 0), lower.peers[0].frame_pos);
+    try std.testing.expectEqual(@as(usize, 0), higher.peers[1].frame_pos);
+    try std.testing.expect(lower.hasPeerConnection(1));
+    try std.testing.expect(higher.hasPeerConnection(0));
 }
 
 test "peer frame buffer fits largest VRR view-change frame" {
@@ -1702,4 +2886,396 @@ test "shiftBuffer saturates when consumed exceeds current position" {
     ConnectionManager.shiftBuffer(&buf, &pos, 8);
 
     try std.testing.expectEqual(@as(usize, 0), pos);
+}
+
+test "processPeerFrames drops malformed VRR plaintext without trapping" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4242);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4242, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4242);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{ .connected = true, .frame_pos = 0 };
+
+    // Frame: [4B len][flags=0][from_id=1][tag=0xFF] — invalid VRR tag.
+    const inner_len: u32 = 1 + 1; // from_id + bad tag
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 1;
+    cm.peers[0].frame_buf[6] = 0xFF;
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expectEqual(@as(usize, 0), cm.peers[0].frame_pos);
+    try std.testing.expect(cm.peers[0].connected);
+}
+
+test "processPeerFrames drops spoofed from_id on bound peer socket" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4244);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4244, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4244);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+
+    var vrr_buf: [64]u8 = undefined;
+    const vrr_len = msg.serialize(.{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 2,
+    } }, &vrr_buf);
+    const inner_len: u32 = @intCast(1 + vrr_len);
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 2; // spoof: claim replica 2 on socket bound to 1
+    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+    try std.testing.expect(cm.peers[0].peer_id_known);
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
+}
+
+test "processPeerFrames drops out-of-range from_id" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4243);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4243, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4243);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+    cm.peers[0] = .{ .connected = true };
+
+    var vrr_buf: [64]u8 = undefined;
+    const vrr_len = msg.serialize(.{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 99,
+    } }, &vrr_buf);
+    const inner_len: u32 = @intCast(1 + vrr_len);
+    std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
+    cm.peers[0].frame_buf[4] = 0x00;
+    cm.peers[0].frame_buf[5] = 99; // from_id >= replica_count
+    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    cm.peers[0].frame_pos = 5 + inner_len;
+
+    cm.processPeerFrames(0);
+    try std.testing.expect(!cm.peers[0].peer_id_known);
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
+}
+
+test "invalid Prepare Commit and StartView cannot evict healthy peer socket" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4245);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4245, 3, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4245);
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    var healthy_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &healthy_fds));
+    defer _ = libc.close(healthy_fds[1]);
+
+    var spoof_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &spoof_fds));
+    defer _ = libc.close(spoof_fds[1]);
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 2;
+    cm.peers[0] = .{
+        .fd = healthy_fds[0],
+        .connected = true,
+        .worker_idx = 1,
+        .peer_id_known = true,
+    };
+    cm.peers[1] = .{
+        .fd = spoof_fds[0],
+        .connected = true,
+        .frame_pos = 0,
+    };
+
+    const invalid_messages = [_]msg.Message{
+        .{ .prepare = .{} }, // op_number zero
+        .{ .commit = .{ .commit_min = 1, .op_number = 0 } },
+        .{ .start_view = .{ .op_number = replica_mod.LOG_SIZE_MAX + 1 } },
+    };
+    for (invalid_messages) |invalid_message| {
+        var vrr_buf: [MAX_FRAME_BYTES - 6]u8 = undefined;
+        const vrr_len = msg.serialize(invalid_message, &vrr_buf);
+        const inner_len: u32 = @intCast(1 + vrr_len);
+        std.mem.writeInt(u32, cm.peers[1].frame_buf[0..4], 1 + inner_len, .little);
+        cm.peers[1].frame_buf[4] = 0x00;
+        cm.peers[1].frame_buf[5] = 1;
+        @memcpy(cm.peers[1].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+        cm.peers[1].frame_pos = 5 + inner_len;
+
+        cm.processPeerFrames(1);
+        try std.testing.expect(cm.peers[0].connected);
+        try std.testing.expect(cm.peers[0].peer_id_known);
+        try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+        try std.testing.expectEqual(healthy_fds[0], cm.peers[0].fd);
+        try std.testing.expect(cm.peers[1].connected);
+        try std.testing.expect(!cm.peers[1].peer_id_known);
+        try std.testing.expectEqual(@as(usize, 0), cm.peers[1].frame_pos);
+    }
+}
+
+fn buildClientRunRequestPayload(request_id: u64, dep_name: []const u8, declared_len: u32, body: []const u8) []u8 {
+    const total = 76 + body.len;
+    const buf = std.testing.allocator.alloc(u8, total) catch unreachable;
+    @memset(buf, 0);
+    @memcpy(buf[0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, request_id)));
+    const name_copy_len = @min(dep_name.len, 64);
+    @memcpy(buf[8..][0..name_copy_len], dep_name[0..name_copy_len]);
+    @memcpy(buf[72..76], &std.mem.toBytes(std.mem.nativeToLittle(u32, declared_len)));
+    if (body.len > 0) @memcpy(buf[76..][0..body.len], body);
+    return buf;
+}
+
+test "handleRunRequest enforces exact declared payload length" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(4242);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(4242, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(4242);
+    _ = sm.apply(.{ .create_deployment = .{
+        .name = msg.strToFixed(64, "echo"),
+        .image = msg.strToFixed(256, "img:v1"),
+        .replicas = 1,
+        .cpu_millicores = 100,
+        .memory_megabytes = 128,
+    } });
+
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.client_count = 1;
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
+    defer _ = libc.close(fds[0]);
+    defer _ = libc.close(fds[1]);
+    try ConnectionManager.setNonBlocking(fds[1]);
+    cm.clients[0] = .{ .fd = fds[0], .connected = true, .client_id = 55 };
+
+    const Case = struct {
+        name: []const u8,
+        declared: u32,
+        body_len: usize,
+        expect_queued: bool,
+        expect_status: ?u8,
+    };
+
+    const cases = [_]Case{
+        .{ .name = "exact zero", .declared = 0, .body_len = 0, .expect_queued = true, .expect_status = null },
+        .{ .name = "exact max", .declared = rq.MAX_PAYLOAD, .body_len = rq.MAX_PAYLOAD, .expect_queued = true, .expect_status = null },
+        .{ .name = "declared short", .declared = 8, .body_len = 4, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "declared long / trailing", .declared = 2, .body_len = 4, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "513 byte payload", .declared = rq.MAX_PAYLOAD + 1, .body_len = rq.MAX_PAYLOAD + 1, .expect_queued = false, .expect_status = 3 },
+        .{ .name = "integer overflow size", .declared = std.math.maxInt(u32), .body_len = 4, .expect_queued = false, .expect_status = 3 },
+    };
+
+    for (cases, 0..) |tc, i| {
+        _ = tc.name;
+        // Drain any prior error frame.
+        var drain: [256]u8 = undefined;
+        _ = std.posix.read(fds[1], &drain) catch {};
+
+        var body_buf: [rq.MAX_PAYLOAD + 1]u8 = undefined;
+        @memset(body_buf[0..tc.body_len], 0x11);
+        const payload = buildClientRunRequestPayload(@intCast(1000 + i), "echo", tc.declared, body_buf[0..tc.body_len]);
+        defer allocator.free(payload);
+
+        const depth_before = cm.request_queue.totalDepth();
+        cm.handleRunRequest(&cm.clients[0], payload);
+
+        if (tc.expect_queued) {
+            try std.testing.expectEqual(depth_before + 1, cm.request_queue.totalDepth());
+            var err_buf: [64]u8 = undefined;
+            const n = std.posix.read(fds[1], &err_buf) catch |err| switch (err) {
+                error.WouldBlock => @as(usize, 0),
+                else => return err,
+            };
+            try std.testing.expectEqual(@as(usize, 0), n);
+        } else {
+            try std.testing.expectEqual(depth_before, cm.request_queue.totalDepth());
+            var err_buf: [64]u8 = undefined;
+            const n = try std.posix.read(fds[1], &err_buf);
+            try std.testing.expect(n >= 17);
+            try std.testing.expectEqual(@as(u8, 0x23), err_buf[7]);
+            try std.testing.expectEqual(tc.expect_status.?, err_buf[16]);
+        }
+    }
+
+    replica.status = .view_change;
+    const follower_payload = buildClientRunRequestPayload(9999, "echo", 1, "x");
+    defer allocator.free(follower_payload);
+    const depth_before = cm.request_queue.totalDepth();
+    cm.handleRunRequest(&cm.clients[0], follower_payload);
+    try std.testing.expectEqual(depth_before, cm.request_queue.totalDepth());
+    var follower_error: [64]u8 = undefined;
+    const follower_n = try std.posix.read(fds[1], &follower_error);
+    try std.testing.expect(follower_n >= 17);
+    try std.testing.expectEqual(@intFromEnum(RunStatus.not_leader), follower_error[16]);
+}
+
+test "fixed worker payload parsers reject trailing bytes and accept exact frames" {
+    var register: [138]u8 = std.mem.zeroes([138]u8);
+    register[72] = @intFromEnum(msg.GpuType.none);
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&register) != null);
+    var register_trailing: [139]u8 = std.mem.zeroes([139]u8);
+    register_trailing[72] = @intFromEnum(msg.GpuType.none);
+    try std.testing.expect(ConnectionManager.parseWorkerRegister(&register_trailing) == null);
+
+    var heartbeat: [23]u8 = std.mem.zeroes([23]u8);
+    try std.testing.expect(ConnectionManager.parseWorkerHeartbeat(&heartbeat) != null);
+    var heartbeat_trailing: [24]u8 = std.mem.zeroes([24]u8);
+    try std.testing.expect(ConnectionManager.parseWorkerHeartbeat(&heartbeat_trailing) == null);
+
+    var pod_status: [150]u8 = std.mem.zeroes([150]u8);
+    pod_status[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&pod_status) != null);
+    var pod_status_trailing: [151]u8 = std.mem.zeroes([151]u8);
+    pod_status_trailing[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status_trailing[9] = @intFromEnum(msg.PodPhase.running);
+    try std.testing.expect(ConnectionManager.parseWorkerPodStatus(&pod_status_trailing) == null);
+}
+
+test "trailing fixed worker frames disconnect sender and release correlations" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(97531);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(97531, 1, &current_tick);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(97531);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 1, .io = sim_io.io(), .state_machine = sm });
+    replica.worker_count = 1;
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.worker_count = 1;
+
+    var register: [139]u8 = std.mem.zeroes([139]u8);
+    register[72] = @intFromEnum(msg.GpuType.none);
+    var heartbeat: [24]u8 = std.mem.zeroes([24]u8);
+    var pod_status: [151]u8 = std.mem.zeroes([151]u8);
+    pod_status[8] = @intFromEnum(msg.PodPhase.pending);
+    pod_status[9] = @intFromEnum(msg.PodPhase.running);
+    const cases = [_]struct { tag: msg.WorkerTag, payload: []const u8 }{
+        .{ .tag = .register, .payload = &register },
+        .{ .tag = .heartbeat, .payload = &heartbeat },
+        .{ .tag = .pod_status, .payload = &pod_status },
+    };
+    for (cases, 0..) |case, index| {
+        cm.workers[0] = .{ .fd = -1, .connected = true, .worker_idx = 0 };
+        replica.workers[0].connected = true;
+        _ = cm.request_queue.trackInFlightForWorker(@intCast(index + 1), 77, 0).?;
+        cm.dispatchWorkerMessage(&cm.workers[0], @intFromEnum(case.tag), case.payload);
+        try std.testing.expect(!cm.workers[0].connected);
+        try std.testing.expectEqual(@as(usize, 0), cm.request_queue.activeInFlightCount());
+    }
 }
