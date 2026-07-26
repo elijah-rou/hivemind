@@ -9,11 +9,16 @@ set -euo pipefail
 
 API_URL="${1:?Usage: ./smoke-test.sh <api-url> [--gpu-worker <ip>] [--ssh-key <path>] [--gpu-type <type>] [--gpu-ssh-user <user>]}"
 shift
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
+source "$SCRIPT_DIR/run_retry.sh"
 
 GPU_WORKER_IP="${GPU_WORKER_IP:-}"
 SSH_KEY="${SSH_KEY:-}"
 GPU_SSH_USER="${GPU_SSH_USER:-ubuntu}"
 GPU_TYPE="${GPU_TYPE:-t4}"
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -27,6 +32,14 @@ done
 
 if [[ -z "$GPU_WORKER_IP" ]] && command -v terraform >/dev/null 2>&1; then
     GPU_WORKER_IP="$(terraform output -raw worker_gpu_public_ip 2>/dev/null || true)"
+fi
+if [[ "$REQUIRE_GPU" != 0 && "$REQUIRE_GPU" != 1 ]]; then
+    echo "FAIL: REQUIRE_GPU must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$REQUIRE_GPU" == 1 && ( -z "$GPU_WORKER_IP" || -z "$SSH_KEY" || "$GPU_TYPE" == none ) ]]; then
+    echo "FAIL: REQUIRE_GPU=1 requires --gpu-worker, --ssh-key, and a non-none --gpu-type" >&2
+    exit 1
 fi
 
 SSH_OPTS=()
@@ -111,20 +124,11 @@ wait_for_run() {
     local max_attempts="${5:-12}"
     local delay="${6:-5}"
 
-    for i in $(seq 1 "$max_attempts"); do
-        local result
-        result=$(curl -s -X POST "$url" \
-            -H "Content-Type: application/json" \
-            -d "$payload" 2>/dev/null || echo "")
-        if echo "$result" | grep -q "$expected" && [ "$result" != "$payload" ]; then
-            echo "  PASS: $name (attempt $i)"
-            PASS=$((PASS + 1))
-            return 0
-        fi
-        echo "    waiting for run response... ($i/$max_attempts)"
-        sleep "$delay"
-    done
-    echo "  FAIL: $name (timed out after $((max_attempts * delay))s)"
+    if hivemind_run_with_retry "$name" "$url" "$payload" "$expected" "$max_attempts" "$delay"; then
+        PASS=$((PASS + 1))
+        return 0
+    fi
+    echo "  FAIL: $name"
     FAIL=$((FAIL + 1))
     return 1
 }
@@ -158,7 +162,8 @@ remote_gpu_checks_enabled() {
 }
 
 remote_ssh() {
-    ssh "${SSH_OPTS[@]}" "$GPU_SSH_USER@$GPU_WORKER_IP" "$1"
+    local remote_command="$1"
+    printf '%s\n' "$remote_command" | ssh "${SSH_OPTS[@]}" "$GPU_SSH_USER@$GPU_WORKER_IP" 'bash -s'
 }
 
 echo "=== Hivemind POC Smoke Test ==="

@@ -13,12 +13,15 @@ set -euo pipefail
 
 API_URL="${1:?Usage: failure-drills.sh <api-url> --ssh-key <key> --replica-ips <ips> --cpu-worker-ip <ip>}"
 shift
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
+source "$SCRIPT_DIR/run_retry.sh"
 
 SSH_KEY=""
 REPLICA_IPS_CSV=""
 CPU_WORKER_IP=""
 GPU_WORKER_IP=""
-GPU_TYPE="t4"
 CPU_IMAGE="${CPU_IMAGE:-docker.io/mendhak/http-https-echo:31}"
 REPLICA_SSH_USER="${REPLICA_SSH_USER:-ec2-user}"
 WORKER_SSH_USER="${WORKER_SSH_USER:-ubuntu}"
@@ -33,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         --replica-ips) REPLICA_IPS_CSV="$2"; shift 2 ;;
         --cpu-worker-ip) CPU_WORKER_IP="$2"; shift 2 ;;
         --gpu-worker-ip) GPU_WORKER_IP="$2"; shift 2 ;;
-        --gpu-type) GPU_TYPE="$2"; shift 2 ;;
+        --gpu-type) shift 2 ;; # Accepted for caller compatibility; this CPU drill does not use it.
         --cpu-image) CPU_IMAGE="$2"; shift 2 ;;
         *) echo "Unknown: $1"; exit 1 ;;
     esac
@@ -44,7 +47,7 @@ done
 [[ -z "$CPU_WORKER_IP" ]] && { echo "--cpu-worker-ip required"; exit 1; }
 
 IFS=',' read -ra REPLICA_IPS <<< "$REPLICA_IPS_CSV"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes -i "$SSH_KEY")
 LEADER_STOPPED_IP=""
@@ -111,7 +114,7 @@ wait_api() {
 capture_worker_runtime_diagnostics() {
     local label="$1"
     local diag_dir="$OUT_DIR/diagnostics-$label"
-    mkdir -p "$diag_dir"
+    install -d -m 700 "$diag_dir"
 
     echo "[Diagnostics] Capturing worker runtime state: $label -> $diag_dir"
     local workers=("cpu:$CPU_WORKER_IP")
@@ -154,7 +157,7 @@ REMOTE
 capture_replica_diagnostics() {
     local label="$1"
     local diag_dir="$OUT_DIR/diagnostics-$label"
-    mkdir -p "$diag_dir"
+    install -d -m 700 "$diag_dir"
 
     echo "[Diagnostics] Capturing replica state: $label -> $diag_dir"
     {
@@ -212,24 +215,16 @@ run_expect_field() {
     local expected_field="$3"
     local max="${4:-12}"
     local delay="${5:-5}"
-    local result=""
-
     RUN_RESULT=""
-    for i in $(seq 1 "$max"); do
-        result="$(curl -s --max-time 30 -X POST "$API_URL/v1/deployments/$DRILL_NAME/run" \
-            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || echo "")"
-        if echo "$result" | grep -q "\"$expected_field\""; then
-            echo "  PASS: $name (attempt $i)"
-            PASS=$((PASS + 1))
-            RUN_RESULT="$result"
-            return 0
-        fi
-        sleep "$delay"
-    done
-
-    echo "  FAIL: $name (expected field '$expected_field', got '$result')" >&2
+    if hivemind_run_with_retry "$name" \
+        "$API_URL/v1/deployments/$DRILL_NAME/run" "$payload" \
+        "\"$expected_field\"" "$max" "$delay" '' 30; then
+        RUN_RESULT="$HIVEMIND_RUN_BODY"
+        PASS=$((PASS + 1))
+        return 0
+    fi
+    echo "  FAIL: $name" >&2
     FAIL=$((FAIL + 1))
-    RUN_RESULT="$result"
     return 1
 }
 
@@ -237,6 +232,71 @@ find_leader() {
     local health
     health="$(curl -s "$API_URL/v1/health" || echo "")"
     echo "$health" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("leader",""))' 2>/dev/null || echo ""
+}
+
+replica_metric() {
+    local public_ip="$1" metric="$2"
+    ssh "${SSH_OPTS[@]}" "$REPLICA_SSH_USER@$public_ip" \
+        "curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:9200/metrics" 2>/dev/null |
+        awk -v metric="$metric" '$1 == metric {print $2; found=1; exit} END {if (!found) exit 1}'
+}
+
+all_csv_values_equal() {
+    local csv="$1" value first=""
+    IFS=',' read -ra values <<<"$csv"
+    [[ "${#values[@]}" -gt 0 ]] || return 1
+    first="${values[0]}"
+    for value in "${values[@]}"; do [[ "$value" == "$first" ]] || return 1; done
+}
+
+wait_restarted_replica_convergence() {
+    local minimum_commit="$1" evidence="$OUT_DIR/restarted-replica-convergence.txt"
+    local public_ip statuses commits digests status commit digest all_normal
+    for _ in $(seq 1 60); do
+        statuses=""; commits=""; digests=""; all_normal=true
+        for public_ip in "${REPLICA_IPS[@]}"; do
+            status="$(replica_metric "$public_ip" hivemind_replica_status 2>/dev/null || echo x)"
+            commit="$(replica_metric "$public_ip" hivemind_consensus_commit 2>/dev/null || echo x)"
+            digest="$(replica_metric "$public_ip" hivemind_committed_state_digest 2>/dev/null || echo x)"
+            [[ "$status" == 0 && "$commit" =~ ^[0-9]+$ && "$digest" =~ ^[0-9]+$ && "$commit" -ge "$minimum_commit" ]] || all_normal=false
+            statuses+="${statuses:+,}$status"; commits+="${commits:+,}$commit"; digests+="${digests:+,}$digest"
+        done
+        if [[ "$all_normal" == true ]] && all_csv_values_equal "$commits" && all_csv_values_equal "$digests"; then
+            printf 'replica_status=%s\ncommit=%s\ncommitted_state_digest=%s\n' "$statuses" "$commits" "$digests" >"$evidence"
+            echo "  PASS: restarted replica rejoined normal and all replicas converged commit/state"
+            PASS=$((PASS + 1))
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'replica_status=%s\ncommit=%s\ncommitted_state_digest=%s\n' "${statuses:-unavailable}" "${commits:-unavailable}" "${digests:-unavailable}" >"$evidence"
+    echo "  FAIL: restarted replica did not rejoin with exact commit/state convergence" >&2
+    FAIL=$((FAIL + 1))
+    return 1
+}
+
+wait_all_replica_queues_zero() {
+    local evidence="$OUT_DIR/queue-zero.txt" public_ip depth in_flight snapshot
+    for _ in $(seq 1 30); do
+        snapshot=""; local all_zero=true
+        for public_ip in "${REPLICA_IPS[@]}"; do
+            depth="$(replica_metric "$public_ip" hivemind_queue_depth_total 2>/dev/null || echo x)"
+            in_flight="$(replica_metric "$public_ip" hivemind_queue_in_flight 2>/dev/null || echo x)"
+            [[ "$depth" == 0 && "$in_flight" == 0 ]] || all_zero=false
+            snapshot+="${snapshot:+;}$public_ip:queue=$depth,in_flight=$in_flight"
+        done
+        if [[ "$all_zero" == true ]]; then
+            printf '%s\n' "$snapshot" >"$evidence"
+            echo "  PASS: every replica queue and in-flight gauge is exactly zero"
+            PASS=$((PASS + 1))
+            return 0
+        fi
+        sleep 2
+    done
+    printf '%s\n' "${snapshot:-unavailable}" >"$evidence"
+    echo "  FAIL: queue/in-flight gauges did not converge exactly to zero" >&2
+    FAIL=$((FAIL + 1))
+    return 1
 }
 
 leader_replica_ip() {
@@ -404,10 +464,14 @@ PRE_RUN="$RUN_RESULT"
 KILLED_LEADER_ADDR="$(find_leader)"
 LEADER_IP="$(leader_replica_ip)"
 echo "[A4] Current leader: $KILLED_LEADER_ADDR public_ip=$LEADER_IP"
+PRE_FAILOVER_COMMIT=0
 if [[ -z "$LEADER_IP" ]]; then
-    echo "  FAIL: could not map leader to public replica IP"
+    echo "  FAIL: could not map leader to public replica IP" >&2
     FAIL=$((FAIL + 1))
+    exit 1
 else
+    PRE_FAILOVER_COMMIT="$(replica_metric "$LEADER_IP" hivemind_consensus_commit)"
+    [[ "$PRE_FAILOVER_COMMIT" =~ ^[0-9]+$ ]] || { echo "  FAIL: invalid pre-failover commit metric" >&2; exit 1; }
     echo "     Killing hivemind on leader..."
     LEADER_STOPPED_IP="$LEADER_IP"
     ssh "${SSH_OPTS[@]}" "$REPLICA_SSH_USER@$LEADER_IP" \
@@ -438,8 +502,11 @@ echo "[A7] Restart killed replica..."
 ssh "${SSH_OPTS[@]}" "$REPLICA_SSH_USER@$LEADER_IP" \
     "sudo systemctl start hivemind hivemind-api" 2>/dev/null || true
 LEADER_STOPPED_IP=""
-sleep 5
-echo "     Restarted."
+echo "     Restarted; waiting for normal rejoin and committed-state convergence."
+if ! wait_restarted_replica_convergence "$PRE_FAILOVER_COMMIT"; then
+    capture_replica_diagnostics "restarted-replica-convergence-failed-$RUN_ID"
+    exit 1
+fi
 
 # Save evidence
 cat > "$OUT_DIR/leader-failover.txt" <<EOF
@@ -487,20 +554,16 @@ CPU_WORKER_STOPPED=false
 sleep 20
 
 echo "[B5] Verify /run recovers after worker restart..."
-for i in $(seq 1 12); do
-    RECOVERED="$(curl -s --max-time 10 -X POST "$API_URL/v1/deployments/$DRILL_NAME/run" \
-        -H 'Content-Type: application/json' -d '{"text":"recovered"}' 2>/dev/null || echo "")"
-    if echo "$RECOVERED" | grep -q '"model"'; then
-        echo "  PASS: run recovered (attempt $i)"
-        PASS=$((PASS + 1))
-        break
-    fi
-    if [[ $i -eq 12 ]]; then
-        echo "  FAIL: run did not recover"
-        FAIL=$((FAIL + 1))
-    fi
-    sleep 5
-done
+RECOVERED=""
+if hivemind_run_with_retry "worker recovery" \
+    "$API_URL/v1/deployments/$DRILL_NAME/run" '{"text":"recovered"}' \
+    '"model"' 12 5 '' 10; then
+    RECOVERED="$HIVEMIND_RUN_BODY"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: run did not recover"
+    FAIL=$((FAIL + 1))
+fi
 
 cat > "$OUT_DIR/worker-loss.txt" <<EOF
 cpu_worker=$CPU_WORKER_IP
@@ -519,10 +582,12 @@ TIMEOUT_OUT="$(curl -s --max-time 2 -X POST "$API_URL/v1/deployments/$DRILL_NAME
 echo "     Timeout response: $TIMEOUT_OUT"
 sleep 5
 
-echo "[C2] Check queue for in-flight leak..."
-QUEUE_METRICS="$(curl -s "$API_URL/dashboard/cluster" 2>/dev/null || echo "")"
-IN_FLIGHT="$(echo "$QUEUE_METRICS" | grep -oi 'in.flight[^0-9]*[0-9]*' | head -1 || echo "unknown")"
-echo "     Queue state: $IN_FLIGHT"
+echo "[C2] Require exact queue and in-flight zero on every replica..."
+if ! wait_all_replica_queues_zero; then
+    capture_replica_diagnostics "queue-zero-failed-$RUN_ID"
+    exit 1
+fi
+IN_FLIGHT="exact_zero_all_replicas"
 
 echo "[C3] Verify next /run still succeeds..."
 run_expect_field "post-timeout run succeeds" '{"text":"after-timeout"}' model

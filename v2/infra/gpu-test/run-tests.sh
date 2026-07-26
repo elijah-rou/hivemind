@@ -3,18 +3,86 @@ set -euo pipefail
 
 # Spin up a g4dn.xlarge, run containerd integration tests, tear down.
 # Usage: ./run-tests.sh
+# Set KEEP_INFRA=1 to skip destroy after success/failure (debug retention).
 #
 # Prerequisites:
-#   - Rust agent built for Linux: cd agent && cross build --release --target x86_64-unknown-linux-gnu --features containerd-integration
+#   - Rust worker built for Linux: cd worker && cross build --release --target x86_64-unknown-linux-gnu --features containerd-integration
 #   - Or use cargo-zigbuild: cargo zigbuild --release --target x86_64-unknown-linux-gnu --features containerd-integration
 #   - Terraform initialized: terraform init
 
 REGION="us-east-1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_DIR="$SCRIPT_DIR/../../agent"
+WORKER_DIR="$SCRIPT_DIR/../../worker"
+KEEP_INFRA="${KEEP_INFRA:-0}"
+REQUIRE_GPU="${REQUIRE_GPU:-0}"
+BUCKET=""
+INSTANCE_ID=""
+CLEANUP_INSTALLED=0
+RUN_WORKSPACE="hivemind-gpu-$(date +%s)-$$-$RANDOM"
+TF_DATA_DIR=""
+WORKER_ARCHIVE=""
+SSM_POLL_INTERVAL_SEC="${SSM_POLL_INTERVAL_SEC:-5}"
+SSM_POLL_TIMEOUT_SEC="${SSM_POLL_TIMEOUT_SEC:-600}"
+# shellcheck source=../bench/ssm_wait.sh disable=SC1091
+source "$SCRIPT_DIR/../bench/ssm_wait.sh"
+hivemind_ssm_assert_poll_bounds
 
-echo "=== Step 1: Build agent + test binary for Linux ==="
-cd "$AGENT_DIR"
+if [[ "$KEEP_INFRA" != "0" && "$KEEP_INFRA" != "1" ]]; then
+  echo "FAIL: KEEP_INFRA must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_GPU" != "0" && "$REQUIRE_GPU" != "1" ]]; then
+  echo "FAIL: REQUIRE_GPU must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! -d "$WORKER_DIR" ]]; then
+  echo "FAIL: worker source not found at $WORKER_DIR" >&2
+  exit 1
+fi
+TF_DATA_DIR="$(mktemp -d)"
+WORKER_ARCHIVE="$(mktemp "$TF_DATA_DIR/worker-src.XXXXXX.tar.gz")"
+export TF_DATA_DIR
+export TF_WORKSPACE="$RUN_WORKSPACE"
+
+cleanup() {
+  local status=$?
+  local cleanup_failed=0
+  trap - EXIT INT TERM
+  set +e
+  if [[ "$KEEP_INFRA" == "1" ]]; then
+    echo "KEEP_INFRA=1: leaving resources for debugging"
+    echo "terraform workspace: $RUN_WORKSPACE"
+    [[ -n "$INSTANCE_ID" ]] && echo "instance: $INSTANCE_ID"
+    [[ -n "$BUCKET" ]] && echo "s3: s3://$BUCKET"
+    rm -rf "$TF_DATA_DIR"
+    exit "$status"
+  fi
+  if [[ -n "$BUCKET" ]] && ! aws s3 rb "s3://$BUCKET" --force --region "$REGION"; then
+    echo "CLEANUP ERROR: s3 bucket removal failed: s3://$BUCKET" >&2
+    cleanup_failed=1
+  fi
+  cd "$SCRIPT_DIR"
+  if ! terraform destroy -auto-approve; then
+    echo "CLEANUP ERROR: terraform destroy failed for workspace $RUN_WORKSPACE" >&2
+    cleanup_failed=1
+  fi
+  if ! env -u TF_WORKSPACE terraform workspace select default >/dev/null; then
+    echo "CLEANUP ERROR: terraform workspace select default failed in isolated state $TF_DATA_DIR" >&2
+    cleanup_failed=1
+  fi
+  if ! env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null; then
+    echo "CLEANUP ERROR: terraform workspace delete failed: $RUN_WORKSPACE" >&2
+    cleanup_failed=1
+  fi
+  rm -rf "$TF_DATA_DIR"
+  if [[ "$status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+echo "=== Step 1: Build worker + test binary for Linux ==="
+cd "$WORKER_DIR"
 
 # Build the integration test binary
 # Note: cross-compilation of test binaries is tricky. We'll compile ON the instance instead.
@@ -24,6 +92,15 @@ echo ""
 echo "=== Step 2: Terraform apply ==="
 cd "$SCRIPT_DIR"
 terraform init -input=false 2>/dev/null
+# Each invocation owns a unique Terraform workspace and local metadata directory.
+# Concurrent runs therefore cannot observe, mutate, or destroy each other's state.
+env -u TF_WORKSPACE terraform workspace new "$RUN_WORKSPACE" >/dev/null
+if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  CLEANUP_INSTALLED=1
+fi
 terraform apply -auto-approve
 
 INSTANCE_ID=$(terraform output -raw instance_id)
@@ -31,29 +108,26 @@ echo "instance: $INSTANCE_ID"
 
 echo ""
 echo "=== Step 3: Wait for SSM ==="
-for i in $(seq 1 60); do
-  status=$(aws ssm describe-instance-information --region "$REGION" \
-    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
-  if [[ "$status" == "Online" ]]; then
-    echo "SSM online"
-    break
-  fi
-  sleep 5
-done
+hivemind_ssm_wait_online "$REGION" "$INSTANCE_ID"
 
 echo ""
 echo "=== Step 4: Setup instance ==="
-# Upload agent source and build on-instance (avoids cross-compilation issues)
-BUCKET="hivemind-gpu-test-$(date +%s)"
-aws s3 mb "s3://$BUCKET" --region "$REGION"
+if [[ "$REQUIRE_GPU" == "1" ]]; then
+  STRICT_GPU_REMOTE='sudo ctr -n hivemind images pull docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04; sudo ctr -n hivemind run --rm --runtime io.containerd.runc.v2 --device nvidia.com/gpu=0 docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 hivemind-strict-gpu nvidia-smi | tee /tmp/hivemind-strict-gpu.txt; grep -E "NVIDIA-SMI|Driver Version" /tmp/hivemind-strict-gpu.txt'
+else
+  STRICT_GPU_REMOTE='echo "SKIP: REQUIRE_GPU=0; CDI-selected in-container nvidia-smi acceptance unavailable"'
+fi
+# Upload worker source and build on-instance (avoids cross-compilation issues)
+BUCKET_CANDIDATE="hivemind-gpu-test-${RUN_WORKSPACE#hivemind-gpu-}"
+aws s3 mb "s3://$BUCKET_CANDIDATE" --region "$REGION"
+BUCKET="$BUCKET_CANDIDATE"
 
-# Package the agent source
-cd "$AGENT_DIR"
-tar czf /tmp/agent-src.tar.gz --exclude target --exclude .git -C .. agent/
-aws s3 cp /tmp/agent-src.tar.gz "s3://$BUCKET/agent-src.tar.gz" --region "$REGION"
+# Package the worker source
+cd "$WORKER_DIR"
+tar czf "$WORKER_ARCHIVE" --exclude target --exclude .git -C .. worker/
+aws s3 cp "$WORKER_ARCHIVE" "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
 
-CMD_ID=$(aws ssm send-command --region "$REGION" \
+CMD_ID=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --timeout-seconds 600 \
@@ -62,9 +136,10 @@ CMD_ID=$(aws ssm send-command --region "$REGION" \
     \"apt-get update -qq && apt-get install -y -qq build-essential pkg-config libssl-dev gvisor 2>/dev/null\",
     \"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\",
     \"source /root/.cargo/env\",
-    \"aws s3 cp s3://$BUCKET/agent-src.tar.gz /tmp/agent-src.tar.gz --region $REGION\",
-    \"cd /tmp && tar xzf agent-src.tar.gz\",
-    \"cd /tmp/agent && cargo test --test containerd_integration --features containerd-integration -- --test-threads=1 2>&1 || true\",
+    \"aws s3 cp s3://$BUCKET/worker-src.tar.gz /tmp/worker-src.tar.gz --region $REGION\",
+    \"cd /tmp && tar xzf worker-src.tar.gz\",
+    \"cd /tmp/worker && cargo test --test containerd_integration --features containerd-integration -- --test-threads=1\",
+    \"$STRICT_GPU_REMOTE\",
     \"echo TESTS_COMPLETE\"
   ]" \
   --query 'Command.CommandId' --output text)
@@ -74,34 +149,21 @@ echo ""
 echo "=== Step 5: Wait for tests ==="
 echo "(this may take 5-10 minutes for first build)"
 
-for i in $(seq 1 120); do
-  status=$(aws ssm list-command-invocations --region "$REGION" \
-    --command-id "$CMD_ID" \
-    --query 'CommandInvocations[0].Status' --output text 2>/dev/null || echo "Pending")
-  if [[ "$status" == "Success" || "$status" == "Failed" ]]; then
-    echo "status: $status"
-    break
-  fi
-  sleep 5
-done
+if ! hivemind_ssm_wait_invocation "$REGION" "$CMD_ID" "$INSTANCE_ID"; then
+  echo "FAIL: remote tests did not reach terminal Success" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== Test Output ==="
-aws ssm list-command-invocations --region "$REGION" \
-  --command-id "$CMD_ID" --details \
-  --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text
+# Diagnostic retrieval is independently bounded and cannot hang cleanup.
+if ! hivemind_ssm_aws "$SSM_POLL_TIMEOUT_SEC" ssm get-command-invocation --region "$REGION" \
+  --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' --output text; then
+  echo "FAIL: bounded remote test output retrieval failed" >&2
+  exit 1
+fi
 
 echo ""
 echo "=== Step 6: Cleanup ==="
-read -p "Destroy instance? [y/N] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  aws s3 rb "s3://$BUCKET" --force --region "$REGION"
-  terraform destroy -auto-approve
-  echo "cleaned up"
-else
-  echo "instance still running: $INSTANCE_ID"
-  echo "connect: aws ssm start-session --target $INSTANCE_ID --region $REGION"
-  echo "destroy: cd $SCRIPT_DIR && terraform destroy -auto-approve"
-  echo "s3 cleanup: aws s3 rb s3://$BUCKET --force --region $REGION"
-fi
+# cleanup trap handles destroy unless KEEP_INFRA=1

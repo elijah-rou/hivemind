@@ -16,7 +16,11 @@ IMAGE_PULL_PASSWORD="${IMAGE_PULL_PASSWORD:-}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 CPU_NAME="op-cpu-${RUN_ID}"
 GPU_NAME="op-gpu-${RUN_ID}"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
+source "$SCRIPT_DIR/run_retry.sh"
 
 TMP_FILES=()
 cleanup() {
@@ -50,19 +54,18 @@ wait_for() {
 }
 run_with_retry() {
     local deployment_name="$1" payload_file="$2" out_file="$3" attempts="${4:-36}" delay="${5:-5}"
-    for i in $(seq 1 "$attempts"); do
-        if curl -fsS -X POST "$API_URL/v1/deployments/$deployment_name/run" \
-            -H 'Content-Type: application/json' \
-            --data-binary "@$payload_file" > "$out_file"; then
-            echo "pass: run $deployment_name attempt=$i"
-            return 0
-        fi
-        rm -f "$out_file"
-        sleep "$delay"
-    done
-    echo "timeout: run $deployment_name" >&2
-    exit 1
+    hivemind_run_with_retry "$deployment_name" \
+        "$API_URL/v1/deployments/$deployment_name/run" \
+        "@$payload_file" '' "$attempts" "$delay" "$out_file"
 }
+
+if [[ "${OPERATOR_WORKFLOW_RETRY_FIXTURE:-false}" == "true" ]]; then
+    run_with_retry fixture \
+        "${OPERATOR_WORKFLOW_RETRY_PAYLOAD:?set OPERATOR_WORKFLOW_RETRY_PAYLOAD}" \
+        "${OPERATOR_WORKFLOW_RETRY_OUTPUT:?set OPERATOR_WORKFLOW_RETRY_OUTPUT}" \
+        3 0
+    exit $?
+fi
 write_create_payloads() {
     local artifact_file="$1"
     local secret_file="$2"

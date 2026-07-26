@@ -9,6 +9,9 @@ set -euo pipefail
 #   SSH_KEY=$HOME/.ssh/id_ed25519 DESTROY_HIVEMIND_AFTER=true bash scripts/poc-section5-cycle.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../infra/poc/http.sh
+# shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
+source "$ROOT_DIR/infra/poc/http.sh"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc}"
@@ -25,6 +28,7 @@ PRELOAD_TIMEOUT_SECONDS="${PRELOAD_TIMEOUT_SECONDS:-600}"
 ARTIFACT_ROOT="$ROOT_DIR/artifacts/poc-final"
 LOG="$ARTIFACT_ROOT/00-runbook/section5-cycle-$TAG.log"
 mkdir -p "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra"
+chmod 700 "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra"
 exec > >(tee -a "$LOG") 2>&1
 
 CLEANUP_STARTED=false
@@ -125,6 +129,7 @@ configure_ssh_cidr() {
     export TF_VAR_ssh_cidr="$SSH_CIDR"
     export TF_VAR_region="$AWS_REGION"
     export TF_VAR_ecr_repository_name="$ECR_REPOSITORY"
+    export TF_VAR_run_token="${HIVEMIND_RUN_TOKEN:?HIVEMIND_RUN_TOKEN is required for isolated POC ownership}"
     echo "ssh_cidr=$SSH_CIDR"
 }
 
@@ -186,8 +191,10 @@ preload_cpu_image() {
     for worker_ip in "$WORKER_CPU_PUBLIC_IP" "$WORKER_GPU_PUBLIC_IP"; do
         [[ -n "$worker_ip" ]] || continue
         echo "preload_cpu_image worker=$worker_ip image=$CPU_IMAGE"
-        docker image save "$CPU_IMAGE" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" \
-            "set -euo pipefail; tmp=/tmp/hivemind-cpu-$TAG.tar; trap 'rm -f \"\$tmp\"' EXIT; cat > \"\$tmp\"; sudo ctr -n hivemind images import \"\$tmp\" >/tmp/hivemind-cpu-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx '$CPU_IMAGE' >/dev/null"
+        local remote_command
+        remote_command="set -euo pipefail; tmp=/tmp/hivemind-cpu-$TAG.tar; trap 'rm -f \"\$tmp\"' EXIT; cat > \"\$tmp\"; sudo ctr -n hivemind images import \"\$tmp\" >/tmp/hivemind-cpu-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx '$CPU_IMAGE' >/dev/null"
+        # shellcheck disable=SC2029 # Command is intentionally assembled from quoted local values; stdin carries the image tar.
+        docker image save "$CPU_IMAGE" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" "$remote_command"
     done
 }
 
