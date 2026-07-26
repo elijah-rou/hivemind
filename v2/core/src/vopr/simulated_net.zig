@@ -88,6 +88,13 @@ pub const MessageStats = struct {
     }
 };
 
+const DropNext = struct {
+    id: u64,
+    from: u8,
+    to: u8,
+    tag: u8,
+};
+
 pub const SimulatedNetwork = struct {
     queues: [msg.REPLICA_COUNT_MAX]MessageQueue,
     // Asymmetric partition matrix: partitioned[from][to] can differ from [to][from]
@@ -111,6 +118,11 @@ pub const SimulatedNetwork = struct {
     partition_stability: i64, // minimum ticks a partition persists
     heal_stability: i64, // minimum ticks after heal before next partition
 
+    // Deterministic one-shot drop used by bounded VRR repair scenarios.
+    drop_next: ?DropNext,
+    drop_next_count: u64,
+    last_drop_next_id: u64,
+
     // Message accounting
     stats: MessageStats,
 
@@ -130,6 +142,9 @@ pub const SimulatedNetwork = struct {
             .heal_stable_until = 0,
             .partition_stability = 0,
             .heal_stability = 0,
+            .drop_next = null,
+            .drop_next_count = 0,
+            .last_drop_next_id = 0,
             .stats = MessageStats.init(),
         };
         for (&network.queues) |*q| {
@@ -152,15 +167,36 @@ pub const SimulatedNetwork = struct {
         self.heal_stable_until = 0;
         self.partition_stability = 0;
         self.heal_stability = 0;
+        self.drop_next = null;
+        self.drop_next_count = 0;
+        self.last_drop_next_id = 0;
         self.stats = MessageStats.init();
         for (&self.queues) |*q| {
             q.* = MessageQueue.init();
         }
     }
 
+    pub fn armDropNext(self: *SimulatedNetwork, id: u64, from: u8, to: u8, tag: u8) void {
+        std.debug.assert(id > 0);
+        std.debug.assert(from < self.replica_count);
+        std.debug.assert(to < self.replica_count);
+        std.debug.assert(self.drop_next == null);
+        self.drop_next = .{ .id = id, .from = from, .to = to, .tag = tag };
+    }
+
     pub fn enqueueSend(self: *SimulatedNetwork, from: u8, to: u8, data: []const u8) void {
-        if (to >= self.replica_count) return;
+        if (from >= self.replica_count or to >= self.replica_count) return;
         if (self.partitioned[from][to]) return;
+
+        if (self.drop_next) |selection| {
+            const tag: u8 = if (data.len == 0) 0 else data[0];
+            if (selection.from == from and selection.to == to and selection.tag == tag) {
+                self.drop_next = null;
+                self.drop_next_count += 1;
+                self.last_drop_next_id = selection.id;
+                return;
+            }
+        }
 
         // Drop
         if (!self.drop_rate.isZero()) {

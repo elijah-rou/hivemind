@@ -16,6 +16,7 @@ const StateMachine = @import("state_machine.zig").StateMachine;
 const sched = @import("scheduler.zig");
 const disk_mod = @import("disk.zig");
 const latency = @import("latency.zig");
+const view_candidate = @import("view_change_candidate.zig");
 pub const DiskInterface = disk_mod.DiskInterface;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,82 @@ const FLUSH_BARRIER_MAX: u8 = 4;
 pub fn journalSlot(op: msg.OpNumber) usize {
     std.debug.assert(op > 0);
     return @intCast(op % LOG_SIZE_MAX);
+}
+
+/// Prepare wire/semantics gate used before onPrepare mutates view/status/log.
+fn prepareSemanticsValid(prepare: msg.PrepareMsg) bool {
+    if (prepare.op_number == 0 or prepare.op_number > LOG_SIZE_MAX) return false;
+    if (prepare.commit_min > prepare.op_number) return false;
+    if (prepare.retention_floor != 0) return false;
+    if (prepare.entry.op_number != prepare.op_number) return false;
+    if (!prepare.entry.valid()) return false;
+    return true;
+}
+
+/// Commit wire/semantics gate used before onCommit mutates view/status/log.
+fn commitSemanticsValid(commit: msg.CommitMsg) bool {
+    if (commit.op_number > LOG_SIZE_MAX) return false;
+    if (commit.commit_min > LOG_SIZE_MAX) return false;
+    if (commit.commit_max > LOG_SIZE_MAX) return false;
+    if (commit.retention_floor != 0) return false;
+    if (commit.commit_min > commit.op_number) return false;
+    if (commit.commit_max > commit.op_number) return false;
+    return true;
+}
+
+/// StartView entry-set gate: bounds, no op above sv.op_number, no duplicate/conflict identities.
+fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
+    if (sv.commit_min > sv.op_number or sv.op_number > LOG_SIZE_MAX) return false;
+    if (sv.retention_floor != 0) return false;
+    if (sv.selected_last_normal_view > sv.view_number) return false;
+    if ((sv.op_number == 0) != (sv.tip_checksum == 0)) return false;
+    if (sv.log_entry_count > msg.SV_LOG_MAX) return false;
+    var i: usize = 0;
+    while (i < sv.log_entry_count) : (i += 1) {
+        const entry = sv.log_entries[i];
+        if (entry.op_number < 1 or entry.op_number > LOG_SIZE_MAX) return false;
+        if (!entry.valid()) return false;
+        if (entry.op_number > sv.op_number) return false;
+        var j: usize = i + 1;
+        while (j < sv.log_entry_count) : (j += 1) {
+            if (sv.log_entries[j].op_number == entry.op_number) return false;
+        }
+    }
+    return true;
+}
+
+fn selectionBindingValid(source: u8, tip_op: msg.OpNumber, tip_checksum: u64) bool {
+    if (tip_checksum == 0) return source == 0 and tip_op == 0;
+    return source < msg.REPLICA_COUNT_MAX and tip_op > 0 and tip_op <= LOG_SIZE_MAX;
+}
+
+/// Stateless peer-message semantics checked before a socket may claim identity.
+pub fn peerMessageSemanticsValid(message: msg.Message) bool {
+    return switch (message) {
+        .prepare => |m| prepareSemanticsValid(m),
+        // A late ack may report a commit watermark above the acked op.
+        .prepare_ok => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.commit_min <= LOG_SIZE_MAX and m.entry_checksum != 0 and ((m.commit_min == 0) == (m.commit_checksum == 0)),
+        .commit => |m| commitSemanticsValid(m),
+        .do_view_change => |m| blk: {
+            if (m.commit_min > m.op_number or m.op_number > LOG_SIZE_MAX) break :blk false;
+            if (m.retention_floor != 0) break :blk false;
+            if (m.log_entry_count > msg.DVC_LOG_MAX) break :blk false;
+            for (m.log_entries[0..m.log_entry_count]) |entry| {
+                if (entry.op_number == 0 or entry.op_number > m.op_number or !entry.valid()) break :blk false;
+            }
+            break :blk true;
+        },
+        .start_view => |m| startViewEntriesValid(m),
+        .request_prepare => |m| m.op_number > 0 and m.op_number <= LOG_SIZE_MAX and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum) and ((m.selected_tip_checksum == 0) == (m.expected_entry_checksum == 0)),
+        .send_prepare => |m| m.entry.op_number > 0 and m.entry.op_number <= LOG_SIZE_MAX and m.entry.valid() and m.selected_commit_bound <= m.selected_tip_op and selectionBindingValid(m.selected_source, m.selected_tip_op, m.selected_tip_checksum) and ((m.selected_tip_checksum == 0) == (m.expected_entry_checksum == 0)),
+        .send_status => |m| m.commit_min <= m.op_number and m.op_number <= LOG_SIZE_MAX and ((m.op_number == 0) == (m.tip_checksum == 0)) and ((m.commit_min == 0) == (m.commit_checksum == 0)),
+        .request,
+        .reply,
+        .start_view_change,
+        .request_status,
+        .request_start_view,
+        => true,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +158,9 @@ pub const WorkerSendFn = *const fn (ctx: *anyopaque, worker_idx: usize, data: []
 // ---------------------------------------------------------------------------
 
 pub const ReplicaConfig = struct {
+    // Direct constructors default to a build-valid allocator to bound test churn.
+    // Production and TestCluster owners inject their allocator explicitly.
+    allocator: std.mem.Allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator,
     replica_id: u8,
     replica_count: u8,
     io: Io,
@@ -112,6 +192,10 @@ pub const WorkerConnection = struct {
 
 pub const Replica = struct {
     // Configuration
+    allocator: std.mem.Allocator,
+    view_change_candidate: view_candidate.ViewChangeCandidate,
+    pending_start_view: view_candidate.PendingStartView,
+    deferred_view_target: msg.ViewNumber,
     replica_id: u8,
     replica_count: u8,
     quorum_size: u8,
@@ -152,6 +236,18 @@ pub const Replica = struct {
     do_vc_received: [msg.REPLICA_COUNT_MAX]bool,
     do_vc_msgs: [msg.REPLICA_COUNT_MAX]msg.DoViewChangeMsg,
     do_vc_total: u8,
+    pending_view_selection: bool,
+    selected_source: u8,
+    selected_last_normal_view: msg.ViewNumber,
+    selected_tip_op: msg.OpNumber,
+    selected_tip_checksum: u64,
+    selected_commit_bound: msg.OpNumber,
+    selected_retention_floor: msg.OpNumber,
+    selected_target_view: msg.ViewNumber,
+    selected_next_op: msg.OpNumber,
+    selected_expected_checksum: u64,
+    selected_sources_attempted: u16,
+    selected_sources_requested: u16,
 
     // I/O -- the single injectable interface
     io: Io,
@@ -234,6 +330,10 @@ pub const Replica = struct {
         const f = (config.replica_count - 1) / 2;
 
         return .{
+            .allocator = config.allocator,
+            .view_change_candidate = .{ .allocator = config.allocator },
+            .pending_start_view = .{},
+            .deferred_view_target = 0,
             .replica_id = config.replica_id,
             .replica_count = config.replica_count,
             .quorum_size = @intCast(f + 1),
@@ -257,6 +357,18 @@ pub const Replica = struct {
             .do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool),
             .do_vc_msgs = undefined,
             .do_vc_total = 0,
+            .pending_view_selection = false,
+            .selected_source = 0,
+            .selected_last_normal_view = 0,
+            .selected_tip_op = 0,
+            .selected_tip_checksum = 0,
+            .selected_commit_bound = 0,
+            .selected_retention_floor = 0,
+            .selected_target_view = 0,
+            .selected_next_op = 0,
+            .selected_expected_checksum = 0,
+            .selected_sources_attempted = 0,
+            .selected_sources_requested = 0,
             .repair_pending = false,
             .repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64),
             .repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool),
@@ -309,6 +421,10 @@ pub const Replica = struct {
     pub fn initInPlace(self: *Replica, config: ReplicaConfig) void {
         std.debug.assert(config.replica_count >= 1 and config.replica_count <= msg.REPLICA_COUNT_MAX);
         const f = (config.replica_count - 1) / 2;
+        self.allocator = config.allocator;
+        self.view_change_candidate = .{ .allocator = config.allocator };
+        self.pending_start_view = .{};
+        self.deferred_view_target = 0;
         self.replica_id = config.replica_id;
         self.replica_count = config.replica_count;
         self.quorum_size = @intCast(f + 1);
@@ -329,6 +445,18 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.pending_view_selection = false;
+        self.selected_source = 0;
+        self.selected_last_normal_view = 0;
+        self.selected_tip_op = 0;
+        self.selected_tip_checksum = 0;
+        self.selected_commit_bound = 0;
+        self.selected_retention_floor = 0;
+        self.selected_target_view = 0;
+        self.selected_next_op = 0;
+        self.selected_expected_checksum = 0;
+        self.selected_sources_attempted = 0;
+        self.selected_sources_requested = 0;
         self.repair_pending = false;
         self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
         self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
@@ -370,6 +498,32 @@ pub const Replica = struct {
         self.pod_scheduled_fn = config.pod_scheduled_fn;
         self.worker_send_ctx = config.worker_send_ctx;
         self.worker_send_fn = config.worker_send_fn;
+        self.assertCandidateOwnership();
+    }
+
+    fn assertCandidateOwnership(self: *const Replica) void {
+        std.debug.assert(self.view_change_candidate.allocator != null);
+        if (self.view_change_candidate.phase == .idle) {
+            std.debug.assert(self.view_change_candidate.entries.len == 0);
+            std.debug.assert(self.view_change_candidate.present.len == 0);
+            std.debug.assert(!self.pending_start_view.active);
+        }
+        if (self.pending_start_view.active) {
+            std.debug.assert(self.pending_start_view.role == .leader);
+            std.debug.assert(self.view_change_candidate.phase == .persisting_start_view);
+        }
+    }
+
+    pub fn deinit(self: *Replica) void {
+        self.view_change_candidate.deinit();
+        std.debug.assert(self.view_change_candidate.allocator == null);
+        std.debug.assert(self.view_change_candidate.entries.len == 0);
+        std.debug.assert(self.view_change_candidate.present.len == 0);
+    }
+
+    pub fn resetInPlace(self: *Replica, config: ReplicaConfig) void {
+        self.deinit();
+        self.initInPlace(config);
     }
 
     /// Recover state from disk after a crash. Restores metadata and journal
@@ -447,6 +601,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.pending_view_selection = false;
 
         return true;
     }
@@ -560,12 +715,23 @@ pub const Replica = struct {
                 }
             },
             .view_change => {
-                const timeout = if (self.recovered_from_disk)
-                    RECOVERED_VIEW_CHANGE_TIMEOUT
-                else
-                    VIEW_CHANGE_TIMEOUT * 2;
-                if (now_tick - self.last_leader_activity >= timeout) {
-                    self.initiateViewChange();
+                if (self.pending_start_view.active) {
+                    std.debug.assert(self.view_change_candidate.phase == .persisting_start_view);
+                } else if (self.pending_view_selection) {
+                    const deadline_tick = self.view_change_candidate.metadata.deadline_tick;
+                    if (deadline_tick > 0 and now_tick >= 0 and @as(u64, @intCast(now_tick)) >= deadline_tick) {
+                        self.abortSelectedView();
+                    } else {
+                        self.advanceSelectedView();
+                    }
+                } else {
+                    const timeout = if (self.recovered_from_disk)
+                        RECOVERED_VIEW_CHANGE_TIMEOUT
+                    else
+                        VIEW_CHANGE_TIMEOUT * 2;
+                    if (now_tick - self.last_leader_activity >= timeout) {
+                        self.initiateViewChange();
+                    }
                 }
             },
             .recovering => {},
@@ -578,8 +744,38 @@ pub const Replica = struct {
     // Message dispatch
     // -----------------------------------------------------------------------
 
+    fn deferredHigherViewTarget(self: *const Replica, from: u8, message: msg.Message) ?msg.ViewNumber {
+        return switch (message) {
+            .start_view_change => |m| if (m.replica_id == from) m.view_number else null,
+            .prepare => |m| if (from == self.leaderForView(m.view_number) and prepareSemanticsValid(m)) m.view_number else null,
+            .commit => |m| if (from == self.leaderForView(m.view_number) and commitSemanticsValid(m)) m.view_number else null,
+            .start_view => |m| if (from == self.leaderForView(m.view_number) and startViewEntriesValid(m)) m.view_number else null,
+            else => null,
+        };
+    }
+
     pub fn onMessage(self: *Replica, from: u8, message: msg.Message) void {
         if (self.storage_failed) return;
+        // Peer-sourced `from` must be a live cluster member. Out-of-range IDs
+        // would OOB-index vote/status arrays or forge quorum identity.
+        if (from >= self.replica_count) return;
+        if (self.pending_start_view.active) {
+            if (self.deferredHigherViewTarget(from, message)) |message_view| {
+                if (message_view > self.pending_start_view.target_view) {
+                    self.deferred_view_target = @max(self.deferred_view_target, message_view);
+                }
+            }
+            // The installed candidate is immutable until its publication point.
+            // Selection-bound RequestPrepare is read-only and must remain
+            // serviceable while a later StartView waits on its barrier.
+            if (message != .request and message != .reply and message != .request_prepare) return;
+        }
+        if (self.pending_view_selection and self.leaderForView(self.selected_target_view) != self.replica_id) {
+            switch (message) {
+                .send_prepare, .start_view, .start_view_change, .request_prepare => {},
+                else => return,
+            }
+        }
         switch (message) {
             .request => |m| self.onRequest(from, m),
             .prepare => |m| self.onPrepare(from, m),
@@ -592,8 +788,30 @@ pub const Replica = struct {
             .send_prepare => |m| self.onSendPrepare(from, m),
             .request_status => |m| self.onRequestStatus(from, m),
             .send_status => |m| self.onSendStatus(from, m),
+            .request_start_view => |m| self.onRequestStartView(from, m),
             .reply => {},
         }
+    }
+
+    fn peerLogBoundsOk(commit_min: msg.OpNumber, op_number: msg.OpNumber) bool {
+        return commit_min <= op_number and op_number <= LOG_SIZE_MAX;
+    }
+
+    fn peerOpInRetainedLog(op: msg.OpNumber) bool {
+        return op >= 1 and op <= LOG_SIZE_MAX;
+    }
+
+    fn peerCommitInRetainedLog(commit_min: msg.OpNumber) bool {
+        return commit_min <= LOG_SIZE_MAX;
+    }
+
+    fn peerLogEntriesOk(entries: []const msg.LogEntry, count: usize, max_count: usize) bool {
+        if (count > max_count) return false;
+        for (entries[0..count]) |entry| {
+            if (!peerOpInRetainedLog(entry.op_number)) return false;
+            if (!entry.valid()) return false;
+        }
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -663,37 +881,37 @@ pub const Replica = struct {
         if (self.status == .recovering) return;
         if (from != self.leaderForView(prepare.view_number)) return;
 
-        // If we see a Prepare from a higher view, we missed the view change.
+        // Reject malformed prepares before any view/status/log mutation.
+        // Unsigned underflow of (op_number - retention_floor) is possible otherwise.
+        if (!prepareSemanticsValid(prepare)) return;
+
+        // One leader cannot propose two identities for the same (view, op).
+        // Reject before heartbeat, retention, status, or journal mutation.
+        if (prepare.view_number == self.view_number) {
+            if (self.journalGet(prepare.op_number)) |existing| {
+                if (existing.checksum != prepare.entry.checksum) return;
+            }
+        }
+
+        // Prepare proves only that a leader is active. StartView is the sole
+        // adoption record for a new view and its selected suffix.
         if (prepare.view_number > self.view_number) {
-            // A higher-view leader may only safely reuse our committed prefix.
-            // Any locally-held uncommitted suffix could be divergent.
-            self.truncateAbove(self.commit_min);
-            self.view_number = prepare.view_number;
-            self.op_number = self.commit_min;
-            self.commit_max = self.commit_min;
+            self.awaitStartView(prepare.view_number);
+            self.requestStartView(prepare.view_number);
+            return;
         }
 
         if (prepare.view_number != self.view_number) return;
-        if (self.isLeader()) return;
-
         if (self.status == .view_change) {
-            // Rejoining via Prepare must discard any uncommitted local suffix.
-            // Preserving entries above our own commit_min can let a stale value
-            // get committed under the new view before the leader repairs us.
-            self.truncateAbove(self.commit_min);
-            self.op_number = self.commit_min;
-            self.commit_max = self.commit_min;
-            self.status = .normal;
-            self.last_normal_view = self.view_number;
-            self.recovered_from_disk = false;
+            self.requestStartView(prepare.view_number);
+            return;
         }
+        if (self.isLeader()) return;
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, prepare.commit_min);
         std.debug.assert(prepare.retention_floor == 0);
         self.retention_floor = 0;
-
-        if (!prepare.entry.valid()) return;
 
         if (prepare.op_number <= self.op_number and prepare.op_number > self.commit_min) {
             if (self.journalGet(prepare.op_number)) |existing| {
@@ -733,6 +951,8 @@ pub const Replica = struct {
                             .op_number = prepare.op_number,
                             .replica_id = self.replica_id,
                             .commit_min = self.commit_min,
+                            .entry_checksum = existing.checksum,
+                            .commit_checksum = if (self.commit_min == 0) 0 else self.journalGet(self.commit_min).?.checksum,
                         } });
                     } else {
                         self.pending_prepare_ok[slot] = true;
@@ -757,7 +977,19 @@ pub const Replica = struct {
         if (self.status != .normal) return;
         if (!self.isLeader()) return;
         if (ok.view_number != self.view_number) return;
+        if (ok.replica_id != from) return;
+        if (!peerOpInRetainedLog(ok.op_number)) return;
+        const current_entry = self.journalGet(ok.op_number) orelse return;
+        if (ok.entry_checksum != current_entry.checksum) return;
+        // commit_min is the sender watermark and may exceed the acked op
+        // (late PrepareOk after the follower has already committed further).
+        if (!peerCommitInRetainedLog(ok.commit_min)) return;
 
+        if (ok.commit_min > self.replica_commit_min[from]) {
+            if (ok.commit_min == 0) return;
+            const committed = self.journalGet(ok.commit_min) orelse return;
+            if (committed.checksum != ok.commit_checksum) return;
+        }
         self.noteReplicaCommitMin(from, ok.commit_min);
 
         if (ok.op_number > self.commit_min and ok.op_number <= self.op_number) {
@@ -780,52 +1012,49 @@ pub const Replica = struct {
         if (self.status == .recovering) return;
         if (from != self.leaderForView(commit_msg.view_number)) return;
 
+        // Reject malformed commits before any view/status/log mutation.
+        if (!commitSemanticsValid(commit_msg)) return;
+
+        const target = @max(commit_msg.commit_min, commit_msg.commit_max);
+        const advancing = target > self.commit_min;
+        if (advancing and commit_msg.commit_checksum == 0) return;
+
+        // Commit cannot substitute for the StartView certificate that selected
+        // this view's suffix. A conflicting local speculative target is exactly
+        // why the follower must request the leader's adoption record.
         if (commit_msg.view_number > self.view_number) {
-            // A higher-view leader may only safely reuse our committed prefix.
-            // Any locally-held uncommitted suffix could be divergent.
-            self.truncateAbove(self.commit_min);
-            self.view_number = commit_msg.view_number;
-            self.op_number = self.commit_min;
-            self.commit_max = self.commit_min;
+            self.awaitStartView(commit_msg.view_number);
+            self.requestStartView(commit_msg.view_number);
+            return;
         }
 
         if (commit_msg.view_number != self.view_number) return;
-        if (self.isLeader()) return;
-
-        if (self.status == .view_change) {
-            // Rejoining via Commit must discard any uncommitted local suffix.
-            // Otherwise a stale tail can become locally committed before repair.
-            self.truncateAbove(self.commit_min);
-            self.op_number = self.commit_min;
-            self.commit_max = self.commit_min;
-            self.status = .normal;
-            self.last_normal_view = self.view_number;
-            self.recovered_from_disk = false;
+        if (advancing) {
+            // Within an adopted view, advancement remains identity-bound.
+            if (self.journalGet(target)) |target_entry| {
+                if (target_entry.checksum != commit_msg.commit_checksum) return;
+            }
         }
+        if (self.status == .view_change) {
+            self.requestStartView(commit_msg.view_number);
+            return;
+        }
+        if (self.isLeader()) return;
 
         self.last_leader_activity = io_mod.nowTick(self.io);
         self.noteReplicaCommitMin(from, commit_msg.commit_min);
         std.debug.assert(commit_msg.retention_floor == 0);
         self.retention_floor = 0;
 
-        const target = @max(commit_msg.commit_min, commit_msg.commit_max);
         if (target > self.commit_min) {
-            if (commit_msg.commit_checksum != 0) {
-                const target_entry = self.journalGet(target) orelse {
-                    self.transfer_pending = true;
-                    self.transfer_target_op = @max(self.transfer_target_op, target);
-                    return;
-                };
-                if (target_entry.checksum != commit_msg.commit_checksum) {
-                    self.truncateAbove(target - 1);
-                    self.op_number = @max(self.logHighOp(), self.commit_min);
-                    self.commit_max = @min(self.commit_max, self.op_number);
-                    self.transfer_pending = true;
-                    self.transfer_target_op = @max(self.transfer_target_op, target);
-                    return;
-                }
+            if (self.journalGet(target) != null) {
+                std.debug.assert(commit_msg.commit_checksum != 0);
+                self.commitUpTo(target);
+            } else {
+                // Valid advancing Commit for an op we lack locally: repair, do not commit.
+                self.transfer_pending = true;
+                self.transfer_target_op = @max(self.transfer_target_op, target);
             }
-            self.commitUpTo(target);
         }
 
         if (commit_msg.op_number > self.op_number) {
@@ -846,7 +1075,32 @@ pub const Replica = struct {
     // -----------------------------------------------------------------------
 
     fn initiateViewChange(self: *Replica) void {
-        const new_view = self.view_number + 1;
+        self.initiateViewChangeTo(self.view_number + 1);
+    }
+
+    fn awaitStartView(self: *Replica, new_view: msg.ViewNumber) void {
+        std.debug.assert(new_view > self.view_number);
+        std.debug.assert(!self.pending_start_view.active);
+
+        self.status = .view_change;
+        self.view_number = new_view;
+        self.repair_pending = false;
+        self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
+        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.repair_status_count = 0;
+        self.transfer_pending = false;
+        self.transfer_target_op = 0;
+        self.last_leader_activity = io_mod.nowTick(self.io);
+        self.start_vc_count = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.start_vc_total = 0;
+        self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.do_vc_total = 0;
+        self.resetSelectedView();
+    }
+
+    fn initiateViewChangeTo(self: *Replica, new_view: msg.ViewNumber) void {
+        std.debug.assert(new_view > self.view_number);
+        std.debug.assert(!self.pending_start_view.active);
 
         self.status = .view_change;
         self.view_number = new_view;
@@ -862,6 +1116,7 @@ pub const Replica = struct {
         self.start_vc_total = 0;
         self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
         self.do_vc_total = 0;
+        self.resetSelectedView();
 
         self.start_vc_count[self.replica_id] = true;
         self.start_vc_total = 1;
@@ -874,9 +1129,9 @@ pub const Replica = struct {
         self.maybeDoViewChange();
     }
 
-    fn onStartViewChange(self: *Replica, _: u8, svc: msg.StartViewChangeMsg) void {
+    fn onStartViewChange(self: *Replica, from: u8, svc: msg.StartViewChangeMsg) void {
+        if (svc.replica_id != from) return;
         if (svc.view_number < self.view_number) return;
-
         if (svc.view_number > self.view_number) {
             self.status = .view_change;
             self.view_number = svc.view_number;
@@ -885,6 +1140,7 @@ pub const Replica = struct {
             self.start_vc_total = 0;
             self.do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
             self.do_vc_total = 0;
+            self.resetSelectedView();
             self.start_vc_count[self.replica_id] = true;
             self.start_vc_total = 1;
 
@@ -921,12 +1177,43 @@ pub const Replica = struct {
         }
     }
 
-    fn onDoViewChange(self: *Replica, _: u8, dvc: msg.DoViewChangeMsg) void {
+    fn dvcTipSemanticsValid(dvc: msg.DoViewChangeMsg) bool {
+        if (dvc.op_number == 0) return dvc.log_entry_count == 0;
+        var matching_tip_count: usize = 0;
+        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+            if (entry.op_number != dvc.op_number) continue;
+            if (!entry.valid()) return false;
+            matching_tip_count += 1;
+        }
+        return matching_tip_count == 1;
+    }
+
+    fn onDoViewChange(self: *Replica, from: u8, dvc: msg.DoViewChangeMsg) void {
         if (self.status != .view_change) return;
         if (dvc.view_number != self.view_number) return;
+        if (dvc.replica_id != from) return;
+        if (!peerLogBoundsOk(dvc.commit_min, dvc.op_number)) return;
+        if (dvc.retention_floor != 0) return;
+        if (!peerLogEntriesOk(&dvc.log_entries, dvc.log_entry_count, msg.DVC_LOG_MAX)) return;
+        if (!dvcTipSemanticsValid(dvc)) return;
 
         const new_leader: u8 = @intCast(self.view_number % self.replica_count);
         if (new_leader != self.replica_id) return;
+
+        if (self.pending_view_selection and dvc.replica_id == self.selected_source) {
+            const tip_checksum = dvcEntryChecksum(&dvc, dvc.op_number) orelse {
+                self.abortSelectedView();
+                return;
+            };
+            if (dvc.last_normal_view != self.selected_last_normal_view or
+                dvc.op_number != self.selected_tip_op or
+                tip_checksum != self.selected_tip_checksum or
+                !dvcOverlapEqual(&dvc, &self.do_vc_msgs[dvc.replica_id]))
+            {
+                self.abortSelectedView();
+                return;
+            }
+        }
 
         if (!self.do_vc_received[dvc.replica_id]) {
             self.do_vc_received[dvc.replica_id] = true;
@@ -940,210 +1227,374 @@ pub const Replica = struct {
 
     fn maybeStartView(self: *Replica) void {
         if (self.do_vc_total < self.quorum_size) return;
+        if (self.pending_view_selection) {
+            self.advanceSelectedView();
+            return;
+        }
 
-        // Nack protocol: for each uncommitted op, count how many DVCs
-        // DON'T have it. If nacks >= quorum_nack_prepare, the op could NOT
-        // have been committed, so truncate.
-
-        // Step 1: Find max_commit and max_op across all DVCs.
         var max_commit: msg.OpNumber = 0;
-        var max_op: msg.OpNumber = 0;
-        var carried_retention_floor = self.effectiveRetentionFloor();
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
             max_commit = @max(max_commit, self.do_vc_msgs[i].commit_min);
-            max_op = @max(max_op, self.do_vc_msgs[i].op_number);
-            carried_retention_floor = @min(carried_retention_floor, self.do_vc_msgs[i].retention_floor);
         }
 
-        // Step 2: Install committed entries. Only replicas that themselves
-        // report an op as committed may contribute its value here. Otherwise a
-        // higher-view but uncommitted suffix entry could overwrite a value that
-        // another replica proved committed via commit_min.
-        var committed_source_lnv = std.mem.zeroes([LOG_SIZE_MAX]msg.ViewNumber);
-        var committed_source_op = std.mem.zeroes([LOG_SIZE_MAX]msg.OpNumber);
-        var committed_source_set = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        var selected_index: ?usize = null;
+        var selected_tip_checksum: u64 = 0;
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
-            const dvc = &self.do_vc_msgs[i];
-            for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
-                if (!entry.valid()) continue;
-                if (entry.op_number > max_commit) continue;
-                if (entry.op_number > dvc.commit_min) continue;
+            const candidate = &self.do_vc_msgs[i];
+            const candidate_tip_checksum = dvcEntryChecksum(candidate, candidate.op_number) orelse return;
 
-                const slot = journalSlot(entry.op_number);
-                const should_install = !committed_source_set[slot] or
-                    committed_source_op[slot] != entry.op_number or
-                    dvc.last_normal_view >= committed_source_lnv[slot];
-                if (!should_install) continue;
-
-                self.journalPut(entry);
-                committed_source_set[slot] = true;
-                committed_source_op[slot] = entry.op_number;
-                committed_source_lnv[slot] = dvc.last_normal_view;
+            if (selected_index) |current_index| {
+                const current = &self.do_vc_msgs[current_index];
+                if (candidate.last_normal_view < current.last_normal_view) continue;
+                if (candidate.last_normal_view == current.last_normal_view and candidate.op_number < current.op_number) continue;
+                if (candidate.last_normal_view == current.last_normal_view and candidate.op_number == current.op_number) {
+                    if (candidate_tip_checksum != selected_tip_checksum) return;
+                    if (!dvcOverlapEqual(candidate, current)) return;
+                    if (candidate.replica_id > current.replica_id) continue;
+                }
             }
+            selected_index = i;
+            selected_tip_checksum = candidate_tip_checksum;
         }
 
-        // Collect present_bitsets from DVCs for targeted repair later
-        self.repair_present = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.LOG_BITSET_WORDS]u64);
+        const source_index = selected_index orelse return;
+        const selected = &self.do_vc_msgs[source_index];
+        if (max_commit > selected.op_number) return;
+        if (!dvcTailChainValid(selected)) return;
+        // Any committed identity exposed by the quorum must agree with the one
+        // selected source. This is a fail-closed guard for implementations that
+        // learned a commit after preparing a different suffix.
         for (0..self.replica_count) |i| {
             if (!self.do_vc_received[i]) continue;
-            self.repair_present[i] = self.do_vc_msgs[i].present_bitset;
+            const evidence = &self.do_vc_msgs[i];
+            for (evidence.log_entries[0..evidence.log_entry_count]) |committed_entry| {
+                if (committed_entry.op_number > evidence.commit_min) continue;
+                for (selected.log_entries[0..selected.log_entry_count]) |selected_entry| {
+                    if (selected_entry.op_number == committed_entry.op_number and selected_entry.checksum != committed_entry.checksum) return;
+                }
+            }
         }
 
-        // Step 3: For each uncommitted op, run nack protocol.
-        var highest_kept = max_commit;
-        var repair_target = highest_kept;
-        var op = max_commit + 1;
-        while (op <= max_op) : (op += 1) {
-            var nacks: u8 = 0;
-            var candidate_entries: [msg.REPLICA_COUNT_MAX]msg.LogEntry = undefined;
-            var candidate_counts: [msg.REPLICA_COUNT_MAX]u8 = std.mem.zeroes([msg.REPLICA_COUNT_MAX]u8);
-            var candidate_lnvs: [msg.REPLICA_COUNT_MAX]msg.ViewNumber = std.mem.zeroes([msg.REPLICA_COUNT_MAX]msg.ViewNumber);
-            var candidate_len: usize = 0;
+        self.pending_view_selection = true;
+        self.selected_source = selected.replica_id;
+        self.selected_last_normal_view = selected.last_normal_view;
+        self.selected_tip_op = selected.op_number;
+        self.selected_tip_checksum = selected_tip_checksum;
+        self.selected_commit_bound = max_commit;
+        self.selected_retention_floor = self.effectiveRetentionFloor();
+        self.selected_target_view = self.view_number;
+        self.selected_next_op = self.commit_min + 1;
 
-            for (0..self.replica_count) |i| {
-                if (!self.do_vc_received[i]) continue;
-                var has_bitsets = false;
-                for (self.do_vc_msgs[i].present_bitset) |word| {
-                    if (word != 0) has_bitsets = true;
-                }
-                for (self.do_vc_msgs[i].nack_bitset) |word| {
-                    if (word != 0) has_bitsets = true;
-                }
-
-                const has_op = if (has_bitsets)
-                    msg.bitsetGet(&self.do_vc_msgs[i].present_bitset, @intCast(op % LOG_SIZE_MAX))
-                else
-                    self.dvcHasOp(i, op);
-
-                if (has_op) {
-                    const candidate_lnv = self.do_vc_msgs[i].last_normal_view;
-                    for (self.do_vc_msgs[i].log_entries[0..self.do_vc_msgs[i].log_entry_count]) |entry| {
-                        if (entry.op_number == op and entry.valid()) {
-                            var matched = false;
-                            var idx: usize = 0;
-                            while (idx < candidate_len) : (idx += 1) {
-                                if (candidate_entries[idx].checksum == entry.checksum) {
-                                    candidate_counts[idx] += 1;
-                                    candidate_lnvs[idx] = @max(candidate_lnvs[idx], candidate_lnv);
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            if (!matched) {
-                                candidate_entries[candidate_len] = entry;
-                                candidate_counts[candidate_len] = 1;
-                                candidate_lnvs[candidate_len] = candidate_lnv;
-                                candidate_len += 1;
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    nacks += 1;
-                }
-            }
-
-            if (nacks >= self.quorum_nack_prepare) break;
-
-            var selected: ?msg.LogEntry = null;
-            var selected_support: u8 = 0;
-            var selected_lnv: msg.ViewNumber = 0;
-            var idx: usize = 0;
-            while (idx < candidate_len) : (idx += 1) {
-                if (selected == null or
-                    candidate_lnvs[idx] > selected_lnv or
-                    (candidate_lnvs[idx] == selected_lnv and candidate_counts[idx] > selected_support))
-                {
-                    selected = candidate_entries[idx];
-                    selected_support = candidate_counts[idx];
-                    selected_lnv = candidate_lnvs[idx];
-                }
-            }
-
-            // If quorum nacks could not rule the op out, preserve the best
-            // old-view candidate rather than dropping the slot. Requiring a
-            // full current DVC checksum quorum is too strong: a previously
-            // committed/prepared value may intersect the new DVC quorum in only
-            // one replica.
-            const entry = selected orelse {
-                repair_target = max_op;
-                break;
+        if (self.selected_tip_op > self.commit_min) {
+            const now_tick = io_mod.nowTick(self.io);
+            const now: u64 = @intCast(@max(0, now_tick));
+            const timeout: u64 = @intCast(VIEW_CHANGE_TIMEOUT * 2);
+            self.view_change_candidate = view_candidate.ViewChangeCandidate.allocate(self.allocator, .{
+                .source_replica = self.selected_source,
+                .target_view = self.selected_target_view,
+                .source_last_normal_view = self.selected_last_normal_view,
+                .base_op = self.commit_min + 1,
+                .tip_op = self.selected_tip_op,
+                .tip_checksum = self.selected_tip_checksum,
+                .commit_bound = self.selected_commit_bound,
+                .deadline_tick = now + timeout,
+            }) catch {
+                self.abortSelectedView();
+                return;
             };
 
-            if (entry.op_number != highest_kept + 1) {
-                repair_target = max_op;
-                break;
+            for (selected.log_entries[0..selected.log_entry_count]) |entry| {
+                if (entry.op_number < self.view_change_candidate.metadata.base_op) continue;
+                self.view_change_candidate.add(entry) catch {
+                    self.abortSelectedView();
+                    return;
+                };
             }
+        }
+        self.advanceSelectedView();
+    }
 
-            self.journalPut(entry);
-            highest_kept = op;
-            repair_target = highest_kept;
+    fn dvcEntryChecksum(dvc: *const msg.DoViewChangeMsg, op: msg.OpNumber) ?u64 {
+        if (op == 0) return 0;
+        for (dvc.log_entries[0..dvc.log_entry_count]) |entry| {
+            if (entry.op_number == op and entry.valid()) return entry.checksum;
+        }
+        return null;
+    }
+
+    fn dvcOverlapEqual(a: *const msg.DoViewChangeMsg, b: *const msg.DoViewChangeMsg) bool {
+        for (a.log_entries[0..a.log_entry_count]) |a_entry| {
+            for (b.log_entries[0..b.log_entry_count]) |b_entry| {
+                if (a_entry.op_number == b_entry.op_number and a_entry.checksum != b_entry.checksum) return false;
+            }
+        }
+        return true;
+    }
+
+    fn dvcTailChainValid(dvc: *const msg.DoViewChangeMsg) bool {
+        for (dvc.log_entries[0..dvc.log_entry_count]) |child| {
+            if (!child.valid()) return false;
+            for (dvc.log_entries[0..dvc.log_entry_count]) |parent| {
+                if (parent.op_number + 1 == child.op_number and child.parent_checksum != parent.checksum) return false;
+            }
+        }
+        return true;
+    }
+
+    fn resetSelectedView(self: *Replica) void {
+        self.view_change_candidate.reset();
+        self.pending_view_selection = false;
+        self.selected_next_op = 0;
+        self.selected_expected_checksum = 0;
+        self.selected_sources_attempted = 0;
+        self.selected_sources_requested = 0;
+    }
+
+    fn abortSelectedView(self: *Replica) void {
+        self.resetSelectedView();
+        if (self.status == .view_change) self.initiateViewChange();
+    }
+
+    fn addSelectedEntry(self: *Replica, entry: msg.LogEntry) bool {
+        if (!self.pending_view_selection) return false;
+        if (self.view_change_candidate.phase == .idle) return false;
+        self.view_change_candidate.add(entry) catch {
+            self.abortSelectedView();
+            return false;
+        };
+        return true;
+    }
+
+    fn selectedEntryExpectedChecksum(self: *const Replica, op: msg.OpNumber) ?u64 {
+        if (op == self.selected_tip_op) return self.selected_tip_checksum;
+        if (op >= self.selected_tip_op) return null;
+        const child_op = op + 1;
+        if (child_op < self.view_change_candidate.metadata.base_op) return null;
+        const child_index: usize = @intCast(child_op - self.view_change_candidate.metadata.base_op);
+        if (child_index >= self.view_change_candidate.entries.len) return null;
+        if (!self.view_change_candidate.present[child_index]) return null;
+        return self.view_change_candidate.entries[child_index].parent_checksum;
+    }
+
+    fn requestSelectedEntry(self: *Replica, op: msg.OpNumber, expected_checksum: u64) void {
+        std.debug.assert(expected_checksum != 0);
+        if (self.leaderForView(self.selected_target_view) != self.replica_id) {
+            self.sendTo(self.selected_source, .{ .request_prepare = .{
+                .view_number = self.selected_target_view,
+                .op_number = op,
+                .selected_source = self.selected_source,
+                .selected_last_normal_view = self.selected_last_normal_view,
+                .selected_tip_op = self.selected_tip_op,
+                .selected_tip_checksum = self.selected_tip_checksum,
+                .selected_commit_bound = self.selected_commit_bound,
+                .expected_entry_checksum = expected_checksum,
+            } });
+            return;
+        }
+        // DVC retention hints are advisory ordering only. If every hinted
+        // source fails exact identity, boundedly try all configured peers.
+        for (0..2) |pass| {
+            for (0..self.replica_count) |source_index| {
+                if (source_index == self.replica_id) continue;
+                const source_bit = @as(u16, 1) << @intCast(source_index);
+                if (self.selected_sources_attempted & source_bit != 0) continue;
+                const hinted = self.do_vc_received[source_index] and
+                    msg.bitsetGet(&self.do_vc_msgs[source_index].present_bitset, @intCast(op % LOG_SIZE_MAX));
+                if ((pass == 0) != hinted) continue;
+
+                self.selected_sources_attempted |= source_bit;
+                self.selected_sources_requested |= source_bit;
+                self.sendTo(@intCast(source_index), .{ .request_prepare = .{
+                    .view_number = self.selected_target_view,
+                    .op_number = op,
+                    .selected_source = self.selected_source,
+                    .selected_last_normal_view = self.selected_last_normal_view,
+                    .selected_tip_op = self.selected_tip_op,
+                    .selected_tip_checksum = self.selected_tip_checksum,
+                    .selected_commit_bound = self.selected_commit_bound,
+                    .expected_entry_checksum = expected_checksum,
+                } });
+                return;
+            }
+        }
+    }
+
+    fn advanceSelectedView(self: *Replica) void {
+        if (!self.pending_view_selection) return;
+        if (self.status != .view_change) return;
+        if (self.view_number != self.selected_target_view) {
+            self.resetSelectedView();
+            return;
         }
 
-        if (highest_kept > max_commit) {
-            var ack_op = max_commit + 1;
-            while (ack_op <= highest_kept) : (ack_op += 1) {
-                if (self.journalHas(ack_op)) {
-                    const slot = journalSlot(ack_op);
-                    self.prepare_ok_counts[slot] = 1;
-                    self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+        if (self.selected_tip_op == self.commit_min) {
+            self.startViewCandidateReady();
+            return;
+        }
+        if (self.view_change_candidate.phase == .idle) {
+            self.abortSelectedView();
+            return;
+        }
+
+        if (self.selected_source == self.replica_id) {
+            var op = self.view_change_candidate.metadata.base_op;
+            while (op <= self.selected_tip_op) : (op += 1) {
+                const index: usize = @intCast(op - self.view_change_candidate.metadata.base_op);
+                if (self.view_change_candidate.present[index]) continue;
+                const entry = self.journalGet(op) orelse break;
+                if (!self.addSelectedEntry(entry.*)) return;
+            }
+        }
+
+        if (self.view_change_candidate.complete()) {
+            self.installCompletedCandidate();
+            return;
+        }
+
+        var op = self.selected_tip_op;
+        while (op >= self.view_change_candidate.metadata.base_op) : (op -= 1) {
+            const index: usize = @intCast(op - self.view_change_candidate.metadata.base_op);
+            if (self.view_change_candidate.present[index]) {
+                if (op == self.view_change_candidate.metadata.base_op) break;
+                continue;
+            }
+            const expected_checksum = self.selectedEntryExpectedChecksum(op) orelse {
+                if (op == self.view_change_candidate.metadata.base_op) break;
+                continue;
+            };
+            if (self.selected_next_op != op or self.selected_expected_checksum != expected_checksum) {
+                self.selected_next_op = op;
+                self.selected_expected_checksum = expected_checksum;
+                self.selected_sources_attempted = 0;
+                self.selected_sources_requested = 0;
+            }
+            if (self.journalGet(op)) |local_entry| {
+                if (local_entry.checksum == expected_checksum) {
+                    if (!self.addSelectedEntry(local_entry.*)) return;
+                    self.selected_sources_attempted = 0;
+                    self.selected_sources_requested = 0;
+                    if (self.view_change_candidate.complete()) {
+                        self.installCompletedCandidate();
+                        return;
+                    }
+                    if (op == self.view_change_candidate.metadata.base_op) break;
+                    continue;
                 }
             }
+            self.requestSelectedEntry(op, expected_checksum);
+            return;
         }
+    }
 
-        // Step 4: Truncate divergent entries above highest_kept, then set op_number.
-        // Committed entries (op_number <= commit_min) are preserved by truncateAbove.
-        // op_number must be >= commit_min to maintain the invariant.
-        self.truncateAbove(highest_kept);
-        self.op_number = @max(repair_target, self.commit_min);
+    fn installCompletedCandidate(self: *Replica) void {
+        if (!self.pending_view_selection) return;
+        if (!self.view_change_candidate.complete()) return;
 
-        if (max_commit > self.commit_min) {
-            self.commitUpTo(max_commit);
+        const committed_checksum: u64 = if (self.commit_min == 0) 0 else blk: {
+            const committed = self.journalGet(self.commit_min) orelse {
+                self.abortSelectedView();
+                return;
+            };
+            break :blk committed.checksum;
+        };
+        self.view_change_candidate.validate(self.commit_min, committed_checksum) catch {
+            self.abortSelectedView();
+            return;
+        };
+
+        self.truncateAboveFromValidatedStartView(self.commit_min);
+        for (self.view_change_candidate.entries) |entry| {
+            self.journalPutFromValidatedStartView(entry);
         }
-        self.commit_max = self.commit_min;
+        self.selected_next_op = self.selected_tip_op + 1;
+        self.startViewCandidateReady();
+    }
 
-        // Seed retention floor from DVC messages
-        {
-            var i: usize = 0;
-            while (i < self.replica_count) : (i += 1) {
-                self.replica_commit_min[i] = carried_retention_floor;
-            }
-            i = 0;
-            while (i < self.replica_count) : (i += 1) {
+    fn startViewCandidateReady(self: *Replica) void {
+        if (!self.pending_view_selection or self.pending_start_view.active) return;
+        if (self.selected_tip_op > 0) {
+            const tip = self.journalGet(self.selected_tip_op) orelse return;
+            if (tip.checksum != self.selected_tip_checksum) return;
+        }
+        if (self.leaderForView(self.selected_target_view) == self.replica_id and self.selected_commit_bound < self.commit_min) return;
+        if (self.selected_commit_bound > self.selected_tip_op) return;
+        if (self.hasSelectedChainGap()) return;
+
+        // A non-empty candidate was installed in one validated truncate+replace
+        // pass. The empty suffix still needs its one tombstone pass here.
+        if (self.view_change_candidate.phase == .idle) {
+            self.truncateAboveFromValidatedStartView(self.selected_tip_op);
+        } else {
+            std.debug.assert(self.view_change_candidate.phase == .candidate_complete);
+        }
+        if (self.logHighOp() != self.selected_tip_op) return;
+        std.debug.assert(!self.hasSelectedChainGap());
+
+        const carried_retention_floor: msg.OpNumber = 0;
+        if (self.leaderForView(self.selected_target_view) == self.replica_id) {
+            for (0..self.replica_count) |i| self.replica_commit_min[i] = 0;
+            for (0..self.replica_count) |i| {
                 if (!self.do_vc_received[i]) continue;
                 self.replica_commit_min[i] = self.do_vc_msgs[i].commit_min;
             }
-            self.replica_commit_min[self.replica_id] = self.commit_min;
-            self.recomputeRetentionFloor();
         }
 
+        // Volatile journal and metadata must name the same selected tip even if
+        // a subsequent slot, metadata, or sync operation fails.
+        self.op_number = self.selected_tip_op;
+
+        self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
+        const final_commit = @max(self.commit_min, self.selected_commit_bound);
+        self.pending_start_view = .{
+            .active = true,
+            .role = if (self.leaderForView(self.selected_target_view) == self.replica_id) .leader else .follower,
+            .source_replica = self.selected_source,
+            .target_view = self.selected_target_view,
+            .source_last_normal_view = self.selected_last_normal_view,
+            .tip_checksum = self.selected_tip_checksum,
+            .op_number = self.selected_tip_op,
+            .commit_min = final_commit,
+            .retention_floor = carried_retention_floor,
+            .last_normal_view = self.selected_target_view,
+        };
+        self.view_change_candidate.phase = .persisting_start_view;
+        self.metadata_dirty = true;
+        self.assertPendingStartViewChain();
+    }
 
-        // Count self as having acked all locally-present uncommitted entries.
-        var ack_op = self.commit_min + 1;
-        while (ack_op <= self.op_number) : (ack_op += 1) {
-            if (self.journalHas(ack_op)) {
-                const slot = journalSlot(ack_op);
-                self.prepare_ok_counts[slot] = 1;
-                self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
-            }
+    fn assertPendingStartViewChain(self: *const Replica) void {
+        if (!self.pending_start_view.active) return;
+        const pending = self.pending_start_view;
+        std.debug.assert(pending.role != .none);
+        std.debug.assert(self.status == .view_change);
+        std.debug.assert(self.logHighOp() == pending.op_number);
+        std.debug.assert(self.op_number == pending.op_number);
+        std.debug.assert(pending.commit_min >= self.commit_min);
+        std.debug.assert(pending.commit_min <= pending.op_number);
+        if (pending.op_number > 0) {
+            const tip = self.journalGet(pending.op_number) orelse unreachable;
+            std.debug.assert(tip.checksum == pending.tip_checksum);
         }
+        std.debug.assert(!self.hasSelectedChainGap());
+    }
 
-        self.status = .normal;
-        self.last_normal_view = self.view_number;
-        const now_tick = io_mod.nowTick(self.io);
-        self.last_heartbeat = now_tick;
-        self.last_leader_activity = now_tick;
-
-        self.sendToAllOthers(.{ .start_view = self.buildStartView() });
-
-        // Always enter repair phase after view change
-        self.repair_pending = true;
-        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
-        self.repair_status_count = 0;
+    fn hasSelectedChainGap(self: *const Replica) bool {
+        var parent_checksum: u64 = if (self.commit_min == 0) 0 else blk: {
+            const committed = self.journalGet(self.commit_min) orelse return true;
+            break :blk committed.checksum;
+        };
+        var op = self.commit_min + 1;
+        while (op <= self.selected_tip_op) : (op += 1) {
+            const entry = self.journalGet(op) orelse return true;
+            if (!entry.valid() or entry.parent_checksum != parent_checksum) return true;
+            parent_checksum = entry.checksum;
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -1600,6 +2051,21 @@ pub const Replica = struct {
         self.transfer_pending = false;
     }
 
+    fn requestStartView(self: *Replica, view_number: msg.ViewNumber) void {
+        std.debug.assert(self.status == .view_change);
+        std.debug.assert(self.view_number == view_number);
+        self.sendTo(self.leaderForView(view_number), .{ .request_start_view = .{
+            .view_number = view_number,
+        } });
+    }
+
+    fn onRequestStartView(self: *Replica, from: u8, request: msg.RequestStartViewMsg) void {
+        if (self.status != .normal) return;
+        if (!self.isLeader()) return;
+        if (request.view_number != self.view_number) return;
+        self.sendTo(from, .{ .start_view = self.buildStartView() });
+    }
+
     fn onRequestStatus(self: *Replica, from: u8, rs: msg.RequestStatusMsg) void {
         if (rs.view_number != self.view_number) return;
 
@@ -1607,14 +2073,25 @@ pub const Replica = struct {
             .view_number = self.view_number,
             .op_number = self.op_number,
             .commit_min = self.commit_min,
+            .tip_checksum = if (self.op_number == 0) 0 else self.journalGet(self.op_number).?.checksum,
+            .commit_checksum = if (self.commit_min == 0) 0 else self.journalGet(self.commit_min).?.checksum,
         } });
     }
 
     fn onSendStatus(self: *Replica, from: u8, ss: msg.SendStatusMsg) void {
         if (self.status != .normal) return;
         if (ss.view_number != self.view_number) return;
+        if (!peerLogBoundsOk(ss.commit_min, ss.op_number)) return;
 
         if (self.isLeader()) {
+            if (ss.op_number > 0) {
+                const tip = self.journalGet(ss.op_number) orelse return;
+                if (tip.checksum != ss.tip_checksum) return;
+            }
+            if (ss.commit_min > 0) {
+                const committed = self.journalGet(ss.commit_min) orelse return;
+                if (committed.checksum != ss.commit_checksum) return;
+            }
             self.noteReplicaCommitMin(from, ss.commit_min);
 
             if (!self.repair_pending) {
@@ -1639,7 +2116,13 @@ pub const Replica = struct {
         self.noteReplicaCommitMin(from, ss.commit_min);
 
         if (ss.commit_min > self.commit_min) {
-            self.commitUpTo(ss.commit_min);
+            if (self.journalGet(ss.commit_min)) |committed| {
+                if (committed.checksum != ss.commit_checksum) return;
+                self.commitUpTo(ss.commit_min);
+            } else {
+                self.transfer_pending = true;
+                self.transfer_target_op = @max(self.transfer_target_op, ss.commit_min);
+            }
         }
 
         if (ss.op_number > self.op_number) {
@@ -1654,26 +2137,78 @@ pub const Replica = struct {
     }
 
     fn onRequestPrepare(self: *Replica, from: u8, rp: msg.RequestPrepareMsg) void {
-        if (rp.view_number != self.view_number) return;
+        if (rp.op_number == 0 or rp.op_number > LOG_SIZE_MAX) return;
+
+        const selection_bound = rp.selected_tip_checksum != 0;
+        if (selection_bound) {
+            if (rp.selected_commit_bound > rp.selected_tip_op) return;
+            if (rp.expected_entry_checksum == 0) return;
+            if (rp.selected_tip_op == 0 or rp.op_number > rp.selected_tip_op) return;
+            if (self.isLeader() and self.status == .normal and rp.view_number == self.view_number) {
+                if (rp.selected_source != self.selected_source) return;
+                if (rp.selected_last_normal_view != self.selected_last_normal_view) return;
+                if (rp.selected_tip_op != self.selected_tip_op) return;
+                if (rp.selected_tip_checksum != self.selected_tip_checksum) return;
+                if (rp.selected_commit_bound != self.selected_commit_bound) return;
+            } else {
+                if (rp.view_number > self.view_number) return;
+                if (from != self.leaderForView(rp.view_number)) return;
+                if (self.replica_id == rp.selected_source) {
+                    if (rp.selected_last_normal_view != self.last_normal_view) return;
+                    if (rp.selected_tip_op > self.op_number) return;
+                    const selected_tip = self.journalGet(rp.selected_tip_op) orelse return;
+                    if (selected_tip.checksum != rp.selected_tip_checksum) return;
+                }
+            }
+        } else {
+            if (rp.view_number != self.view_number) return;
+        }
 
         if (self.journalGet(rp.op_number)) |entry| {
-            // Only the leader may source uncommitted suffix entries. Followers
-            // can safely help each other recover committed gaps, but serving a
-            // locally-held uncommitted op to another follower can resurrect a
-            // divergent suffix after view change.
-            if (from != self.leader() and rp.op_number > self.commit_min) return;
+            if (!selection_bound and from != self.leader() and rp.op_number > self.commit_min) return;
+            if (selection_bound and entry.checksum != rp.expected_entry_checksum) return;
             self.sendTo(from, .{ .send_prepare = .{
-                .view_number = self.view_number,
+                .view_number = rp.view_number,
                 .entry = entry.*,
+                .selected_source = rp.selected_source,
+                .selected_last_normal_view = rp.selected_last_normal_view,
+                .selected_tip_op = rp.selected_tip_op,
+                .selected_tip_checksum = rp.selected_tip_checksum,
+                .selected_commit_bound = rp.selected_commit_bound,
+                .expected_entry_checksum = rp.expected_entry_checksum,
             } });
         }
     }
 
     fn onSendPrepare(self: *Replica, from: u8, sp: msg.SendPrepareMsg) void {
-        if (self.status != .normal) return;
         if (sp.view_number != self.view_number) return;
         if (!sp.entry.valid()) return;
+        if (sp.entry.op_number == 0 or sp.entry.op_number > LOG_SIZE_MAX) return;
 
+        if (self.status == .view_change and self.pending_view_selection) {
+            if (sp.selected_source != self.selected_source) return;
+            if (sp.selected_last_normal_view != self.selected_last_normal_view) return;
+            if (sp.selected_tip_op != self.selected_tip_op) return;
+            if (sp.selected_tip_checksum != self.selected_tip_checksum) return;
+            if (sp.selected_commit_bound != self.selected_commit_bound) return;
+            if (sp.entry.op_number != self.selected_next_op) return;
+            if (sp.expected_entry_checksum != self.selected_expected_checksum) return;
+            if (self.leaderForView(self.selected_target_view) == self.replica_id) {
+                const source_bit = @as(u16, 1) << @intCast(from);
+                if (self.selected_sources_requested & source_bit == 0) return;
+            } else if (from != self.selected_source) return;
+            if (sp.entry.checksum != self.selected_expected_checksum) {
+                self.advanceSelectedView();
+                return;
+            }
+            if (!self.addSelectedEntry(sp.entry)) return;
+            self.selected_sources_attempted = 0;
+            self.selected_sources_requested = 0;
+            self.advanceSelectedView();
+            return;
+        }
+
+        if (self.status != .normal) return;
         const entry = sp.entry;
         const sender_committed = entry.op_number <= self.replica_commit_min[from];
         if (!sender_committed and !self.entryFitsLog(entry)) return;
@@ -1764,70 +2299,66 @@ pub const Replica = struct {
     fn onStartView(self: *Replica, from: u8, sv: msg.StartViewMsg) void {
         if (from != self.leaderForView(sv.view_number)) return;
         if (sv.view_number < self.view_number) return;
+        if (!startViewEntriesValid(sv)) return;
+        if (self.commit_min > sv.op_number) return;
+        const anchor_checksum: u64 = if (self.commit_min == 0) 0 else blk: {
+            const anchor = self.journalGet(self.commit_min) orelse return;
+            if (!self.isDurablePrepare(self.commit_min)) return;
+            break :blk anchor.checksum;
+        };
+        if (self.commit_min == sv.op_number and anchor_checksum != sv.tip_checksum) return;
 
-        self.view_number = sv.view_number;
-        std.debug.assert(sv.retention_floor == 0);
-        self.retention_floor = 0;
-
-        // StartView is the new leader's selected log suffix. Local uncommitted
-        // entries above commit_min may be from an abandoned view and must not be
-        // preserved or acknowledged, otherwise a follower can help commit a
-        // value the new leader did not choose. Gaps from the bounded StartView
-        // tail are repaired through the explicit transfer path below.
-        self.truncateAbove(self.commit_min);
-        self.op_number = @max(self.logHighOp(), self.commit_min);
-
-        for (sv.log_entries[0..sv.log_entry_count]) |entry| {
-            if (!entry.valid()) continue;
-            self.journalPut(entry);
+        if (sv.view_number > self.view_number) self.awaitStartView(sv.view_number);
+        if (self.status != .view_change or sv.view_number != self.view_number) return;
+        if (self.pending_view_selection) {
+            if (from != self.selected_source or
+                sv.selected_last_normal_view != self.selected_last_normal_view or
+                sv.op_number != self.selected_tip_op or
+                sv.tip_checksum != self.selected_tip_checksum or
+                sv.commit_min != self.selected_commit_bound)
+            {
+                self.abortSelectedView();
+            }
+            return;
         }
 
-        self.op_number = @max(@max(sv.op_number, self.logHighOp()), self.commit_min);
-
-        self.status = .normal;
-        self.last_normal_view = self.view_number;
+        self.resetSelectedView();
+        self.pending_view_selection = true;
+        self.selected_source = from;
+        self.selected_last_normal_view = sv.selected_last_normal_view;
+        self.selected_tip_op = sv.op_number;
+        self.selected_tip_checksum = sv.tip_checksum;
+        self.selected_commit_bound = sv.commit_min;
+        std.debug.assert(sv.retention_floor == 0);
+        self.selected_retention_floor = 0;
+        self.selected_target_view = sv.view_number;
+        self.selected_next_op = self.commit_min + 1;
         self.last_leader_activity = io_mod.nowTick(self.io);
 
-        if (sv.commit_min > self.commit_min) {
-            self.commitUpTo(sv.commit_min);
-        }
-        self.commit_max = self.commit_min;
-
-        const new_leader = self.leader();
-
-        // Seed per-replica tracking from leader's retention_floor
-        {
-            var i: usize = 0;
-            while (i < self.replica_count) : (i += 1) {
-                self.replica_commit_min[i] = self.retention_floor;
+        if (self.selected_tip_op > self.commit_min) {
+            const now: u64 = @intCast(@max(0, io_mod.nowTick(self.io)));
+            self.view_change_candidate = view_candidate.ViewChangeCandidate.allocate(self.allocator, .{
+                .source_replica = from,
+                .target_view = sv.view_number,
+                .source_last_normal_view = sv.selected_last_normal_view,
+                .base_op = self.commit_min + 1,
+                .tip_op = sv.op_number,
+                .tip_checksum = sv.tip_checksum,
+                .commit_bound = sv.commit_min,
+                .deadline_tick = now + @as(u64, @intCast(VIEW_CHANGE_TIMEOUT * 2)),
+            }) catch {
+                self.abortSelectedView();
+                return;
+            };
+            for (sv.log_entries[0..sv.log_entry_count]) |entry| {
+                if (entry.op_number < self.view_change_candidate.metadata.base_op) continue;
+                self.view_change_candidate.add(entry) catch {
+                    self.abortSelectedView();
+                    return;
+                };
             }
-            self.replica_commit_min[new_leader] = sv.commit_min;
-            self.replica_commit_min[self.replica_id] = self.commit_min;
         }
-
-        self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
-        self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
-        var ack_op = self.commit_min + 1;
-        while (ack_op <= self.op_number) : (ack_op += 1) {
-            const e = self.journalGet(ack_op) orelse break;
-            if (!e.valid()) break;
-            self.sendTo(new_leader, .{ .prepare_ok = .{
-                .view_number = self.view_number,
-                .op_number = ack_op,
-                .replica_id = self.replica_id,
-                .commit_min = self.commit_min,
-            } });
-        }
-
-        if (self.hasLogGaps()) {
-            self.transfer_pending = true;
-            self.transfer_target_op = self.op_number;
-        } else {
-            self.transfer_pending = false;
-            self.transfer_target_op = 0;
-        }
-
-        self.recovered_from_disk = false;
+        self.advanceSelectedView();
     }
 
     // -----------------------------------------------------------------------
@@ -1870,14 +2401,17 @@ pub const Replica = struct {
             }
         }
 
+        std.debug.assert(dvcTipSemanticsValid(dvc));
         return dvc;
     }
 
     fn buildStartView(self: *const Replica) msg.StartViewMsg {
         var sv = msg.StartViewMsg{
             .view_number = self.view_number,
-            .op_number = self.op_number,
-            .commit_min = self.commit_min,
+            .selected_last_normal_view = self.selected_last_normal_view,
+            .op_number = self.selected_tip_op,
+            .tip_checksum = self.selected_tip_checksum,
+            .commit_min = self.selected_commit_bound,
             .retention_floor = 0,
         };
 
@@ -1886,8 +2420,8 @@ pub const Replica = struct {
         }
 
         var count: u8 = 0;
-        if (self.op_number > 0) {
-            var scan_op = self.op_number;
+        if (sv.op_number > 0) {
+            var scan_op = sv.op_number;
             while (count < msg.SV_LOG_MAX) : (scan_op -= 1) {
                 if (self.journalHas(scan_op)) {
                     sv.log_entries[count] = self.journalGet(scan_op).?.*;
@@ -2056,20 +2590,87 @@ pub const Replica = struct {
         self.storage_failures += 1;
     }
 
+    fn metadataForPersistence(self: *const Replica) disk_mod.Metadata {
+        if (self.pending_start_view.active) {
+            const pending = self.pending_start_view;
+            self.assertPendingStartViewChain();
+            return .{
+                .view_number = pending.target_view,
+                .last_normal_view = pending.last_normal_view,
+                .op_number = pending.op_number,
+                .commit_min = pending.commit_min,
+                .commit_max = pending.commit_min,
+            };
+        }
+        return .{
+            .view_number = self.view_number,
+            .last_normal_view = self.last_normal_view,
+            .op_number = self.op_number,
+            .commit_min = self.commit_min,
+            .commit_max = self.commit_max,
+        };
+    }
+
+    fn syncPendingStartView(self: *Replica, disk: *DiskInterface) bool {
+        self.assertPendingStartViewChain();
+        const meta = self.metadataForPersistence();
+        std.debug.assert(meta.op_number == self.logHighOp());
+        std.debug.assert(meta.commit_min == self.pending_start_view.commit_min);
+        std.debug.assert(meta.commit_max == meta.commit_min);
+
+        for (0..LOG_SIZE_MAX) |i| {
+            if (!self.journal_dirty[i]) continue;
+            if (self.journal_occupied[i]) {
+                disk.writeSlot(i, &self.journal[i]) catch {
+                    self.markStorageFailed();
+                    return false;
+                };
+            } else {
+                disk.clearSlot(i) catch {
+                    self.markStorageFailed();
+                    return false;
+                };
+            }
+        }
+        disk.writeMetadata(meta) catch {
+            self.markStorageFailed();
+            return false;
+        };
+        self.metadata_dirty = true;
+        disk.sync() catch {
+            self.markStorageFailed();
+            return false;
+        };
+        std.debug.assert(disk.metadataEquals(meta));
+        for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
+        self.metadata_dirty = false;
+        return true;
+    }
+
     /// Group-commit flush: stage all dirty journal/metadata, one durability
     /// barrier, then publish pending Prepare/PrepareOk/client/worker traffic.
     fn flushDurableState(self: *Replica) void {
         if (self.storage_failed) return;
         var disk = self.disk orelse {
-            // No disk backend: treat memory as durable and publish immediately.
+            // Volatile mode explicitly uses the same publication transition,
+            // synchronously, with memory as the durability boundary.
             for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
             const before = self.durable_prepare_through;
+            const through = if (self.pending_start_view.active) self.pending_start_view.op_number else self.op_number;
             self.metadata_dirty = false;
-            self.publishPendingAfterBarrier(before, self.op_number);
+            self.publishPendingAfterBarrier(before, through);
             self.metadata_dirty = false;
             self.publishCommitEffects();
             return;
         };
+
+        if (self.pending_start_view.active) {
+            const before = self.durable_prepare_through;
+            const through = self.pending_start_view.op_number;
+            if (!self.syncPendingStartView(&disk)) return;
+            self.publishPendingAfterBarrier(before, through);
+            return;
+        }
 
         var barriers: u8 = 0;
         while (barriers < FLUSH_BARRIER_MAX) : (barriers += 1) {
@@ -2092,13 +2693,7 @@ pub const Replica = struct {
                 }
             }
 
-            const meta = disk_mod.Metadata{
-                .view_number = self.view_number,
-                .last_normal_view = self.last_normal_view,
-                .op_number = self.op_number,
-                .commit_min = self.commit_min,
-                .commit_max = self.commit_max,
-            };
+            const meta = self.metadataForPersistence();
             const need_meta = self.metadata_dirty or any_journal_dirty or !disk.metadataEquals(meta);
             if (need_meta) {
                 disk.writeMetadata(meta) catch {
@@ -2117,13 +2712,14 @@ pub const Replica = struct {
                 self.markStorageFailed();
                 return;
             };
+            std.debug.assert(disk.metadataEquals(meta));
 
             for (0..LOG_SIZE_MAX) |i| {
                 self.journal_dirty[i] = false;
             }
             self.metadata_dirty = false;
 
-            self.publishPendingAfterBarrier(prepare_through_before, self.op_number);
+            self.publishPendingAfterBarrier(prepare_through_before, meta.op_number);
 
             if (!self.metadata_dirty and !anyJournalDirty(self)) break;
         }
@@ -2149,8 +2745,94 @@ pub const Replica = struct {
         }
     }
 
+    fn publishPendingStartViewAfterBarrier(self: *Replica) void {
+        if (!self.pending_start_view.active) return;
+        const pending = self.pending_start_view;
+        const deferred_view = self.deferred_view_target;
+        self.assertPendingStartViewChain();
+
+        self.view_number = pending.target_view;
+        self.last_normal_view = pending.last_normal_view;
+        self.op_number = pending.op_number;
+        std.debug.assert(pending.retention_floor == 0);
+        self.retention_floor = 0;
+        self.commit_max = @max(self.commit_max, pending.commit_min);
+        if (pending.commit_min > self.commit_min) self.commitUpTo(pending.commit_min);
+        std.debug.assert(self.commit_min == pending.commit_min);
+        self.commit_max = self.commit_min;
+        self.replica_commit_min[self.replica_id] = self.commit_min;
+
+        self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
+        self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
+        self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
+        if (pending.role == .leader) {
+            self.recomputeRetentionFloor();
+            var self_op = self.commit_min + 1;
+            while (self_op <= self.op_number) : (self_op += 1) {
+                std.debug.assert(self.isDurablePrepare(self_op));
+                const slot = journalSlot(self_op);
+                self.prepare_ok_counts[slot] = 1;
+                self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
+            }
+        } else {
+            for (0..self.replica_count) |i| self.replica_commit_min[i] = self.retention_floor;
+            self.replica_commit_min[self.leader()] = self.selected_commit_bound;
+            var ack_op = self.commit_min + 1;
+            while (ack_op <= self.op_number) : (ack_op += 1) {
+                std.debug.assert(self.isDurablePrepare(ack_op));
+                const slot = journalSlot(ack_op);
+                self.pending_prepare_ok[slot] = true;
+                self.pending_prepare_ok_to[slot] = self.leader();
+            }
+        }
+
+        self.status = .normal;
+        const now_tick = io_mod.nowTick(self.io);
+        self.last_heartbeat = now_tick;
+        self.last_leader_activity = now_tick;
+        self.repair_pending = pending.role == .leader;
+        self.repair_status_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        self.repair_status_count = 0;
+        self.transfer_pending = false;
+        self.transfer_target_op = 0;
+        self.recovered_from_disk = false;
+        self.metadata_dirty = false;
+
+        if (pending.role == .leader) {
+            const start_view = self.buildStartView();
+            self.sendToAllOthers(.{ .start_view = start_view });
+        } else {
+            self.sendTo(self.leader(), .{ .send_status = .{
+                .view_number = self.view_number,
+                .op_number = self.op_number,
+                .commit_min = self.commit_min,
+                .tip_checksum = if (self.op_number == 0) 0 else self.journalGet(self.op_number).?.checksum,
+                .commit_checksum = if (self.commit_min == 0) 0 else self.journalGet(self.commit_min).?.checksum,
+            } });
+        }
+
+        self.view_change_candidate.reset();
+        self.pending_view_selection = false;
+        self.selected_next_op = 0;
+        self.pending_start_view = .{};
+        self.deferred_view_target = 0;
+        if (self.disk) |disk| std.debug.assert(disk.metadataEquals(self.metadataForPersistence()));
+
+        if (deferred_view > self.view_number) self.initiateViewChangeTo(deferred_view);
+    }
+
     fn publishPendingAfterBarrier(self: *Replica, prepare_through_before: msg.OpNumber, prepare_through_after: msg.OpNumber) void {
         _ = prepare_through_before;
+
+        var durable_op: msg.OpNumber = 1;
+        while (durable_op <= prepare_through_after) : (durable_op += 1) {
+            if (!self.journalHas(durable_op)) continue;
+            const slot = journalSlot(durable_op);
+            self.durable_prepare_op[slot] = durable_op;
+            self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
+        }
+        self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
+        self.publishPendingStartViewAfterBarrier();
 
         var op: msg.OpNumber = 1;
         while (op <= prepare_through_after) : (op += 1) {
@@ -2181,6 +2863,8 @@ pub const Replica = struct {
                     .op_number = op,
                     .replica_id = self.replica_id,
                     .commit_min = self.commit_min,
+                    .entry_checksum = self.journal[slot].checksum,
+                    .commit_checksum = if (self.commit_min == 0) 0 else self.journalGet(self.commit_min).?.checksum,
                 } });
                 self.pending_prepare_ok[slot] = false;
             }
@@ -2190,8 +2874,6 @@ pub const Replica = struct {
                 self.durable_prepare_checksum[slot] = self.journal[slot].checksum;
             }
         }
-        self.durable_prepare_through = @max(self.durable_prepare_through, prepare_through_after);
-
         if (self.isLeader() and self.status == .normal) {
             self.advanceCommit();
         }
@@ -2231,24 +2913,30 @@ pub const Replica = struct {
     }
 
     pub fn journalPut(self: *Replica, entry: msg.LogEntry) void {
-        std.debug.assert(entry.op_number > 0);
-        // Without a snapshot floor, never replace an occupied slot with a different op.
-        std.debug.assert(entry.op_number <= LOG_SIZE_MAX);
+        self.journalPutInternal(entry, false);
+    }
+
+    fn journalPutFromValidatedStartView(self: *Replica, entry: msg.LogEntry) void {
+        self.journalPutInternal(entry, true);
+    }
+
+    fn journalPutInternal(self: *Replica, entry: msg.LogEntry, validated_start_view: bool) void {
+        if (entry.op_number == 0 or entry.op_number > LOG_SIZE_MAX) return;
         const slot = journalSlot(entry.op_number);
         if (self.journal_occupied[slot] and
             (self.journal[slot].op_number != entry.op_number or
                 self.journal[slot].checksum != entry.checksum))
         {
-            // Reject stale overwrites (older op landing on a slot already
-            // holding a newer one). Different-op replacement is forbidden
-            // until snapshots exist.
-            if (entry.op_number != self.journal[slot].op_number) {
-                std.debug.assert(false);
-                return;
-            }
-            if (entry.op_number < self.journal[slot].op_number) return;
+            if (entry.op_number != self.journal[slot].op_number) return;
+            if (entry.op_number <= self.commit_min) return;
+            // Durable prepared evidence is immutable during normal traffic and
+            // repair. Only the separately preflighted StartView install path may
+            // replace it in a later view.
+            if (self.isDurablePrepare(entry.op_number) and !validated_start_view) return;
             self.prepare_ok_counts[slot] = 0;
             self.prepare_ok_from[slot] = 0;
+            self.durable_prepare_op[slot] = 0;
+            self.durable_prepare_checksum[slot] = 0;
         }
         self.journal[slot] = entry;
         self.journal_occupied[slot] = true;
@@ -2256,16 +2944,24 @@ pub const Replica = struct {
     }
 
     fn truncateAbove(self: *Replica, limit: msg.OpNumber) void {
+        self.truncateAboveInternal(limit, false);
+    }
+
+    fn truncateAboveFromValidatedStartView(self: *Replica, limit: msg.OpNumber) void {
+        self.truncateAboveInternal(limit, true);
+    }
+
+    fn truncateAboveInternal(self: *Replica, limit: msg.OpNumber, validated_start_view: bool) void {
         for (0..LOG_SIZE_MAX) |i| {
             if (!self.journal_occupied[i]) continue;
-            if (self.journal[i].op_number > limit and self.journal[i].op_number > self.commit_min) {
-                self.journal_occupied[i] = false;
-                self.prepare_ok_counts[i] = 0;
-                self.prepare_ok_from[i] = 0;
-                self.durable_prepare_op[i] = 0;
-                self.durable_prepare_checksum[i] = 0;
-                self.journal_dirty[i] = true;
-            }
+            if (self.journal[i].op_number <= limit or self.journal[i].op_number <= self.commit_min) continue;
+            if (self.isDurablePrepare(self.journal[i].op_number) and !validated_start_view) continue;
+            self.journal_occupied[i] = false;
+            self.prepare_ok_counts[i] = 0;
+            self.prepare_ok_from[i] = 0;
+            self.durable_prepare_op[i] = 0;
+            self.durable_prepare_checksum[i] = 0;
+            self.journal_dirty[i] = true;
         }
     }
 
@@ -2418,10 +3114,13 @@ pub const Replica = struct {
 
     fn sendCommitHeartbeat(self: *Replica) void {
         const target = @max(self.commit_min, self.commit_max);
-        const commit_checksum = if (target > 0) blk: {
-            const entry = self.journalGet(target) orelse break :blk 0;
+        // Never emit checksum 0 for a nonzero advancing/current commit target.
+        const commit_checksum: u64 = if (target > 0) blk: {
+            const entry = self.journalGet(target) orelse return;
+            if (entry.checksum == 0) return;
             break :blk entry.checksum;
         } else 0;
+        std.debug.assert(target == 0 or commit_checksum != 0);
         self.sendToAllOthers(.{ .commit = .{
             .view_number = self.view_number,
             .commit_min = self.commit_min,
@@ -2510,6 +3209,76 @@ const ReplicaDispatchCapture = struct {
         capture.count += 1;
     }
 };
+
+const ClientReplyCapture = struct {
+    count: usize = 0,
+    client_id: u128 = 0,
+    request_id: msg.RequestId = 0,
+    result: msg.Result = .{ .ok = .{ .entity_id = 0 } },
+
+    fn reply(ctx: *anyopaque, client_id: u128, request_id: msg.RequestId, result: msg.Result) void {
+        const capture: *ClientReplyCapture = @ptrCast(@alignCast(ctx));
+        capture.count += 1;
+        capture.client_id = client_id;
+        capture.request_id = request_id;
+        capture.result = result;
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Replica) <= 8 * 1024 * 1024);
+    std.debug.assert(@sizeOf(view_candidate.ViewChangeCandidate) <= 256);
+}
+
+
+test "restart rebuild preserves dedup beyond 64 unique clients" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(1202);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(1202, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(1202);
+    var capture = ClientReplyCapture{};
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = sim_io.io(),
+        .state_machine = sm,
+        .client_reply_ctx = &capture,
+        .client_reply_fn = ClientReplyCapture.reply,
+    });
+
+    var parent_checksum: u64 = 0;
+    for (1..97) |op| {
+        var entry = msg.LogEntry{
+            .view_number = 0,
+            .op_number = @intCast(op),
+            .command = .{ .noop = {} },
+            .client_id = @intCast(10_000 + op),
+            .request_id = 1,
+            .parent_checksum = parent_checksum,
+        };
+        entry.checksum = entry.computeChecksum();
+        replica.journalPut(entry);
+        parent_checksum = entry.checksum;
+    }
+    replica.op_number = 96;
+    replica.commit_min = 96;
+    replica.commit_max = 96;
+    try replica.rebuildCommittedState(96);
+    try std.testing.expectEqual(@as(usize, 96), replica.client_count);
+
+    replica.onRequest(0, .{ .client_id = 10_001, .request_id = 1, .command = .{ .noop = {} } });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u128, 1), capture.request_id);
+    try std.testing.expectEqual(@as(u64, 96), replica.op_number);
+}
 
 test "duplicate in-flight scheduler request is ignored before commit" {
     const allocator = std.testing.allocator;
@@ -3062,33 +3831,177 @@ test "committed batch bind dispatches all bound pods to worker" {
     try std.testing.expectEqual(sm.pods[2].id, capture.records[2].pod_id);
 }
 
-const ClientReplyCapture = struct {
-    count: usize = 0,
-    client_id: u128 = 0,
-    request_id: msg.RequestId = 0,
-    result: msg.Result = .{ .ok = .{ .entity_id = 0 } },
-
-    fn reply(ctx: *anyopaque, client_id: u128, request_id: msg.RequestId, result: msg.Result) void {
-        const capture: *ClientReplyCapture = @ptrCast(@alignCast(ctx));
-        capture.count += 1;
-        capture.client_id = client_id;
-        capture.request_id = request_id;
-        capture.result = result;
-    }
-};
-
-test "restart rebuild preserves dedup beyond 64 unique clients" {
+test "onMessage drops out-of-range from" {
     const allocator = std.testing.allocator;
-    var prng = @import("prng.zig").Prng.init(1202);
+    var prng = @import("prng.zig").Prng.init(7001);
     var current_tick: i64 = 0;
     const network = try allocator.create(net_mod.SimulatedNetwork);
     defer allocator.destroy(network);
-    network.initInPlace(1202, 1, &current_tick);
+    network.initInPlace(7001, 3, &current_tick);
     var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
     const sm = try allocator.create(StateMachine);
     defer allocator.destroy(sm);
-    sm.initInPlace(1202);
-    var capture = ClientReplyCapture{};
+    sm.initInPlace(7001);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+
+    replica.onMessage(99, .{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 99,
+    } });
+    try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
+}
+
+test "onStartViewChange rejects spoofed replica_id" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7002);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7002, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7002);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.start_vc_count[0] = true;
+    replica.start_vc_total = 1;
+
+    replica.onMessage(1, .{ .start_view_change = .{
+        .view_number = 1,
+        .replica_id = 2,
+    } });
+    try std.testing.expectEqual(@as(u8, 1), replica.start_vc_total);
+    try std.testing.expect(!replica.start_vc_count[2]);
+}
+
+test "onDoViewChange rejects unbounded op_number" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7003);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7003, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7003);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+
+    replica.onMessage(0, .{ .do_view_change = .{
+        .view_number = 1,
+        .replica_id = 0,
+        .op_number = LOG_SIZE_MAX + 1,
+        .commit_min = 0,
+    } });
+    try std.testing.expectEqual(@as(u8, 0), replica.do_vc_total);
+}
+
+test "DVC tip preflight rejects missing duplicate conflicting and zero-op tips before quorum" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD7C71F);
+    defer tc.deinit();
+    const leader = tc.replicas[1];
+    leader.status = .view_change;
+    leader.view_number = 1;
+
+    var tip = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    tip.checksum = tip.computeChecksum();
+    var conflicting = tip;
+    conflicting.client_id = 2;
+    conflicting.checksum = conflicting.computeChecksum();
+
+    const missing = msg.DoViewChangeMsg{ .view_number = 1, .replica_id = 0, .op_number = 1 };
+    leader.onMessage(0, .{ .do_view_change = missing });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var duplicate = missing;
+    duplicate.log_entry_count = 2;
+    duplicate.log_entries[0] = tip;
+    duplicate.log_entries[1] = tip;
+    leader.onMessage(0, .{ .do_view_change = duplicate });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var conflict = duplicate;
+    conflict.log_entries[1] = conflicting;
+    leader.onMessage(0, .{ .do_view_change = conflict });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var zero_with_tip = msg.DoViewChangeMsg{ .view_number = 1, .replica_id = 0, .op_number = 0, .log_entry_count = 1 };
+    zero_with_tip.log_entries[0] = tip;
+    leader.onMessage(0, .{ .do_view_change = zero_with_tip });
+    try std.testing.expectEqual(@as(u8, 0), leader.do_vc_total);
+
+    var valid = missing;
+    valid.log_entry_count = 1;
+    valid.log_entries[0] = tip;
+    leader.onMessage(0, .{ .do_view_change = valid });
+    try std.testing.expectEqual(@as(u8, 1), leader.do_vc_total);
+    try std.testing.expectEqual(tip.checksum, leader.do_vc_msgs[0].log_entries[0].checksum);
+}
+
+test "local and recovered DVC always contain exactly one matching tip" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD7C72F);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    replica.journalPut(entry);
+    replica.op_number = 1;
+    var dvc = replica.buildDvc();
+    try std.testing.expect(Replica.dvcTipSemanticsValid(dvc));
+
+    replica.recovered_from_disk = true;
+    dvc = replica.buildDvc();
+    try std.testing.expect(Replica.dvcTipSemanticsValid(dvc));
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), dvc.op_number);
+    try std.testing.expectEqual(entry.checksum, Replica.dvcEntryChecksum(&dvc, 1).?);
+}
+
+test "journalPut soft-drops zero and oversize op" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7004);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7004, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7004);
+
     const replica = try allocator.create(Replica);
     defer allocator.destroy(replica);
     replica.initInPlace(.{
@@ -3096,32 +4009,893 @@ test "restart rebuild preserves dedup beyond 64 unique clients" {
         .replica_count = 1,
         .io = sim_io.io(),
         .state_machine = sm,
-        .client_reply_ctx = &capture,
-        .client_reply_fn = ClientReplyCapture.reply,
     });
 
-    var parent_checksum: u64 = 0;
-    for (1..97) |op| {
-        var entry = msg.LogEntry{
-            .view_number = 0,
-            .op_number = @intCast(op),
-            .command = .{ .noop = {} },
-            .client_id = @intCast(10_000 + op),
-            .request_id = 1,
-            .parent_checksum = parent_checksum,
-        };
-        entry.checksum = entry.computeChecksum();
-        replica.journalPut(entry);
-        parent_checksum = entry.checksum;
-    }
-    replica.op_number = 96;
-    replica.commit_min = 96;
-    replica.commit_max = 96;
-    try replica.rebuildCommittedState(96);
-    try std.testing.expectEqual(@as(usize, 96), replica.client_count);
+    var zero = msg.LogEntry{ .op_number = 0, .command = .{ .noop = {} } };
+    zero.checksum = zero.computeChecksum();
+    replica.journalPut(zero);
+    try std.testing.expect(!replica.journalHas(0));
 
-    replica.onRequest(0, .{ .client_id = 10_001, .request_id = 1, .command = .{ .noop = {} } });
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqual(@as(u128, 1), capture.request_id);
-    try std.testing.expectEqual(@as(u64, 96), replica.op_number);
+    var huge = msg.LogEntry{ .op_number = LOG_SIZE_MAX + 1, .command = .{ .noop = {} } };
+    huge.checksum = huge.computeChecksum();
+    replica.journalPut(huge);
+    for (replica.journal_occupied) |occ| {
+        try std.testing.expect(!occ);
+    }
+}
+
+test "onPrepare rejects bad retention before mutating view_change status" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7011);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7011, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7011);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.op_number = 0;
+
+    var entry = msg.LogEntry{
+        .view_number = 2,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+    };
+    entry.checksum = entry.computeChecksum();
+
+    // Leader for view 2 with replica_count=3 is replica 2.
+    // retention_floor > commit_min must not promote out of view_change.
+    replica.onMessage(2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 5,
+        .entry = entry,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+
+    // Mismatched entry.op_number must also be ignored pre-mutation.
+    entry.op_number = 9;
+    entry.checksum = entry.computeChecksum();
+    replica.onMessage(2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+}
+
+test "onCommit rejects bad semantics before mutating view_change status" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7012);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7012, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7012);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var committed = msg.LogEntry{
+        .view_number = 1,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 7,
+        .request_id = 7,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+    replica.journalPut(committed);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+    const journal_checksum_before = replica.journalGet(1).?.checksum;
+    const sm_seed_before = sm.seed;
+
+    // Leader for view 2 with replica_count=3 is replica 2.
+    // retention_floor > commit_min must not promote or truncate.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 5,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_max);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.retention_floor);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+
+    // commit_min > op_number must also be ignored pre-mutation.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 5,
+        .commit_max = 5,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+
+    // op_number beyond retained log must be ignored pre-mutation.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = LOG_SIZE_MAX + 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+}
+
+test "onStartView rejects out-of-range duplicate and conflicting entries before mutation" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7013);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7013, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7013);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var entry1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry1.checksum = entry1.computeChecksum();
+
+    var entry2 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 2,
+        .request_id = 2,
+        .parent_checksum = entry1.checksum,
+    };
+    entry2.checksum = entry2.computeChecksum();
+
+    // Leader for view 3 with replica_count=3 is replica 0.
+    // Entry above sv.op_number must not mutate view/status/log.
+    var sv_oor = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv_oor.log_entries[0] = entry2;
+    replica.onMessage(0, .{ .start_view = sv_oor });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.op_number);
+    try std.testing.expect(!replica.journalHas(2));
+
+    // Exact duplicate same-op identity must be rejected pre-mutation.
+    var sv_dup = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_dup.log_entries[0] = entry1;
+    sv_dup.log_entries[1] = entry1;
+    replica.onMessage(0, .{ .start_view = sv_dup });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(1));
+
+    // Conflicting same-op identities must be rejected pre-mutation.
+    var conflict = entry1;
+    conflict.client_id = 99;
+    conflict.request_id = 99;
+    conflict.checksum = conflict.computeChecksum();
+    try std.testing.expect(conflict.checksum != entry1.checksum);
+    var sv_conflict = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_conflict.log_entries[0] = entry1;
+    sv_conflict.log_entries[1] = conflict;
+    replica.onMessage(0, .{ .start_view = sv_conflict });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(1));
+}
+
+test "higher valid StartView adoption emits no StartViewChange" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xAD0A7);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    follower.status = .normal;
+    follower.view_number = 0;
+    const svc_tag = @intFromEnum(msg.Tag.start_view_change);
+    const before = tc.network.stats.sent[svc_tag];
+
+    follower.onMessage(0, .{ .start_view = .{ .view_number = 3 } });
+
+    try std.testing.expectEqual(before, tc.network.stats.sent[svc_tag]);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), follower.view_number);
+    try std.testing.expect(follower.pending_start_view.active);
+}
+
+test "onStartView accepts valid bounded message" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7014);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7014, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7014);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+
+    var entry1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry1.checksum = entry1.computeChecksum();
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 0,
+        .op_number = 1,
+        .tip_checksum = entry1.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry1;
+    replica.onMessage(0, .{ .start_view = sv });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    replica.tick();
+    try std.testing.expectEqual(msg.Status.normal, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(entry1.checksum, replica.journalGet(1).?.checksum);
+}
+
+test "onStartView rejects broken prospective parent chain before mutation" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7020);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7020, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7020);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 0;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+
+    var committed = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+    replica.journalPut(committed);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+
+    var bad_child = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 2,
+        .request_id = 2,
+        .parent_checksum = 0xDEADBEEF, // does not match local committed predecessor
+    };
+    bad_child.checksum = bad_child.computeChecksum();
+
+    // Leader for view 3 with replica_count=3 is replica 0.
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 2,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = bad_child;
+    replica.onMessage(0, .{ .start_view = sv });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expect(!replica.journalHas(2));
+    try std.testing.expectEqual(committed.checksum, replica.journalGet(1).?.checksum);
+
+    // Incoming adjacent entries with a broken parent link must also be rejected.
+    var e1 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 2,
+        .command = .{ .noop = {} },
+        .client_id = 3,
+        .request_id = 3,
+        .parent_checksum = committed.checksum,
+    };
+    e1.checksum = e1.computeChecksum();
+    var e2 = msg.LogEntry{
+        .view_number = 3,
+        .op_number = 3,
+        .command = .{ .noop = {} },
+        .client_id = 4,
+        .request_id = 4,
+        .parent_checksum = 0xBAD0BAD0,
+    };
+    e2.checksum = e2.computeChecksum();
+    var sv_chain = msg.StartViewMsg{
+        .view_number = 3,
+        .op_number = 3,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 2,
+    };
+    sv_chain.log_entries[0] = e1;
+    sv_chain.log_entries[1] = e2;
+    replica.onMessage(0, .{ .start_view = sv_chain });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), replica.view_number);
+    try std.testing.expect(!replica.journalHas(2));
+    try std.testing.expect(!replica.journalHas(3));
+}
+
+test "onCommit advancing requires nonzero checksum and exact local match" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7021);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7021, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7021);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 1,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .view_change;
+    replica.view_number = 1;
+    replica.commit_min = 0;
+    replica.commit_max = 0;
+    replica.op_number = 0;
+    replica.retention_floor = 0;
+
+    var e1 = msg.LogEntry{
+        .view_number = 1,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    e1.checksum = e1.computeChecksum();
+    replica.journalPut(e1);
+    replica.op_number = 1;
+
+    const journal_checksum_before = e1.checksum;
+    const sm_seed_before = sm.seed;
+
+    // Advancing with zero commit_checksum must not mutate view/status/log.
+    // Leader for view 2 with replica_count=3 is replica 2.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = 0,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 1), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.retention_floor);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+
+    // A nonzero higher-view checksum that conflicts with speculative local A
+    // enters view change so StartView can install the leader's committed B.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = journal_checksum_before ^ 1,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expect(replica.journalHas(1));
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+    try std.testing.expectEqual(sm_seed_before, sm.seed);
+    try std.testing.expect(!replica.transfer_pending);
+
+    // A valid higher-view Commit is not an adoption record. It can move the
+    // follower into view change, but cannot promote or commit its local suffix.
+    replica.onMessage(2, .{ .commit = .{
+        .view_number = 2,
+        .commit_min = 1,
+        .commit_max = 1,
+        .op_number = 1,
+        .retention_floor = 0,
+        .commit_checksum = journal_checksum_before,
+    } });
+    try std.testing.expectEqual(msg.Status.view_change, replica.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), replica.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), replica.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), replica.op_number);
+    try std.testing.expectEqual(journal_checksum_before, replica.journalGet(1).?.checksum);
+}
+
+test "initialized leader serves an empty StartView certificate after follower recovery" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(0x57A28);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(0x57A28, 3, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(0x57A28);
+
+    const Capture = struct {
+        start_view: ?msg.StartViewMsg = null,
+
+        fn send(ctx: *anyopaque, _: u8, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const message = msg.deserialize(data[5..]) catch return;
+            switch (message) {
+                .start_view => |start_view| self.start_view = start_view,
+                else => {},
+            }
+        }
+    };
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    @memset(std.mem.asBytes(replica), 0xA5);
+    replica.initInPlace(.{
+        .allocator = allocator,
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    defer replica.deinit();
+    var capture = Capture{};
+    replica.peer_send_ctx = &capture;
+    replica.peer_send_fn = Capture.send;
+
+    replica.onMessage(1, .{ .request_start_view = .{ .view_number = 0 } });
+
+    const start_view = capture.start_view orelse return error.MissingStartView;
+    try std.testing.expect(startViewEntriesValid(start_view));
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), start_view.selected_last_normal_view);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), start_view.op_number);
+    try std.testing.expectEqual(@as(u64, 0), start_view.tip_checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), start_view.commit_min);
+}
+
+test "higher-view Prepare retains suffix and requests StartView adoption" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0x57A27);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+
+    const leader = tc.replicas[2];
+    const follower = tc.replicas[1];
+    var committed = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 7, .request_id = 1 };
+    committed.checksum = committed.computeChecksum();
+    var speculative = msg.LogEntry{ .view_number = 0, .op_number = 2, .client_id = 7, .request_id = 2, .parent_checksum = committed.checksum };
+    speculative.checksum = speculative.computeChecksum();
+    var proposed = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 8, .request_id = 2, .parent_checksum = committed.checksum };
+    proposed.checksum = proposed.computeChecksum();
+
+    follower.journalPut(committed);
+    follower.journalPut(speculative);
+    follower.op_number = 2;
+    follower.commit_min = 1;
+    follower.commit_max = 1;
+    follower.durable_prepare_op[journalSlot(1)] = 1;
+    follower.durable_prepare_checksum[journalSlot(1)] = committed.checksum;
+
+    leader.status = .normal;
+    leader.view_number = 2;
+    leader.last_normal_view = 2;
+    leader.journalPut(committed);
+    leader.op_number = 1;
+    leader.commit_min = 1;
+    leader.commit_max = 1;
+    leader.selected_source = 2;
+    leader.selected_last_normal_view = 0;
+    leader.selected_tip_op = 1;
+    leader.selected_tip_checksum = committed.checksum;
+    leader.selected_commit_bound = 1;
+    leader.durable_prepare_op[journalSlot(1)] = 1;
+    leader.durable_prepare_checksum[journalSlot(1)] = committed.checksum;
+
+    const request_tag = @intFromEnum(msg.Tag.request_start_view);
+    const before = tc.network.stats.sent[request_tag];
+    tc.deliver(1, 2, .{ .prepare = .{
+        .view_number = 2,
+        .op_number = 2,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .entry = proposed,
+    } });
+
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), follower.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.commit_min);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), follower.op_number);
+    try std.testing.expectEqual(speculative.checksum, follower.journalGet(2).?.checksum);
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[request_tag]);
+
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const start_view_before = tc.network.stats.sent[start_view_tag];
+    leader.onMessage(1, .{ .request_start_view = .{ .view_number = 2 } });
+    try std.testing.expectEqual(start_view_before + 1, tc.network.stats.sent[start_view_tag]);
+    follower.onMessage(2, .{ .start_view = leader.buildStartView() });
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+    follower.tick();
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 2), follower.view_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+    try std.testing.expect(!follower.journalHas(2));
+}
+
+test "selection-bound RequestPrepare serves retained source across later current view" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 5, 0x50A2CE);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    const source = tc.replicas[4];
+    source.status = .view_change;
+    source.view_number = 9;
+    source.last_normal_view = 4;
+
+    var parent: u64 = 0;
+    var entries: [3]msg.LogEntry = undefined;
+    for (&entries, 0..) |*entry, index| {
+        entry.* = .{ .view_number = 4, .op_number = index + 1, .client_id = 40, .request_id = index + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+        source.journalPut(entry.*);
+    }
+    source.op_number = 3;
+    source.commit_min = 1;
+    source.commit_max = 1;
+
+    const request = msg.RequestPrepareMsg{
+        .view_number = 7,
+        .op_number = 1,
+        .selected_source = 4,
+        .selected_last_normal_view = 4,
+        .selected_tip_op = 3,
+        .selected_tip_checksum = entries[2].checksum,
+        .selected_commit_bound = 1,
+        .expected_entry_checksum = entries[0].checksum,
+    };
+    const send_tag = @intFromEnum(msg.Tag.send_prepare);
+    const before = tc.network.stats.sent[send_tag];
+    source.onMessage(2, .{ .request_prepare = request });
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[send_tag]);
+
+    var wire: [16 * 1024]u8 = undefined;
+    const received = tc.network.deliverAndMaybeReplay(2, &wire) orelse return error.TestUnexpectedResult;
+    const response = try msg.deserialize(wire[0..received.len]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 7), response.send_prepare.view_number);
+    try std.testing.expectEqual(entries[0].checksum, response.send_prepare.entry.checksum);
+
+    var changed_lnv = request;
+    changed_lnv.selected_last_normal_view += 1;
+    source.onMessage(2, .{ .request_prepare = changed_lnv });
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[send_tag]);
+
+    var changed_tip = request;
+    changed_tip.selected_tip_checksum ^= 1;
+    source.onMessage(2, .{ .request_prepare = changed_tip });
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[send_tag]);
+
+    source.onMessage(2, .{ .request_prepare = .{ .view_number = 7, .op_number = 1 } });
+    try std.testing.expectEqual(before + 1, tc.network.stats.sent[send_tag]);
+
+    source.pending_start_view = .{
+        .active = true,
+        .role = .follower,
+        .target_view = 9,
+        .op_number = 3,
+        .commit_min = 1,
+    };
+    source.onMessage(2, .{ .request_prepare = request });
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[send_tag]);
+}
+
+test "PrepareOk binds votes to exact entry identity and sender" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xACCE55);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+
+    var entry_a = msg.LogEntry{ .view_number = 0, .op_number = 1, .command = .{ .noop = {} }, .client_id = 1, .request_id = 1 };
+    entry_a.checksum = entry_a.computeChecksum();
+    var entry_b = entry_a;
+    entry_b.client_id = 2;
+    entry_b.request_id = 2;
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    leader.journalPut(entry_b);
+    leader.op_number = 1;
+    const slot = journalSlot(1);
+    leader.prepare_ok_counts[slot] = 1;
+    leader.prepare_ok_from[slot] = 1;
+
+    try std.testing.expect(!peerMessageSemanticsValid(.{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = 0 } }));
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 1, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 1), leader.prepare_ok_counts[slot]);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_a.checksum } });
+    try std.testing.expectEqual(@as(u8, 1), leader.prepare_ok_counts[slot]);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.commit_min);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.commit_min);
+
+    leader.onMessage(1, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+    leader.onMessage(2, .{ .prepare_ok = .{ .view_number = 0, .op_number = 1, .replica_id = 1, .entry_checksum = entry_b.checksum } });
+    try std.testing.expectEqual(@as(u8, 2), leader.prepare_ok_counts[slot]);
+}
+
+test "same-view conflicting Prepare preserves durable prepared identity" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD0AB1E);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+
+    var entry_a = msg.LogEntry{ .view_number = 0, .op_number = 1, .command = .{ .noop = {} }, .client_id = 1, .request_id = 1 };
+    entry_a.checksum = entry_a.computeChecksum();
+    var entry_b = entry_a;
+    entry_b.client_id = 2;
+    entry_b.request_id = 2;
+    entry_b.checksum = entry_b.computeChecksum();
+    follower.journalPut(entry_a);
+    follower.op_number = 1;
+    const slot = journalSlot(1);
+    follower.durable_prepare_op[slot] = 1;
+    follower.durable_prepare_checksum[slot] = entry_a.checksum;
+
+    follower.onMessage(0, .{ .prepare = .{ .view_number = 0, .op_number = 1, .entry = entry_b } });
+    try std.testing.expectEqual(entry_a.checksum, follower.journalGet(1).?.checksum);
+    try std.testing.expectEqual(entry_a.checksum, follower.durable_prepare_checksum[slot]);
+
+    follower.journalPut(entry_b);
+    try std.testing.expectEqual(entry_a.checksum, follower.journalGet(1).?.checksum);
+    try std.testing.expectEqual(entry_a.checksum, follower.durable_prepare_checksum[slot]);
+}
+
+test "leader StartView durable sync survives crash before broadcast" {
+    const tc = try @import("vopr/test_harness.zig").TestCluster.init(std.testing.allocator, 3, 0xD07AB1E);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+    leader.pending_view_selection = true;
+    leader.selected_source = 1;
+    leader.selected_last_normal_view = 2;
+    leader.selected_target_view = 3;
+    leader.selected_commit_bound = 0;
+
+    var first = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    first.checksum = first.computeChecksum();
+    var second = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = first.checksum };
+    second.checksum = second.computeChecksum();
+    leader.journalPutFromValidatedStartView(first);
+    leader.journalPutFromValidatedStartView(second);
+    leader.selected_tip_op = 2;
+    leader.selected_tip_checksum = second.checksum;
+    leader.view_change_candidate.phase = .candidate_complete;
+    leader.startViewCandidateReady();
+    try std.testing.expect(leader.pending_start_view.active);
+
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+    var disk = leader.disk.?;
+    try std.testing.expect(leader.syncPendingStartView(&disk));
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(before, tc.network.stats.sent[start_view_tag]);
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), tc.replicas[0].op_number);
+    try std.testing.expectEqual(second.checksum, tc.replicas[0].journalGet(2).?.checksum);
+}
+
+test "sendCommitHeartbeat never emits zero checksum for advancing target" {
+    const allocator = std.testing.allocator;
+    var prng = @import("prng.zig").Prng.init(7022);
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(7022, 1, &current_tick);
+    var sim_io = io_mod.SimulatedIo.init(&prng, &current_tick, network, 0);
+
+    const sm = try allocator.create(StateMachine);
+    defer allocator.destroy(sm);
+    sm.initInPlace(7022);
+
+    const replica = try allocator.create(Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{
+        .replica_id = 0,
+        .replica_count = 3,
+        .io = sim_io.io(),
+        .state_machine = sm,
+    });
+    replica.status = .normal;
+    replica.view_number = 0;
+
+    var e1 = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    e1.checksum = e1.computeChecksum();
+    replica.journalPut(e1);
+    replica.op_number = 1;
+    replica.commit_min = 1;
+    replica.commit_max = 1;
+
+    const Capture = struct {
+        checksum: u64 = 0,
+        seen: bool = false,
+
+        fn send(ctx: *anyopaque, to: u8, data: []const u8) void {
+            _ = to;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (data.len < 5) return;
+            const message = msg.deserialize(data[5..]) catch return;
+            switch (message) {
+                .commit => |c| {
+                    self.checksum = c.commit_checksum;
+                    self.seen = true;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{};
+    replica.peer_send_ctx = &capture;
+    replica.peer_send_fn = Capture.send;
+
+    replica.sendCommitHeartbeat();
+    try std.testing.expect(capture.seen);
+    try std.testing.expect(capture.checksum != 0);
+    try std.testing.expectEqual(e1.checksum, capture.checksum);
 }

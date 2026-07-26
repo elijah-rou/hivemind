@@ -21,3 +21,7 @@ comptime {
     _ = @import("connection.zig");
     _ = @import("latency.zig");
 }
+
+comptime {
+    _ = @import("view_change_candidate.zig");
+}
