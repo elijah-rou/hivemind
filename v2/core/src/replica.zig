@@ -23,7 +23,9 @@ pub const DiskInterface = disk_mod.DiskInterface;
 // ---------------------------------------------------------------------------
 
 pub const LOG_SIZE_MAX: usize = msg.LOG_BITSET_BITS;
-pub const CLIENT_TABLE_MAX: usize = 64;
+/// One committed operation can introduce one unique client. Retain dedup for
+/// the entire unsnapshotted journal lifetime.
+pub const CLIENT_TABLE_MAX: usize = LOG_SIZE_MAX;
 pub const MAX_WORKERS: usize = 128;
 pub const HEARTBEAT_INTERVAL: i64 = 100;
 pub const VIEW_CHANGE_TIMEOUT: i64 = 2000;
@@ -51,6 +53,12 @@ const ClientEntry = struct {
     result: msg.Result,
     active: bool,
 };
+
+pub const CLIENT_TABLE_MEMORY_BYTES: usize = CLIENT_TABLE_MAX * @sizeOf(ClientEntry);
+comptime {
+    std.debug.assert(CLIENT_TABLE_MAX >= LOG_SIZE_MAX);
+    std.debug.assert(CLIENT_TABLE_MEMORY_BYTES <= 128 * 1024);
+}
 
 const StopDispatch = struct {
     worker_idx: usize,
@@ -2374,15 +2382,14 @@ pub const Replica = struct {
                 return;
             }
         }
-        if (self.client_count < CLIENT_TABLE_MAX) {
-            self.client_table[self.client_count] = .{
-                .client_id = client_id,
-                .request_id = request_id,
-                .result = result,
-                .active = true,
-            };
-            self.client_count += 1;
-        }
+        std.debug.assert(self.client_count < CLIENT_TABLE_MAX);
+        self.client_table[self.client_count] = .{
+            .client_id = client_id,
+            .request_id = request_id,
+            .result = result,
+            .active = true,
+        };
+        self.client_count += 1;
     }
 
     // -----------------------------------------------------------------------
@@ -3054,6 +3061,21 @@ test "committed batch bind dispatches all bound pods to worker" {
     try std.testing.expectEqual(sm.pods[1].id, capture.records[1].pod_id);
     try std.testing.expectEqual(sm.pods[2].id, capture.records[2].pod_id);
 }
+
+const ClientReplyCapture = struct {
+    count: usize = 0,
+    client_id: u128 = 0,
+    request_id: msg.RequestId = 0,
+    result: msg.Result = .{ .ok = .{ .entity_id = 0 } },
+
+    fn reply(ctx: *anyopaque, client_id: u128, request_id: msg.RequestId, result: msg.Result) void {
+        const capture: *ClientReplyCapture = @ptrCast(@alignCast(ctx));
+        capture.count += 1;
+        capture.client_id = client_id;
+        capture.request_id = request_id;
+        capture.result = result;
+    }
+};
 
 test "restart rebuild preserves dedup beyond 64 unique clients" {
     const allocator = std.testing.allocator;
