@@ -200,6 +200,10 @@ pub const WorkerConnection = struct {
     register_seq: u64 = 0,
 };
 
+pub const BarrierKind = enum { prepare, commit, leader_start_view, follower_start_view };
+pub const BarrierCutPoint = enum { before_slot_write, before_metadata_write, before_sync, before_publication };
+pub const BarrierCut = struct { id: u64, kind: BarrierKind, point: BarrierCutPoint };
+
 pub const Replica = struct {
     // Configuration
     allocator: std.mem.Allocator,
@@ -279,9 +283,15 @@ pub const Replica = struct {
     // Persistence tracking
     journal_dirty: [LOG_SIZE_MAX]bool,
     metadata_dirty: bool,
+    /// Protocol causes covered by the next normal group-commit barrier.
+    pending_prepare_barrier: bool,
+    pending_commit_barrier: bool,
     disk: ?DiskInterface,
     /// Fail-stop: disk write/sync failed; no further consensus/client/worker traffic.
     storage_failed: bool,
+    barrier_cut: ?BarrierCut,
+    barrier_cut_count: u64,
+    last_barrier_cut_id: u64,
 
     // Deferred protocol/client publication until covering durability barrier
     pending_prepare_broadcast: [LOG_SIZE_MAX]bool,
@@ -387,8 +397,13 @@ pub const Replica = struct {
             .transfer_target_op = 0,
             .journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool),
             .metadata_dirty = false,
+            .pending_prepare_barrier = false,
+            .pending_commit_barrier = false,
             .disk = config.disk,
             .storage_failed = false,
+            .barrier_cut = null,
+            .barrier_cut_count = 0,
+            .last_barrier_cut_id = 0,
             .pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool),
             .pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool),
             .pending_prepare_ok_to = std.mem.zeroes([LOG_SIZE_MAX]u8),
@@ -475,8 +490,13 @@ pub const Replica = struct {
         self.transfer_target_op = 0;
         self.journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.metadata_dirty = false;
+        self.pending_prepare_barrier = false;
+        self.pending_commit_barrier = false;
         self.disk = config.disk;
         self.storage_failed = false;
+        self.barrier_cut = null;
+        self.barrier_cut_count = 0;
+        self.last_barrier_cut_id = 0;
         self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_prepare_ok_to = std.mem.zeroes([LOG_SIZE_MAX]u8);
@@ -600,6 +620,8 @@ pub const Replica = struct {
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
         self.journal_dirty = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.metadata_dirty = false;
+        self.pending_prepare_barrier = false;
+        self.pending_commit_barrier = false;
         self.pending_prepare_broadcast = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_prepare_ok = std.mem.zeroes([LOG_SIZE_MAX]bool);
         self.pending_reply = std.mem.zeroes([LOG_SIZE_MAX]bool);
@@ -2500,6 +2522,7 @@ pub const Replica = struct {
         self.replica_commit_min[self.replica_id] = self.commit_min;
         if (self.isLeader()) self.recomputeRetentionFloor();
         self.metadata_dirty = true;
+        self.pending_commit_barrier = true;
 
         const slot = journalSlot(op);
         self.pending_reply[slot] = true;
@@ -2608,6 +2631,38 @@ pub const Replica = struct {
         self.storage_failures += 1;
     }
 
+    pub fn armBarrierCut(self: *Replica, cut: BarrierCut) void {
+        std.debug.assert(cut.id > 0);
+        std.debug.assert(self.barrier_cut == null);
+        self.barrier_cut = cut;
+    }
+
+    fn triggerBarrierCut(self: *Replica, kind: BarrierKind, point: BarrierCutPoint) bool {
+        const cut = self.barrier_cut orelse return false;
+        if (cut.kind != kind or cut.point != point) return false;
+        self.barrier_cut = null;
+        self.barrier_cut_count += 1;
+        self.last_barrier_cut_id = cut.id;
+        self.markStorageFailed();
+        return true;
+    }
+
+    fn triggerNormalBarrierCut(self: *Replica, prepare: bool, commit: bool, point: BarrierCutPoint) bool {
+        std.debug.assert(prepare or commit);
+        const cut = self.barrier_cut orelse return false;
+        const cause_matches = switch (cut.kind) {
+            .prepare => prepare,
+            .commit => commit,
+            .leader_start_view, .follower_start_view => false,
+        };
+        if (!cause_matches or cut.point != point) return false;
+        self.barrier_cut = null;
+        self.barrier_cut_count += 1;
+        self.last_barrier_cut_id = cut.id;
+        self.markStorageFailed();
+        return true;
+    }
+
     fn metadataForPersistence(self: *const Replica) disk_mod.Metadata {
         if (self.pending_start_view.active) {
             const pending = self.pending_start_view;
@@ -2629,13 +2684,15 @@ pub const Replica = struct {
         };
     }
 
-    fn syncPendingStartView(self: *Replica, disk: *DiskInterface) bool {
+    fn syncPendingStartView(self: *Replica, disk: *DiskInterface, kind: BarrierKind) bool {
+        std.debug.assert(kind == .leader_start_view or kind == .follower_start_view);
         self.assertPendingStartViewChain();
         const meta = self.metadataForPersistence();
         std.debug.assert(meta.op_number == self.logHighOp());
         std.debug.assert(meta.commit_min == self.pending_start_view.commit_min);
         std.debug.assert(meta.commit_max == meta.commit_min);
 
+        if (self.triggerBarrierCut(kind, .before_slot_write)) return false;
         for (0..LOG_SIZE_MAX) |i| {
             if (!self.journal_dirty[i]) continue;
             if (self.journal_occupied[i]) {
@@ -2650,11 +2707,13 @@ pub const Replica = struct {
                 };
             }
         }
+        if (self.triggerBarrierCut(kind, .before_metadata_write)) return false;
         disk.writeMetadata(meta) catch {
             self.markStorageFailed();
             return false;
         };
         self.metadata_dirty = true;
+        if (self.triggerBarrierCut(kind, .before_sync)) return false;
         disk.sync() catch {
             self.markStorageFailed();
             return false;
@@ -2662,6 +2721,8 @@ pub const Replica = struct {
         std.debug.assert(disk.metadataEquals(meta));
         for (0..LOG_SIZE_MAX) |i| self.journal_dirty[i] = false;
         self.metadata_dirty = false;
+        self.pending_prepare_barrier = false;
+        self.pending_commit_barrier = false;
         return true;
     }
 
@@ -2676,6 +2737,8 @@ pub const Replica = struct {
             const before = self.durable_prepare_through;
             const through = if (self.pending_start_view.active) self.pending_start_view.op_number else self.op_number;
             self.metadata_dirty = false;
+            self.pending_prepare_barrier = false;
+            self.pending_commit_barrier = false;
             self.publishPendingAfterBarrier(before, through);
             self.metadata_dirty = false;
             self.publishCommitEffects();
@@ -2685,19 +2748,27 @@ pub const Replica = struct {
         if (self.pending_start_view.active) {
             const before = self.durable_prepare_through;
             const through = self.pending_start_view.op_number;
-            if (!self.syncPendingStartView(&disk)) return;
+            const kind: BarrierKind = switch (self.pending_start_view.role) {
+                .leader => .leader_start_view,
+                .follower => .follower_start_view,
+                .none => unreachable,
+            };
+            if (!self.syncPendingStartView(&disk, kind)) return;
+            if (self.triggerBarrierCut(kind, .before_publication)) return;
             self.publishPendingAfterBarrier(before, through);
             return;
         }
 
         var barriers: u8 = 0;
         while (barriers < FLUSH_BARRIER_MAX) : (barriers += 1) {
-            var any_journal_dirty = false;
+            const any_journal_dirty = anyJournalDirty(self);
+            const prepare_cause = self.pending_prepare_barrier;
+            const commit_cause = self.pending_commit_barrier;
             const prepare_through_before = self.durable_prepare_through;
 
+            if ((prepare_cause or commit_cause) and self.triggerNormalBarrierCut(prepare_cause, commit_cause, .before_slot_write)) return;
             for (0..LOG_SIZE_MAX) |i| {
                 if (!self.journal_dirty[i]) continue;
-                any_journal_dirty = true;
                 if (self.journal_occupied[i]) {
                     disk.writeSlot(i, &self.journal[i]) catch {
                         self.markStorageFailed();
@@ -2714,6 +2785,7 @@ pub const Replica = struct {
             const meta = self.metadataForPersistence();
             const need_meta = self.metadata_dirty or any_journal_dirty or !disk.metadataEquals(meta);
             if (need_meta) {
+                if ((prepare_cause or commit_cause) and self.triggerNormalBarrierCut(prepare_cause, commit_cause, .before_metadata_write)) return;
                 disk.writeMetadata(meta) catch {
                     self.markStorageFailed();
                     return;
@@ -2726,6 +2798,7 @@ pub const Replica = struct {
                 return;
             }
 
+            if ((prepare_cause or commit_cause) and self.triggerNormalBarrierCut(prepare_cause, commit_cause, .before_sync)) return;
             disk.sync() catch {
                 self.markStorageFailed();
                 return;
@@ -2736,7 +2809,10 @@ pub const Replica = struct {
                 self.journal_dirty[i] = false;
             }
             self.metadata_dirty = false;
+            if (prepare_cause) self.pending_prepare_barrier = false;
+            if (commit_cause) self.pending_commit_barrier = false;
 
+            if ((prepare_cause or commit_cause) and self.triggerNormalBarrierCut(prepare_cause, commit_cause, .before_publication)) return;
             self.publishPendingAfterBarrier(prepare_through_before, meta.op_number);
 
             if (!self.metadata_dirty and !anyJournalDirty(self)) break;
@@ -2959,6 +3035,7 @@ pub const Replica = struct {
         self.journal[slot] = entry;
         self.journal_occupied[slot] = true;
         self.journal_dirty[slot] = true;
+        self.pending_prepare_barrier = true;
     }
 
     fn truncateAbove(self: *Replica, limit: msg.OpNumber) void {
@@ -2980,6 +3057,7 @@ pub const Replica = struct {
             self.durable_prepare_op[i] = 0;
             self.durable_prepare_checksum[i] = 0;
             self.journal_dirty[i] = true;
+            self.pending_prepare_barrier = true;
         }
     }
 
@@ -4842,7 +4920,7 @@ test "leader StartView durable sync survives crash before broadcast" {
     const start_view_tag = @intFromEnum(msg.Tag.start_view);
     const before = tc.network.stats.sent[start_view_tag];
     var disk = leader.disk.?;
-    try std.testing.expect(leader.syncPendingStartView(&disk));
+    try std.testing.expect(leader.syncPendingStartView(&disk, .leader_start_view));
     try std.testing.expectEqual(msg.Status.view_change, leader.status);
     try std.testing.expect(leader.pending_start_view.active);
     try std.testing.expectEqual(before, tc.network.stats.sent[start_view_tag]);

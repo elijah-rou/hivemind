@@ -16,6 +16,8 @@ pub const EventKind = union(enum) {
     crash: struct { replica: u8, pre_view: u64, pre_op: u64, pre_commit: u64, post_view: u64, post_op: u64, post_commit: u64 },
     pause: struct { replica: u8, duration: u16 },
     unpause: struct { replica: u8 },
+    drop_next: struct { count: u64, id: u64, from: u8, to: u8, tag: u8 },
+    barrier_cut: struct { replica: u8, id: u64, kind: replica_mod.BarrierKind, point: replica_mod.BarrierCutPoint },
     request: struct { leader: u8, request_num: u32 },
     state: [8]ReplicaSnapshot,
     violation: struct { message_buf: [256]u8, message_len: usize, replica: u8 },
@@ -30,6 +32,9 @@ pub const ReplicaSnapshot = struct {
     op: u64 = 0,
     commit: u64 = 0,
     is_leader: bool = false,
+    paused: bool = false,
+    barrier_cut_count: u64 = 0,
+    last_barrier_cut_id: u64 = 0,
     active: bool = false,
 };
 
@@ -43,18 +48,20 @@ pub const JournalSnapshot = struct {
 };
 
 pub const MAX_EVENTS = 16384;
+pub const MAX_TRACE_COLLECTOR_BYTES: usize = 16 * 1024 * 1024;
 
 pub const TraceCollector = struct {
     events: [MAX_EVENTS]TraceEvent,
     count: usize,
     replica_count: u8,
 
-    pub fn init(replica_count: u8) TraceCollector {
-        return .{
-            .events = undefined,
-            .count = 0,
-            .replica_count = replica_count,
-        };
+    pub fn initInPlace(self: *TraceCollector, replica_count: u8) void {
+        self.count = 0;
+        self.replica_count = replica_count;
+    }
+
+    pub fn deinit(self: *TraceCollector) void {
+        self.count = 0;
     }
 
     pub fn push(self: *TraceCollector, event: TraceEvent) void {
@@ -87,11 +94,27 @@ pub const TraceCollector = struct {
         } } });
     }
 
+    pub fn addDropNext(self: *TraceCollector, tick: u64, count: u64, id: u64, from: u8, to: u8, tag: u8) void {
+        std.debug.assert(count > 0);
+        std.debug.assert(id > 0);
+        self.push(.{ .tick = tick, .kind = .{ .drop_next = .{ .count = count, .id = id, .from = from, .to = to, .tag = tag } } });
+    }
+
+    pub fn addBarrierCut(self: *TraceCollector, tick: u64, replica: u8, cut: replica_mod.BarrierCut) void {
+        std.debug.assert(cut.id > 0);
+        self.push(.{ .tick = tick, .kind = .{ .barrier_cut = .{
+            .replica = replica,
+            .id = cut.id,
+            .kind = cut.kind,
+            .point = cut.point,
+        } } });
+    }
+
     pub fn addRequest(self: *TraceCollector, tick: u64, leader: u8, request_num: u32) void {
         self.push(.{ .tick = tick, .kind = .{ .request = .{ .leader = leader, .request_num = request_num } } });
     }
 
-    pub fn addState(self: *TraceCollector, tick: u64, replicas: []const *replica_mod.Replica, count: u8) void {
+    pub fn addState(self: *TraceCollector, tick: u64, replicas: []const *replica_mod.Replica, paused: []const bool, count: u8) void {
         var snap: [8]ReplicaSnapshot = std.mem.zeroes([8]ReplicaSnapshot);
         for (0..count) |i| {
             const r = replicas[i];
@@ -102,6 +125,9 @@ pub const TraceCollector = struct {
                 .op = r.op_number,
                 .commit = r.commit_min,
                 .is_leader = r.isLeader() and r.status == .normal,
+                .paused = i < paused.len and paused[i],
+                .barrier_cut_count = r.barrier_cut_count,
+                .last_barrier_cut_id = r.last_barrier_cut_id,
                 .active = true,
             };
         }
@@ -146,6 +172,34 @@ pub const TraceCollector = struct {
     }
 };
 
+comptime {
+    std.debug.assert(@sizeOf(TraceCollector) > 1024 * 1024);
+    std.debug.assert(@sizeOf(TraceCollector) <= MAX_TRACE_COLLECTOR_BYTES);
+}
+
+test "multi-MiB trace collector supports explicit heap lifetime" {
+    const collector = try std.testing.allocator.create(TraceCollector);
+    collector.initInPlace(5);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    try std.testing.expect(@sizeOf(TraceCollector) > 1024 * 1024);
+    try std.testing.expect(@sizeOf(TraceCollector) <= MAX_TRACE_COLLECTOR_BYTES);
+    try std.testing.expectEqual(@as(usize, 0), collector.count);
+    collector.addInit(5, 7);
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+}
+
+test "state trace exposes paused replicas" {
+    var snapshots = std.mem.zeroes([8]ReplicaSnapshot);
+    snapshots[0] = .{ .id = 0, .active = true, .paused = true };
+    var buf: [2048]u8 = undefined;
+    const line = formatEvent(&buf, .{ .tick = 7, .kind = .{ .state = snapshots } }).?;
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"paused\":true") != null);
+}
+
 fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
     return switch (event.kind) {
         .init => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"init\",\"replicas\":{d},\"seed\":{d}}}\n", .{ event.tick, e.replicas, e.seed }) catch null,
@@ -157,6 +211,8 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
         }) catch null,
         .pause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"pause\",\"replica\":{d},\"duration\":{d}}}\n", .{ event.tick, e.replica, e.duration }) catch null,
         .unpause => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"unpause\",\"replica\":{d}}}\n", .{ event.tick, e.replica }) catch null,
+        .drop_next => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"drop_next\",\"count\":{d},\"id\":{d},\"from\":{d},\"to\":{d},\"tag\":{d}}}\n", .{ event.tick, e.count, e.id, e.from, e.to, e.tag }) catch null,
+        .barrier_cut => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"barrier_cut\",\"replica\":{d},\"id\":{d},\"kind\":\"{s}\",\"point\":\"{s}\"}}\n", .{ event.tick, e.replica, e.id, @tagName(e.kind), @tagName(e.point) }) catch null,
         .request => |e| std.fmt.bufPrint(buf, "{{\"tick\":{d},\"type\":\"request\",\"leader\":{d},\"num\":{d}}}\n", .{ event.tick, e.leader, e.request_num }) catch null,
         .state => |snaps| blk: {
             var pos: usize = 0;
@@ -165,11 +221,19 @@ fn formatEvent(buf: *[2048]u8, event: TraceEvent) ?[]const u8 {
             var first = true;
             for (&snaps) |*s| {
                 if (!s.active) continue;
-                if (!first) { buf[pos] = ','; pos += 1; }
+                if (!first) {
+                    buf[pos] = ',';
+                    pos += 1;
+                }
                 first = false;
-                const status_str: []const u8 = switch (s.status) { 0 => "N", 1 => "V", 2 => "R", else => "?" };
-                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{}}}", .{
-                    s.id, status_str, s.view, s.op, s.commit, s.is_leader,
+                const status_str: []const u8 = switch (s.status) {
+                    0 => "N",
+                    1 => "V",
+                    2 => "R",
+                    else => "?",
+                };
+                const entry = std.fmt.bufPrint(buf[pos..], "{{\"id\":{d},\"status\":\"{s}\",\"view\":{d},\"op\":{d},\"commit\":{d},\"leader\":{},\"paused\":{},\"barrier_cuts\":{d},\"last_barrier_cut_id\":{d}}}", .{
+                    s.id, status_str, s.view, s.op, s.commit, s.is_leader, s.paused, s.barrier_cut_count, s.last_barrier_cut_id,
                 }) catch break :blk null;
                 pos += entry.len;
             }
