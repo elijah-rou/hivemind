@@ -1077,13 +1077,10 @@ pub const Replica = struct {
         if (highest_kept > max_commit) {
             var ack_op = max_commit + 1;
             while (ack_op <= highest_kept) : (ack_op += 1) {
-                if (!self.journalHas(ack_op)) continue;
-                const slot = journalSlot(ack_op);
-                if (self.isDurablePrepare(ack_op)) {
+                if (self.journalHas(ack_op)) {
+                    const slot = journalSlot(ack_op);
                     self.prepare_ok_counts[slot] = 1;
                     self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
-                } else {
-                    self.pending_prepare_broadcast[slot] = true;
                 }
             }
         }
@@ -1117,16 +1114,13 @@ pub const Replica = struct {
         self.prepare_ok_counts = std.mem.zeroes([LOG_SIZE_MAX]u8);
         self.prepare_ok_from = std.mem.zeroes([LOG_SIZE_MAX]u16);
 
-        // Self-ack only durable matching identities; otherwise queue Prepare publish.
+        // Count self as having acked all locally-present uncommitted entries.
         var ack_op = self.commit_min + 1;
         while (ack_op <= self.op_number) : (ack_op += 1) {
-            if (!self.journalHas(ack_op)) continue;
-            const slot = journalSlot(ack_op);
-            if (self.isDurablePrepare(ack_op)) {
+            if (self.journalHas(ack_op)) {
+                const slot = journalSlot(ack_op);
                 self.prepare_ok_counts[slot] = 1;
                 self.prepare_ok_from[slot] = @as(u16, 1) << @intCast(self.replica_id);
-            } else {
-                self.pending_prepare_broadcast[slot] = true;
             }
         }
 
@@ -1809,11 +1803,13 @@ pub const Replica = struct {
         while (ack_op <= self.op_number) : (ack_op += 1) {
             const e = self.journalGet(ack_op) orelse break;
             if (!e.valid()) break;
-            const slot = journalSlot(ack_op);
-            self.pending_prepare_ok[slot] = true;
-            self.pending_prepare_ok_to[slot] = new_leader;
+            self.sendTo(new_leader, .{ .prepare_ok = .{
+                .view_number = self.view_number,
+                .op_number = ack_op,
+                .replica_id = self.replica_id,
+                .commit_min = self.commit_min,
+            } });
         }
-        self.metadata_dirty = true;
 
         if (self.hasLogGaps()) {
             self.transfer_pending = true;

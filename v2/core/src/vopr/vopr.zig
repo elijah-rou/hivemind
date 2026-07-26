@@ -80,17 +80,10 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
         tc.disks[i].write_fault_rate = Ratio.zero();
         tc.disks[i].fail_next_write = false;
         tc.disks[i].fail_next_sync = false;
-        // Restart storage-failed / offline replicas. If local durable state is
-        // corrupt, wipe once and rejoin empty under a healed network.
+        // Production restart does not erase durable state. Retry recovery after
+        // transient faults clear; corrupt durable state remains fail-stopped.
         if (!tc.replica_running[i] or tc.replicas[i].storage_failed) {
-            if (!tc.replica_running[i] and tc.replicas[i].storage_failed) {
-                tc.disks[i].wipe();
-            }
             tc.crashReplica(@intCast(i));
-            if (!tc.replica_running[i]) {
-                tc.disks[i].wipe();
-                tc.crashReplica(@intCast(i));
-            }
         }
     }
 }

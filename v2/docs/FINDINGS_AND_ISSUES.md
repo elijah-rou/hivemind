@@ -21,7 +21,8 @@
 | C2 | Authentication | API and agent connections previously had no auth |
 | C3 | Provider adapter | Nodes are manual / out-of-band |
 | C4 | App spec model | CreateDeployment is minimal vs probes, scaling policy, env, storage |
-| C5 | Log compaction | 256-slot circular log; long-lived clusters need compaction / snapshots |
+| C5 | Crash-consistent versioned storage + torn-write simulation | Layout v2 is a single-copy journal with write/sync-before-publication and I/O fail-stop behavior; torn writes and power loss are not modeled, so it does not establish production durability. |
+| C6 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) operations; `log_full` / HTTP 507 until snapshots exist. |
 
 ### Important — Knative / platform parity
 

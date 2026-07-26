@@ -218,17 +218,16 @@ pub const TestCluster = struct {
 
         const recovered = self.replicas[i].recoverFromDisk() catch {
             // Corrupt local durable prefix: production exits nonzero. Keep this
-            // simulated replica offline until an operator/liveness restart wipes it.
+            // simulated replica offline. Recovery never erases durable state.
             self.replicas[i].storage_failed = true;
             self.replica_running[i] = false;
             self.network.queues[i].count = 0;
-            self.checker.replica_commit_max[id] = 0;
             return;
         };
-        _ = recovered;
 
-        // Reset checker watermark across process restart.
-        self.checker.replica_commit_max[id] = self.replicas[i].commit_min;
+        if (recovered) {
+            self.checker.observeRecovery(id, self.replicas[i]);
+        }
 
         // After crash, multi-node replicas must enter view_change to rejoin
         // safely, even if disk recovery failed and initInPlace left status=normal.
@@ -1382,15 +1381,6 @@ test "durable storage: replaced op cannot re-ack on stale durable watermark" {
     replacement.checksum = replacement.computeChecksum();
     try std.testing.expect(replacement.checksum != original.checksum);
 
-    var sv = msg.StartViewMsg{
-        .view_number = 3,
-        .op_number = 1,
-        .commit_min = 0,
-        .retention_floor = 0,
-        .log_entry_count = 1,
-    };
-    sv.log_entries[0] = replacement;
-
     // Leader must be able to accept a PrepareOk for op 1 if one is wrongly sent.
     tc.replicas[0].view_number = 3;
     tc.replicas[0].last_normal_view = 3;
@@ -1403,7 +1393,12 @@ test "durable storage: replaced op cannot re-ack on stale durable watermark" {
     tc.replicas[0].prepare_ok_from[slot] = 0;
     tc.replicas[0].prepare_ok_counts[slot] = 0;
 
-    tc.deliver(1, 0, .{ .start_view = sv });
+    // Replace the in-memory slot directly so this storage scenario does not own
+    // StartView installation/publication policy from the VRR slice.
+    tc.replicas[1].view_number = 3;
+    tc.replicas[1].status = .normal;
+    tc.replicas[1].journalPut(replacement);
+    tc.replicas[1].op_number = 1;
     try std.testing.expectEqual(replacement.checksum, tc.replicas[1].journalGet(1).?.checksum);
     try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
     try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);

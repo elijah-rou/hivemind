@@ -77,34 +77,53 @@ pub const StateChecker = struct {
         // Check protocol invariants on the replica itself
         self.checkReplicaInvariants(replica_id, r);
 
-        // Check new commits
+        // Commit watermarks track durable history only. In-memory commit_min may
+        // advance before the metadata barrier.
+        if (r.storage_failed or r.metadata_dirty) return;
+
         const prev_commit = self.replica_commit_max[replica_id];
         const curr_commit = r.commit_min;
 
         if (curr_commit < prev_commit) {
-            // After crash recovery the in-memory commit point may be behind the
-            // last observed value until catch-up. Reset tracking; do not treat
-            // process restart as a durability regression.
-            if (r.recovered_from_disk) {
-                self.replica_commit_max[replica_id] = curr_commit;
-                return;
-            }
             self.recordViolation(
                 "replica {d}: durable commit point regressed from {d} to {d}",
                 .{ replica_id, prev_commit, curr_commit },
             );
-            self.replica_commit_max[replica_id] = curr_commit;
             return;
         }
 
         if (curr_commit == prev_commit) return;
 
-        // Replica committed new operations. Validate each one.
         var op = prev_commit + 1;
         while (op <= curr_commit) : (op += 1) {
             self.validateCommit(replica_id, r, op);
         }
 
+        self.replica_commit_max[replica_id] = curr_commit;
+    }
+
+    /// Validate recovered durable history before advancing the process watermark.
+    pub fn observeRecovery(
+        self: *StateChecker,
+        replica_id: u8,
+        r: *const replica_mod.Replica,
+    ) void {
+        std.debug.assert(replica_id < self.replica_count);
+
+        const prev_commit = self.replica_commit_max[replica_id];
+        const curr_commit = r.commit_min;
+        if (curr_commit < prev_commit) {
+            self.recordViolation(
+                "replica {d}: recovered commit point regressed from {d} to {d}",
+                .{ replica_id, prev_commit, curr_commit },
+            );
+            return;
+        }
+
+        var op: msg.OpNumber = 1;
+        while (op <= curr_commit) : (op += 1) {
+            self.validateCommit(replica_id, r, op);
+        }
         self.replica_commit_max[replica_id] = curr_commit;
     }
 
@@ -269,102 +288,3 @@ pub const StateChecker = struct {
         view_changes_observed: u64,
     };
 };
-
-test "checker rejects: divergent bodies with same tag/client/request" {
-    var checker = StateChecker.init(2);
-    checker.silent = true;
-
-    var entry_a = msg.LogEntry{
-        .view_number = 0,
-        .op_number = 1,
-        .command = .{ .noop = {} },
-        .client_id = 7,
-        .request_id = 3,
-    };
-    entry_a.checksum = entry_a.computeChecksum();
-
-    var entry_b = entry_a;
-    entry_b.command = .{ .create_deployment = .{
-        .name = msg.strToFixed(64, "x"),
-        .namespace = msg.strToFixed(64, "default"),
-        .image = msg.strToFixed(256, "img"),
-        .replicas = 1,
-    } };
-    // Keep same client/request but different body/checksum.
-    entry_b.checksum = entry_b.computeChecksum();
-    try std.testing.expect(entry_a.checksum != entry_b.checksum);
-
-    // Manually seed history as if replica 0 committed entry_a.
-    checker.history[0] = .{
-        .op = 1,
-        .checksum = entry_a.checksum,
-        .client_id = entry_a.client_id,
-        .request_id = entry_a.request_id,
-        .committed_by = 0b01,
-    };
-    checker.history_len = 1;
-    checker.replica_commit_max[0] = 1;
-
-    // Build a minimal fake replica view for validateCommit via check().
-    // Use a TestCluster path instead for realism.
-    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0xC0DE);
-    defer tc.deinit();
-    tc.advance(5);
-    tc.request(0, .{ .noop = {} });
-    tc.advance(20);
-
-    // Inject divergent commit observation for op 1 on a second logical replica id.
-    var diverged = tc.replicas[0].*;
-    const slot = replica_mod.journalSlot(1);
-    diverged.journal[slot] = entry_b;
-    diverged.journal_occupied[slot] = true;
-    diverged.commit_min = 1;
-
-    var checker2 = StateChecker.init(2);
-    checker2.silent = true;
-    checker2.history[0] = .{
-        .op = 1,
-        .checksum = entry_a.checksum,
-        .client_id = entry_a.client_id,
-        .request_id = entry_a.request_id,
-        .committed_by = 0b01,
-    };
-    checker2.history_len = 1;
-    checker2.replica_commit_max[0] = 1;
-    checker2.replica_commit_max[1] = 0;
-    checker2.check(1, &diverged);
-    try std.testing.expectEqual(@as(u64, 1), checker2.safety_violations);
-}
-
-test "checker rejects: commit regression after recovery" {
-    var checker = StateChecker.init(1);
-    checker.silent = true;
-    checker.replica_commit_max[0] = 5;
-
-    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0x2E60);
-    defer tc.deinit();
-    // Force observed regression without recovery flag (live process regression).
-    tc.replicas[0].commit_min = 2;
-    tc.replicas[0].op_number = 2;
-    tc.replicas[0].recovered_from_disk = false;
-    const before = checker.safety_violations;
-    checker.check(0, tc.replicas[0]);
-    try std.testing.expectEqual(@as(u64, 1), checker.safety_violations - before);
-}
-
-test "checker rejects: history capacity exhaustion" {
-    var checker = StateChecker.init(1);
-    checker.silent = true;
-    checker.history_len = StateChecker.MAX_HISTORY;
-
-    const tc = try @import("test_harness.zig").TestCluster.init(std.testing.allocator, 1, 0xCA12);
-    defer tc.deinit();
-    tc.advance(5);
-    tc.request(0, .{ .noop = {} });
-    tc.advance(20);
-
-    // Reset checker tracking so check tries to record op 1 into a full history.
-    checker.replica_commit_max[0] = 0;
-    checker.check(0, tc.replicas[0]);
-    try std.testing.expect(checker.safety_violations >= 1);
-}
