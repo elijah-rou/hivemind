@@ -39,7 +39,7 @@ Historical AWS functional/resilience and benchmark results remain useful context
 What changed:
 - partitioned the durability/safety work into ten linear reviewer-sized slices: storage journal, VRR view change, bounded ingress and `/run`, core VOPR, worker runtime simulation, protocol v6, local durable E2E, offline operations/containerd, guarded live evidence, and aggregate evidence/governance docs
 - retained historical `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c` results as historical only
-- incorporated approved lower-slice corrections, including StartView initialization, runtime cleanup/deadline ownership, protocol declaration checks, local E2E ownership, offline launcher bounds, and guarded-live authorization/redaction/inventory hardening
+- incorporated approved lower-slice corrections, including StartView initialization, runtime cleanup/deadline ownership, containerd workload-identity adoption, protocol declaration checks, local E2E ownership, offline launcher bounds, and guarded-live closed resource/action validation, bounded ownership reconciliation, aggregate cleanup, and semantic evidence validation
 - added contributor, navigation, handoff, acceptance, harness-catalog, and documentation-layout ownership for the complete stack
 - the POC Terraform module now derives its default ECR repository from the required run token
 - the full runbook and bounded Section 5 cycle generate or validate one token, export it to Terraform and evidence helpers, and derive the ECR repository consistently

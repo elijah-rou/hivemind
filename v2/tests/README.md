@@ -52,8 +52,8 @@ The runner gives every phase a 900-second deadline, continues after a failed or 
 | Containerd component integration | `tests/containerd/run-tests.sh` | Conditional on Docker and no `--skip-containerd` |
 | Local cleanup contract | `tests/local_cluster_cleanup_test.sh` | Always invoked; stopped-owned-child, shared multi-group deadline, and token-scoped residue contract |
 | Local data-plane failover | `tests/local-failover-smoke.sh --build` | Conditional on no `--skip-smoke`; mandatory local phase |
-| Local retained-storage recovery | `tests/storage_mode_smoke_test.sh` | Conditional on no `--skip-smoke`; compatibility entry point to the maintained recovery contract |
-| Local run contract | `tests/local-smoke.sh` | Conditional on no `--skip-smoke`; compatibility entry point to the maintained run contract |
+| Local retained-storage recovery | `tests/local-storage-recovery-smoke.sh --build` | Conditional on no `--skip-smoke`; mandatory maintained recovery contract |
+| Local run contract | `tests/local-run-contract-smoke.sh --build` | Conditional on no `--skip-smoke`; mandatory maintained run contract |
 
 `build_binaries_test.sh` is maintained but remains absent from the runner.
 
