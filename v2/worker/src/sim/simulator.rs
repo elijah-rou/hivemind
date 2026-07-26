@@ -69,36 +69,42 @@ impl WorkerSimulator {
     pub fn tick(&mut self) {
         self.current_tick += 1;
 
-        // A. Control plane generates commands for this tick
-        let commands = self.control_plane.commands_for_tick(self.current_tick);
-        for (agent_id, cmd) in commands {
-            self.network.send_to_agent(agent_id, cmd, self.current_tick);
+        // A. Deliver run responses enqueued on an earlier tick.
+        for i in 0..self.agent_count {
+            while let Some(message) = self.network.pop_outbound(i, self.current_tick) {
+                self.control_plane
+                    .on_agent_message(self.current_tick, i, message);
+            }
         }
 
-        // B. For each agent: deliver messages, tick, collect outbound
+        // B. Control plane generates commands for this tick.
+        let commands = self.control_plane.commands_for_tick(self.current_tick);
+        for (agent_id, command) in commands {
+            self.network
+                .send_to_agent(agent_id, command, self.current_tick);
+        }
+
+        // C. Deliver control messages, tick each worker, then enqueue its output.
         for i in 0..self.agent_count {
-            // Deliver ready inbound messages to SimulatedIo
             self.sim_ios[i].current_tick = self.current_tick;
-            while let Some(msg) = self.network.pop_inbound(i, self.current_tick) {
-                self.sim_ios[i].inbound.push_back(msg);
+            while let Some(message) = self.network.pop_inbound(i, self.current_tick) {
+                self.sim_ios[i].push_inbound(message);
             }
 
-            // Runtime fault injection
             self.sim_runtimes[i].maybe_crash_pods();
-
-            // Tick the agent
             self.workers[i].tick(&mut self.sim_ios[i], &self.sim_runtimes[i]);
 
-            // Drain outbound messages
-            let outbound: Vec<_> = self.sim_ios[i].outbound.drain(..).collect();
-            for msg in outbound {
-                self.control_plane
-                    .on_agent_message(self.current_tick, i, msg.clone());
-                self.network.send_from_agent(i, msg, self.current_tick);
+            for message in self.sim_ios[i].drain_outbound() {
+                if matches!(message, crate::message::WorkerMessage::RunResponse(_)) {
+                    self.network.send_from_agent(i, message, self.current_tick);
+                } else {
+                    self.control_plane
+                        .on_agent_message(self.current_tick, i, message);
+                }
             }
         }
 
-        // C. Invariant checking
+        // D. Invariant checking
         for i in 0..self.agent_count {
             let partitioned = self.network.is_partitioned(i);
             self.checker
@@ -129,8 +135,209 @@ impl WorkerSimulator {
 mod tests {
     use super::*;
     use crate::message::*;
+    use crate::protocol::MAX_RUN_RESPONSE_BODY;
+    use crate::sim::runtime::RunOutcome;
     use crate::types::GpuType;
     use crate::worker::TrackedPodState;
+
+    #[test]
+    fn deterministic_run_outcomes_preserve_identity_bounds_and_accounting() {
+        let mut sim = WorkerSimulator::new(1, 0xB4_02);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        let mut gpu_start = match start_cmd(820, 8_200) {
+            ControlMessage::StartPod(command) => command,
+            _ => unreachable!("start_cmd must construct StartPod"),
+        };
+        gpu_start.gpu_count = 1;
+        gpu_start.gpu_type = GpuType::H100Sxm;
+        sim.network
+            .send_to_agent(0, ControlMessage::StartPod(gpu_start), 0);
+        sim.run(5);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&820].state,
+            TrackedPodState::Running
+        );
+        sim.sim_runtimes[0].script_run_outcomes(
+            820,
+            &[
+                RunOutcome::Echo,
+                RunOutcome::ExactResponseBoundary,
+                RunOutcome::ResponseBoundaryOverflow,
+                RunOutcome::ForwardingFailure,
+                RunOutcome::Timeout,
+                RunOutcome::Echo,
+            ],
+        );
+
+        let resources = |sim: &WorkerSimulator| {
+            (
+                sim.workers[0].gpu_allocated(),
+                sim.workers[0].cpu_allocated_millicores(),
+                sim.workers[0].memory_allocated_megabytes(),
+            )
+        };
+        let running_resources = resources(&sim);
+        assert_eq!(running_resources, (1, 10, 16));
+
+        for (request_id, expected_status, payload, expected_response_len) in [
+            (821, 0, b"success".as_slice(), b"success".len()),
+            (822, 0, b"exact-boundary".as_slice(), MAX_RUN_RESPONSE_BODY),
+            (
+                823,
+                crate::protocol::RUN_STATUS_RESPONSE_TOO_LARGE,
+                b"overflow".as_slice(),
+                0,
+            ),
+            (
+                824,
+                crate::protocol::RUN_STATUS_FORWARDING_FAILED,
+                b"failure".as_slice(),
+                "internal error: simulated forwarding failure".len(),
+            ),
+            (
+                825,
+                crate::protocol::RUN_STATUS_FORWARDING_FAILED,
+                b"timeout".as_slice(),
+                "internal error: simulated forwarding timeout".len(),
+            ),
+        ] {
+            sim.network.send_to_agent(
+                0,
+                ControlMessage::RunRequest(RunRequestCmd {
+                    request_id,
+                    deployment_id: 8_200,
+                    payload: payload.to_vec(),
+                }),
+                sim.current_tick,
+            );
+            sim.run(3);
+            let responses: Vec<_> = sim
+                .control_plane
+                .received_messages()
+                .iter()
+                .filter_map(|(_, agent_id, message)| match message {
+                    WorkerMessage::RunResponse(response)
+                        if *agent_id == 0 && response.request_id == request_id =>
+                    {
+                        Some(response)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                responses.len(),
+                1,
+                "request must produce exactly one response"
+            );
+            let response = responses[0];
+            assert_eq!(response.status, expected_status);
+            assert_eq!(response.payload.len(), expected_response_len);
+            assert!(response.payload.len() <= MAX_RUN_RESPONSE_BODY);
+            if request_id == 821 {
+                assert_eq!(response.payload, payload);
+            }
+            assert_eq!(resources(&sim), running_resources);
+        }
+
+        sim.sim_ios[0].push_inbound(ControlMessage::RunRequest(RunRequestCmd {
+            request_id: 826,
+            deployment_id: 8_200,
+            payload: b"healed".to_vec(),
+        }));
+        sim.partition_agent(0);
+        sim.tick();
+        assert!(!sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .any(|(_, _, message)| matches!(
+                message,
+                WorkerMessage::RunResponse(response) if response.request_id == 826
+            )));
+        sim.heal_all();
+        sim.run(3);
+        let healed_responses: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::RunResponse(response)
+                    if *agent_id == 0 && response.request_id == 826 =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(healed_responses.len(), 1);
+        let healed = healed_responses[0];
+        assert_eq!(healed.status, 0);
+        assert_eq!(healed.payload, b"healed");
+        assert!(healed.payload.len() <= MAX_RUN_RESPONSE_BODY);
+        assert_eq!(resources(&sim), running_resources);
+
+        sim.sim_runtimes[0].crash_pod(820, 137);
+        sim.sim_ios[0].push_inbound(ControlMessage::RunRequest(RunRequestCmd {
+            request_id: 827,
+            deployment_id: 8_200,
+            payload: b"crash-tick".to_vec(),
+        }));
+        sim.tick();
+        let stopped_resources = resources(&sim);
+        assert_eq!(stopped_resources, (0, 0, 0));
+        sim.tick();
+        let crash_tick_responses: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::RunResponse(response)
+                    if *agent_id == 0 && response.request_id == 827 =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(crash_tick_responses.len(), 1);
+        assert_eq!(
+            crash_tick_responses[0].status,
+            crate::protocol::RUN_STATUS_FORWARDING_FAILED,
+            "a request already delivered on the crash tick observes runtime forwarding failure"
+        );
+        assert_eq!(resources(&sim), stopped_resources);
+
+        sim.network.send_to_agent(
+            0,
+            ControlMessage::RunRequest(RunRequestCmd {
+                request_id: 828,
+                deployment_id: 8_200,
+                payload: b"after-crash".to_vec(),
+            }),
+            sim.current_tick,
+        );
+        sim.run(3);
+        let no_pod_responses: Vec<_> = sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .filter_map(|(_, agent_id, message)| match message {
+                WorkerMessage::RunResponse(response)
+                    if *agent_id == 0 && response.request_id == 828 =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(no_pod_responses.len(), 1);
+        let no_pod = no_pod_responses[0];
+        assert_eq!(no_pod.status, crate::protocol::RUN_STATUS_NO_RUNNING_POD);
+        assert!(no_pod.payload.len() <= MAX_RUN_RESPONSE_BODY);
+        assert_eq!(resources(&sim), stopped_resources);
+        assert_eq!(sim.checker.safety_violations, 0);
+    }
 
     #[test]
     fn single_agent_registers_and_heartbeats() {
@@ -339,7 +546,7 @@ mod tests {
         );
 
         sim.workers[0].on_connection_lost();
-        sim.tick();
+        sim.run(2);
 
         let register_count = sim
             .control_plane

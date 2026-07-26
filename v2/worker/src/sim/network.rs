@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::message::{ControlMessage, WorkerMessage};
 use crate::prng::Prng;
+use crate::protocol::{MAX_RUN_RESPONSE_BODY, RUN_STATUS_RESPONSE_TOO_LARGE};
 
 const QUEUE_CAPACITY: usize = 256;
 
@@ -118,9 +119,16 @@ impl SimulatedNetwork {
     }
 
     pub fn send_from_agent(&mut self, agent_id: usize, msg: WorkerMessage, current_tick: u64) {
-        if self.partitioned[agent_id] {
-            return;
-        }
+        let msg = match msg {
+            WorkerMessage::RunResponse(mut response)
+                if response.payload.len() > MAX_RUN_RESPONSE_BODY =>
+            {
+                response.status = RUN_STATUS_RESPONSE_TOO_LARGE;
+                response.payload.clear();
+                WorkerMessage::RunResponse(response)
+            }
+            other => other,
+        };
         if self.drop_rate_percent > 0 && self.prng.chance(self.drop_rate_percent) {
             return;
         }
@@ -136,12 +144,18 @@ impl SimulatedNetwork {
     }
 
     pub fn pop_inbound(&mut self, agent_id: usize, now: u64) -> Option<ControlMessage> {
+        if self.partitioned[agent_id] {
+            return None;
+        }
         let queue = &mut self.inbound[agent_id];
         let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
         Some(queue.remove(pos).unwrap().msg)
     }
 
     pub fn pop_outbound(&mut self, agent_id: usize, now: u64) -> Option<WorkerMessage> {
+        if self.partitioned[agent_id] {
+            return None;
+        }
         let queue = &mut self.outbound[agent_id];
         let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
         Some(queue.remove(pos).unwrap().msg)
@@ -233,6 +247,34 @@ mod tests {
 
         net.send_to_agent(0, test_start_cmd(1), 10);
         assert!(net.pop_inbound(0, 100).is_none());
+    }
+
+    #[test]
+    fn outbound_run_response_matches_wire_overflow_semantics() {
+        let mut net = SimulatedNetwork::new(1, 0xB4_10);
+        net.min_delay = 1;
+        net.max_delay = 1;
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 44,
+                status: 0,
+                payload: vec![0x5a; MAX_RUN_RESPONSE_BODY + 1],
+            }),
+            0,
+        );
+
+        let delivered = net
+            .pop_outbound(0, 1)
+            .expect("encoded run response must be delivered");
+        match delivered {
+            WorkerMessage::RunResponse(response) => {
+                assert_eq!(response.request_id, 44);
+                assert_eq!(response.status, RUN_STATUS_RESPONSE_TOO_LARGE);
+                assert!(response.payload.is_empty());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]
