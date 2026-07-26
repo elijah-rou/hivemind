@@ -43,6 +43,44 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+### 2026-07-23 — Lane C2 canonical shared wire corpus
+
+What changed:
+- added one bounded canonical `tests/wire/contract-v6.json` corpus with exact little-endian/frame/AAD semantics and fixture-only deterministic PSK/nonce material
+- covered worker register, heartbeat, pod status, StartPod, worker/client run request and response, leader probe request and response, representative VRR peer envelopes, worker-origin statuses 0-8, core-origin statuses 0-9, plaintext, and deterministic encrypted worker/client/peer examples
+- Zig, Rust, Go API, and Go bench load this same repository-relative file, decode applicable vectors through production codecs, validate message semantics, and re-encode byte-identically where applicable; Zig compares the fixture StartPod bytes with the production serializer
+- `tests/wire-contract-test.sh` fails closed on schema/bound/encoding drift, exact origins, legal message/channel/direction/tag/consumer tuples, complete per-origin status-vector sets, and missing consumer coverage, proves all four protocol constants are exactly 6, and runs every consumer; the aggregate runner invokes this gate
+
+Why it matters:
+- replaces language-local self-generated-only compatibility claims with one reviewable normative byte corpus
+- makes protocol drift, incomplete status inventories, accidental fixture key use, and mixed version constants active test failures
+
+Evidence and limits:
+- RED: the new shell contract failed with `FileNotFoundError` because `tests/wire/contract-v6.json` did not exist
+- GREEN: `tests/wire-contract-test.sh`; Zig Debug and ReleaseFast; Rust formatting and all targets; Go API/bench formatting, race tests, and builds; shell syntax/ShellCheck; and docs/layout gates pass on the C2 commit
+- `cd v2 && ./tests/run-all.sh --skip-containerd` passed `19` invoked phases and local smoke `16 passed, 0 failed`; it explicitly skipped containerd, so no containerd, live AWS, GPU/CDI, or cloud boundary is implied
+- upgrades remain stop-the-world: stop every replica, worker, API gateway, and bench client, replace all components, then restart; mixed-version rolling operation is unsupported
+- version compatibility is not authentication; TLS/mTLS remains required for authenticated peer identity
+
+### 2026-07-23 — Lane C1 protocol-v6 peer envelope
+
+What changed:
+- the replica peer body is now `[2B little-endian version][1B sender identity][VRR payload]` in plaintext, or encryption of that same complete body
+- peer version mismatch is consumed and rejected before sender identity binding, connection replacement/disconnect decisions, VRR deserialization, or replica dispatch
+- the global client, worker, API, bench, and peer protocol version moved atomically from 5 to 6
+- named deterministic AF_UNIX socketpair coverage exercises current-v6 plaintext, current-1, malformed, plaintext-on-keyed-connection, and fixed-nonce encrypted envelopes
+
+Why it matters:
+- mixed-version peers can no longer bind a socket identity or mutate replica state before incompatibility is detected
+- all TCP roles now share one explicit global compatibility epoch
+
+Evidence and limits:
+- RED: the focused peer-envelope socketpair test found current-version frames could not bind because the peer body had no version field
+- GREEN: focused peer tests and Zig Debug/ReleaseFast pass; Rust formatting/all-targets and Go API/bench formatting/race/build gates pass; the documentation layout test, shell syntax, and protocol-constant equality check pass
+- upgrades remain stop-the-world: stop replicas, workers, API gateways, and bench clients, replace every component, then restart; there is no rolling mixed-version support
+- version validation is not authentication; peer identity remains unauthenticated without TLS/mTLS, and no shared cross-language byte corpus exists until C2
+- no live, cloud, containerd, GPU/CDI, or external TCP environment ran
+
 
 ### 2026-08-06 — Reconcile worker shutdown without a control-plane session
 

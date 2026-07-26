@@ -158,11 +158,16 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
 ## Wire Protocol
 
 ```
-Client/Agent frames: [4B LE len][2B LE version][1B tag][payload...]
-Peer frames (VRR):   [4B len][1B from_id][VRR payload]
-PROTOCOL_VERSION = 1 (2 bytes = 65535 possible versions)
-FRAME_HEADER = 7 bytes
+Client/Agent frames (plaintext): [4B LE len][1B flags=0x00][2B LE version][1B tag][payload...]
+Client/Agent frames (encrypted): [4B LE len][1B flags=0x01][24B nonce][ciphertext(version+tag+payload)][16B tag]
+Peer frames (plaintext):         [4B LE len][1B flags=0x00][2B LE version][1B from_id][VRR payload]
+Peer frames (encrypted):         [4B LE len][1B flags=0x01][24B nonce][ciphertext(version+from_id+VRR)][16B tag]
+PROTOCOL_VERSION = 6 (mismatch fails before peer identity binding, connection-state decisions, or VRR dispatch)
 ```
+
+Mixed-version rolling upgrades are unsupported. Stop every replica, worker, API gateway, and bench client, replace all components, then restart. This compatibility gate does not authenticate peers; without TLS/mTLS, reachable senders can still claim a configured peer identity.
+
+The bounded canonical corpus is `tests/wire/contract-v6.json`; `tests/wire-contract-test.sh` validates its schema and exact version constants, then runs Zig, Rust, Go API, and Go bench consumers. It covers worker lifecycle/control messages, client `/run` and leader probes, peer envelopes, status bytes 0-9, plaintext, and fixed-nonce encrypted worker/client/peer examples. Its PSK and nonce are insecure fixture-only material.
 
 **Client command tags:** RegisterNode(0), CreateDeployment(3), ScaleDeployment(6), UpdateDeployment(10), SetTrafficSplit(11), RollbackDeployment(12), DeleteDeployment(13), PauseDeployment(14), ResumeDeployment(15), ClientRequest(0x20), RunRequest(0x22)
 
@@ -312,7 +317,7 @@ Legacy deploy-mode benchmark, retained for historical context only:
 - [x] Nydus snapshotter support
 - [x] GPU pod support (CDI devices with `io.containerd.runc.v2`)
 - [x] Prometheus metrics (replica + agent)
-- [x] Protocol versioning (2-byte version field)
+- [x] Protocol versioning (2-byte version field) with one bounded canonical cross-language fixture corpus
 - [x] Peer connection retry (2s interval)
 - [x] VOPR simulation testing
 

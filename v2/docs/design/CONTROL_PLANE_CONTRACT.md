@@ -114,3 +114,20 @@ Current `state_machine.zig` has nodes, deployments, pods with basic lifecycle. N
 4. **Pool membership** - which nodes match filter criteria (region, provider, GPU type)
 
 These are materialized views built from consensus mutations. Every replica computes them identically.
+
+## TCP Frame Validation
+
+Client, agent, and replica peer streams use one outer frame contract:
+
+- Outer layout is `[4B little-endian length][1B flags][body]`; length includes flags and body, not the four-byte length field.
+- Flags are exactly `0x00` for plaintext or `0x01` for XChaCha20-Poly1305. Other values are invalid.
+- Encryption is required if and only if that connection has a key configured. Plaintext on a keyed connection and encrypted data on an unkeyed connection are invalid.
+- Plaintext body is `[2B little-endian protocol_version][1B tag][payload]`. Encrypted body is `[24B nonce][ciphertext of the same version/tag/payload body][16B authentication tag]`.
+- A receiver validates the declared frame bound before slicing or allocating. A complete plaintext or decrypted body must contain at least the version and tag. `protocol_version` must equal `PROTOCOL_VERSION` before tag dispatch.
+- One decode consumes exactly the declared frame. Bytes after it remain available as the next stream frame; they are not part of the current payload.
+
+Receiver limits remain explicit per connection role: Zig connection staging is 64 KiB, Rust agent payloads are at most 16 KiB, and Go callers supply a bounded receive buffer sized for the expected response. A declaration may exactly fill its receiver's bound; larger declarations are rejected before body read/allocation.
+
+Peer VRR bodies are `[2B little-endian protocol_version][1B from_id][VRR payload]` in plaintext, or encryption of that same complete body. The receiver validates `protocol_version` before reading or binding `from_id`, changing peer connection state, or deserializing and dispatching the VRR payload. Version 6 does not support mixed-version peers.
+
+Version validation is not peer authentication. Without an authenticated transport such as mTLS, a network participant that can reach the peer listener may still claim a configured sender identity; optional shared-key frame encryption does not provide distinct per-peer identity.
