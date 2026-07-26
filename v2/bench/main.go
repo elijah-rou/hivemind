@@ -2,27 +2,82 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"time"
 )
 
+type RunStatus byte
+
 const (
-	ClientTagRequest     byte   = 0x20
-	ClientTagReply       byte   = 0x21
-	ClientTagRunRequest  byte   = 0x22
-	ClientTagRunResponse byte   = 0x23
-	CmdCreateDeploy      byte   = 3
-	ProtocolVersion      uint16 = 1
+	RunStatusOK                 RunStatus = 0
+	RunStatusDeploymentNotFound RunStatus = 1
+	RunStatusQueueFull          RunStatus = 2
+	RunStatusInvalidPayload     RunStatus = 3
+	RunStatusResponseTooLarge   RunStatus = 4
+	RunStatusOutcomeAmbiguous   RunStatus = 5
+	RunStatusForwardingFailed   RunStatus = 6
+	RunStatusNoRunningPod       RunStatus = 7
+	RunStatusUnavailable        RunStatus = 8
+	RunStatusNotLeader          RunStatus = 9
+)
+
+func runStatusName(status RunStatus) string {
+	switch status {
+	case RunStatusOK:
+		return "ok"
+	case RunStatusDeploymentNotFound:
+		return "deployment_not_found"
+	case RunStatusQueueFull:
+		return "queue_full"
+	case RunStatusInvalidPayload:
+		return "invalid_payload"
+	case RunStatusResponseTooLarge:
+		return "response_too_large"
+	case RunStatusOutcomeAmbiguous:
+		return "outcome_ambiguous"
+	case RunStatusForwardingFailed:
+		return "forwarding_failed"
+	case RunStatusNoRunningPod:
+		return "no_running_pod"
+	case RunStatusUnavailable:
+		return "unavailable"
+	case RunStatusNotLeader:
+		return "not_leader"
+	default:
+		return "unknown"
+	}
+}
+
+const (
+	ClientTagRequest             byte   = 0x20
+	ClientTagReply               byte   = 0x21
+	ClientTagRunRequest          byte   = 0x22
+	ClientTagRunResponse         byte   = 0x23
+	ClientTagClusterStateRequest byte   = 0x24
+	ClientTagClusterStateResp    byte   = 0x25
+	ClientTagLeaderProbeRequest  byte   = 0x26
+	ClientTagLeaderProbeResponse byte   = 0x27
+	LeaderProbeResponseBytes            = 12
+	CmdCreateDeploy              byte   = 3
+	ProtocolVersion              uint16 = 5
+	MaxFrameBytes                       = 64 * 1024
+	MaxRunPayload                       = 512
+	MaxRunResponseBody                  = 16*1024 - 9
 
 	ResultOk     byte = 0
 	ResultErr    byte = 1
 	ErrNotLeader byte = 5
 )
+
+var errExplicitNotLeader = errors.New("reply error code 5: explicit not-leader response")
 
 func main() {
 	addrs := flag.String("addrs", "127.0.0.1:9001", "comma-separated client API addresses")
@@ -34,15 +89,35 @@ func main() {
 	payloadSize := flag.Int("payload", 64, "workload request payload size in bytes")
 	flag.Parse()
 
+	if *count <= 0 {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -n must be > 0\n")
+		os.Exit(2)
+	}
+	if *payloadSize < 0 || *payloadSize > MaxRunPayload {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -payload must be between 0 and %d\n", MaxRunPayload)
+		os.Exit(2)
+	}
+	if *replicas < 0 || *gpuCount < 0 {
+		fmt.Fprintf(os.Stderr, "hivemind-bench: -replicas and -gpus must be >= 0\n")
+		os.Exit(2)
+	}
+
 	addrList := strings.Split(*addrs, ",")
 
 	switch *mode {
 	case "deploy":
-		runDeployBenchmark(addrList, *count, *replicas, *gpuCount)
+		if err := runDeployBenchmark(addrList, *count, *replicas, *gpuCount); err != nil {
+			fmt.Fprintf(os.Stderr, "hivemind-bench: %v\n", err)
+			os.Exit(1)
+		}
 	case "workload":
-		runWorkloadBenchmark(addrList, *count, *depName, *payloadSize)
+		if err := runWorkloadBenchmark(addrList, *count, *depName, *payloadSize); err != nil {
+			fmt.Fprintf(os.Stderr, "hivemind-bench: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Printf("unknown mode: %s (use deploy or workload)\n", *mode)
+		os.Exit(1)
 	}
 }
 
@@ -50,20 +125,22 @@ func main() {
 // Deploy benchmark (consensus path)
 // =================================================================
 
-func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) {
+func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) error {
+	totalStart := time.Now()
+	probeStart := totalStart
 	conn := findLeader(addrList)
 	if conn == nil {
-		return
+		return fmt.Errorf("no leader found")
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
+	probeDuration := time.Since(probeStart)
+	fmt.Printf("hivemind-bench: leader probe %s (included in total throughput duration)\n", probeDuration)
 
 	fmt.Printf("hivemind-bench: submitting %d deployments (%d replicas, %d GPUs each)\n",
 		count, replicas, gpuCount)
 
 	latencies := make([]time.Duration, 0, count)
 	recvBuf := make([]byte, 256)
-
-	totalStart := time.Now()
 
 	// Use timestamp-based clientID so repeated runs don't collide in the client table
 	benchClientID := uint64(time.Now().UnixNano())
@@ -74,37 +151,45 @@ func runDeployBenchmark(addrList []string, count, replicas, gpuCount int) {
 
 		start := time.Now()
 
-		if err := sendCreateDeployment(conn, clientID, requestID, name, replicas, gpuCount); err != nil {
-			fmt.Printf("send failed at %d: %v\n", i, err)
-			return
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := sendCreateDeployment(conn, clientID, requestID, name, replicas, gpuCount); err != nil {
+				return fmt.Errorf("send failed at %d (outcome ambiguous; not retried): %w", i, err)
+			}
+			if err := readReply(conn, recvBuf, requestID); err != nil {
+				if errors.Is(err, errExplicitNotLeader) && attempt == 0 {
+					_ = conn.Close()
+					conn = findLeader(addrList)
+					if conn == nil {
+						return fmt.Errorf("leader changed at %d and reprobe failed", i)
+					}
+					continue
+				}
+				return fmt.Errorf("recv failed at %d (not retried unless explicitly not-leader): %w", i, err)
+			}
+			latencies = append(latencies, time.Since(start))
+			break
 		}
-
-		if _, err := readReply(conn, recvBuf); err != nil {
-			fmt.Printf("recv failed at %d: %v\n", i, err)
-			return
-		}
-
-		latencies = append(latencies, time.Since(start))
 	}
 
 	printResults("Deploy", count, time.Since(totalStart), latencies)
+	return nil
 }
 
 // =================================================================
 // Workload benchmark (data plane, no consensus)
 // =================================================================
 
-func runWorkloadBenchmark(addrList []string, count int, depName string, payloadSize int) {
-	// Connect directly (workload doesn't need leader discovery via consensus probe)
-	addr := strings.TrimSpace(addrList[0])
-	fmt.Printf("hivemind-bench: connecting to %s for workload\n", addr)
+func runWorkloadBenchmark(addrList []string, count int, depName string, payloadSize int) error {
+	return runWorkloadBenchmarkWithFinder(addrList, count, depName, payloadSize, findLeader)
+}
 
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		fmt.Printf("connect failed: %v\n", err)
-		return
+func runWorkloadBenchmarkWithFinder(addrList []string, count int, depName string, payloadSize int, find func([]string) net.Conn) error {
+	if payloadSize < 0 || payloadSize > MaxRunPayload {
+		return fmt.Errorf("payload size must be between 0 and %d", MaxRunPayload)
 	}
-	defer conn.Close()
+	if len(addrList) == 0 {
+		return fmt.Errorf("no replica addresses configured")
+	}
 
 	payload := make([]byte, payloadSize)
 	for i := range payload {
@@ -115,74 +200,146 @@ func runWorkloadBenchmark(addrList []string, count int, depName string, payloadS
 		count, depName, payloadSize)
 
 	latencies := make([]time.Duration, 0, count)
-	recvBuf := make([]byte, 8192)
+	recvBuf := make([]byte, MaxFrameBytes)
 
 	totalStart := time.Now()
+	probeStart := totalStart
+	conn := find(addrList)
+	if conn == nil {
+		return fmt.Errorf("no leader found")
+	}
+	defer func() { _ = conn.Close() }()
+	probeDuration := time.Since(probeStart)
+	fmt.Printf("hivemind-bench: leader probe %s (included in total throughput duration)\n", probeDuration)
 
 	for i := 0; i < count; i++ {
 		requestID := uint64(i + 1)
-
 		start := time.Now()
-
 		if err := sendRunRequest(conn, requestID, depName, payload); err != nil {
-			fmt.Printf("send failed at %d: %v\n", i, err)
-			return
+			return fmt.Errorf("send failed at %d (outcome may be ambiguous; not retried): %w", i, err)
 		}
-
-		if _, err := readRunResponse(conn, recvBuf); err != nil {
-			fmt.Printf("recv failed at %d: %v\n", i, err)
-			return
+		if err := readRunResponse(conn, recvBuf, requestID); err != nil {
+			return fmt.Errorf("recv failed at %d (outcome ambiguous; not retried): %w", i, err)
 		}
-
 		latencies = append(latencies, time.Since(start))
 	}
 
 	printResults("Workload", count, time.Since(totalStart), latencies)
+	return nil
 }
 
 func sendRunRequest(conn net.Conn, requestID uint64, depName string, payload []byte) error {
+	if len(payload) > MaxRunPayload {
+		return fmt.Errorf("run payload exceeds max %d bytes", MaxRunPayload)
+	}
 	// Payload: request_id(u64) + deployment_name(64 bytes) + payload_len(u32) + payload
 	data := make([]byte, 8+64+4+len(payload))
 	binary.LittleEndian.PutUint64(data[0:8], requestID)
 	copy(data[8:72], depName)
 	binary.LittleEndian.PutUint32(data[72:76], uint32(len(payload)))
 	copy(data[76:], payload)
-
-	frame := make([]byte, 4+2+1+len(data))
-	binary.LittleEndian.PutUint32(frame[0:4], uint32(2+1+len(data)))
-	binary.LittleEndian.PutUint16(frame[4:6], ProtocolVersion)
-	frame[6] = ClientTagRunRequest
-	copy(frame[7:], data)
-
-	_, err := conn.Write(frame)
-	return err
+	return writeFrame(conn, ClientTagRunRequest, data)
 }
 
-func readRunResponse(conn net.Conn, buf []byte) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := readFull(conn, buf[:4]); err != nil {
-		return nil, err
+func readRunResponse(conn net.Conn, buf []byte, expectedRequestID uint64) error {
+	frame, err := readFrame(conn, buf, 5*time.Second)
+	if err != nil {
+		return err
 	}
-	frameLen := binary.LittleEndian.Uint32(buf[:4])
-	if frameLen > uint32(len(buf)) {
-		return nil, fmt.Errorf("frame too large: %d", frameLen)
+	if len(frame) < 3 || frame[2] != ClientTagRunResponse {
+		if len(frame) < 3 {
+			return fmt.Errorf("short run response frame: %d bytes", len(frame))
+		}
+		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
 	}
-	if frameLen < 3 {
-		return nil, fmt.Errorf("frame too short: %d", frameLen)
-	}
-	if _, err := readFull(conn, buf[:frameLen]); err != nil {
-		return nil, err
-	}
-	// buf[0:2] = version, buf[2] = tag
-	if buf[2] != ClientTagRunResponse {
-		return nil, fmt.Errorf("unexpected tag: 0x%02x", buf[2])
-	}
-	return buf[3:frameLen], nil
+	return expectSuccessRunResponse(frame[3:], expectedRequestID)
 }
 
 // =================================================================
 // Shared helpers
 // =================================================================
+
+// writeFrame encodes plaintext client frames:
+// [4B len][1B flags=0x00][2B version][1B tag][payload...]
+func writeFrame(conn net.Conn, tag byte, payload []byte) (err error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear write deadline: %w", clearErr)
+		}
+	}()
+
+	inner := make([]byte, 2+1+len(payload))
+	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
+	inner[2] = tag
+	copy(inner[3:], payload)
+
+	frameLen := uint32(1 + len(inner)) // flags + inner
+	header := make([]byte, 5)
+	binary.LittleEndian.PutUint32(header[0:4], frameLen)
+	header[4] = 0x00 // plaintext
+	if err := writeAll(conn, header); err != nil {
+		return err
+	}
+	return writeAll(conn, inner)
+}
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count %d for %d bytes", n, len(data))
+		}
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+// readFrame returns [version(2)][tag(1)][payload...].
+func readFrame(conn net.Conn, buf []byte, timeout time.Duration) (frame []byte, err error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil {
+			_ = conn.Close()
+			frame = nil
+			err = fmt.Errorf("clear read deadline: %w", clearErr)
+		}
+	}()
+	if _, err := readFull(conn, buf[:4]); err != nil {
+		return nil, err
+	}
+	frameLen := binary.LittleEndian.Uint32(buf[:4])
+	if frameLen < 1 || frameLen > uint32(len(buf))-4 {
+		return nil, fmt.Errorf("bad frame len: %d", frameLen)
+	}
+	if _, err := readFull(conn, buf[4:4+frameLen]); err != nil {
+		return nil, err
+	}
+	flags := buf[4]
+	if flags != 0x00 {
+		return nil, fmt.Errorf("unsupported frame flags: 0x%02x", flags)
+	}
+	if frameLen < 4 {
+		return nil, fmt.Errorf("frame too short for flags+version+tag: %d", frameLen)
+	}
+	body := buf[5 : 4+frameLen]
+	version := binary.LittleEndian.Uint16(body[0:2])
+	if version != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported protocol version: %d", version)
+	}
+	return body, nil
+}
 
 func findLeader(addrList []string) net.Conn {
 	for _, addr := range addrList {
@@ -195,22 +352,20 @@ func findLeader(addrList []string) net.Conn {
 			continue
 		}
 
-		probeClientID := uint64(time.Now().UnixNano())
-		if err := sendProbe(c, probeClientID, 1); err != nil {
+		if err := sendLeaderProbe(c); err != nil {
 			fmt.Printf("send failed\n")
 			c.Close()
 			continue
 		}
 
-		buf := make([]byte, 256)
-		reply, err := readReply(c, buf)
+		buf := make([]byte, MaxFrameBytes)
+		isLeader, err := readLeaderProbe(c, buf)
 		if err != nil {
 			fmt.Printf("read failed\n")
 			c.Close()
 			continue
 		}
-
-		if len(reply) >= 9 && reply[8] == ResultErr && len(reply) >= 10 && reply[9] == ErrNotLeader {
+		if !isLeader {
 			fmt.Printf("not leader\n")
 			c.Close()
 			continue
@@ -253,54 +408,125 @@ func sendCreateDeployment(conn net.Conn, clientID, requestID uint64, name string
 	off++
 	payload[off] = byte(gpuCount)
 
-	frame := make([]byte, 4+2+1+len(payload))
-	binary.LittleEndian.PutUint32(frame[0:4], uint32(2+1+len(payload)))
-	binary.LittleEndian.PutUint16(frame[4:6], ProtocolVersion)
-	frame[6] = ClientTagRequest
-	copy(frame[7:], payload)
-
-	_, err := conn.Write(frame)
-	return err
+	return writeFrame(conn, ClientTagRequest, payload)
 }
 
-func sendProbe(conn net.Conn, clientID, requestID uint64) error {
-	const cmdSize = 138
-	payload := make([]byte, 8+8+1+cmdSize)
-	binary.LittleEndian.PutUint64(payload[0:8], clientID)
-	binary.LittleEndian.PutUint64(payload[8:16], requestID)
-	payload[16] = 0
-	copy(payload[17:17+64], "bench-probe")
-
-	frame := make([]byte, 4+2+1+len(payload))
-	binary.LittleEndian.PutUint32(frame[0:4], uint32(2+1+len(payload)))
-	binary.LittleEndian.PutUint16(frame[4:6], ProtocolVersion)
-	frame[6] = ClientTagRequest
-	copy(frame[7:], payload)
-
-	_, err := conn.Write(frame)
-	return err
+func sendLeaderProbe(conn net.Conn) error {
+	return writeFrame(conn, ClientTagLeaderProbeRequest, nil)
 }
 
-func readReply(conn net.Conn, buf []byte) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := readFull(conn, buf[:4]); err != nil {
-		return nil, err
+func readLeaderProbe(conn net.Conn, buf []byte) (bool, error) {
+	frame, err := readFrame(conn, buf, 2*time.Second)
+	if err != nil {
+		return false, err
 	}
-	frameLen := binary.LittleEndian.Uint32(buf[:4])
-	if frameLen > uint32(len(buf)) {
-		return nil, fmt.Errorf("frame too large: %d", frameLen)
+	if len(frame) != 3+LeaderProbeResponseBytes || frame[2] != ClientTagLeaderProbeResponse {
+		return false, fmt.Errorf("invalid leader probe tag/length: length=%d", len(frame))
 	}
-	if frameLen < 3 {
-		return nil, fmt.Errorf("frame too short: %d", frameLen)
+	payload := frame[3:]
+	if payload[0] > 2 || payload[1] > 1 || payload[2] >= 11 || payload[3] >= 11 {
+		return false, fmt.Errorf("malformed leader probe response")
 	}
-	if _, err := readFull(conn, buf[:frameLen]); err != nil {
-		return nil, err
+	return payload[0] == 0 && payload[1] == 1 && payload[2] == payload[3], nil
+}
+
+// CommandResult mirrors the client API wire result for deploy replies.
+// Wire: [request_id(8)][result_type(1)][ok:entity_id(8) | err:code(1)].
+type CommandResult struct {
+	OK       bool
+	EntityID uint64
+	ErrCode  byte
+}
+
+// parseResult matches v2/api/client.go decode contract (bench is a separate module).
+func parseResult(reply []byte, expectedRequestID uint64) (CommandResult, error) {
+	if len(reply) < 9 {
+		return CommandResult{}, fmt.Errorf("reply too short: %d bytes", len(reply))
 	}
-	// buf[0:2] = version, buf[2] = tag
-	if buf[2] != ClientTagReply {
-		return nil, fmt.Errorf("unexpected tag: 0x%02x", buf[2])
+	replyRequestID := binary.LittleEndian.Uint64(reply[0:8])
+	if replyRequestID != expectedRequestID {
+		return CommandResult{}, fmt.Errorf("reply request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
 	}
-	return buf[3:frameLen], nil
+
+	switch reply[8] {
+	case ResultOk:
+		if len(reply) != 17 {
+			return CommandResult{}, fmt.Errorf("ok reply length %d, want 17", len(reply))
+		}
+		return CommandResult{OK: true, EntityID: binary.LittleEndian.Uint64(reply[9:17])}, nil
+	case ResultErr:
+		if len(reply) != 10 {
+			return CommandResult{}, fmt.Errorf("err reply length %d, want 10", len(reply))
+		}
+		return CommandResult{OK: false, ErrCode: reply[9]}, nil
+	default:
+		return CommandResult{}, fmt.Errorf("unknown result type: %d", reply[8])
+	}
+}
+
+func expectSuccessResult(reply []byte, expectedRequestID uint64) error {
+	result, err := parseResult(reply, expectedRequestID)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("reply error code %d", result.ErrCode)
+	}
+	return nil
+}
+
+func expectSuccessRunResponse(raw []byte, expectedRequestID uint64) error {
+	if len(raw) < 9 {
+		return fmt.Errorf("run response too short: %d bytes", len(raw))
+	}
+	replyRequestID := binary.LittleEndian.Uint64(raw[0:8])
+	if replyRequestID != expectedRequestID {
+		return fmt.Errorf("run response request_id mismatch: got %d want %d", replyRequestID, expectedRequestID)
+	}
+	status := RunStatus(raw[8])
+	if status > RunStatusNotLeader {
+		return fmt.Errorf("unknown run status %d", status)
+	}
+	if status != RunStatusOK {
+		return fmt.Errorf("run status %s (%d)", runStatusName(status), status)
+	}
+	// Success requires explicit body length: request_id(8)+status(1)+len(4)+body.
+	if len(raw) < 13 {
+		return fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
+	}
+	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
+	if bodyLen > MaxRunResponseBody {
+		return fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
+	}
+	want := 13 + int(bodyLen)
+	if len(raw) != want {
+		return fmt.Errorf("run success length %d, want %d", len(raw), want)
+	}
+	return nil
+}
+
+func readReply(conn net.Conn, buf []byte, expectedRequestID uint64) error {
+	frame, err := readFrame(conn, buf, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if len(frame) < 3 || frame[2] != ClientTagReply {
+		if len(frame) < 3 {
+			return fmt.Errorf("short reply frame: %d bytes", len(frame))
+		}
+		return fmt.Errorf("unexpected tag: 0x%02x", frame[2])
+	}
+	result, err := parseResult(frame[3:], expectedRequestID)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		if result.ErrCode == ErrNotLeader {
+			return errExplicitNotLeader
+		}
+		return fmt.Errorf("reply error code %d", result.ErrCode)
+	}
+	return nil
 }
 
 func readFull(conn net.Conn, buf []byte) (int, error) {
@@ -316,6 +542,12 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 }
 
 func printResults(label string, count int, totalDuration time.Duration, latencies []time.Duration) {
+	if len(latencies) == 0 {
+		fmt.Printf("\n=== Hivemind %s Benchmark Results ===\n", label)
+		fmt.Printf("Requests:     %d\n", count)
+		fmt.Printf("No completed samples\n")
+		return
+	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
 	n := len(latencies)

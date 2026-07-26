@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,46 @@ import (
 	"strconv"
 	"strings"
 )
+
+const (
+	createDeploymentJSONMax = 6*(64+256+128+64+256) + 512
+	updateDeploymentJSONMax = 6*256 + 256
+	scaleDeploymentJSONMax  = 64
+	trafficSplitJSONMax     = 256
+)
+
+func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("json body exceeds max %d bytes", limit))
+		} else {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		}
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: multiple JSON values")
+		} else {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("json body exceeds max %d bytes", limit))
+			} else {
+				writeErr(w, http.StatusBadRequest, "invalid json: trailing data: "+err.Error())
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func stringFitsWire(value string, maximum int) bool {
+	return len(value) <= maximum && !strings.ContainsRune(value, '\x00')
+}
 
 func writeFixedStr(dst []byte, s string) {
 	n := copy(dst, s)
@@ -67,8 +108,7 @@ func handleCreateDeployment(client *HivemindClient, latency *LatencyRecorder) ht
 		handlerStart := nowWallMS()
 		var req request
 		decodeStart := nowWallMS()
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, createDeploymentJSONMax) {
 			return
 		}
 		decodeEnd := nowWallMS()
@@ -81,6 +121,12 @@ func handleCreateDeployment(client *HivemindClient, latency *LatencyRecorder) ht
 		}
 		if req.Image == "" {
 			writeErr(w, http.StatusBadRequest, "image is required")
+			return
+		}
+		if !stringFitsWire(req.Name, 64) || !stringFitsWire(req.Image, 256) ||
+			!stringFitsWire(req.ImagePullRegistry, 128) || !stringFitsWire(req.ImagePullUsername, 64) ||
+			!stringFitsWire(req.ImagePullPassword, 256) {
+			writeErr(w, http.StatusBadRequest, "string field exceeds wire maximum or contains NUL")
 			return
 		}
 		if req.Replicas == 0 {
@@ -165,16 +211,37 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "deployment name is required")
 			return
 		}
+		if !stringFitsWire(name, 64) {
+			writeErr(w, http.StatusBadRequest, "deployment name exceeds wire maximum 64 bytes or contains NUL")
+			return
+		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+		body, err := io.ReadAll(io.LimitReader(r.Body, int64(MaxRunPayload)+1))
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "failed to read body: "+err.Error())
+			return
+		}
+		if len(body) > MaxRunPayload {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("run payload exceeds max %d bytes", MaxRunPayload))
 			return
 		}
 
 		resp, err := client.SendRunRequest(name, body)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
+			switch {
+			case errors.Is(err, ErrRunOutcomeAmbiguous):
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"error":  "outcome_ambiguous",
+					"status": RunStatusOutcomeAmbiguous,
+				})
+			case errors.Is(err, ErrRunUnavailable):
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+					"error":  RunStatusUnavailable.String(),
+					"status": RunStatusUnavailable,
+				})
+			default:
+				writeErr(w, http.StatusBadGateway, err.Error())
+			}
 			return
 		}
 
@@ -202,14 +269,20 @@ func handleRunRequest(client *HivemindClient) http.HandlerFunc {
 // runStatusToHTTP maps a nonzero run-request status to an HTTP status + reason.
 // Values 1-2 come from the gateway (v2/src/connection.zig), everything else
 // comes from the worker runtime.
-func runStatusToHTTP(status byte) (int, string) {
+func runStatusToHTTP(status RunStatus) (int, string) {
 	switch status {
-	case RunStatusNotFound:
-		return http.StatusNotFound, "deployment_not_found"
+	case RunStatusDeploymentNotFound:
+		return http.StatusNotFound, status.String()
 	case RunStatusQueueFull:
-		return http.StatusServiceUnavailable, "queue_full"
+		return http.StatusServiceUnavailable, status.String()
+	case RunStatusInvalidPayload:
+		return http.StatusBadRequest, status.String()
+	case RunStatusResponseTooLarge, RunStatusOutcomeAmbiguous, RunStatusForwardingFailed:
+		return http.StatusBadGateway, status.String()
+	case RunStatusNoRunningPod, RunStatusUnavailable, RunStatusNotLeader:
+		return http.StatusServiceUnavailable, status.String()
 	default:
-		return http.StatusBadGateway, "worker_error"
+		return http.StatusBadGateway, "unknown_status"
 	}
 }
 
@@ -257,12 +330,15 @@ func handleUpdateDeployment(client *HivemindClient) http.HandlerFunc {
 		}
 
 		var req request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, updateDeploymentJSONMax) {
 			return
 		}
 		if req.Image == "" {
 			writeErr(w, http.StatusBadRequest, "image is required")
+			return
+		}
+		if !stringFitsWire(req.Image, 256) {
+			writeErr(w, http.StatusBadRequest, "image exceeds wire maximum 256 bytes or contains NUL")
 			return
 		}
 
@@ -312,8 +388,7 @@ func handleScaleDeployment(client *HivemindClient, latency *LatencyRecorder) htt
 
 		var req request
 		decodeStart := nowWallMS()
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, scaleDeploymentJSONMax) {
 			return
 		}
 		decodeEnd := nowWallMS()
@@ -374,8 +449,7 @@ func handleSetTrafficSplit(client *HivemindClient) http.HandlerFunc {
 		}
 
 		var req request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		if !decodeBoundedJSON(w, r, &req, trafficSplitJSONMax) {
 			return
 		}
 
