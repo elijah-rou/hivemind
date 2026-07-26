@@ -109,7 +109,7 @@ local_cluster_stop_pid() {
 local_cluster_cleanup_inventory() {
     local pid failed=0
     for pid in "${LOCAL_CLUSTER_PIDS[@]}"; do
-        [[ -n "$pid" ]] || continue
+        [[ -n "$pid" && -n "${LOCAL_CLUSTER_PID_START_TIMES[$pid]:-}" ]] || continue
         if local_cluster_group_running "$pid"; then
             echo "cleanup residue: owned process group $pid members $(local_cluster_group_members "$pid" | tr '\n' ' ')" >&2
             failed=1

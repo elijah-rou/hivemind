@@ -1,6 +1,10 @@
 # Hivemind POC Changelog
 
+<<<<<<< HEAD
 _Last updated: 2026-08-06_
+=======
+_Last updated: 2026-07-24_
+>>>>>>> 84243f3 (fix(e2e): preserve runtime and cleanup ownership)
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 

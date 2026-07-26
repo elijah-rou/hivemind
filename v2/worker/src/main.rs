@@ -46,6 +46,7 @@ struct RunConfig {
     encryption_key_hex: String,
     test_process_controls: bool,
     test_process_base_port: u16,
+    test_process_base_port_explicit: bool,
 }
 
 fn parse_replica_addrs(replica_addr: &str) -> Vec<String> {
@@ -83,6 +84,7 @@ where
     let mut encryption_key_hex = String::new();
     let mut test_process_controls = false;
     let mut test_process_base_port = 15_000;
+    let mut test_process_base_port_explicit = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -109,6 +111,7 @@ where
             }
             "--test-process-base-port" if i + 1 < args.len() => {
                 test_process_base_port = args[i + 1].parse().unwrap_or(0);
+                test_process_base_port_explicit = true;
                 i += 2;
             }
             _ if replica_addr.is_empty() => {
@@ -147,6 +150,7 @@ where
         encryption_key_hex,
         test_process_controls,
         test_process_base_port,
+        test_process_base_port_explicit,
     }
 }
 
@@ -187,12 +191,13 @@ fn cmd_run(args: &[String]) {
     let encryption_key_hex = cfg.encryption_key_hex;
     let test_process_controls = cfg.test_process_controls;
     let test_process_base_port = cfg.test_process_base_port;
+    let test_process_base_port_explicit = cfg.test_process_base_port_explicit;
 
     if test_process_controls && runtime_mode != "process" {
         eprintln!("--test-process-controls requires --runtime process");
         std::process::exit(2);
     }
-    if !test_process_controls && test_process_base_port != 15_000 {
+    if !test_process_controls && test_process_base_port_explicit {
         eprintln!("--test-process-base-port requires --test-process-controls");
         std::process::exit(2);
     }
@@ -523,6 +528,7 @@ mod tests {
     fn process_test_controls_are_disabled_by_default_and_require_explicit_flag() {
         let default_cfg = parse(&["127.0.0.1:9000"], &[]);
         assert!(!default_cfg.test_process_controls);
+        assert!(!default_cfg.test_process_base_port_explicit);
 
         let enabled_cfg = parse(&["127.0.0.1:9000", "--test-process-controls"], &[]);
         assert!(enabled_cfg.test_process_controls);
@@ -538,6 +544,13 @@ mod tests {
             &[],
         );
         assert_eq!(isolated_cfg.test_process_base_port, 24_500);
+        assert!(isolated_cfg.test_process_base_port_explicit);
+
+        let explicit_default_cfg = parse(
+            &["127.0.0.1:9000", "--test-process-base-port", "15000"],
+            &[],
+        );
+        assert!(explicit_default_cfg.test_process_base_port_explicit);
     }
 
     fn running_pod_sim(pod_id: u64) -> sim::simulator::WorkerSimulator {
