@@ -190,5 +190,5 @@ fn secret_resolver_plain_passthrough() {
 #[test]
 fn volume_mount_cleanup() {
     use hivemind_worker::volumes;
-    volumes::unmount_juicefs(99999); // should not panic
+    volumes::unmount_juicefs(99999).expect("nonexistent mount cleanup");
 }

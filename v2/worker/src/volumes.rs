@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const MOUNT_BASE: &str = "/tmp/hivemind/mounts";
 
@@ -52,20 +53,61 @@ pub fn mount_juicefs(pod_id: u64, juicefs_subpath: &str) -> Result<VolumeMount, 
 }
 
 /// Unmount and clean up a JuiceFS volume for a pod.
-pub fn unmount_juicefs(pod_id: u64) {
+pub fn unmount_juicefs(pod_id: u64) -> Result<(), String> {
+    unmount_juicefs_until(pod_id, Instant::now() + Duration::from_secs(20))
+}
+
+pub fn unmount_juicefs_until(pod_id: u64, deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("shutdown deadline reached before volume cleanup".into());
+    }
+    let command_timeout = || -> Result<String, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("shutdown deadline reached before volume cleanup".into());
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, u64::MAX as u128) as u64;
+        Ok(format!("{timeout_ms}ms"))
+    };
+
     let mount_dir = format!("{MOUNT_BASE}/{pod_id}/juicefs");
+    if mount_is_active(&mount_dir)? {
+        let _ = Command::new("timeout")
+            .args([&command_timeout()?, "juicefs", "umount", &mount_dir])
+            .output();
+        if mount_is_active(&mount_dir)? {
+            let _ = Command::new("timeout")
+                .args([&command_timeout()?, "fusermount", "-uz", &mount_dir])
+                .output();
+        }
+        if mount_is_active(&mount_dir)? {
+            return Err(format!("mount remains active at {mount_dir}"));
+        }
+    }
 
-    let _ = Command::new("juicefs")
-        .args(["umount", &mount_dir])
-        .output();
+    let pod_dir = PathBuf::from(format!("{MOUNT_BASE}/{pod_id}"));
+    match fs::remove_dir_all(&pod_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {}: {error}", pod_dir.display())),
+    }
+    if pod_dir.exists() {
+        return Err(format!(
+            "pod mount directory remains at {}",
+            pod_dir.display()
+        ));
+    }
+    Ok(())
+}
 
-    // Also try fusermount as fallback
-    let _ = Command::new("fusermount")
-        .args(["-uz", &mount_dir])
-        .output();
-
-    let pod_dir = format!("{MOUNT_BASE}/{pod_id}");
-    let _ = fs::remove_dir_all(&pod_dir);
+fn mount_is_active(mount_dir: &str) -> Result<bool, String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("read mount table: {error}"))?;
+    Ok(mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mount_point| mount_point == mount_dir)
+    }))
 }
 
 /// Check if the juicefs binary is available on PATH.
@@ -92,7 +134,12 @@ mod tests {
 
     #[test]
     fn unmount_nonexistent_is_safe() {
-        // Should not panic
-        unmount_juicefs(999999);
+        unmount_juicefs(999999).unwrap();
+    }
+
+    #[test]
+    fn expired_shutdown_deadline_rejects_volume_cleanup() {
+        let error = unmount_juicefs_until(999998, Instant::now()).unwrap_err();
+        assert!(error.contains("shutdown deadline"));
     }
 }
