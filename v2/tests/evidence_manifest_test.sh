@@ -11,6 +11,9 @@ printf 'journal fixture\n' >"$TMP/journals.txt"
 printf 'instances=0 volumes=0 buckets=0 repositories=0 locks=0 units=0 processes=0\n' >"$TMP/cleanup.txt"
 printf 'commit=%s\ndirty=\n' "$sha" >"$TMP/source-state.txt"
 printf 'instances=0\n' >"$TMP/pre.txt"
+printf 'instances=1\n' >"$TMP/post-apply.txt"
+printf 'instances=1\n' >"$TMP/pre-cleanup.txt"
+printf 'owner=none expiry=none cleanup=complete\n' >"$TMP/retention.txt"
 printf '%s  fixture-binary\n' "$sha" >"$TMP/binary-list.sha256"
 printf 'sha256:%s\n' "$sha" >"$TMP/image-digests.txt"
 printf '%s\n' "$sha" >"$TMP/review-record.txt"
@@ -20,45 +23,44 @@ printf '{"api_url":"[REDACTED]"}\n' >"$TMP/terraform-outputs.json"
 mkdir "$TMP/runbook-artifacts"
 printf '{"request_id":1,"status":0}\n' >"$TMP/runbook-artifacts/api-identities.jsonl"
 printf 'fault_queue=0\n' >"$TMP/runbook-artifacts/fault-period-metrics.txt"
-printf 'tasks=1 containers=1 cdi=0 cgroup=verified gpu=verified\n' >"$TMP/runbook-artifacts/runtime-proof.txt"
+printf 'tasks=1 containers=1 cdi=verified cgroup=verified gpu=verified\n' >"$TMP/runbook-artifacts/runtime-proof.txt"
 printf 'instances=1\n' >"$TMP/runbook-artifacts/intermediate-inventory.txt"
+printf 'cold_pull=verified digest=sha256:%s\n' "$sha" >"$TMP/runbook-artifacts/ecr-proof.txt"
+printf 'mode=0600 checksum=%s recovery=verified\n' "$sha" >"$TMP/runbook-artifacts/journal-proof.txt"
 export HIVEMIND_EVIDENCE_STARTED_AT=2026-07-24T00:00:00Z HIVEMIND_EVIDENCE_ENDED_AT=2026-07-24T00:01:00Z
 export HIVEMIND_EVIDENCE_COMMAND='./tests/live/run.sh' HIVEMIND_EVIDENCE_REGION=us-test-1
+export HIVEMIND_EVIDENCE_ACCOUNT_ALIAS=fixture HIVEMIND_EVIDENCE_RUN_ID=fixture-run-1
+export HIVEMIND_EVIDENCE_WORKSPACE='hm-[REDACTED_TOKEN]' HIVEMIND_EVIDENCE_UNAVAILABLE_CAPABILITIES='[]'
 export HIVEMIND_EVIDENCE_OWNERSHIP_HASH="$sha" HIVEMIND_EVIDENCE_WORKSPACE_HASH="$sha"
 export HIVEMIND_EVIDENCE_KEEP_INFRA=0 HIVEMIND_EVIDENCE_FINAL_STATUS=0
 
-"$BUILDER" --commit "$sha" --binary-sha "$sha" --image-sha "$sha" \
-  --binary-list "$TMP/binary-list.sha256" --image-digests "$TMP/image-digests.txt" --plan-sha "$sha" \
-  --command-statuses "$TMP/status.tsv" --metrics "$TMP/metrics.txt" --journals "$TMP/journals.txt" \
-  --source-state "$TMP/source-state.txt" --pre-inventory "$TMP/pre.txt" \
-  --review-record "$TMP/review-record.txt" --apply-log "$TMP/terraform-apply.log" \
-  --destroy-log "$TMP/terraform-destroy.log" --terraform-outputs "$TMP/terraform-outputs.json" \
-  --runbook-artifacts "$TMP/runbook-artifacts" \
-  --cleanup "$TMP/cleanup.txt" --redaction-status 0 --output "$TMP/manifest.json"
+common_args=(
+  --binary-sha "$sha" --image-sha "$sha" --binary-list "$TMP/binary-list.sha256"
+  --image-digests "$TMP/image-digests.txt" --plan-sha "$sha" --command-statuses "$TMP/status.tsv"
+  --journals "$TMP/journals.txt" --source-state "$TMP/source-state.txt" --pre-inventory "$TMP/pre.txt"
+  --post-apply-inventory "$TMP/post-apply.txt" --pre-cleanup-inventory "$TMP/pre-cleanup.txt"
+  --retention-record "$TMP/retention.txt" --review-record "$TMP/review-record.txt"
+  --apply-log "$TMP/terraform-apply.log" --destroy-log "$TMP/terraform-destroy.log"
+  --terraform-outputs "$TMP/terraform-outputs.json" --runbook-artifacts "$TMP/runbook-artifacts"
+  --cleanup "$TMP/cleanup.txt" --redaction-status 0
+)
+"$BUILDER" --commit "$sha" "${common_args[@]}" --metrics "$TMP/metrics.txt" --output "$TMP/manifest.json"
 python3 - "$TMP/manifest.json" <<'PY'
 import json, sys
 m=json.load(open(sys.argv[1]))
-required={"commit_sha","binary_sha256","image_sha256","exact_binary_digests","exact_image_digests","terraform_plan_sha256","reviewed_plan_record","terraform_apply_log","terraform_destroy_log","terraform_outputs","runbook_artifacts","command_exit_statuses","metrics","journals","source_state","pre_ownership_inventory","cleanup_inventory","started_at_utc","ended_at_utc","exact_command","region","ownership_token_sha256","workspace_sha256","keep_infra","capability_requirements","final_exit_status","redaction_scan_command","redaction_scan_exit_status"}
+required={"commit_sha","binary_sha256","image_sha256","exact_binary_digests","exact_image_digests","terraform_plan_sha256","reviewed_plan_record","terraform_apply_log","terraform_destroy_log","terraform_outputs","runbook_artifacts","command_exit_statuses","metrics","journals","source_state","pre_ownership_inventory","post_apply_inventory","pre_cleanup_inventory","cleanup_inventory","retention_record","started_at_utc","ended_at_utc","exact_command","account_alias","region","run_id","workspace","unavailable_capabilities","ownership_token_sha256","workspace_sha256","keep_infra","capability_requirements","final_exit_status","redaction_scan_command","redaction_scan_exit_status"}
 assert required <= m.keys()
 assert m["command_exit_statuses"] == {"preflight": 0, "workload": 0, "cleanup": 0, "redaction_scan": 0}
 assert m["cleanup_inventory"]["sha256"]
-assert {item["relative_path"] for item in m["runbook_artifacts"]} == {"api-identities.jsonl", "fault-period-metrics.txt", "intermediate-inventory.txt", "runtime-proof.txt"}
+assert {item["relative_path"] for item in m["runbook_artifacts"]} == {"api-identities.jsonl", "ecr-proof.txt", "fault-period-metrics.txt", "intermediate-inventory.txt", "journal-proof.txt", "runtime-proof.txt"}
 PY
 
 too_large="$TMP/large"
 dd if=/dev/zero of="$too_large" bs=1048577 count=1 status=none
-if "$BUILDER" --commit "$sha" --binary-sha "$sha" --image-sha "$sha" \
-  --binary-list "$TMP/binary-list.sha256" --image-digests "$TMP/image-digests.txt" --plan-sha "$sha" \
-  --command-statuses "$TMP/status.tsv" --metrics "$too_large" --journals "$TMP/journals.txt" \
-  --source-state "$TMP/source-state.txt" --pre-inventory "$TMP/pre.txt" \
-  --cleanup "$TMP/cleanup.txt" --redaction-status 0 --output "$TMP/bad.json" 2>/dev/null; then
+if "$BUILDER" --commit "$sha" "${common_args[@]}" --metrics "$too_large" --output "$TMP/bad-large.json" 2>/dev/null; then
   echo "FAIL: oversized artifact accepted" >&2; exit 1
 fi
-if "$BUILDER" --commit dirty --binary-sha "$sha" --image-sha "$sha" \
-  --binary-list "$TMP/binary-list.sha256" --image-digests "$TMP/image-digests.txt" --plan-sha "$sha" \
-  --command-statuses "$TMP/status.tsv" --metrics "$TMP/metrics.txt" --journals "$TMP/journals.txt" \
-  --source-state "$TMP/source-state.txt" --pre-inventory "$TMP/pre.txt" \
-  --cleanup "$TMP/cleanup.txt" --redaction-status 0 --output "$TMP/bad.json" 2>/dev/null; then
+if "$BUILDER" --commit dirty "${common_args[@]}" --metrics "$TMP/metrics.txt" --output "$TMP/bad-commit.json" 2>/dev/null; then
   echo "FAIL: malformed digest accepted" >&2; exit 1
 fi
 
@@ -75,4 +77,15 @@ if HIVEMIND_REDACTION_TOKEN=e1fixtureabc123 "$SCRIPT_DIR/live/redaction-scan.sh"
   echo "FAIL: redaction scan accepted raw ownership token" >&2; exit 1
 fi
 grep -q 'ownership token' "$TMP/scan-token.out"
+rm "$TMP/scan/token.txt"
+printf '\000ownership=e1fixtureabc123\377' >"$TMP/scan/token.bin"
+if HIVEMIND_REDACTION_TOKEN=e1fixtureabc123 "$SCRIPT_DIR/live/redaction-scan.sh" "$TMP/scan" >"$TMP/scan-binary.out" 2>&1; then
+  echo "FAIL: redaction scan accepted a binary ownership token" >&2; exit 1
+fi
+grep -q 'ownership token' "$TMP/scan-binary.out"
+mkdir "$TMP/raw"
+printf '\000token=e1fixtureabc123 account=111111111111 ip=192.0.2.1\377' >"$TMP/raw/artifact-e1fixtureabc123.bin"
+HIVEMIND_REDACTION_TOKEN=e1fixtureabc123 "$SCRIPT_DIR/live/publish-redacted.sh" "$TMP/raw" "$TMP/published"
+[[ -f "$TMP/published/artifact-[REDACTED_TOKEN].bin" ]]
+HIVEMIND_REDACTION_TOKEN=e1fixtureabc123 "$SCRIPT_DIR/live/redaction-scan.sh" "$TMP/published" >/dev/null
 echo "PASS: bounded evidence manifest fields and validation"

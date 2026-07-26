@@ -11,6 +11,9 @@ ACCOUNT_ALLOWLIST="${HIVEMIND_AWS_ACCOUNT_ALLOWLIST:-}"
 REGION="${AWS_REGION:-}"
 REGION_ALLOWLIST="${HIVEMIND_AWS_REGION_ALLOWLIST:-}"
 RUN_TOKEN="${HIVEMIND_RUN_TOKEN:-}"
+RUN_ID="${HIVEMIND_RUN_ID:-}"
+ACCOUNT_ALIAS="${HIVEMIND_AWS_ACCOUNT_ALIAS:-}"
+APPROVAL_RECORD="${HIVEMIND_LIVE_APPROVAL_RECORD:-}"
 WORKSPACE="${TF_WORKSPACE:-}"
 BUCKET="${HIVEMIND_LIVE_BUCKET:-}"
 ECR_NAME="${HIVEMIND_LIVE_ECR:-}"
@@ -50,6 +53,9 @@ else
        "$(realpath -e -- "$CLEANUP" 2>/dev/null || true)" == "$SCRIPT_DIR/cleanup-owned.sh" &&
        "$(realpath -e -- "$INVENTORY" 2>/dev/null || true)" == "$SCRIPT_DIR/inventory-owned.sh" ]] ||
         fail "production mode requires canonical live hooks"
+    EXECUTOR="$SCRIPT_DIR/execute-reviewed-plan.sh"
+    CLEANUP="$SCRIPT_DIR/cleanup-owned.sh"
+    INVENTORY="$SCRIPT_DIR/inventory-owned.sh"
 fi
 [[ "${HIVEMIND_COST_APPROVED:-0}" == 1 ]] || fail "HIVEMIND_COST_APPROVED=1 is required"
 [[ "${HIVEMIND_CLEANUP_APPROVED:-0}" == 1 ]] || fail "HIVEMIND_CLEANUP_APPROVED=1 is required"
@@ -65,6 +71,11 @@ for timeout_pair in \
         fail "$timeout_name must be a bounded decimal integer in $timeout_min..$timeout_max"
 done
 [[ "$RUN_TOKEN" =~ ^[a-z][a-z0-9]{11,31}$ ]] || fail "run token must be 12..32 lowercase alphanumeric characters"
+[[ "$(fold -w1 <<<"$RUN_TOKEN" | sort -u | tr -d '\n' | wc -c)" -ge 6 ]] || fail "run token lacks required unpredictability"
+[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{7,63}$ ]] || fail "run ID must be 8..64 safe characters"
+[[ "$ACCOUNT_ALIAS" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]] || fail "AWS account alias is required"
+[[ -f "$APPROVAL_RECORD" && ! -L "$APPROVAL_RECORD" && "$(stat -c %s "$APPROVAL_RECORD" 2>/dev/null || echo 0)" -le 65536 ]] ||
+    fail "bounded per-run approval record is required"
 [[ -n "$REGION" && -n "$REGION_ALLOWLIST" ]] || fail "explicit AWS region and region allowlist are required"
 contains_csv "$REGION_ALLOWLIST" "$REGION" || fail "AWS region is not allowlisted"
 [[ -n "$ACCOUNT_ALLOWLIST" ]] || fail "explicit AWS account allowlist is required"
@@ -91,7 +102,6 @@ if [[ "$FIXTURE_MODE" == 0 ]]; then
         "SKIP_WORKLOAD_PRELOAD:${SKIP_WORKLOAD_PRELOAD:-false}"; do
         [[ "${skip_pair#*:}" == false ]] || fail "live acceptance requires ${skip_pair%%:*}=false"
     done
-    fail "REQUIRE_JUICEFS=1: current API/AppSpec cannot request a required JuiceFS mount; refusing before ownership"
 fi
 if [[ "$KEEP_INFRA" == 1 ]]; then
     [[ -n "${HIVEMIND_KEEP_OWNER:-}" && -n "${HIVEMIND_KEEP_REASON:-}" && -n "${HIVEMIND_KEEP_EXPIRY:-}" && -n "${HIVEMIND_KEEP_CLEANUP_PLAN:-}" ]] ||
@@ -103,20 +113,50 @@ CURRENT_ACCOUNT="$(timeout --foreground --kill-after=2s 15s aws sts get-caller-i
     fail "AWS caller identity lookup failed"
 [[ "$CURRENT_ACCOUNT" =~ ^[0-9]{12}$ ]] || fail "AWS caller identity returned an invalid account"
 contains_csv "$ACCOUNT_ALLOWLIST" "$CURRENT_ACCOUNT" || fail "current AWS account does not match the allowlist"
+APPROVED_COST="$(python3 - "$APPROVAL_RECORD" "$CURRENT_ACCOUNT" "$ACCOUNT_ALIAS" "$REGION" "$RUN_ID" "$RUN_TOKEN_HASH" "$WORKSPACE" \
+    "$HIVEMIND_APPROVED_PLAN_SHA256" "${HIVEMIND_LIVE_TIMEOUT_SECONDS:-14400}" <<'PY'
+import datetime, json, math, sys
+(path, account, alias, region, run_id, token_hash, workspace, plan_sha, duration) = sys.argv[1:]
+with open(path, encoding="utf-8") as source:
+    record = json.load(source)
+expected = {"account": account, "account_alias": alias, "region": region, "run_id": run_id,
+            "ownership_token_sha256": token_hash, "workspace": workspace,
+            "terraform_plan_sha256": plan_sha, "maximum_duration_seconds": int(duration),
+            "cost_approved": True, "cleanup_approved": True, "quota_confirmed": True}
+if any(record.get(key) != value for key, value in expected.items()):
+    raise SystemExit(1)
+cost = record.get("maximum_estimated_cost_usd")
+if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost <= 0 or cost > 10000:
+    raise SystemExit(1)
+expiry = datetime.datetime.fromisoformat(record.get("expires_at_utc", "").replace("Z", "+00:00"))
+now = datetime.datetime.now(datetime.timezone.utc)
+if expiry.tzinfo is None or not now < expiry <= now + datetime.timedelta(days=7):
+    raise SystemExit(1)
+print(f"{cost:.2f}")
+PY
+)" || fail "per-run approval record is invalid, expired, or does not match this run"
 unset CURRENT_ACCOUNT
 if [[ "$FIXTURE_MODE" == 0 ]]; then
     timeout --kill-after=5s 60s "$SCRIPT_DIR/quota-preflight.sh" >"${TMPDIR:-/tmp}/hivemind-quota-${RUN_TOKEN_HASH:0:16}.txt" ||
         fail "bounded quota/capability preflight failed"
     rm -f "${TMPDIR:-/tmp}/hivemind-quota-${RUN_TOKEN_HASH:0:16}.txt"
+    fail "strict pre-mutation JuiceFS/containerd/GPU/Nydus capability evidence is unavailable; refusing before ownership"
 fi
 
 umask 077
 [[ ! -e "$EVIDENCE_DIR" ]] || fail "evidence directory already exists: $EVIDENCE_DIR"
 mkdir -p "$EVIDENCE_DIR"
+RAW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hivemind-live-${RUN_TOKEN_HASH:0:16}.XXXXXX")"
 STATUS_FILE="$EVIDENCE_DIR/command-statuses.tsv"
 export HIVEMIND_LIVE_STATUS_FILE="$STATUS_FILE"
+export HIVEMIND_LIVE_RAW_DIR="$RAW_DIR" HIVEMIND_LIVE_INVENTORY_HOOK="$INVENTORY" HIVEMIND_LIVE_STARTED_AT="$STARTED_AT"
 PRE_INVENTORY_FILE="$EVIDENCE_DIR/pre-ownership-inventory.txt"
+POST_APPLY_INVENTORY_FILE="$EVIDENCE_DIR/post-apply-inventory.txt"
+PRE_CLEANUP_INVENTORY_FILE="$EVIDENCE_DIR/pre-cleanup-inventory.txt"
 INVENTORY_FILE="$EVIDENCE_DIR/post-cleanup-inventory.txt"
+printf 'keep_infra=%s\nowner=%s\nreason=%s\nexpiry=%s\ncleanup_plan=%s\n' "$KEEP_INFRA" \
+    "${HIVEMIND_KEEP_OWNER:-none}" "${HIVEMIND_KEEP_REASON:-none}" "${HIVEMIND_KEEP_EXPIRY:-none}" \
+    "${HIVEMIND_KEEP_CLEANUP_PLAN:-automatic}" >"$EVIDENCE_DIR/retention-record.txt"
 : >"$STATUS_FILE"
 
 validate_zero_inventory() {
@@ -136,6 +176,10 @@ finish() {
     trap - EXIT INT TERM
     set +e
     if [[ "$OWNERSHIP_STARTED" == 1 ]]; then
+        timeout --foreground --kill-after=5s "${HIVEMIND_INVENTORY_TIMEOUT_SECONDS:-300}s" "$INVENTORY" post >"$PRE_CLEANUP_INVENTORY_FILE"
+        pre_cleanup_status=$?
+        printf 'pre_cleanup_inventory\t%s\n' "$pre_cleanup_status" >>"$STATUS_FILE"
+        [[ "$pre_cleanup_status" == 0 ]] || status=1
         timeout --foreground --kill-after=10s "${HIVEMIND_CLEANUP_TIMEOUT_SECONDS:-1800}s" "$CLEANUP"
         cleanup_status=$?
         printf 'cleanup\t%s\n' "$cleanup_status" >>"$STATUS_FILE"
@@ -165,9 +209,11 @@ finish() {
                 export HIVEMIND_EVIDENCE_STARTED_AT="$STARTED_AT"
                 HIVEMIND_EVIDENCE_ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
                 export HIVEMIND_EVIDENCE_ENDED_AT
-                HIVEMIND_EVIDENCE_COMMAND="timeout --kill-after=30s ${HIVEMIND_LIVE_TIMEOUT_SECONDS:-14400}s ./tests/live/run.sh"
+                HIVEMIND_EVIDENCE_COMMAND="timeout --foreground --kill-after=2200s 16740s ./tests/live/run.sh"
                 export HIVEMIND_EVIDENCE_COMMAND
-                export HIVEMIND_EVIDENCE_REGION="$REGION"
+                export HIVEMIND_EVIDENCE_ACCOUNT_ALIAS="$ACCOUNT_ALIAS" HIVEMIND_EVIDENCE_REGION="$REGION"
+                export HIVEMIND_EVIDENCE_RUN_ID="$RUN_ID" HIVEMIND_EVIDENCE_UNAVAILABLE_CAPABILITIES='[]'
+                export HIVEMIND_EVIDENCE_WORKSPACE="${WORKSPACE//$RUN_TOKEN/[REDACTED_TOKEN]}"
                 export HIVEMIND_EVIDENCE_OWNERSHIP_HASH="$RUN_TOKEN_HASH"
                 export HIVEMIND_EVIDENCE_WORKSPACE_HASH
                 HIVEMIND_EVIDENCE_WORKSPACE_HASH="$(printf '%s' "$WORKSPACE" | sha256sum | awk '{print $1}')"
@@ -178,7 +224,10 @@ finish() {
                     --image-digests "$EVIDENCE_DIR/image-digests.txt" --plan-sha "${HIVEMIND_APPROVED_PLAN_SHA256}" \
                     --command-statuses "$STATUS_FILE" --metrics "$EVIDENCE_DIR/metrics.txt" \
                     --journals "$EVIDENCE_DIR/journals.txt" --source-state "$EVIDENCE_DIR/source-state.txt" \
-                    --pre-inventory "$PRE_INVENTORY_FILE" --cleanup "$INVENTORY_FILE" \
+                    --pre-inventory "$PRE_INVENTORY_FILE" \
+                    --post-apply-inventory "$POST_APPLY_INVENTORY_FILE" \
+                    --pre-cleanup-inventory "$PRE_CLEANUP_INVENTORY_FILE" \
+                    --cleanup "$INVENTORY_FILE" --retention-record "$EVIDENCE_DIR/retention-record.txt" \
                     --review-record "$EVIDENCE_DIR/reviewed-plan-record.txt" \
                     --apply-log "$EVIDENCE_DIR/terraform-apply.log" \
                     --destroy-log "$EVIDENCE_DIR/terraform-destroy.log" \
@@ -194,6 +243,7 @@ finish() {
             fi
         fi
     fi
+    rm -rf -- "${RAW_DIR:-}"
     exit "$status"
 }
 trap finish EXIT
@@ -211,8 +261,8 @@ if [[ "$pre_inventory_status" != 0 ]] || ! validate_zero_inventory "$PRE_INVENTO
     fail "pre-ownership inventory is not zero for every owned category"
 fi
 
-printf 'guardrails=passed region=%s ownership_hash=%s KEEP_INFRA=%s\n' \
-    "$REGION" "${RUN_TOKEN_HASH:0:16}" "$KEEP_INFRA"
+printf 'guardrails=passed region=%s ownership_hash=%s KEEP_INFRA=%s max_duration_seconds=%s max_estimated_cost_usd=%s scope=EC2,EBS,EIP,ECR,S3,SSM,data-transfer\n' \
+    "$REGION" "${RUN_TOKEN_HASH:0:16}" "$KEEP_INFRA" "${HIVEMIND_LIVE_TIMEOUT_SECONDS:-14400}" "$APPROVED_COST"
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
     echo "PREPARED ONLY: no ownership or live executor invocation"
     exit 0
@@ -221,9 +271,11 @@ fi
 [[ -x "$CLEANUP" ]] || fail "live cleanup hook is not executable: $CLEANUP"
 # The trap is active before this boundary. Only the executor may acquire ownership.
 OWNERSHIP_STARTED=1
-export HIVEMIND_LIVE_GUARD_NONCE HIVEMIND_GUARDRAILS_ACTIVE
-HIVEMIND_LIVE_GUARD_NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-HIVEMIND_GUARDRAILS_ACTIVE=1
+guard_capability="$(mktemp "${TMPDIR:-/tmp}/hivemind-guard.XXXXXX")"
+printf '%s' "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" >"$guard_capability"
+exec 9<"$guard_capability"
+rm -f -- "$guard_capability"
+export HIVEMIND_GUARDRAILS_ACTIVE=1
 set +e
 # GNU timeout without --foreground owns a process group and kills all executor descendants.
 timeout --kill-after=30s "${HIVEMIND_LIVE_TIMEOUT_SECONDS:-14400}s" "$EXECUTOR"

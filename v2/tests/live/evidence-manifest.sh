@@ -24,6 +24,9 @@ parser.add_argument("--journals", required=True)
 parser.add_argument("--cleanup", required=True)
 parser.add_argument("--source-state", required=True)
 parser.add_argument("--pre-inventory", required=True)
+parser.add_argument("--post-apply-inventory", required=True)
+parser.add_argument("--pre-cleanup-inventory", required=True)
+parser.add_argument("--retention-record", required=True)
 parser.add_argument("--review-record", required=True)
 parser.add_argument("--apply-log", required=True)
 parser.add_argument("--destroy-log", required=True)
@@ -98,7 +101,9 @@ if not statuses:
 
 required_environment = (
     "HIVEMIND_EVIDENCE_STARTED_AT", "HIVEMIND_EVIDENCE_ENDED_AT",
-    "HIVEMIND_EVIDENCE_COMMAND", "HIVEMIND_EVIDENCE_REGION",
+    "HIVEMIND_EVIDENCE_COMMAND", "HIVEMIND_EVIDENCE_ACCOUNT_ALIAS",
+    "HIVEMIND_EVIDENCE_REGION", "HIVEMIND_EVIDENCE_RUN_ID", "HIVEMIND_EVIDENCE_WORKSPACE",
+    "HIVEMIND_EVIDENCE_UNAVAILABLE_CAPABILITIES",
     "HIVEMIND_EVIDENCE_OWNERSHIP_HASH", "HIVEMIND_EVIDENCE_WORKSPACE_HASH",
     "HIVEMIND_EVIDENCE_KEEP_INFRA", "HIVEMIND_EVIDENCE_FINAL_STATUS",
 )
@@ -110,12 +115,44 @@ if environment["HIVEMIND_EVIDENCE_KEEP_INFRA"] not in ("0", "1"):
     raise SystemExit("invalid KEEP_INFRA evidence value")
 if environment["HIVEMIND_EVIDENCE_FINAL_STATUS"] != "0":
     raise SystemExit("successful manifest requires final status 0")
+if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", environment["HIVEMIND_EVIDENCE_ACCOUNT_ALIAS"]):
+    raise SystemExit("invalid account alias")
+if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", environment["HIVEMIND_EVIDENCE_RUN_ID"]):
+    raise SystemExit("invalid run ID")
+try:
+    unavailable_capabilities = json.loads(environment["HIVEMIND_EVIDENCE_UNAVAILABLE_CAPABILITIES"])
+except json.JSONDecodeError as error:
+    raise SystemExit("invalid unavailable capability evidence") from error
+if not isinstance(unavailable_capabilities, list) or len(unavailable_capabilities) > 16 or any(
+    not isinstance(value, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", value)
+    for value in unavailable_capabilities
+):
+    raise SystemExit("invalid unavailable capability evidence")
 capabilities = {}
 for name in ("REQUIRE_CONTAINERD", "REQUIRE_GPU", "REQUIRE_NYDUS", "REQUIRE_JUICEFS", "REQUIRE_ECR_COLD_PULL"):
     value = os.environ.get(name, "0")
     if value not in ("0", "1"):
         raise SystemExit(f"invalid capability evidence: {name}")
     capabilities[name] = int(value)
+
+runbook_records = artifact_tree(args.runbook_artifacts)
+runbook_by_path = {record["relative_path"]: record for record in runbook_records}
+required_runbook = {
+    "api-identities.jsonl": (b"request_id", b"status"),
+    "fault-period-metrics.txt": (b"fault", b"queue"),
+    "intermediate-inventory.txt": (b"instances=",),
+    "runtime-proof.txt": (b"tasks=", b"containers=", b"cdi=", b"cgroup=", b"gpu="),
+    "ecr-proof.txt": (b"cold_pull=verified", b"digest=sha256:"),
+    "journal-proof.txt": (b"mode=", b"checksum=", b"recovery=verified"),
+}
+missing_runbook = sorted(set(required_runbook) - set(runbook_by_path))
+if missing_runbook:
+    raise SystemExit(f"runbook evidence contract is incomplete: {', '.join(missing_runbook)}")
+for relative_path, markers in required_runbook.items():
+    with open(runbook_by_path[relative_path]["path"], "rb") as source:
+        content = source.read(MAX_ARTIFACT_BYTES + 1)
+    if any(marker not in content for marker in markers):
+        raise SystemExit(f"runbook evidence is semantically incomplete: {relative_path}")
 
 manifest = {
     "commit_sha": args.commit,
@@ -128,18 +165,25 @@ manifest = {
     "terraform_apply_log": artifact(args.apply_log),
     "terraform_destroy_log": artifact(args.destroy_log),
     "terraform_outputs": artifact(args.terraform_outputs),
-    "runbook_artifacts": artifact_tree(args.runbook_artifacts),
+    "runbook_artifacts": runbook_records,
     "command_exit_statuses": statuses,
     "command_status_artifact": status_artifact,
     "metrics": artifact(args.metrics),
     "journals": artifact(args.journals),
     "source_state": artifact(args.source_state),
     "pre_ownership_inventory": artifact(args.pre_inventory),
+    "post_apply_inventory": artifact(args.post_apply_inventory),
+    "pre_cleanup_inventory": artifact(args.pre_cleanup_inventory),
     "cleanup_inventory": artifact(args.cleanup),
+    "retention_record": artifact(args.retention_record),
     "started_at_utc": environment["HIVEMIND_EVIDENCE_STARTED_AT"],
     "ended_at_utc": environment["HIVEMIND_EVIDENCE_ENDED_AT"],
     "exact_command": environment["HIVEMIND_EVIDENCE_COMMAND"],
+    "account_alias": environment["HIVEMIND_EVIDENCE_ACCOUNT_ALIAS"],
     "region": environment["HIVEMIND_EVIDENCE_REGION"],
+    "run_id": environment["HIVEMIND_EVIDENCE_RUN_ID"],
+    "workspace": environment["HIVEMIND_EVIDENCE_WORKSPACE"],
+    "unavailable_capabilities": unavailable_capabilities,
     "ownership_token_sha256": environment["HIVEMIND_EVIDENCE_OWNERSHIP_HASH"],
     "workspace_sha256": environment["HIVEMIND_EVIDENCE_WORKSPACE_HASH"],
     "keep_infra": int(environment["HIVEMIND_EVIDENCE_KEEP_INFRA"]),

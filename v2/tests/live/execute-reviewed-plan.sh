@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "${HIVEMIND_ALLOW_LIVE:-0}" == 1 && "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_LIVE_GUARD_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || {
-    echo "FAIL: private live helper requires guarded parent" >&2
-    exit 1
-}
-guard_parent="$(awk '{print $4}' "/proc/$PPID/stat" 2>/dev/null || true)"
-tr '\0' ' ' <"/proc/$guard_parent/cmdline" 2>/dev/null | grep -Fq '/tests/live/run.sh' || {
-    echo "FAIL: private live helper requires guarded parent" >&2
-    exit 1
-}
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+RUNNER="$ROOT_DIR/tests/live/run.sh"
+[[ "${HIVEMIND_ALLOW_LIVE:-0}" == 1 && "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && -r /proc/self/fd/9 ]] || {
+    echo "FAIL: private live helper requires guarded parent" >&2
+    exit 1
+}
+python3 - "$PPID" "$RUNNER" <<'PY' || { echo "FAIL: private live helper requires guarded parent" >&2; exit 1; }
+import os, sys
+pid = int(sys.argv[1])
+expected = os.path.realpath(sys.argv[2])
+capability = os.stat("/proc/self/fd/9")
+for _ in range(6):
+    try:
+        script = os.path.realpath(f"/proc/{pid}/fd/255")
+        inherited = os.stat(f"/proc/{pid}/fd/9")
+        argv = [os.fsdecode(value) for value in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if value]
+        exact_script_arg = any("/" in value and os.path.realpath(value) == expected for value in argv)
+        if script == expected and exact_script_arg and "-c" not in argv and (inherited.st_dev, inherited.st_ino) == (capability.st_dev, capability.st_ino):
+            raise SystemExit(0)
+        with open(f"/proc/{pid}/stat", encoding="ascii") as source:
+            pid = int(source.read().split()[3])
+    except (FileNotFoundError, PermissionError, ValueError):
+        break
+raise SystemExit(1)
+PY
 TF_ROOT="$ROOT_DIR/infra/poc"
 RUN_TOKEN="${HIVEMIND_RUN_TOKEN:?}"
 WORKSPACE="${TF_WORKSPACE:?}"
@@ -17,6 +32,8 @@ BUCKET="${HIVEMIND_LIVE_BUCKET:?}"
 ECR_NAME="${HIVEMIND_LIVE_ECR:?}"
 REGION="${AWS_REGION:?}"
 EVIDENCE_DIR="${HIVEMIND_LIVE_EVIDENCE_DIR:?}"
+RAW_DIR="${HIVEMIND_LIVE_RAW_DIR:?}"
+INVENTORY="${HIVEMIND_LIVE_INVENTORY_HOOK:?}"
 PLAN="${HIVEMIND_TF_PLAN:?HIVEMIND_TF_PLAN is required}"
 PLAN_SHA="${HIVEMIND_APPROVED_PLAN_SHA256:?}"
 REVIEW_RECORD="${HIVEMIND_PLAN_REVIEW_RECORD:?}"
@@ -35,9 +52,14 @@ run_recorded() {
 }
 
 [[ -f "$PLAN" && ! -L "$PLAN" && "$(stat -c %s "$PLAN")" -le 104857600 ]] || { echo "FAIL: saved plan must be a regular file no larger than 100 MiB" >&2; exit 1; }
-PLAN="$(realpath -- "$PLAN")"
-[[ "$(sha256sum "$PLAN" | awk '{print $1}')" == "$PLAN_SHA" ]] || { echo "FAIL: saved Terraform plan digest differs from approval" >&2; exit 1; }
-grep -Fqx "$PLAN_SHA" "$REVIEW_RECORD" || { echo "FAIL: review record does not bind the approved plan digest" >&2; exit 1; }
+SEALED_PLAN="$RAW_DIR/terraform-plan-$PLAN_SHA.tfplan"
+SEALED_REVIEW="$RAW_DIR/reviewed-plan-record.txt"
+install -m 600 -- "$PLAN" "$SEALED_PLAN"
+install -m 600 -- "$REVIEW_RECORD" "$SEALED_REVIEW"
+[[ "$(sha256sum "$SEALED_PLAN" | awk '{print $1}')" == "$PLAN_SHA" ]] || { echo "FAIL: sealed Terraform plan digest differs from approval" >&2; exit 1; }
+grep -Fqx "$PLAN_SHA" "$SEALED_REVIEW" || { echo "FAIL: sealed review record does not bind the approved plan digest" >&2; exit 1; }
+PLAN="$SEALED_PLAN"
+REVIEW_RECORD="$SEALED_REVIEW"
 [[ "$(terraform -chdir="$TF_ROOT" workspace show)" == "$WORKSPACE" ]] || { echo "FAIL: selected Terraform workspace differs from guarded workspace" >&2; exit 1; }
 PLAN_JSON="$EVIDENCE_DIR/.reviewed-plan.json"
 terraform -chdir="$TF_ROOT" show -json "$PLAN" >"$PLAN_JSON"
@@ -63,7 +85,8 @@ for change in changes:
         raise SystemExit("plan ECR repository differs from guarded name")
 PY
 rm -f "$PLAN_JSON"
-install -m 600 "$REVIEW_RECORD" "$EVIDENCE_DIR/reviewed-plan-record.txt"
+HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh" \
+    "$REVIEW_RECORD" "$EVIDENCE_DIR/reviewed-plan-record.txt"
 record_success reviewed_plan_validation
 
 # Ownership starts only after the parent wrapper's cleanup trap and zero inventory.
@@ -76,19 +99,32 @@ record_success bucket_ownership
 
 set +e
 timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_APPLY_TIMEOUT_SECONDS:-1800}s" \
-    terraform -chdir="$TF_ROOT" apply "$PLAN" > >(tee "$EVIDENCE_DIR/terraform-apply.log") 2>&1
-apply_status=$?
+    terraform -chdir="$TF_ROOT" apply "$PLAN" 2>&1 | python3 -c 'import sys; p=open(sys.argv[1], "xb"); n=0
+for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
+ sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+ if n < 1048576: data=chunk[:1048576-n]; p.write(data); n += len(data)
+p.close()' "$RAW_DIR/terraform-apply.log"
+apply_status=${PIPESTATUS[0]}
 set -e
 printf 'terraform_apply\t%s\n' "$apply_status" >>"$STATUS_FILE"
 [[ "$apply_status" == 0 ]] || exit "$apply_status"
-terraform -chdir="$TF_ROOT" output -json >"$EVIDENCE_DIR/terraform-outputs.json"
+terraform -chdir="$TF_ROOT" output -json >"$RAW_DIR/terraform-outputs.json"
+HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh" \
+    "$RAW_DIR/terraform-apply.log" "$EVIDENCE_DIR/terraform-apply.log"
+HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh" \
+    "$RAW_DIR/terraform-outputs.json" "$EVIDENCE_DIR/terraform-outputs.json"
+timeout --foreground --kill-after=5s "${HIVEMIND_INVENTORY_TIMEOUT_SECONDS:-300}s" "$INVENTORY" post \
+    >"$EVIDENCE_DIR/post-apply-inventory.txt"
+record_success post_apply_inventory
 
 export TF_VAR_run_token="$RUN_TOKEN" TF_VAR_ecr_repository_name="$ECR_NAME" TF_VAR_region="$REGION"
 export ECR_REPOSITORY="$ECR_NAME" TAG="live-${RUN_TOKEN:0:8}" SKIP_HIVEMIND_APPLY=true
 export DESTROY_HIVEMIND_AFTER=false DESTROY_EKS_AFTER=false RUN_EKS=false
-export ARTIFACT_ROOT="$EVIDENCE_DIR/runbook"
+export ARTIFACT_ROOT="$RAW_DIR/runbook"
 run_recorded poc_runbook bash "$ROOT_DIR/scripts/poc-runbook.sh"
-[[ -d "$EVIDENCE_DIR/runbook" ]] || { echo "FAIL: runbook evidence directory missing" >&2; exit 1; }
+[[ -d "$RAW_DIR/runbook" ]] || { echo "FAIL: runbook evidence directory missing" >&2; exit 1; }
+HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh" \
+    "$RAW_DIR/runbook" "$EVIDENCE_DIR/runbook"
 
 replica_ips="$(terraform -chdir="$TF_ROOT" output -json replica_public_ips)"
 worker_cpu="$(terraform -chdir="$TF_ROOT" output -raw worker_cpu_public_ip)"

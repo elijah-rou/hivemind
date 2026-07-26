@@ -21,9 +21,9 @@ for instance_type in c5.xlarge g4dn.xlarge; do
 done
 
 check_quota() {
-    local code="$1" required="$2" label="$3" value
+    local service="$1" code="$2" required="$3" label="$4" value
     value="$(aws_bounded service-quotas get-service-quota --region "$REGION" \
-        --service-code ec2 --quota-code "$code" --query 'Quota.Value' --output text)"
+        --service-code "$service" --quota-code "$code" --query 'Quota.Value' --output text)"
     python3 - "$value" "$required" "$label" <<'PY'
 import math, sys
 value = float(sys.argv[1])
@@ -34,6 +34,19 @@ PY
 }
 
 # Five c5 replicas plus one c5 worker need 24 standard vCPUs; one g4dn.xlarge needs 4 G-family vCPUs.
-check_quota L-1216C47A 24 standard-vcpu
-check_quota L-DB2E81BA 4 gpu-vcpu
-echo "PASS: bounded regional instance-offering and EC2 quota preflight"
+check_quota ec2 L-1216C47A 24 standard-vcpu
+check_quota ec2 L-DB2E81BA 4 gpu-vcpu
+# The reviewed topology uses seven subnet addresses and 450 GiB of gp3 root storage,
+# plus one isolated repository and one ownership-marker bucket.
+if [[ -n "${TF_VAR_subnet_id:-}" ]]; then
+    address_count="$(aws_bounded ec2 describe-subnets --region "$REGION" --subnet-ids "$TF_VAR_subnet_id" \
+        --query 'sum(Subnets[].AvailableIpAddressCount)' --output text)"
+else
+    address_count="$(aws_bounded ec2 describe-subnets --region "$REGION" \
+        --filters Name=default-for-az,Values=true --query 'sum(Subnets[].AvailableIpAddressCount)' --output text)"
+fi
+[[ "$address_count" =~ ^[0-9]+$ && "$address_count" -ge 7 ]] || { echo "FAIL: fewer than seven subnet addresses are available" >&2; exit 1; }
+check_quota ebs L-7A658B76 0.44 gp3-storage-tib
+check_quota ecr L-03A36CE1 1 ecr-repository
+check_quota s3 L-DC2B2D3D 1 s3-bucket
+echo "PASS: bounded regional offerings and EC2/address/EBS/ECR/S3 quota preflight; max duration and cost require the bound approval record"

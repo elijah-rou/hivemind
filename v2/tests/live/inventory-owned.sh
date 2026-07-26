@@ -56,14 +56,21 @@ deployments="$instances"
 containerd_tasks="$instances"
 containerd_containers="$instances"
 juicefs_mounts="$instances"
-ssm_commands=0
-for command_status in Pending InProgress Delayed Cancelling; do
-    active_commands="$(aws_count ssm list-commands --region "$REGION" --filters \
-        "key=Comment,value=$RUN_TOKEN" "key=Status,value=$command_status" \
-        --query 'length(Commands)' --output text)"
-    [[ "$active_commands" =~ ^[0-9]+$ ]] || { echo "invalid SSM inventory count" >&2; exit 1; }
-    ssm_commands=$((ssm_commands + active_commands))
-done
+ssm_inventory="$(aws_count ssm list-commands --region "$REGION" --no-paginate --max-results 50 \
+    --filters "key=InvokedAfter,value=${HIVEMIND_LIVE_STARTED_AT:?}" --output json)"
+ssm_commands="$(python3 - "$RUN_TOKEN" "$ssm_inventory" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[2])
+if payload.get("NextToken"):
+    raise SystemExit("SSM inventory exceeded the bounded 50-command window")
+token = sys.argv[1]
+active = {"Pending", "InProgress", "Delayed", "Cancelling"}
+commands = payload.get("Commands")
+if not isinstance(commands, list):
+    raise SystemExit("invalid SSM inventory response")
+print(sum(command.get("Status") in active and token in command.get("Comment", "") for command in commands))
+PY
+)"
 temporary_secret_files="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name "*${RUN_TOKEN}*" -print 2>/dev/null | awk 'END {print NR + 0}')"
 for value in "$instances" "$volumes" "$network_resources" "$buckets" "$repositories" "$locks" "$units" "$processes" \
     "$deployments" "$containerd_tasks" "$containerd_containers" "$juicefs_mounts" "$ssm_commands" "$temporary_secret_files"; do

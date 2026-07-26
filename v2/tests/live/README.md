@@ -2,11 +2,11 @@
 
 > **Prepared, never default:** `tests/live/run.sh` is the unified guarded acceptance wrapper. E1 exercised only deterministic stub fixtures. No cloud, provider, containerd, GPU, registry, storage, systemd, SSM, S3, or destructive boundary ran. This document does not authorize a live run.
 
-The wrapper requires an already reviewed saved Terraform plan and separate per-run authorization, credentials, cost approval, quota review, and destructive-cleanup approval. Prepare the plan outside the execution command, record its SHA-256 as the sole line in a protected review record, then supply both to the wrapper. `HIVEMIND_LIVE_PREFLIGHT_ONLY=1` performs guard and read-only zero-inventory checks without invoking the executor. Do not use fixture mode outside `live_guardrails_test.sh`.
+The wrapper requires an already reviewed saved Terraform plan and a bounded per-run JSON approval record that binds the account, account alias, region, run ID, ownership-token SHA-256, workspace, plan SHA-256, maximum duration, maximum estimated cost, expiry, quota confirmation, and destructive-cleanup approval. Prepare the plan outside the execution command, record its SHA-256 as the sole line in a protected review record, then supply both records to the wrapper. `HIVEMIND_LIVE_PREFLIGHT_ONLY=1` performs guard and read-only zero-inventory checks without invoking the executor. Do not use fixture mode outside `live_guardrails_test.sh`.
 
 The POC runbook refuses direct invocation unless the wrapper activates guardrails. Other legacy/operator scripts under `infra/` are not unified acceptance entry points. Deterministic fixtures, offline Terraform validation, historical artifacts, and prepared privileged scripts are not live evidence.
 
-Required execution environment includes `HIVEMIND_ALLOW_LIVE=1`, `HIVEMIND_AWS_ACCOUNT_ALLOWLIST`, `HIVEMIND_AWS_REGION_ALLOWLIST`, `AWS_REGION`, `HIVEMIND_RUN_TOKEN`, token-containing `TF_WORKSPACE`, `HIVEMIND_LIVE_BUCKET`, and `HIVEMIND_LIVE_ECR`, `HIVEMIND_COST_APPROVED=1`, `HIVEMIND_CLEANUP_APPROVED=1`, `HIVEMIND_QUOTA_CONFIRMED=1`, `HIVEMIND_TF_PLAN`, `HIVEMIND_APPROVED_PLAN_SHA256`, `HIVEMIND_PLAN_REVIEW_RECORD`, `HIVEMIND_WORKSPACE_CREATION_RECORD`, and every required capability flag set to `1`. Production mode accepts only repository-owned executor, cleanup, and inventory hooks. `KEEP_INFRA` defaults to `0`. The exact command is `cd v2 && timeout --kill-after=30s 14400s ./tests/live/run.sh`; omitting `--foreground` gives the executor a killable process group. The wrapper currently refuses before ownership because required JuiceFS AppSpec semantics are absent. Do not paste numeric account identifiers or credentials into tracked files or command transcripts.
+Required execution environment includes `HIVEMIND_ALLOW_LIVE=1`, `HIVEMIND_AWS_ACCOUNT_ALLOWLIST`, `HIVEMIND_AWS_ACCOUNT_ALIAS`, `HIVEMIND_AWS_REGION_ALLOWLIST`, `AWS_REGION`, `HIVEMIND_RUN_ID`, `HIVEMIND_RUN_TOKEN`, token-containing `TF_WORKSPACE`, `HIVEMIND_LIVE_BUCKET`, and `HIVEMIND_LIVE_ECR`, `HIVEMIND_COST_APPROVED=1`, `HIVEMIND_CLEANUP_APPROVED=1`, `HIVEMIND_QUOTA_CONFIRMED=1`, `HIVEMIND_LIVE_APPROVAL_RECORD`, `HIVEMIND_TF_PLAN`, `HIVEMIND_APPROVED_PLAN_SHA256`, `HIVEMIND_PLAN_REVIEW_RECORD`, `HIVEMIND_WORKSPACE_CREATION_RECORD`, and every required capability flag set to `1`. Production mode canonicalizes and accepts only repository-owned executor, cleanup, and inventory hooks. `KEEP_INFRA` defaults to `0`. The outer command is `cd v2 && timeout --foreground --kill-after=2200s 16740s ./tests/live/run.sh`; its deadline reserves the wrapper's full 14,400-second executor, 1,800-second cleanup, and two 300-second inventory budgets, and its kill grace exceeds cleanup plus inventory. The wrapper currently refuses before ownership because strict pre-mutation JuiceFS/containerd/GPU/Nydus evidence is unavailable. Do not paste numeric account identifiers or credentials into tracked files or command transcripts.
 
 ## Mandatory preflight
 
@@ -25,7 +25,7 @@ The live entry point exits nonzero before ownership unless every condition below
 11. Pre-apply inventory proves the run does not already own resources. The gate refuses to adopt, mutate, unlock, or delete anything without an exact ownership token/marker and expected run tags/state.
 12. Acceptance mode enables strict capability semantics. Any required capability that is absent, skipped, degraded, or unverifiable fails nonzero before acceptance.
 
-Authorization is per run. Prior credentials, a prior approval, or an existing Terraform workspace do not satisfy a new run.
+Authorization is per run. Prior credentials, a prior approval, or an existing Terraform workspace do not satisfy a new run. Canonical private helpers also require an inherited wrapper-created file-descriptor capability and verify the actual Bash script identity through `/proc/*/fd/255`; caller-supplied environment values or forged argv text are insufficient.
 
 ## Required functional matrix
 
@@ -91,20 +91,22 @@ A successful live run must retain a bounded, reviewable manifest containing:
 
 - full source commit SHA and explicit clean/dirty declaration;
 - UTC start/end timestamps, exact command, phase exit statuses, and final exit status;
-- account alias, region, run ID, and workspace, with the numeric account identifier redacted;
+- account alias, region, run ID, and token-redacted workspace, with the numeric account identifier redacted;
 - every capability flag and any capability detected as unavailable;
 - Terraform saved-plan SHA-256, review record, apply log, outputs, destroy log, and state/workspace disposition;
 - binary and image SHA-256 digests, including the exact private ECR digest when exercised;
-- API request/response artifacts and request identities needed to reason about retries;
+- API request/response artifacts and request identities needed to reason about retries, summarized in `api-identities.jsonl`;
 - metrics before, during, and after each fault;
 - systemd journals and service-state snapshots;
-- containerd task/container/CDI/cgroup evidence and in-task GPU output;
-- journal metadata/checksums and permission evidence;
+- containerd task/container/CDI/cgroup evidence and in-task GPU output, summarized in `runtime-proof.txt`;
+- exact cold-pull digest evidence in `ecr-proof.txt`;
+- journal metadata/checksums, permission evidence, and recovery result in `journal-proof.txt`;
+- fault-period queue snapshots in `fault-period-metrics.txt`;
 - resource inventory before ownership, after apply, before cleanup, and after cleanup;
 - `KEEP_INFRA` value and, when `1`, owner/reason/expiry/cost/cleanup record;
 - exact redaction and credential-scan command/result.
 
-Evidence is current only for the recorded commit, environment, capabilities, and run. Historical evidence is not silently promoted.
+Raw Terraform and runbook output is bounded to 1 MiB per file in a mode-0700 temporary staging directory. Only explicit byte-redacted copies enter the manifest tree; the staging directory is removed after cleanup. Evidence is current only for the recorded commit, environment, capabilities, and run. Historical evidence is not silently promoted.
 
 ## Redaction contract
 

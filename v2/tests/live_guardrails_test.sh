@@ -27,7 +27,13 @@ printf 'reviewed fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/reviewed-plan-record.t
 printf 'apply fixture\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-apply.log"
 printf '{}\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/terraform-outputs.json"
 mkdir "$HIVEMIND_LIVE_EVIDENCE_DIR/runbook"
-printf 'request=1 status=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/api-identities.txt"
+printf 'request_id=1 status=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/api-identities.jsonl"
+printf 'fault_queue=0\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/fault-period-metrics.txt"
+printf 'instances=1\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/intermediate-inventory.txt"
+printf 'tasks=1 containers=1 cdi=verified cgroup=verified gpu=verified\n' >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/runtime-proof.txt"
+printf 'cold_pull=verified digest=sha256:%s\n' "$sha" >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/ecr-proof.txt"
+printf 'mode=0600 checksum=%s recovery=verified\n' "$sha" >"$HIVEMIND_LIVE_EVIDENCE_DIR/runbook/journal-proof.txt"
+"${HIVEMIND_LIVE_INVENTORY_HOOK:?}" post >"$HIVEMIND_LIVE_EVIDENCE_DIR/post-apply-inventory.txt"
 exit "${EXECUTOR_RC:-0}"
 STUB
 cat >"$TMP/cleanup" <<'STUB'
@@ -44,18 +50,23 @@ printf 'instances=%s\nvolumes=0\nnetwork_resources=0\nbuckets=0\nrepositories=0\
 STUB
 chmod +x "$TMP/bin/aws" "$TMP/executor" "$TMP/cleanup" "$TMP/inventory"
 : >"$TMP/review"
+expiry="$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+cat >"$TMP/approval.json" <<EOF
+{"account":"111111111111","account_alias":"fixture","region":"us-test-1","run_id":"fixture-run-1","ownership_token_sha256":"$(printf e1fixtureabc123 | sha256sum | awk '{print $1}')","workspace":"hm-e1fixtureabc123","terraform_plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","maximum_duration_seconds":14400,"maximum_estimated_cost_usd":10,"expires_at_utc":"$expiry","cost_approved":true,"cleanup_approved":true,"quota_confirmed":true}
+EOF
 export PATH="$TMP/bin:/usr/bin:/bin" FIXTURE_LOG="$TMP/calls.log"
 FIXTURE_ACCOUNT="$(printf '1%.0s' {1..12})"
 export FIXTURE_ACCOUNT
 
 base_env=(
   HIVEMIND_ALLOW_LIVE=1 HIVEMIND_LIVE_FIXTURE_MODE=1 HIVEMIND_AWS_ACCOUNT_ALLOWLIST="$FIXTURE_ACCOUNT"
-  AWS_REGION=us-test-1 HIVEMIND_AWS_REGION_ALLOWLIST=us-test-1
-  HIVEMIND_RUN_TOKEN=e1fixtureabc123 TF_WORKSPACE=hm-e1fixtureabc123
+  AWS_REGION=us-test-1 HIVEMIND_AWS_REGION_ALLOWLIST=us-test-1 HIVEMIND_AWS_ACCOUNT_ALIAS=fixture
+  HIVEMIND_RUN_ID=fixture-run-1 HIVEMIND_RUN_TOKEN=e1fixtureabc123 TF_WORKSPACE=hm-e1fixtureabc123
   HIVEMIND_LIVE_BUCKET=hm-e1fixtureabc123 HIVEMIND_LIVE_ECR=hm-e1fixtureabc123
   HIVEMIND_COST_APPROVED=1 HIVEMIND_CLEANUP_APPROVED=1 HIVEMIND_QUOTA_CONFIRMED=1 KEEP_INFRA=0
   HIVEMIND_APPROVED_PLAN_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  HIVEMIND_PLAN_REVIEW_RECORD="$TMP/review" HIVEMIND_LIVE_EXECUTOR="$TMP/executor"
+  HIVEMIND_PLAN_REVIEW_RECORD="$TMP/review" HIVEMIND_LIVE_APPROVAL_RECORD="$TMP/approval.json"
+  HIVEMIND_LIVE_EXECUTOR="$TMP/executor"
   HIVEMIND_LIVE_CLEANUP="$TMP/cleanup" HIVEMIND_LIVE_INVENTORY="$TMP/inventory"
   HIVEMIND_LIVE_EVIDENCE_DIR="$TMP/evidence"
 )
@@ -66,6 +77,12 @@ for private_helper in "$SCRIPT_DIR/live/execute-reviewed-plan.sh" "$SCRIPT_DIR/l
     echo "FAIL: direct private live helper execution accepted: $private_helper" >&2; exit 1
   fi
   grep -q 'private live helper requires guarded parent' "$TMP/direct-helper.out"
+  HELPER="$private_helper" HIVEMIND_ALLOW_LIVE=1 HIVEMIND_GUARDRAILS_ACTIVE=1 \
+      bash -c 'exec 9<"$1"; bash -c '\''"$HELPER"; :'\''' "$RUNNER" "$TMP/review" \
+      >"$TMP/forged-tree.out" 2>&1
+  grep -q 'private live helper requires guarded parent' "$TMP/forged-tree.out" || {
+    echo "FAIL: forged argv process tree passed helper guard: $private_helper" >&2; exit 1
+  }
 done
 if "$SCRIPT_DIR/../scripts/poc-runbook.sh" >"$TMP/direct-runbook.out" 2>&1; then
   echo "FAIL: direct unguarded runbook execution accepted" >&2; exit 1
@@ -109,6 +126,8 @@ grep -q 'KEEP_INFRA=0' "$TMP/preflight.out"
 : >"$FIXTURE_LOG"; rm -rf "$TMP/evidence"
 env "${base_env[@]}" "$RUNNER" >"$TMP/success.out"
 [[ "$(cat "$FIXTURE_LOG")" == $'aws:sts get-caller-identity --query Account --output text --region us-test-1\nexecutor\ncleanup' ]]
+grep -q '^instances=0$' "$TMP/evidence/post-apply-inventory.txt"
+grep -q '^instances=0$' "$TMP/evidence/pre-cleanup-inventory.txt"
 grep -q '^instances=0$' "$TMP/evidence/post-cleanup-inventory.txt"
 if grep -Rq 'e1fixtureabc123' "$TMP/success.out" "$TMP/evidence"; then
   echo "FAIL: raw ownership token entered publishable output" >&2; exit 1

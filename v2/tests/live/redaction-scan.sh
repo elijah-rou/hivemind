@@ -23,7 +23,7 @@ if [[ -n "$TOKEN" ]]; then
     for file in "${files[@]}"; do
         [[ "$file" != *"$TOKEN"* ]] || { echo "FAIL: ownership token appears in evidence path" >&2; exit 1; }
     done
-    if [[ "${#files[@]}" -gt 0 ]] && grep -IlF -- "$TOKEN" "${files[@]}" | grep -q .; then
+    if [[ "${#files[@]}" -gt 0 ]] && grep -alF -- "$TOKEN" "${files[@]}" | grep -q .; then
         echo "FAIL: redaction scan found raw ownership token" >&2
         exit 1
     fi
