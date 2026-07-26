@@ -44,6 +44,8 @@ struct RunConfig {
     snapshotter: String,
     metrics_port: Option<u16>,
     encryption_key_hex: String,
+    test_process_controls: bool,
+    test_process_base_port: u16,
 }
 
 fn parse_replica_addrs(replica_addr: &str) -> Vec<String> {
@@ -79,6 +81,8 @@ where
     let mut snapshotter = "overlayfs".to_string();
     let mut metrics_port: Option<u16> = None;
     let mut encryption_key_hex = String::new();
+    let mut test_process_controls = false;
+    let mut test_process_base_port = 15_000;
 
     let mut i = 0;
     while i < args.len() {
@@ -97,6 +101,14 @@ where
             }
             "--encryption-key" if i + 1 < args.len() => {
                 encryption_key_hex = args[i + 1].clone();
+                i += 2;
+            }
+            "--test-process-controls" => {
+                test_process_controls = true;
+                i += 1;
+            }
+            "--test-process-base-port" if i + 1 < args.len() => {
+                test_process_base_port = args[i + 1].parse().unwrap_or(0);
                 i += 2;
             }
             _ if replica_addr.is_empty() => {
@@ -133,6 +145,8 @@ where
         snapshotter,
         metrics_port,
         encryption_key_hex,
+        test_process_controls,
+        test_process_base_port,
     }
 }
 
@@ -171,6 +185,32 @@ fn cmd_run(args: &[String]) {
     let snapshotter = cfg.snapshotter;
     let metrics_port = cfg.metrics_port;
     let encryption_key_hex = cfg.encryption_key_hex;
+    let test_process_controls = cfg.test_process_controls;
+    let test_process_base_port = cfg.test_process_base_port;
+
+    if test_process_controls && runtime_mode != "process" {
+        eprintln!("--test-process-controls requires --runtime process");
+        std::process::exit(2);
+    }
+    if !test_process_controls && test_process_base_port != 15_000 {
+        eprintln!("--test-process-base-port requires --test-process-controls");
+        std::process::exit(2);
+    }
+    if test_process_base_port == 0 {
+        eprintln!("--test-process-base-port must be nonzero");
+        std::process::exit(2);
+    }
+    if test_process_controls
+        && test_process_base_port
+            .checked_add(runtime::process::TEST_PROCESS_PORT_COUNT)
+            .is_none()
+    {
+        eprintln!(
+            "--test-process-base-port must leave room for {} bounded ports",
+            runtime::process::TEST_PROCESS_PORT_COUNT
+        );
+        std::process::exit(2);
+    }
 
     #[cfg(not(target_os = "linux"))]
     let _ = &snapshotter;
@@ -268,10 +308,19 @@ fn cmd_run(args: &[String]) {
         );
     }
 
-    // Runtime ownership spans control-plane sessions. Reconnects reset transport
-    // registration only; recreating the runtime would orphan retained pod handles.
+    // Runtime ownership spans every control-plane session. Reconnects reset
+    // transport registration only; recreating this owner would orphan pods.
     let runtime_owner = RuntimeOwner::new(|| match runtime_mode.as_str() {
-        "process" => Box::new(runtime::process::ProcessRuntime::new()),
+        "process" => {
+            if test_process_controls {
+                eprintln!("worker: explicit test-only process controls enabled");
+                Box::new(runtime::process::ProcessRuntime::with_test_controls(
+                    test_process_base_port,
+                ))
+            } else {
+                Box::new(runtime::process::ProcessRuntime::new())
+            }
+        }
         "simulated" => Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())),
         #[cfg(target_os = "linux")]
         "containerd" => {
@@ -362,8 +411,8 @@ mod tests {
     use hivemind_worker::message::{ControlMessage, StartPodCmd};
     use hivemind_worker::runtime::Runtime;
     use hivemind_worker::sim;
-    use hivemind_worker::types::GpuType;
-    use hivemind_worker::worker::TrackedPodState;
+    use hivemind_worker::types::{self, GpuType};
+    use hivemind_worker::worker::{self, TrackedPodState};
     use std::cell::Cell;
     use std::collections::HashMap;
 
@@ -448,17 +497,47 @@ mod tests {
     }
 
     #[test]
-    fn runtime_owner_is_constructed_once_across_sessions() {
+    fn runtime_owner_is_constructed_once_across_connection_loss() {
         let constructions = Cell::new(0);
         let owner = RuntimeOwner::new(|| {
             constructions.set(constructions.get() + 1);
             Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())) as Box<dyn Runtime>
         });
-        let first = owner.runtime() as *const dyn Runtime as *const ();
-        let second = owner.runtime() as *const dyn Runtime as *const ();
+        let first_runtime = owner.runtime() as *const dyn Runtime as *const ();
+
+        let mut node_worker = worker::Worker::new(
+            "runtime-owner-test".into(),
+            types::GpuType::None,
+            0,
+            1000,
+            1024,
+        );
+        node_worker.on_connection_lost();
+        let second_runtime = owner.runtime() as *const dyn Runtime as *const ();
 
         assert_eq!(constructions.get(), 1);
-        assert_eq!(first, second);
+        assert_eq!(first_runtime, second_runtime);
+    }
+
+    #[test]
+    fn process_test_controls_are_disabled_by_default_and_require_explicit_flag() {
+        let default_cfg = parse(&["127.0.0.1:9000"], &[]);
+        assert!(!default_cfg.test_process_controls);
+
+        let enabled_cfg = parse(&["127.0.0.1:9000", "--test-process-controls"], &[]);
+        assert!(enabled_cfg.test_process_controls);
+        assert_eq!(default_cfg.test_process_base_port, 15_000);
+
+        let isolated_cfg = parse(
+            &[
+                "127.0.0.1:9000",
+                "--test-process-controls",
+                "--test-process-base-port",
+                "24500",
+            ],
+            &[],
+        );
+        assert_eq!(isolated_cfg.test_process_base_port, 24_500);
     }
 
     fn running_pod_sim(pod_id: u64) -> sim::simulator::WorkerSimulator {
