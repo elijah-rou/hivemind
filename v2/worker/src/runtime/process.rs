@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ const BASE_PORT: u16 = 15000;
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_PATH_MAX: usize = 1024;
 const HTTP_STATUS_LINE_MAX: usize = 1024;
+const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 
 struct RunningProcess {
     child: Child,
@@ -292,6 +293,27 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 }
 
+fn wait_for_child_exit_until<F>(
+    deadline: Instant,
+    mut try_wait: F,
+) -> std::io::Result<Option<ExitStatus>>
+where
+    F: FnMut() -> std::io::Result<Option<ExitStatus>>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    loop {
+        if let Some(status) = try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+}
+
 /// Send a bounded HTTP GET and accept exactly a well-formed `200` status line.
 pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
     validate_probe_path(path)?;
@@ -559,6 +581,15 @@ mod tests {
             runtime.pod_status(&handle),
             Err(RuntimeError::ContainerNotFound(_))
         ));
+    }
+
+    #[test]
+    fn post_kill_wait_is_bounded_when_exit_remains_unobservable() {
+        let started = Instant::now();
+        let status =
+            wait_for_child_exit_until(started + Duration::from_millis(20), || Ok(None)).unwrap();
+        assert!(status.is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
