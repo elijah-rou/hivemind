@@ -35,11 +35,223 @@ These principles are non-negotiable. Every component must be built with these in
 - Mature ecosystem (K8s clients, HTTP servers, Prometheus)
 - Good enough performance for orchestration layers
 
-See `docs/STATUS.md` for current implementation architecture and `docs/frozen/ARCHITECTURE.md` for historical rationale.
+See [STATUS.md](STATUS.md) for current implementation architecture and [frozen/ARCHITECTURE.md](frozen/ARCHITECTURE.md) for historical rationale.
 
 ---
 
-## Protocol compatibility boundary
+## Test-harness architecture and boundaries
+
+This section describes executable topology separately from future acceptance topology. Mutable limits, ports, and wire constants remain source-owned; follow the linked files instead of copying values from this document into automation. [TESTING.md](TESTING.md) defines evidence semantics, and the [harness catalog](../tests/README.md) defines script operation.
+
+### Historical accepted local evidence
+
+The historical accepted run on 2026-07-25 tested code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, from `2026-07-25T01:06:39Z` through `01:14:01Z`. All `25 / 25` bounded gates passed (`0` failed), with `433s` summed gate time and `442s` wall time.
+
+The matrix included Zig Debug and ReleaseFast, 29 core regression replays, a four-thread mutated core sweep of exact seeds `0..9999` (`10,000`, `0` failures, `164.9s`), Rust formatting and all targets (`176 + 3 + 7 + 5` tests; containerd-feature binary `0`), 27 worker regression replays, and a four-thread mutated worker sweep of exact seeds `0..999` (`1,000`, `0` failures, `6.6s`). Go API/bench formatting, race tests, and builds passed. The `--skip-containerd` aggregate passed all `26` invoked phases in `139s`, including real local process/socket/filesystem failover, recovery, and `/run` contracts. The shared protocol-v6 gate passed under `PYTHONOPTIMIZE=2`; active Bash syntax, default ShellCheck, docs/layout, Terraform formatting, and backend-disabled readonly init/static validation of all four roots passed.
+
+The bounded value-redacting credential scanner passed self-tests with 12 safe, 6 unsafe, and 2 redacted-output fixtures, then found no reportable changed-line credential. Residue self-tests and the final inventory found zero branch-owned processes, branch-attributable listener deltas, port locks, or lock owners; unrelated pre-existing host listeners were not owned by the run. Containerd/full-stack and privileged namespace/cgroup execution, Docker, GPU/CDI, Nydus, JuiceFS, Doppler, private registry/image pulls, AWS/ECR/EKS/S3/SSM/systemd, Terraform plan/apply/destroy/provider operations, `tests/live/run.sh`, `scripts/poc-runbook.sh`, and every live/cost/destructive action were explicitly skipped or unexecuted. Prepared E1 harnesses are not execution evidence. Current live-resource state remains unknown pending authorized inventory, and no product/runtime limitation changed. This record attests only historical `bc9f5f63` / tree `78f4c95c`; fresh full acceptance of the rewritten ten-PR tip is pending the final matrix.
+
+### Component and boundary map
+
+| Layer | Current, implemented components | Boundary actually crossed | Source of truth |
+|---|---|---|---|
+| Zig control-plane DST | VRR replicas and state machines, simulated `Io`, network and disk, virtual clock, checker, trace, seeded VOPR runner | Deterministic message-level and whole-I/O model | [`core/src/vopr/`](../core/src/vopr/), [`core/src/disk.zig`](../core/src/disk.zig) |
+| Rust worker DST | production `Worker`, `SimulatedIo`, structurally bidirectional `SimulatedNetwork`, `SimulatedRuntime`, `ControlPlaneStub`, `WorkerChecker`, runner | Deterministic worker lifecycle/runtime model | [`worker/src/sim/`](../worker/src/sim/) |
+| Local run contract | three journal-backed Zig replicas, Go API, Rust worker/process runtime, Go bench | Real processes, localhost sockets, retained filesystem state, negative `/run` outcomes, kill/restart reprobe | [`tests/local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh) |
+| Local failover contract | three journal-backed Zig replicas, Go API, Rust worker/process runtime | Real process/runtime traffic across leader kill, election, retained restart, and convergence | [`tests/local-failover-smoke.sh`](../tests/local-failover-smoke.sh) |
+| Local storage recovery | the same cluster stopped and restarted from three retained journal directories | Committed state survives failover, rejoin, and full restart; a new command commits afterward | [`tests/local-storage-recovery-smoke.sh`](../tests/local-storage-recovery-smoke.sh) |
+| Containerd component integration | privileged Docker test environment, containerd, Rust runtime tests | Real runtime namespace/task/cgroup behavior; not the full stack | [`tests/containerd/`](../tests/containerd/), [`worker/tests/containerd_integration.rs`](../worker/tests/containerd_integration.rs) |
+| Infrastructure tooling | Terraform, ECR, S3/SSM helpers, SSH/systemd deployment, POC CPU/GPU scripts | Historical and operator tooling boundaries; no guarded current live gate | [`infra/`](../infra/) |
+
+### Current, implemented: Zig VOPR topology
+
+```text
+                         seeded driver
+                  fuzz.zig / vopr.zig
+                              |
+             fault schedule + requests + virtual ticks
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+   Replica 0             Replica 1             Replica N
+   StateMachine          StateMachine          StateMachine
+   SimulatedIo           SimulatedIo           SimulatedIo
+   SimulatedDisk         SimulatedDisk         SimulatedDisk
+        |                     |                     |
+        +---------- bounded SimulatedNetwork ------+
+                              |
+                 StateChecker / safety oracles
+                              |
+                 trace + seed replay + JSONL
+                    generated failure corpus
+```
+
+[`TestCluster`](../core/src/vopr/test_harness.zig) owns the replicas, state machines, per-replica disks, running/paused state, seeded PRNG, virtual tick, network, and checker. [`SimulatedIo`](../core/src/vopr/simulated_io.zig) maps a tick to virtual time and routes replica traffic through in-memory queues. Paused replicas retain memory and disk but do not tick, sync, publish, or receive queued traffic. Crash/restart discards modeled unsynced writes and rebuilds memory from durable simulated disk.
+
+[`SimulatedNetwork`](../core/src/vopr/simulated_net.zig) bounds destination queues and message size and models delay, asymmetric partition, drop, replay, path capacity, and selected one-shot drops. [`VoprConfig`](../core/src/vopr/vopr.zig) owns current replica/tick/workload defaults and available network, pause, crash, disk, and durability-cut faults. [`StateChecker`](../core/src/vopr/checker.zig) bounds canonical history to the retained log and checks complete committed identity, durable commit regression, replica invariants, and healed convergence including active log and committed state digest. [`TraceCollector`](../core/src/vopr/trace.zig) owns trace bounds and event inventory.
+
+The [fuzz runner](../core/src/fuzz.zig) supplies sequential, random, and replay seed modes, mutation, bounded thread/budget options, and trace output. Failures append to `core/fuzz_failures.jsonl`; that generated replay corpus is evidence, not a normative wire corpus. Exact invocations are in [TESTING.md](TESTING.md).
+
+**Current limitation:** VOPR proves invariants only within its deterministic message-level and whole-I/O fault model. It does not prove kernel TCP behavior, process scheduling, actual filesystem ordering, torn sectors, power loss, systemd, containerd namespaces/cgroups, GPU/CDI, or cloud-provider correctness.
+
+### Current, implemented: Rust worker simulation topology
+
+```text
+                    seeded runner / fault schedule
+                          runner.rs
+                              |
+                      ControlPlaneStub
+                        |           ^
+               inbound |           | outbound structure
+                        v           |
+                    SimulatedNetwork
+                              |
+        +---------------------+---------------------+
+        |                     |                     |
+     Worker 0              Worker 1              Worker N
+  SimulatedIo           SimulatedIo           SimulatedIo
+  SimulatedRuntime      SimulatedRuntime      SimulatedRuntime
+        |                     |                     |
+        +------------- WorkerChecker ---------------+
+```
+
+| Component | Current role | Current limitation |
+|---|---|---|
+| [`Worker`](../worker/src/worker.rs) | Production worker state machine exercised through injected I/O and runtime interfaces | Simulation cannot attest host or cloud integration |
+| [`SimulatedIo`](../worker/src/sim/io.rs) | Virtual tick, seeded random values, inbound control messages, outbound worker messages | Per-tick inbound and outbound staging is fail-loud bounded at 256 messages; it is not a real socket buffer |
+| [`SimulatedNetwork`](../worker/src/sim/network.rs) | Separate bounded control-plane-to-worker and worker-to-control-plane queues, delays, partitions, one-shot ratio replay, ratio drop, and path capacity | Models messages, not kernel TCP/session behavior |
+| [`SimulatedRuntime`](../worker/src/sim/runtime.rs) | Pull/create/start/forward/probe/stop/status/remove, bounded scripted probe outcomes, and spontaneous crash model | No real process namespace, containerd, cgroup, mount, CDI, or GPU behavior |
+| [`ControlPlaneStub`](../worker/src/sim/control_plane.rs) | Bounded seeded command schedule and received-message recorder | Not a Zig replica or real protocol endpoint |
+| [`WorkerChecker`](../worker/src/sim/checker.rs) | GPU/CPU/memory accounting, legal pod transitions, heartbeat liveness | No cross-language protocol oracle |
+| [`runner.rs`](../worker/src/sim/runner.rs) | Seeded safety/liveness phases and configured bidirectional network/runtime faults | Pause partitions instead of freezing worker execution |
+
+Worker output enters `send_from_agent` after a worker tick and can reach the recorder only through `pop_outbound` at the beginning of a later tick. Partition, ratio drop/replay, delay, and path capacity apply to both directions; accepted worker message counts and encoded payload bytes are tracked. Queue entries carry explicit session epochs and preserve FIFO under variable delay. Delayed partitions retain the current session and queued traffic. Explicit session loss advances the epoch, discards both old-session queues, invokes `Worker::on_connection_lost`, and requires re-registration before later new-session traffic. Deterministic registration, heartbeat, exact pod-status sequence, run-response, one-shot replay, and session-loss cases assert identities, ordering, counts, and no extra delivery.
+
+Runner convergence requires a control-plane-observed registration from every worker after the most recent explicit session loss and a control-plane-observed terminal status for every generated start command. The healed liveness phase retries unresolved registration and start commands through the same faulted network; permanent total loss therefore fails liveness rather than passing with an empty worker state. Worker liveness HTTP checks use the injected `Runtime::probe_pod` boundary. The simulated runtime consumes at most 64 explicitly scripted probe outcomes and 64 explicitly scripted `/run` outcomes per pod. Named liveness scenarios prove that a success clears two consecutive failures and that a third consecutive failure retains runtime ownership through verified stop/removal before publishing `Failed`. The three-failure scenario injects a failed stop and proves that accounting denies replacement GPU admission while the original runtime remains live. Named GPU and `/run` scenarios reject a mismatched nonzero GPU type before allocating resources, then exercise statuses 0, 4, 6, and 7 for success, overflow, forwarding failure or timeout, and crash/no-running-pod. Partition-healed response delivery uses the same bidirectional B1 simulated network; every request preserves its identity, response bound, and CPU, memory, and GPU accounting. Process probes enforce one absolute connect/write/status-read deadline, bound request-target and HTTP status-line lengths, require the status-code separator, and accept only exact status code 200. Stop grace is capped at 30 seconds; process and containerd runtimes use TERM/grace/KILL, containerd polls for early exit, and shutdown uses one bounded reconciliation pass with a 20-second aggregate grace budget before nonzero exit. Terminal publication and resource release require verified runtime and mount cleanup, including spontaneous crashes and transient-start failures. Containerd verifies exact task, container, and owned shim absence during removal. It resolves the task PID and performs network-namespace work in a disposable thread, containing any namespace-restoration failure to that thread. Process and containerd runtimes reject GPU workloads until concrete per-pod physical device reservation is implemented.
+
+**Current limitation:** delayed partitions are a bounded queued-delivery model, while explicit session loss drops whole queued messages. Neither is a complete model of kernel TCP buffers, partial-frame loss, half-close, or reconnect timing. Pause still partitions rather than freezing worker execution. Evidence must not generalize these scenarios to process, containerd, GPU, or cloud behavior.
+
+### Current, implemented: reusable local real-process contracts
+
+#### Three-replica full-stack run contract
+
+```text
+HTTP/bench -> Go API -> three journal-backed Zig replicas
+                                  |
+                                  v
+                        Rust worker, process runtime
+                                  |
+                                  v
+                           child workload process
+```
+
+[`local-smoke.sh`](../tests/local-smoke.sh) is now a compatibility entry point for the three-replica [`local-run-contract-smoke.sh`](../tests/local-run-contract-smoke.sh). The maintained contract crosses real process, localhost TCP, retained journal, process-runtime child, API reprobe, and bench boundaries. It checks success, statuses 4/6/9, exact enqueue/dispatch deltas for abandonment, status 9 from the restarted old leader after that exact replica becomes a normal follower, one aggregate dispatch delta after the API reprobe, exactly-once execution, and exact zero queue/in-flight metrics. Explicit test-only process controls are disabled by default, retain only one bounded last-payload execution counter slot when enabled, and do not alter default process responses.
+
+#### Three-replica data-plane failover
+
+```text
+                              Go API
+                        /       |       \
+                       v        v        v
+                Zig replica 0  replica 1  replica 2
+                journal dir    journal   journal
+                    ^------------+------------^
+                             VRR peer TCP
+
+commit -> kill leader -> reconnect/elect -> commit
+       -> restart old replica from its retained directory
+```
+
+[`local-failover-smoke.sh`](../tests/local-failover-smoke.sh) uses the shared three-replica harness, starts the Rust worker/process runtime, executes `/run` before killing the elected leader, waits separately for replacement-leader worker/pod readiness, then executes the post-failover workload exactly once without manually retrying an ambiguous result. Explicit test controls require `execution_count == 1`. The contract restarts the old replica with the same journal and requires commit/state convergence plus exact zero accounting. It is mandatory in `run-all.sh` unless `--skip-smoke` is explicit.
+
+#### Retained storage recovery
+
+[`storage_mode_smoke_test.sh`](../tests/storage_mode_smoke_test.sh) is now a compatibility entry point for [`local-storage-recovery-smoke.sh`](../tests/local-storage-recovery-smoke.sh). The maintained contract commits named state, kills and rejoins a leader from its journal, stops and restarts the full cluster from all three retained directories, verifies original state and commit/state convergence, and commits new state.
+
+### Current, implemented: combined local recovery and run contract
+
+```text
+HTTP and bench clients
+          |
+          v
+        Go API
+          |
+          +------ three journal-backed Zig replicas ------+
+          |                 VRR peer TCP                   |
+          +------------------------------------------------+
+                              |
+                              v
+                    real Rust worker process
+                       process runtime
+                              |
+                         workload process
+
+commit state + successful /run
+ -> kill leader while traffic continues
+ -> elect new leader and restart old leader
+ -> prove watermark and state convergence
+ -> stop/restart the full cluster from retained directories
+ -> verify old state and commit new state
+ -> exercise negative /run and abandonment outcomes
+ -> require queue and in-flight metrics to return to zero
+```
+
+[`tests/lib/local_cluster.sh`](../tests/lib/local_cluster.sh) implements this topology with isolated exact ports and token-owned locks. Every component leads an inventoried owned process group; cleanup records the leader's start identity, inventories all non-zombie members by PGID even after the leader exits, sends CONT before TERM, polls boundedly, falls back to group KILL, and verifies no owned process, exact listener, or lock remains on both pass and failure. `ss` is mandatory for listener allocation and cleanup inventory. Cleanup does not use broad process-name killing. Failover, storage recovery, and run contract are mandatory aggregate phases unless `--skip-smoke` is explicit, and every aggregate phase has a 900-second deadline.
+
+### Current, implemented: privileged runtime-component containerd
+
+```text
+host Docker
+    |
+    v
+privileged test container
+    |
+    +-- real containerd daemon
+    |
+    `-- Rust containerd integration tests
+             |
+             v
+       ContainerdRuntime
+       namespace/tasks/cgroups/network namespace
+```
+
+[`tests/containerd/run-tests.sh`](../tests/containerd/run-tests.sh) builds the test image and uses privileged Docker; [`run.sh`](../tests/containerd/run.sh) starts containerd, checks `ctr`, and runs Rust integration tests serially. The tests cover runtime lifecycle and include constructing a replacement runtime that adopts one verified live owned task before stale cleanup while preserving task PID continuity. Runtime socket, namespace, runtime, snapshotter, command bounds, and cleanup behavior remain owned by [`containerd.rs`](../worker/src/runtime/containerd.rs). This gate starts neither Zig nor Go nor a networked worker process. Optional gVisor, Nydus, and JuiceFS branches can skip or tolerate absence and are not strict acceptance evidence. GPU execution is blocked on physical device reservation.
+
+### Prepared, not executed: full-stack containerd recovery
+
+```text
+HTTP client -> Go API -> Zig replica cluster -> Rust worker process
+                                                     |
+                                                     v
+                                               real containerd
+                                        namespace / cgroups / task shims
+                                                     |
+                                              workload container
+
+restart worker -> adopt or safely recreate owned task
+               -> recover request path
+               -> remove owned task/container state
+```
+
+[`tests/containerd/full-stack.sh`](../tests/containerd/full-stack.sh) prepares this exact topology inside the privileged full-stack image. It records baseline task/container inventories, starts three retained Zig replicas plus Go API and Rust worker/containerd, sends traffic, restarts the worker, requires adoption/recreation and recovered traffic, deletes the deployment, and requires exact baseline inventory. Cleanup removes only inventory deltas and chains into the bounded local process cleanup. `--require-containerd` makes component and full-stack absence/failure nonzero. E1 did not execute this privileged boundary, so it is prepared harness code, not containerd evidence.
+
+### Historical/tooling boundary: infrastructure and cloud
+
+```text
+operator
+   |
+Terraform roots ----> EC2/network/ECR resources
+   |
+deploy tooling -----> SSH + systemd + replicas/workers
+   |
+POC tooling --------> CPU/GPU workload and failure scripts
+   |
+artifacts ----------> local files + ownership-scoped S3 + SSM output
+```
+
+[`infra/poc/`](../infra/poc/), [`infra/bench/`](../infra/bench/), [`infra/gpu-test/`](../infra/gpu-test/), and [`infra/poc-eks/`](../infra/poc-eks/) contain Terraform, ECR, S3/SSM, SSH/systemd, CPU/GPU, workload, benchmark, and cleanup tooling. [`tests/live/run.sh`](../tests/live/run.sh) is the only prepared unified acceptance wrapper: it requires literal authorization, account/region allowlists, unique token-derived workspace/bucket/ECR names, reviewed-plan digest binding, cost/cleanup approvals, pre-ownership zero inventory, trap installation before execution, and post-cleanup zero inventory. The wrapped runbook refuses direct live execution outside that guard. Evidence generation is bounded and redaction-scanned. E1 ran deterministic stubs only, so no current cloud, provider, systemd, S3/SSM, GPU, ECR, or cleanup evidence exists.
+
+### Protocol and version process
 
 | Surface | Current framing/version owner | Fixture state | Change rule |
 |---|---|---|---|
@@ -74,6 +286,29 @@ Required mapping:
 Acceptance evidence belongs in `docs/POC_V2_ACCEPTANCE.md` and `docs/POC_CHANGELOG.md`. Generated benchmark/run artifacts stay ignored unless explicitly promoted to curated docs.
 
 Design rule: Hivemind should not clone broad Kubernetes APIs by default. Build primitives needed for inference workloads and Hivemind-native serving semantics; integrate external systems for GitOps, certs, logging backends, and provider identity where cloning has poor ROI.
+
+## Bounded operational boundaries
+
+- Bench replacement is serialized per node and owned by a uniquely named transient systemd service. A deploy must bound `systemctl stop`, verify the old unit is inactive, and start the expected executable/argument vector with journald diagnostics. Raw PID files and numeric signaling are not part of the contract.
+- Bench transfer artifacts use an internally generated AWS-account-scoped 128-bit run identity, content-addressed object keys, and an exit trap armed before preparation. The trap is a no-op until a conditional per-invocation marker write succeeds or an ambiguous write is reconciled to the exact token and claim. This prevents us-east-1 already-owned success or same-token races from becoming ownership while ensuring every later verification/upload failure cleans proven ownership. AWS calls use GNU `timeout` with TERM then bounded KILL for the full process group. Cleanup revalidates the current exact marker before removing only the owned run prefix and bucket unless explicit keep mode is enabled.
+- Active POC shell HTTP calls use `infra/poc/http.sh`, which always sets explicit connect and total request timeouts. Operation-specific callers may narrow the total timeout. Retry helpers must clean temporary workspaces on every post-creation return and fail if a requested response artifact cannot be copied.
+- Go JSON mutation handlers bound bytes before decoding, accept exactly one JSON value, and validate fixed-wire string and array maxima.
+- Fixed-size worker register, heartbeat, and pod-status messages require exact payload lengths. Malformed worker frames close the sender so owned correlations are released.
+
+## Stable storage and group commit
+
+Validated POC storage contract when a journal is configured: write/sync success before publication, fail-stop on complete I/O errors, fail-closed 1024-op retention. This is an experimental POC contract only — not production crash durability under torn writes or power loss.
+
+1. `--data-dir` is optional. Absent: explicit logged volatile POC mode (in-memory only; not durable across restart). Present: experimental v2 single-copy file journal with an explicit warning that torn writes and power loss are not validated and are not simulated. When present, the data directory is created/chmod'd to `0700`; `journal.bin` is created mode `0600` (commands may contain registry passwords or secret names). Actual legacy layout v1 journals are rejected fail-closed as incompatible at open; no specific error category is promised (no migration).
+2. Journal slot writes and protocol metadata are staged on the replica control loop.
+3. A single synchronous durability barrier (`fdatasync`, with `fsync` fallback) covers the flush batch for that tick.
+4. Prepare / PrepareOk / client replies / worker side effects are published only after the barrier that covers their current entry identity `(op, checksum)` succeeds. A monotonic op watermark alone is not sufficient after same-op replacement (view change / StartView).
+5. Any whole write/metadata/sync error sets `storage_failed`, stops consensus/client/worker traffic, and causes the production process to exit nonzero. Simulation models whole write/sync failures and unsynced-write loss only — not torn/partial sector writes or power-loss bit corruption.
+6. Opening an existing `journal.bin` that is not exactly the expected layout size fails closed (no silent empty re-init of truncated/partial journals). New journals are created exclusively (`O_EXCL`) and the parent directory is fsynced. FileDisk layout is version 2: fixed-size little-endian header, metadata, LogEntry, canonical tag-first Command, and checksum input codecs, with no native struct/union bytes in the durable format. Actual legacy v1 journals are rejected fail-closed as incompatible; callers may observe a size or version rejection. This POC does not support mixed-version peer clusters or in-place legacy-v1 journal upgrades. Operators must stop the full cluster and restart v2 with fresh data directories or legacy data explicitly archived/replaced out of band. No rolling migration or incarnation protocol is implemented or claimed. Fail-closed 1024-op retained-log lifetime cap remains.
+7. Restart recovery on the experimental journal is best-effort: validate the metadata-declared committed prefix checksum chain, then rejoin via view change. VOPR enforces canonical recovered-prefix and immutable committed-prefix contracts (`observeRecovery`, StartView/DVC rejection of conflicting committed entries). Corrupt/truncated/wrong-sized journals fail-stop.
+8. S3 journal backup (`aws s3 cp` of the mutable v2 `journal.bin`) is **not** an atomic restore artifact and does not guarantee a crash-consistent snapshot.
+
+Group commit keeps sync count O(1) per tick batch (typically one prepare barrier and one commit-metadata barrier), not one sync per operation. Persistence remains on the single core loop; slow disks can still stall unrelated work. Snapshots are required before removing the 1024-operation retained-log cap. Crash-consistent versioned storage plus torn-write simulation remain a production blocker (see `docs/FINDINGS_AND_ISSUES.md`).
 
 
 ## Principle 1: Deterministic Simulation Testing
@@ -1121,8 +1356,27 @@ fn test_scheduler_under_network_partition() {
 
 Run request bodies are bounded by `MAX_PAYLOAD = 512` bytes (Zig `request_queue.MAX_PAYLOAD`, Go `MaxRunPayload`, Rust `MAX_RUN_PAYLOAD`).
 
-Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Response bodies are bounded by `MAX_RUN_RESPONSE_BODY = 16 KiB - 9 bytes`. Zero-length and exactly-512 request bodies are valid.
+Declared `payload_len` must equal the trailing body byte count exactly (no clamp, truncation, or trailing bytes). Oversized or mismatched lengths are rejected. Gateway `sendRunError` replies remain 9 bytes (status only); successful client run responses require an exact length prefix. Zero-length and exactly-512 bodies are valid.
 
-The shared `/run` status bytes are: `0 ok`, `1 deployment_not_found`, `2 queue_full`, `3 invalid_payload`, `4 response_too_large`, `5 outcome_ambiguous`, `6 forwarding_failed`, `7 no_running_pod`, `8 unavailable`, and `9 not_leader`. Workers may emit only 0-8. Status 9 is core-only and proves rejection before enqueue; a worker-emitted 9 is a protocol violation that disconnects that worker.
+The `/run` status byte is one non-overlapping enum across Zig, Rust, the Go API, the Go bench, and shell automation:
 
-Write or read failures can leave execution ambiguous and must never trigger an automatic resend. The sole safe exception is one reprobe and resend of the same request ID after an explicit status-9 response. The Go API and workload bench apply that exception at most once; every other non-success status is returned without an implicit resend.
+| byte | name | retry automatically |
+|---:|---|---|
+| 0 | `ok` | n/a |
+| 1 | `deployment_not_found` | no |
+| 2 | `queue_full` | yes |
+| 3 | `invalid_payload` | no |
+| 4 | `response_too_large` | no |
+| 5 | `outcome_ambiguous` | no |
+| 6 | `forwarding_failed` | no |
+| 7 | `no_running_pod` | yes |
+| 8 | `unavailable` | yes |
+| 9 | `not_leader` | gateway client: once; shell automation: no |
+
+`outcome_ambiguous` means the worker may have accepted the request before a write failure or disconnect. `forwarding_failed` means a selected running pod's HTTP forwarding operation failed. `no_running_pod` means the worker had no eligible pod. `unavailable` is emitted only when no request bytes were sent. `not_leader` is gateway-only and is emitted before enqueue; workers must never emit it, and a worker frame carrying byte 9 is a protocol violation that disconnects that worker. The Go gateway client safely retries one time only after an explicit `not_leader`, because that response proves the request was not executed. HTTP errors always include the matching machine-readable `error` and numeric `status`. Operator automation retries only exact, valid JSON `unavailable`, `queue_full`, and `no_running_pod`; it aborts on transport errors, malformed responses, `not_leader`, ambiguous outcomes, forwarding failures, overflow, and permanent statuses.
+
+## Peer identity limitation
+
+Configured peer targets and validated socket identities are separate. Outbound TCP connect is nonblocking and bounded by a 2,000-tick completion deadline; successful TCP alone does not create an established peer binding. Both outbound and accepted sockets must carry a valid identity-consistent VRR frame within a further 2,000 ticks or they expire and the configured target remains retryable. Once validated, application frames cannot replace or evict that binding. For each configured pair, only the lower replica ID initiates TCP and the higher ID accepts inbound.
+
+This initial binding is unauthenticated unless the shared encryption key is configured, and a shared key still does not provide unique per-peer identity. Authenticated per-peer TLS/mTLS handshakes remain required. Mixed-version rolling upgrades are unsupported; stop and upgrade the full cluster together.
