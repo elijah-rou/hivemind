@@ -194,9 +194,8 @@ test "invalid PSK hex rejected" {
     try std.testing.expectError(error.InvalidHexKey, EncryptionState.init("gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"));
 }
 
-test "HKDF golden bytes cross-language" {
-    // These derived keys MUST match across Zig, Rust, and Go.
-    // If this test fails after changing HKDF parameters, update all three languages.
+test "HKDF purpose keys are deterministic" {
+    // Cross-language agreement is owned by tests/wire/contract-v6.json consumers.
     const psk_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const state = try EncryptionState.init(psk_hex);
 
@@ -213,12 +212,7 @@ test "HKDF golden bytes cross-language" {
     try std.testing.expectEqualSlices(u8, &state.peer_key, &state2.peer_key);
     try std.testing.expectEqualSlices(u8, &state.gossip_key, &state2.gossip_key);
 
-    // Print golden bytes for cross-language verification (visible in test output with --verbose)
-    // Agent key first 8 bytes: used as golden reference
-    const agent_prefix = state.worker_key[0..8];
-    const client_prefix = state.client_key[0..8];
-    _ = agent_prefix;
-    _ = client_prefix;
+    try std.testing.expect(!std.mem.eql(u8, &state.worker_key, &state.client_key));
 }
 
 test "gossip encrypt-decrypt round trip" {

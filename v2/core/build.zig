@@ -23,12 +23,15 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // Unit tests (Debug, or whatever -Doptimize= was passed)
+    const wire_contract_options = b.addOptions();
+    wire_contract_options.addOptionPath("wire_contract_path", b.path("../tests/wire/contract-v6.json"));
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/unit_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addOptions("wire_contract_options", wire_contract_options);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -40,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
+    test_mod_release.addOptions("wire_contract_options", wire_contract_options);
     const unit_tests_release = b.addTest(.{ .root_module = test_mod_release });
     const run_unit_tests_release = b.addRunArtifact(unit_tests_release);
 

@@ -21,10 +21,10 @@ const PEER_CONNECT_TIMEOUT_TICKS: u64 = 2_000;
 const PEER_IDENTITY_TIMEOUT_TICKS: u64 = 2_000;
 const PEER_RETRY_INTERVAL_TICKS: u64 = 2_000;
 
-// Wire protocol version. Included in every client and agent frame.
-// Frame format: [4B LE len][2B LE version][1B tag][payload...]
-// len = 2 (version) + 1 (tag) + payload_len
-pub const PROTOCOL_VERSION: u16 = 5;
+// Global TCP wire protocol version for client, agent, and peer bodies.
+// Client/agent body: [2B LE version][1B tag][payload...]
+// Peer body: [2B LE version][1B sender identity][VRR payload...]
+pub const PROTOCOL_VERSION: u16 = msg.PROTOCOL_VERSION;
 pub const FRAME_HEADER: usize = 4 + 2 + 1; // len + version + tag
 
 const libc = struct {
@@ -1051,8 +1051,8 @@ pub const ConnectionManager = struct {
         }
     }
 
-    /// Decode one bounded frame. Client/worker payloads are versioned; peer payloads are not.
-    fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
+    /// Decode one bounded frame. Every stream body starts with the global version.
+    pub fn decodeFrame(self: *ConnectionManager, key: ?*const [enc.KEY_LEN]u8, data: []const u8, consumed: *usize, decrypt_buf: []u8, versioned: bool) ?[]const u8 {
         if (data.len < 5) return null;
 
         const frame_len = std.mem.readInt(u32, data[0..4], .little);
@@ -1160,21 +1160,21 @@ pub const ConnectionManager = struct {
 
         const peer_key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.peer_key else null;
 
-        // Frame format (plaintext): [4B len][1B flags=0x00][1B from_id][VRR bytes]
-        // Frame format (encrypted): [4B len][1B flags=0x01][24B nonce][encrypted(from_id + VRR)][16B tag]
+        // Frame format (plaintext): [4B len][1B flags=0x00][2B version][1B from_id][VRR bytes]
+        // Frame format (encrypted): [4B len][1B flags=0x01][24B nonce][encrypted(version + from_id + VRR)][16B tag]
         while (consumed + 5 <= data.len) {
             var frame_consumed: usize = 0;
-            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf, false) orelse {
+            const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break;
                 consumed += frame_consumed;
                 continue;
             };
             consumed += frame_consumed;
 
-            if (frame_payload.len < 2) continue;
-            const from_id = frame_payload[0];
+            if (frame_payload.len < 4) continue;
+            const from_id = frame_payload[2];
             if (from_id >= self.replica.replica_count) continue;
-            const vrr_data = frame_payload[1..];
+            const vrr_data = frame_payload[3..];
 
             // Deserialize and identity-check before any peer bind/replace so a
             // malformed spoof frame cannot evict a healthy bound socket.
@@ -1203,12 +1203,12 @@ pub const ConnectionManager = struct {
     }
 
     /// Send a framed VRR message to a peer. `data` is pre-framed:
-    /// [4-byte LE len][1-byte from_id][VRR message bytes]
+    /// [4-byte LE len][2-byte version][1-byte from_id][VRR message bytes]
     /// We re-frame with encryption if enabled.
     pub fn sendToPeer(self: *ConnectionManager, to: u8, data: []const u8) void {
-        if (data.len < 5) return;
+        if (data.len < 7) return;
 
-        // Extract inner payload (from_id + VRR bytes, skip the 4-byte length prefix)
+        // Extract inner payload (version + from_id + VRR bytes, skipping length).
         const inner = data[4..];
         const key = if (self.encryption != null and self.encryption.?.enabled) &self.encryption.?.peer_key else null;
 
@@ -1506,7 +1506,7 @@ pub const ConnectionManager = struct {
         }
     }
 
-    fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
+    pub fn parseWorkerRegister(payload: []const u8) ?msg.WorkerRegisterMsg {
         // Wire size is 138 (packed), not @sizeOf which includes alignment padding
         if (payload.len != 138) return null;
         const gpu_type = msg.enumFromIntChecked(msg.GpuType, payload[72]) catch return null;
@@ -1521,7 +1521,7 @@ pub const ConnectionManager = struct {
         return register;
     }
 
-    fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
+    pub fn parseWorkerHeartbeat(payload: []const u8) ?msg.WorkerHeartbeatMsg {
         if (payload.len != 23) return null;
         var heartbeat = msg.WorkerHeartbeatMsg{};
         heartbeat.timestamp = std.mem.littleToNative(u64, std.mem.bytesToValue(u64, payload[0..8]));
@@ -1532,7 +1532,7 @@ pub const ConnectionManager = struct {
         return heartbeat;
     }
 
-    fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
+    pub fn parseWorkerPodStatus(payload: []const u8) ?msg.WorkerPodStatusMsg {
         if (payload.len != 150) return null;
         const old_phase = msg.enumFromIntChecked(msg.PodPhase, payload[8]) catch return null;
         const new_phase = msg.enumFromIntChecked(msg.PodPhase, payload[9]) catch return null;
@@ -2819,15 +2819,153 @@ test "identifyPeerConnection preserves established duplicate peer socket" {
 
 fn sendTestPeerMessage(cm: *ConnectionManager, to: u8, message: msg.Message) void {
     var frame: [MAX_FRAME_BYTES]u8 = undefined;
-    const message_len = msg.serialize(message, frame[5..]);
-    std.mem.writeInt(u32, frame[0..4], @intCast(1 + message_len), .little);
-    frame[4] = cm.replica_id;
-    cm.sendToPeer(to, frame[0 .. 5 + message_len]);
+    const message_len = msg.serialize(message, frame[7..]);
+    std.mem.writeInt(u32, frame[0..4], @intCast(3 + message_len), .little);
+    std.mem.writeInt(u16, frame[4..6], PROTOCOL_VERSION, .little);
+    frame[6] = cm.replica_id;
+    cm.sendToPeer(to, frame[0 .. 7 + message_len]);
 }
 
 fn disconnectTestPeers(cm: *ConnectionManager) void {
     for (cm.peers[0..cm.peer_count]) |*peer| {
         if (peer.fd >= 0) disconnectPeer(peer);
+    }
+}
+
+fn buildDeterministicPeerTestFrame(
+    out: []u8,
+    version: u16,
+    from_id: u8,
+    message: msg.Message,
+    key: ?*const [enc.KEY_LEN]u8,
+) usize {
+    var plaintext: [MAX_FRAME_BYTES]u8 = undefined;
+    std.mem.writeInt(u16, plaintext[0..2], version, .little);
+    plaintext[2] = from_id;
+    const vrr_len = msg.serialize(message, plaintext[3..]);
+    const plaintext_len = 3 + vrr_len;
+
+    if (key) |encryption_key| {
+        const frame_len = 1 + enc.NONCE_LEN + plaintext_len + enc.TAG_LEN;
+        std.debug.assert(4 + frame_len <= out.len);
+        std.mem.writeInt(u32, out[0..4], @intCast(frame_len), .little);
+        out[4] = 0x01;
+        const nonce = [_]u8{0xA5} ** enc.NONCE_LEN;
+        @memcpy(out[5 .. 5 + enc.NONCE_LEN], &nonce);
+        var tag: [enc.TAG_LEN]u8 = undefined;
+        std.crypto.aead.chacha_poly.XChaCha20Poly1305.encrypt(
+            out[5 + enc.NONCE_LEN ..][0..plaintext_len],
+            &tag,
+            plaintext[0..plaintext_len],
+            out[0..5],
+            nonce,
+            encryption_key.*,
+        );
+        @memcpy(out[5 + enc.NONCE_LEN + plaintext_len ..][0..enc.TAG_LEN], &tag);
+        return 4 + frame_len;
+    }
+
+    const frame_len = 1 + plaintext_len;
+    std.debug.assert(4 + frame_len <= out.len);
+    std.mem.writeInt(u32, out[0..4], @intCast(frame_len), .little);
+    out[4] = 0x00;
+    @memcpy(out[5..][0..plaintext_len], plaintext[0..plaintext_len]);
+    return 4 + frame_len;
+}
+
+test "peer envelope socketpair rejects before identity binding and VRR dispatch" {
+    const allocator = std.testing.allocator;
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(0xC1, 3, &current_tick);
+
+    var prng = @import("prng.zig").Prng.init(0xC1);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const state_machine = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(state_machine);
+    state_machine.initInPlace(0xC1);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 3, .io = sim_io.io(), .state_machine = state_machine });
+    replica.status = .normal;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+
+    try std.testing.expectEqual(@as(u16, 6), PROTOCOL_VERSION);
+    const encryption_state = try enc.EncryptionState.init("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const Case = struct {
+        name: []const u8,
+        version: u16,
+        malformed: bool = false,
+        encrypt: bool = false,
+        key_configured: bool = false,
+        accepted: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "current-1", .version = PROTOCOL_VERSION - 1, .accepted = false },
+        .{ .name = "malformed", .version = PROTOCOL_VERSION, .malformed = true, .accepted = false },
+        .{ .name = "plaintext on encrypted connection", .version = PROTOCOL_VERSION, .key_configured = true, .accepted = false },
+        .{ .name = "current v6 plaintext", .version = PROTOCOL_VERSION, .accepted = true },
+        .{ .name = "current v6 deterministic encrypted", .version = PROTOCOL_VERSION, .encrypt = true, .key_configured = true, .accepted = true },
+    };
+
+    for (cases, 0..) |case, case_index| {
+        replica.status = .normal;
+        replica.view_number = 0;
+        replica.start_vc_count = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        replica.start_vc_total = 0;
+
+        var sockets: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets));
+        try ConnectionManager.setNonBlocking(sockets[0]);
+        defer _ = libc.close(sockets[1]);
+
+        cm.peers[0] = .{
+            .fd = sockets[0],
+            .connected = true,
+            .peer_direction = .outbound,
+            .configured_peer_id = 1,
+            .configured_peer_id_known = true,
+            .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        };
+        cm.encryption = if (case.key_configured) @constCast(&encryption_state) else null;
+
+        var frame: [MAX_FRAME_BYTES]u8 = undefined;
+        var frame_len = buildDeterministicPeerTestFrame(
+            &frame,
+            case.version,
+            1,
+            .{ .start_view_change = .{ .view_number = @intCast(case_index + 1), .replica_id = 1 } },
+            if (case.encrypt) &encryption_state.peer_key else null,
+        );
+        if (case.malformed) {
+            frame[7] = 0xFF;
+            frame_len = 8;
+            std.mem.writeInt(u32, frame[0..4], 4, .little);
+        }
+
+        const dispatch_before = replica.start_vc_total;
+        try ConnectionManager.writeAll(sockets[1], frame[0..frame_len]);
+        cm.readPeers();
+
+        try std.testing.expect(cm.peers[0].connected);
+        try std.testing.expectEqual(sockets[0], cm.peers[0].fd);
+        try std.testing.expectEqual(PeerDirection.outbound, cm.peers[0].peer_direction);
+        try std.testing.expect(cm.peers[0].configured_peer_id_known);
+        try std.testing.expectEqual(@as(u8, 1), cm.peers[0].configured_peer_id);
+        try std.testing.expectEqual(case.accepted, cm.peers[0].peer_id_known);
+        if (case.accepted) {
+            try std.testing.expect(replica.start_vc_total > dispatch_before);
+            try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+        } else {
+            try std.testing.expectEqual(PEER_IDENTITY_TIMEOUT_TICKS, cm.peers[0].peer_deadline_tick);
+            try std.testing.expectEqual(dispatch_before, replica.start_vc_total);
+        }
+        disconnectPeer(&cm.peers[0]);
     }
 }
 
@@ -2907,13 +3045,17 @@ test "simultaneous reciprocal sockets converge and carry bidirectional VRR traff
     try std.testing.expect(higher.hasPeerConnection(0));
 }
 
-test "peer frame buffer fits largest VRR view-change frame" {
-    const largest_plain_payload = 1 + @sizeOf(msg.DoViewChangeMsg); // from_id + serialized VRR message
-    const largest_plain_frame = 5 + largest_plain_payload; // len + flags + payload
-    const largest_encrypted_frame = 5 + enc.NONCE_LEN + largest_plain_payload + enc.TAG_LEN;
+test "peer frame buffer fits largest serialized VRR view-change frame" {
+    var serialized: [MAX_FRAME_BYTES]u8 = undefined;
+    const serialized_len = msg.serialize(.{ .do_view_change = .{} }, &serialized);
+    try std.testing.expectEqual(1 + @sizeOf(msg.DoViewChangeMsg), serialized_len);
 
-    try std.testing.expect(largest_plain_frame <= MAX_FRAME_BYTES);
-    try std.testing.expect(largest_encrypted_frame <= MAX_FRAME_BYTES);
+    const peer_body_len = 2 + 1 + serialized_len; // version + from_id + tagged VRR message
+    const plaintext_frame_len = 5 + peer_body_len; // len + flags + body
+    const encrypted_frame_len = 5 + enc.NONCE_LEN + peer_body_len + enc.TAG_LEN;
+
+    try std.testing.expect(plaintext_frame_len <= MAX_FRAME_BYTES);
+    try std.testing.expect(encrypted_frame_len <= MAX_FRAME_BYTES);
 }
 
 test "shiftBuffer saturates when consumed exceeds current position" {
@@ -2958,12 +3100,13 @@ test "processPeerFrames drops malformed VRR plaintext without trapping" {
     cm.peer_count = 1;
     cm.peers[0] = .{ .connected = true, .frame_pos = 0 };
 
-    // Frame: [4B len][flags=0][from_id=1][tag=0xFF] — invalid VRR tag.
-    const inner_len: u32 = 1 + 1; // from_id + bad tag
+    // Frame: [4B len][flags=0][version][from_id=1][tag=0xFF].
+    const inner_len: u32 = 2 + 1 + 1;
     std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
     cm.peers[0].frame_buf[4] = 0x00;
-    cm.peers[0].frame_buf[5] = 1;
-    cm.peers[0].frame_buf[6] = 0xFF;
+    std.mem.writeInt(u16, cm.peers[0].frame_buf[5..7], PROTOCOL_VERSION, .little);
+    cm.peers[0].frame_buf[7] = 1;
+    cm.peers[0].frame_buf[8] = 0xFF;
     cm.peers[0].frame_pos = 5 + inner_len;
 
     cm.processPeerFrames(0);
@@ -3010,11 +3153,12 @@ test "processPeerFrames drops spoofed from_id on bound peer socket" {
         .view_number = 1,
         .replica_id = 2,
     } }, &vrr_buf);
-    const inner_len: u32 = @intCast(1 + vrr_len);
+    const inner_len: u32 = @intCast(2 + 1 + vrr_len);
     std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
     cm.peers[0].frame_buf[4] = 0x00;
-    cm.peers[0].frame_buf[5] = 2; // spoof: claim replica 2 on socket bound to 1
-    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    std.mem.writeInt(u16, cm.peers[0].frame_buf[5..7], PROTOCOL_VERSION, .little);
+    cm.peers[0].frame_buf[7] = 2; // spoof: claim replica 2 on socket bound to 1
+    @memcpy(cm.peers[0].frame_buf[8 .. 8 + vrr_len], vrr_buf[0..vrr_len]);
     cm.peers[0].frame_pos = 5 + inner_len;
 
     cm.processPeerFrames(0);
@@ -3056,11 +3200,12 @@ test "processPeerFrames drops out-of-range from_id" {
         .view_number = 1,
         .replica_id = 99,
     } }, &vrr_buf);
-    const inner_len: u32 = @intCast(1 + vrr_len);
+    const inner_len: u32 = @intCast(2 + 1 + vrr_len);
     std.mem.writeInt(u32, cm.peers[0].frame_buf[0..4], 1 + inner_len, .little);
     cm.peers[0].frame_buf[4] = 0x00;
-    cm.peers[0].frame_buf[5] = 99; // from_id >= replica_count
-    @memcpy(cm.peers[0].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+    std.mem.writeInt(u16, cm.peers[0].frame_buf[5..7], PROTOCOL_VERSION, .little);
+    cm.peers[0].frame_buf[7] = 99; // from_id >= replica_count
+    @memcpy(cm.peers[0].frame_buf[8 .. 8 + vrr_len], vrr_buf[0..vrr_len]);
     cm.peers[0].frame_pos = 5 + inner_len;
 
     cm.processPeerFrames(0);
@@ -3122,13 +3267,14 @@ test "invalid Prepare Commit and StartView cannot evict healthy peer socket" {
         .{ .start_view = .{ .op_number = replica_mod.LOG_SIZE_MAX + 1 } },
     };
     for (invalid_messages) |invalid_message| {
-        var vrr_buf: [MAX_FRAME_BYTES - 6]u8 = undefined;
+        var vrr_buf: [MAX_FRAME_BYTES - 8]u8 = undefined;
         const vrr_len = msg.serialize(invalid_message, &vrr_buf);
-        const inner_len: u32 = @intCast(1 + vrr_len);
+        const inner_len: u32 = @intCast(2 + 1 + vrr_len);
         std.mem.writeInt(u32, cm.peers[1].frame_buf[0..4], 1 + inner_len, .little);
         cm.peers[1].frame_buf[4] = 0x00;
-        cm.peers[1].frame_buf[5] = 1;
-        @memcpy(cm.peers[1].frame_buf[6 .. 6 + vrr_len], vrr_buf[0..vrr_len]);
+        std.mem.writeInt(u16, cm.peers[1].frame_buf[5..7], PROTOCOL_VERSION, .little);
+        cm.peers[1].frame_buf[7] = 1;
+        @memcpy(cm.peers[1].frame_buf[8 .. 8 + vrr_len], vrr_buf[0..vrr_len]);
         cm.peers[1].frame_pos = 5 + inner_len;
 
         cm.processPeerFrames(1);

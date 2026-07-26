@@ -97,7 +97,7 @@ struct WirePodStatusEvent {
 // len = 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 const FRAME_FLAGS_LEN: usize = 1;
 const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
 const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;
@@ -1360,13 +1360,11 @@ mod tests {
     }
 
     // =================================================================
-    // Cross-language golden byte tests
-    //
-    // These use the same known values as src/wire_compat_test.zig.
-    // Both sides produce identical packed bytes for the same input.
+    // Local codec regressions. Cross-language claims come only from the shared
+    // contract-v6.json consumer below.
     // =================================================================
 
-    fn golden_register_msg() -> WorkerMessage {
+    fn fixture_register_msg() -> WorkerMessage {
         WorkerMessage::NodeRegister(NodeRegisterMsg {
             node_name: "test-agent-01".into(),
             cpu_millicores: 32000,
@@ -1376,7 +1374,7 @@ mod tests {
         })
     }
 
-    fn golden_heartbeat_msg() -> WorkerMessage {
+    fn fixture_heartbeat_msg() -> WorkerMessage {
         WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
             tick: 1234567890,
             active_pods: 4,
@@ -1384,7 +1382,7 @@ mod tests {
         })
     }
 
-    fn golden_start_pod_payload() -> Vec<u8> {
+    fn local_start_pod_payload() -> Vec<u8> {
         build_start_pod_payload(
             42,
             100,
@@ -1403,8 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_register_payload_matches_zig() {
-        let msg = golden_register_msg();
+    fn local_register_payload_layout() {
+        let msg = fixture_register_msg();
         let mut buf = [0u8; 256];
         let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
 
@@ -1428,8 +1426,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_heartbeat_payload_matches_zig() {
-        let msg = golden_heartbeat_msg();
+    fn local_heartbeat_payload_layout() {
+        let msg = fixture_heartbeat_msg();
         let mut buf = [0u8; 64];
         let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
 
@@ -1447,8 +1445,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_start_pod_decode_matches_zig() {
-        let payload = golden_start_pod_payload();
+    fn local_start_pod_decode() {
+        let payload = local_start_pod_payload();
 
         let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
         match msg {
@@ -1470,8 +1468,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_start_pod_bytes_match_zig() {
-        let bytes = golden_start_pod_payload();
+    fn local_start_pod_byte_layout() {
+        let bytes = local_start_pod_payload();
 
         // Fixed header: 8+8+256+256+2+1+1+4+4+128+64+64+1 = 797 + 0 env entries
         assert_eq!(bytes.len(), 797);
@@ -1547,6 +1545,221 @@ mod tests {
                 }
             } else {
                 assert!(result.is_err(), "{name}: expected rejection");
+            }
+        }
+    }
+
+    fn fixture_hex(value: &str, max_bytes: usize) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        assert!(value.len() / 2 <= max_bytes);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn fixture_has_consumer(vector: &serde_json::Value, consumer: &str) -> bool {
+        vector["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(consumer))
+    }
+
+    #[test]
+    fn wire_contract_corpus_is_canonical_and_byte_identical() {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit, Payload},
+            XChaCha20Poly1305, XNonce,
+        };
+        use std::collections::BTreeSet;
+
+        let source = include_str!("../../tests/wire/contract-v6.json");
+        assert!(source.len() <= 256 * 1024);
+        let contract: serde_json::Value = serde_json::from_str(source).unwrap();
+        let keys: BTreeSet<_> = contract
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "encoding",
+                "protocol_version",
+                "schema",
+                "statuses",
+                "test_material",
+                "vectors",
+            ])
+        );
+        assert_eq!(contract["schema"], "hivemind-wire-contract-v1");
+        assert_eq!(contract["protocol_version"], PROTOCOL_VERSION);
+
+        let status_names = [
+            "ok",
+            "deployment_not_found",
+            "queue_full",
+            "invalid_payload",
+            "response_too_large",
+            "outcome_ambiguous",
+            "forwarding_failed",
+            "no_running_pod",
+            "unavailable",
+            "not_leader",
+        ];
+        let statuses = contract["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), status_names.len());
+        for (index, status) in statuses.iter().enumerate() {
+            assert_eq!(status["byte"], index);
+            assert_eq!(status["name"], status_names[index]);
+            if index < 9 {
+                let wire_statuses = [
+                    RunStatus::Ok,
+                    RunStatus::DeploymentNotFound,
+                    RunStatus::QueueFull,
+                    RunStatus::InvalidPayload,
+                    RunStatus::ResponseTooLarge,
+                    RunStatus::OutcomeAmbiguous,
+                    RunStatus::ForwardingFailed,
+                    RunStatus::NoRunningPod,
+                    RunStatus::Unavailable,
+                ];
+                assert_eq!(wire_statuses[index] as usize, index);
+            } else {
+                assert_eq!(status["origins"], serde_json::json!(["core"]));
+            }
+        }
+
+        let psk = contract["test_material"]["psk_hex"].as_str().unwrap();
+        let state = crate::crypto::EncryptionState::from_hex(psk).unwrap();
+        let nonce = fixture_hex(
+            contract["test_material"]["nonce_hex"].as_str().unwrap(),
+            crate::crypto::NONCE_LEN,
+        );
+        assert_eq!(nonce.len(), crate::crypto::NONCE_LEN);
+
+        let vectors = contract["vectors"].as_array().unwrap();
+        assert!(vectors.len() <= 32);
+        for vector in vectors {
+            let vector_keys: BTreeSet<_> = vector
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                vector_keys,
+                BTreeSet::from([
+                    "channel",
+                    "consumers",
+                    "direction",
+                    "flags",
+                    "frame_hex",
+                    "id",
+                    "key_purpose",
+                    "message",
+                    "payload_hex",
+                    "plaintext_hex",
+                    "tag",
+                ])
+            );
+            if !fixture_has_consumer(vector, "rust") {
+                continue;
+            }
+            let id = vector["id"].as_str().unwrap();
+            let frame = fixture_hex(vector["frame_hex"].as_str().unwrap(), 64 * 1024);
+            let plaintext = fixture_hex(vector["plaintext_hex"].as_str().unwrap(), 64 * 1024);
+            let payload = fixture_hex(vector["payload_hex"].as_str().unwrap(), MAX_FRAME_PAYLOAD);
+            let flags = vector["flags"].as_u64().unwrap() as u8;
+            let key = (flags == 1).then_some(&state.worker_key);
+            let mut decoded_payload = [0u8; MAX_FRAME_PAYLOAD];
+            let (tag, decoded_len, consumed) = try_decode_frame(&frame, &mut decoded_payload, key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(consumed, frame.len(), "{id}");
+            assert_eq!(tag, vector["tag"].as_u64().unwrap() as u8, "{id}");
+            assert_eq!(&decoded_payload[..decoded_len], payload.as_slice(), "{id}");
+            assert_eq!(&plaintext[3..], payload.as_slice(), "{id}");
+
+            if flags == 0 {
+                let mut reencoded = Vec::new();
+                write_frame(&mut reencoded, tag, &payload).unwrap();
+                assert_eq!(reencoded, frame, "{id}");
+            } else {
+                assert_eq!(vector["key_purpose"], "worker");
+                let mut aad = [0u8; 5];
+                aad.copy_from_slice(&frame[..5]);
+                let cipher = XChaCha20Poly1305::new((&state.worker_key).into());
+                let sealed = cipher
+                    .encrypt(
+                        XNonce::from_slice(&nonce),
+                        Payload {
+                            msg: &plaintext,
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                let mut reencoded = aad.to_vec();
+                reencoded.extend_from_slice(&nonce);
+                reencoded.extend_from_slice(&sealed);
+                assert_eq!(reencoded, frame, "{id}");
+            }
+
+            match vector["message"].as_str().unwrap() {
+                "register" => {
+                    let message = fixture_register_msg();
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "heartbeat" => {
+                    let message = fixture_heartbeat_msg();
+                    let mut encoded = [0u8; 64];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "pod-status" => {
+                    let message = WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                        pod_id: 42,
+                        status: PodStatusReport::Running,
+                    });
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "start-pod" => match decode_control_message(tag, &payload).unwrap() {
+                    ControlMessage::StartPod(command) => {
+                        assert_eq!(command.pod_id, 42);
+                        assert_eq!(command.deployment_id, 100);
+                        assert_eq!(command.image, "registry.io/model:v1");
+                    }
+                    _ => panic!("{id}: expected StartPod"),
+                },
+                "run-request" => match decode_control_message(tag, &payload).unwrap() {
+                    ControlMessage::RunRequest(command) => {
+                        assert_eq!(command.request_id, 0x0102030405060708);
+                        assert_eq!(command.payload, b"ping");
+                    }
+                    _ => panic!("{id}: expected RunRequest"),
+                },
+                "run-response" => {
+                    assert!(payload.len() >= 9, "{id}");
+                    let message = WorkerMessage::RunResponse(RunResponseMsg {
+                        request_id: u64::from_le_bytes(payload[..8].try_into().unwrap()),
+                        status: payload[8],
+                        payload: payload[9..].to_vec(),
+                    });
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                other => panic!("{id}: unexpected Rust fixture message {other}"),
             }
         }
     }
