@@ -17,10 +17,39 @@ set -euo pipefail
 #   SSH_CIDR=<deployer-ip>/32     # auto-detected if omitted
 #   ADOPT_EXISTING_ECR=true       # import an existing same-name repo into Terraform state
 #
-# Typical full run with teardown:
-#   SSH_KEY=~/.ssh/id_ed25519 RUN_EKS=true DESTROY_HIVEMIND_AFTER=true DESTROY_EKS_AFTER=true bash scripts/poc-runbook.sh
+# This executor is invoked only by tests/live/execute-reviewed-plan.sh after
+# guarded authorization, reviewed-plan verification, and cleanup trap setup.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_ALLOW_LIVE:-0}" == 1 &&
+   "${HIVEMIND_LIVE_GUARD_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || {
+    echo "refusing live runbook outside tests/live/run.sh guardrails" >&2
+    exit 1
+}
+python3 - "$PPID" "$ROOT_DIR/tests/live/execute-reviewed-plan.sh" "$ROOT_DIR/tests/live/run.sh" <<'PY' || {
+import os, sys
+pid = int(sys.argv[1])
+required = [os.path.realpath(path) for path in sys.argv[2:]]
+seen = set()
+for _ in range(5):
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        stat = open(f"/proc/{pid}/stat", encoding="ascii").read().split()
+    except (FileNotFoundError, PermissionError, ValueError):
+        break
+    for raw in argv:
+        if not raw:
+            continue
+        value = os.fsdecode(raw)
+        if "/" in value:
+            seen.add(os.path.realpath(value))
+    pid = int(stat[3])
+if not all(path in seen for path in required):
+    raise SystemExit(1)
+PY
+    echo "refusing live runbook outside tests/live/run.sh guardrails" >&2
+    exit 1
+}
 # shellcheck source=../infra/poc/http.sh
 # shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
 source "$ROOT_DIR/infra/poc/http.sh"

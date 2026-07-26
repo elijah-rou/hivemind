@@ -106,8 +106,14 @@ run_phase "GPU-test cleanup trap fixture" \
     bash -c "'$SCRIPT_DIR/gpu_test_cleanup_trap_test.sh'"
 run_phase "Strict capability flag fixtures" \
     bash -c "'$SCRIPT_DIR/strict_capabilities_test.sh'"
+run_phase "GPU CDI/in-container evidence fixtures" \
+    bash -c "'$SCRIPT_DIR/gpu_evidence_test.sh'"
 run_phase "ECR cold-cache evidence fixtures" \
     bash -c "'$SCRIPT_DIR/ecr_cold_pull_test.sh'"
+run_phase "Live guardrail fixtures" \
+    bash -c "'$SCRIPT_DIR/live_guardrails_test.sh'"
+run_phase "Evidence manifest fixtures" \
+    bash -c "'$SCRIPT_DIR/evidence_manifest_test.sh'"
 run_phase "Shared protocol-v6 wire contract" \
     bash -c "'$SCRIPT_DIR/wire-contract-test.sh'"
 run_phase "Run retry fixtures" \
