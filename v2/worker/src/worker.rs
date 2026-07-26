@@ -1506,7 +1506,7 @@ mod tests {
                 }],
                 image_pull_registry: "registry.example".into(),
                 image_pull_username: "user".into(),
-                image_pull_password: "password".into(),
+                image_pull_password: String::new(),
                 image_pull_password_is_secret: false,
             },
             0,
