@@ -37,9 +37,16 @@ set -euo pipefail
 workspace="${TF_WORKSPACE:-default}"
 printf 'terraform:%s:workspace=%s\n' "$*" "$workspace" >> "$STUB_STATE/terraform.log"
 case "${1:-}" in
-  init) exit 0 ;;
-  workspace) exit 0 ;;
+  init)
+    if [[ "${STUB_HANG_COMMAND:-}" == init ]]; then /bin/sleep 10; fi
+    exit 0
+    ;;
+  workspace)
+    if [[ "${STUB_HANG_COMMAND:-}" == workspace ]]; then /bin/sleep 10; fi
+    exit 0
+    ;;
   apply)
+    if [[ "${STUB_HANG_COMMAND:-}" == apply ]]; then /bin/sleep 10; fi
     if [[ "${STUB_BARRIER:-0}" == "1" ]]; then
       : > "$STUB_STATE/apply-$workspace"
       ready=0
@@ -57,6 +64,7 @@ case "${1:-}" in
   output) echo "i-stub-${workspace}" ;;
   destroy)
     printf '%s\n' "$workspace" >> "$STUB_STATE/destroyed.log"
+    if [[ "${STUB_HANG_COMMAND:-}" == destroy ]]; then /bin/sleep 10; fi
     [[ "${STUB_DESTROY:-success}" == "success" ]] || { echo "stub terraform destroy failed" >&2; exit 9; }
     ;;
   *) echo "unexpected terraform call: $*" >&2; exit 2 ;;
@@ -77,8 +85,12 @@ case "$*" in
   "ssm get-command-invocation"*"--query Status"*) echo "${STUB_REMOTE_STATUS:-Success}" ;;
   "ssm get-command-invocation"*"--query StandardOutputContent"*) echo "TESTS_COMPLETE" ;;
   "ssm get-command-invocation"*"--output json"*) echo '{"Status":"Failed"}' ;;
-  "s3 mb "*) echo bucket-created >> "$STUB_STATE/bucket-created.log" ;;
+  "s3 mb "*)
+    echo bucket-created >> "$STUB_STATE/bucket-created.log"
+    if [[ "${STUB_HANG_COMMAND:-}" == s3-mb ]]; then /bin/sleep 10; fi
+    ;;
   "s3 rb "*)
+    if [[ "${STUB_HANG_COMMAND:-}" == s3-rb ]]; then /bin/sleep 10; fi
     [[ "${STUB_S3_RB:-success}" == "success" ]] || { echo "stub s3 remove failed" >&2; exit 8; }
     echo bucket-removed >> "$STUB_STATE/bucket-removed.log"
     ;;
@@ -120,7 +132,8 @@ run_gpu_test() {
   local output_name="$1"
   shift
   set +e
-  env "$@" "$GPU_TEST" >"$TMP_DIR/$output_name.out" 2>"$TMP_DIR/$output_name.err"
+  env GPU_COMMAND_TIMEOUT_SEC=1 GPU_CLEANUP_TIMEOUT_SEC=4 GPU_KILL_AFTER_SEC=1 \
+    "$@" "$GPU_TEST" >"$TMP_DIR/$output_name.out" 2>"$TMP_DIR/$output_name.err"
   RUN_RC=$?
   set -e
 }
@@ -187,6 +200,30 @@ if [[ "$RUN_RC" -eq 1 ]] && grep -q 'CLEANUP ERROR: terraform destroy' "$TMP_DIR
   pass "cleanup failure preserves original test failure status"
 else
   fail "cleanup must preserve original test failure status (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test hung-apply KEEP_INFRA=0 STUB_HANG_COMMAND=apply
+if [[ "$RUN_RC" -ne 0 && -s "$STUB_STATE/destroyed.log" ]]; then
+  pass "hung Terraform apply is bounded and still reaches teardown"
+else
+  fail "hung Terraform apply must be bounded and torn down (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test ambiguous-s3-create KEEP_INFRA=0 STUB_APPLY=success STUB_HANG_COMMAND=s3-mb
+if [[ "$RUN_RC" -ne 0 && -f "$STUB_STATE/bucket-created.log" && -f "$STUB_STATE/bucket-removed.log" && -s "$STUB_STATE/destroyed.log" ]]; then
+  pass "ambiguous S3 creation is reconciled during bounded cleanup"
+else
+  fail "ambiguous S3 creation must retain cleanup ownership (rc=$RUN_RC)"
+fi
+
+reset_state
+run_gpu_test hung-s3-cleanup KEEP_INFRA=0 STUB_APPLY=success STUB_REMOTE_STATUS=Success STUB_HANG_COMMAND=s3-rb
+if [[ "$RUN_RC" -ne 0 && -s "$STUB_STATE/destroyed.log" ]]; then
+  pass "hung S3 cleanup is bounded and does not skip Terraform teardown"
+else
+  fail "hung S3 cleanup must not block Terraform teardown (rc=$RUN_RC)"
 fi
 
 # Two invocations synchronize inside apply. Distinct TF_WORKSPACE values prove

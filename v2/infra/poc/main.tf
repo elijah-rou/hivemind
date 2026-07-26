@@ -57,9 +57,9 @@ variable "s3_backup_uri" {
 }
 
 variable "ecr_repository_name" {
-  description = "POC ECR repository for workload images. Terraform force-deletes it during teardown."
+  description = "Optional POC ECR repository override. Defaults to a run-token-scoped name; Terraform force-deletes it during teardown."
   type        = string
-  default     = "hivemind-poc"
+  default     = ""
 }
 
 variable "ssh_cidr" {
@@ -81,20 +81,21 @@ variable "subnet_id" {
 }
 
 locals {
-  name = "hivemind-${var.run_token}"
+  name                = "hivemind-${var.run_token}"
+  ecr_repository_name = var.ecr_repository_name != "" ? var.ecr_repository_name : "hivemind-poc-${var.run_token}"
   ownership_tags = {
     HivemindRunToken = var.run_token
   }
 }
 
 resource "aws_ecr_repository" "workloads" {
-  name                 = var.ecr_repository_name
+  name                 = local.ecr_repository_name
   image_tag_mutability = "MUTABLE"
   force_delete         = true
 
   lifecycle {
     precondition {
-      condition     = strcontains(var.ecr_repository_name, var.run_token)
+      condition     = strcontains(local.ecr_repository_name, var.run_token)
       error_message = "ecr_repository_name must contain the exact run_token."
     }
   }

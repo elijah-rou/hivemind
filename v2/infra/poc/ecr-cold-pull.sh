@@ -26,7 +26,13 @@ repository_and_tag="${IMAGE#*/}"
 [[ "$repository_and_tag" == *"$RUN_TOKEN"* ]] || { echo "FAIL: ECR image is not owned by this run token" >&2; exit 1; }
 [[ ! -e "$EVIDENCE_DIR" ]] || { echo "FAIL: evidence directory already exists" >&2; exit 1; }
 umask 077
-mkdir -p "$EVIDENCE_DIR"
+EVIDENCE_PARENT="$(dirname "$EVIDENCE_DIR")"
+mkdir -p "$EVIDENCE_PARENT"
+STAGING_DIR="$(mktemp -d "${EVIDENCE_DIR}.tmp.XXXXXX")"
+cleanup_staging() {
+    rm -rf "$STAGING_DIR"
+}
+trap cleanup_staging EXIT INT TERM
 
 EXPECTED_DIGEST="$(timeout --foreground --kill-after=2s 30s aws ecr describe-images \
     --region "$REGION" --repository-name "${repository_and_tag%%:*}" \
@@ -35,7 +41,7 @@ EXPECTED_DIGEST="$(timeout --foreground --kill-after=2s 30s aws ecr describe-ima
 
 # Inputs are strictly character-validated above. Credentials are resolved on the
 # worker and never cross stdout or the local process argument list.
-RAW_EVIDENCE="$EVIDENCE_DIR/.cold-pull.raw"
+RAW_EVIDENCE="$STAGING_DIR/.cold-pull.raw"
 timeout --foreground --kill-after=5s "${ECR_COLD_PULL_TIMEOUT_SECONDS:-600}s" \
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE_USER@$HOST" bash -s -- \
     "$IMAGE" "$REGION" "$EXPECTED_DIGEST" >"$RAW_EVIDENCE" <<'REMOTE'
@@ -84,6 +90,8 @@ grep -q '^pull_auth=temporary-ecr-hosts-file$' "$RAW_EVIDENCE"
 grep -q "^pulled_digest=$EXPECTED_DIGEST$" "$RAW_EVIDENCE"
 grep -q '^cache_after=owned$' "$RAW_EVIDENCE"
 redacted_image="[REDACTED_ACCOUNT].${IMAGE#*.}"
-sed "s|^removed_exact=$IMAGE$|removed_exact=$redacted_image|" "$RAW_EVIDENCE" >"$EVIDENCE_DIR/cold-pull.txt"
+sed "s|^removed_exact=$IMAGE$|removed_exact=$redacted_image|" "$RAW_EVIDENCE" >"$STAGING_DIR/cold-pull.txt"
 rm -f "$RAW_EVIDENCE"
+mv "$STAGING_DIR" "$EVIDENCE_DIR"
+trap - EXIT INT TERM
 echo "PASS: exact owned ECR image cold-pulled with credential and digest evidence"

@@ -31,9 +31,13 @@ done
 [[ "$REQUIRE_CONTAINERD" == 1 ]] || { echo "FAIL: full-stack containerd requires REQUIRE_CONTAINERD=1" >&2; exit 2; }
 [[ "$RUN_TOKEN" =~ ^[A-Za-z0-9-]+$ ]] || { echo "FAIL: invalid run token" >&2; exit 2; }
 
+ctr_bounded() {
+    timeout --foreground --kill-after=2s 15s ctr "$@"
+}
+
 ctr_ids() {
     local kind="$1"
-    timeout --foreground --kill-after=2s 15s ctr -n hivemind "$kind" list -q 2>/dev/null | LC_ALL=C sort
+    ctr_bounded -n hivemind "$kind" list -q 2>/dev/null | LC_ALL=C sort
 }
 
 owned_ids() {
@@ -95,13 +99,17 @@ command -v containerd >/dev/null
 command -v ctr >/dev/null
 containerd >"/tmp/$RUN_TOKEN-containerd.log" 2>&1 &
 CONTAINERD_PID=$!
-for _ in $(seq 1 100); do ctr version >/dev/null 2>&1 && break; sleep 0.1; done
-ctr version
+containerd_start_deadline=$((SECONDS + 30))
+while (( SECONDS < containerd_start_deadline )); do
+    timeout --foreground --kill-after=1s 2s ctr version >/dev/null 2>&1 && break
+    sleep 0.1
+done
+ctr_bounded version
 BASE_TASKS="$(ctr_ids tasks)"
 BASE_CONTAINERS="$(ctr_ids containers)"
 
 if [[ "$REQUIRE_NYDUS" == 1 ]]; then
-    ctr plugins list | awk '$1 == "io.containerd.snapshotter.v1" && $2 == "nydus" && $4 == "ok" {found=1} END {exit !found}'
+    ctr_bounded plugins list | awk '$1 == "io.containerd.snapshotter.v1" && $2 == "nydus" && $4 == "ok" {found=1} END {exit !found}'
     SNAPSHOTTER=nydus
     echo "PASS: REQUIRE_NYDUS=1 active snapshotter plugin is healthy"
 else
@@ -168,7 +176,7 @@ mapfile -t container_delta < <(owned_ids "$BASE_CONTAINERS" "$(ctr_ids container
 [[ "${#container_delta[@]}" == 1 && "${container_delta[0]}" == "$owned_task" ]]
 
 if [[ "$REQUIRE_GPU" == 1 ]]; then
-    cdi_info="$(ctr -n hivemind containers info "$owned_task")"
+    cdi_info="$(ctr_bounded -n hivemind containers info "$owned_task")"
     grep -q 'nvidia.com/gpu=' <<<"$cdi_info"
     exec_id="gpu-proof-$RUN_TOKEN"
     gpu_evidence="$(timeout --foreground --kill-after=2s 30s ctr -n hivemind tasks exec --exec-id "$exec_id" "$owned_task" nvidia-smi)"

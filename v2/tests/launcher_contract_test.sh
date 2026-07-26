@@ -60,6 +60,8 @@ SERVICE="$REPO_ROOT/infra/poc/hivemind.service"
 BENCH_TF="$REPO_ROOT/infra/bench/main.tf"
 GPU_TEST="$REPO_ROOT/infra/gpu-test/run-tests.sh"
 RUNBOOK="$REPO_ROOT/scripts/poc-runbook.sh"
+SECTION5_CYCLE="$REPO_ROOT/scripts/poc-section5-cycle.sh"
+POC_TF="$REPO_ROOT/infra/poc/main.tf"
 RUN_ALL="$SCRIPT_DIR/run-all.sh"
 
 echo "==> Compatibility smoke wrappers"
@@ -137,9 +139,16 @@ assert_file "$BENCH_TF"
 assert_contains "$BENCH_TF" '--worker-port'
 assert_lacks "$BENCH_TF" '--agent-port'
 
-echo "==> runbook credentials never enter command arguments"
+echo "==> runbook credentials and ownership defaults"
 assert_file "$RUNBOOK"
 assert_lacks "$RUNBOOK" '--user[[:space:]]+AWS:'
+assert_contains "$RUNBOOK" 'TF_VAR_run_token'
+assert_contains "$RUNBOOK" 'ECR_REPOSITORY=.*hivemind-poc-.*RUN_TOKEN'
+assert_file "$SECTION5_CYCLE"
+assert_contains "$SECTION5_CYCLE" 'TF_VAR_run_token'
+assert_contains "$SECTION5_CYCLE" 'ECR_REPOSITORY=.*hivemind-poc-.*RUN_TOKEN'
+assert_file "$POC_TF"
+assert_contains "$POC_TF" 'var.ecr_repository_name != "".*var.ecr_repository_name.*run_token'
 
 echo "==> run-all executes both Go module tests"
 assert_file "$RUN_ALL"

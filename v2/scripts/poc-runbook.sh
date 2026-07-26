@@ -12,12 +12,13 @@ set -euo pipefail
 #   SSH_KEY=~/.ssh/id_ed25519
 #
 # Optional:
-#   ECR_REPOSITORY=hivemind-poc   # Terraform-managed ECR repo name
+#   HIVEMIND_RUN_TOKEN=<12..32 lowercase alphanumeric chars>  # generated when omitted
+#   ECR_REPOSITORY=hivemind-poc-<run-token>                   # derived when omitted
 #   SSH_CIDR=<deployer-ip>/32     # auto-detected if omitted
 #   ADOPT_EXISTING_ECR=true       # import an existing same-name repo into Terraform state
 #
 # Typical full run with teardown:
-#   SSH_KEY=~/.ssh/id_ed25519 ECR_REPOSITORY=hivemind-poc RUN_EKS=true DESTROY_HIVEMIND_AFTER=true DESTROY_EKS_AFTER=true bash scripts/poc-runbook.sh
+#   SSH_KEY=~/.ssh/id_ed25519 RUN_EKS=true DESTROY_HIVEMIND_AFTER=true DESTROY_EKS_AFTER=true bash scripts/poc-runbook.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../infra/poc/http.sh
@@ -25,7 +26,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/infra/poc/http.sh"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc}"
+RUN_TOKEN="${HIVEMIND_RUN_TOKEN:-${TF_VAR_run_token:-}}"
+if [[ -z "$RUN_TOKEN" ]]; then
+    RUN_TOKEN="p$(date +%s)$(printf '%05d' "$$")$(printf '%05d' "$RANDOM")"
+fi
+[[ "$RUN_TOKEN" =~ ^[a-z][a-z0-9]{11,31}$ ]] || { echo "HIVEMIND_RUN_TOKEN must be 12..32 lowercase alphanumeric characters starting with a letter" >&2; exit 2; }
+ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc-$RUN_TOKEN}"
 SSH_CIDR="${SSH_CIDR:-${TF_VAR_ssh_cidr:-}}"
 TAG="${TAG:-poc-$(date +%Y%m%d%H%M%S)}"
 GPU_TYPE="${GPU_TYPE:-t4}"
@@ -393,8 +399,13 @@ need terraform
 need python3
 
 ECR_REPOSITORY_NAME="$(ecr_repository_name)"
+[[ "$ECR_REPOSITORY_NAME" == *"$RUN_TOKEN"* ]] || { echo "ECR_REPOSITORY must contain the exact run token: $RUN_TOKEN" >&2; exit 2; }
+export HIVEMIND_RUN_TOKEN="$RUN_TOKEN"
+export TF_VAR_run_token="$RUN_TOKEN"
 export TF_VAR_ecr_repository_name="$ECR_REPOSITORY_NAME"
 export TF_VAR_region="$AWS_REGION"
+echo "run_token=$RUN_TOKEN"
+echo "ecr_repository=$ECR_REPOSITORY_NAME"
 configure_ssh_cidr
 
 section "1. Apply isolated Hivemind POC infra"

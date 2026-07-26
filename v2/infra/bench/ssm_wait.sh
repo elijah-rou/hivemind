@@ -50,10 +50,17 @@ hivemind_ssm_wait_online() {
   while true; do
     remaining="$(hivemind_ssm_remaining "$deadline")"
     (( remaining > 0 )) || break
-    status="$(hivemind_ssm_aws "$remaining" ssm describe-instance-information --region "$region" \
+    if status="$(hivemind_ssm_aws "$remaining" ssm describe-instance-information --region "$region" \
       --filters "Key=InstanceIds,Values=$instance_id" \
-      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>&1)"; then
+      :
+    else
+      echo "FAIL: aws ssm describe-instance-information API error for instance_id=$instance_id: $status" >&2
+      return 1
+    fi
     [[ "$status" == "Online" ]] && { echo "  $instance_id: online"; return 0; }
+    remaining="$(hivemind_ssm_remaining "$deadline")"
+    (( remaining > 0 )) || break
     sleep_for=$SSM_POLL_INTERVAL_SEC
     (( sleep_for <= remaining )) || sleep_for=$remaining
     sleep "$sleep_for"

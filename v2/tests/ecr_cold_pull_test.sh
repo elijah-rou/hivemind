@@ -19,6 +19,10 @@ cat >"$TMP/bin/ssh" <<'STUB'
 set -euo pipefail
 printf 'ssh:%s\n' "$*" >>"$FIXTURE_LOG"
 cat >/dev/null
+if [[ "${FIXTURE_SSH_FAIL:-0}" == 1 ]]; then
+  echo 'simulated SSH failure' >&2
+  exit 7
+fi
 cat <<EOF
 cache_before=owned
 removed_exact=${FIXTURE_IMAGE:?}
@@ -46,4 +50,8 @@ grep -q 'pulled_digest=sha256:' "$TMP/evidence/cold-pull.txt"
 if REQUIRE_ECR_COLD_PULL=1 "$SCRIPT" 'docker.io/library/nginx:latest' e1fixtureabc123 host user "$TMP/bad" 2>/dev/null; then
   echo "FAIL: non-owned image accepted" >&2; exit 1
 fi
-echo "PASS: ECR cold-cache requires owned image, credentials, removal, pull, and digest evidence"
+if FIXTURE_SSH_FAIL=1 REQUIRE_ECR_COLD_PULL=1 "$SCRIPT" "$image" e1fixtureabc123 host user "$TMP/failed-evidence" 2>/dev/null; then
+  echo "FAIL: simulated SSH failure accepted" >&2; exit 1
+fi
+[[ ! -e "$TMP/failed-evidence" ]] || { echo "FAIL: failed cold pull left evidence residue" >&2; exit 1; }
+echo "PASS: ECR cold-cache requires owned image, credentials, removal, pull, digest evidence, and atomic publication"

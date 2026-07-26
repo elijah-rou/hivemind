@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CHECK="$SCRIPT_DIR/lib/require_capability.sh"
 RUN_ALL="$SCRIPT_DIR/run-all.sh"
+CONTAINERD_RUNNER="$SCRIPT_DIR/containerd/run-tests.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -25,7 +26,17 @@ cat >"$TMP_DIR/empty" <<'STUB'
 #!/usr/bin/env bash
 exit 0
 STUB
-chmod +x "$TMP_DIR/available" "$TMP_DIR/unavailable" "$TMP_DIR/empty"
+cat >"$TMP_DIR/docker-fixture" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${DOCKER_FIXTURE_LOG:?}"
+if [[ "$*" == "info --format {{.OSType}}" ]]; then
+    echo linux
+    exit 0
+fi
+exit 9
+STUB
+chmod +x "$TMP_DIR/available" "$TMP_DIR/unavailable" "$TMP_DIR/empty" "$TMP_DIR/docker-fixture"
 
 for capability in CONTAINERD GPU NYDUS JUICEFS; do
     if REQUIRE_FLAG="REQUIRE_${capability}" "$CHECK" "$capability" 0 "$TMP_DIR/unavailable" >"$TMP_DIR/$capability.skip" 2>&1 &&
@@ -56,6 +67,13 @@ if REQUIRE_FLAG=REQUIRE_GPU "$CHECK" GPU 1 "$TMP_DIR/empty" >"$TMP_DIR/empty.out
     fail "required capability must reject empty evidence"
 else
     pass "required capability rejects empty evidence"
+fi
+
+DOCKER_FIXTURE_LOG="$TMP_DIR/docker.log" DOCKER="$TMP_DIR/docker-fixture" "$CONTAINERD_RUNNER" --check >"$TMP_DIR/containerd-check.out"
+if [[ "$(cat "$TMP_DIR/docker.log")" == 'info --format {{.OSType}}' ]] && grep -q 'passive=verified' "$TMP_DIR/containerd-check.out"; then
+    pass "containerd --check is passive and read-only"
+else
+    fail "containerd --check must not launch a privileged container"
 fi
 
 missing_runner="$TMP_DIR/deliberately-missing-containerd-runner"

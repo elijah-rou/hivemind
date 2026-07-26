@@ -23,6 +23,9 @@ TF_DATA_DIR=""
 WORKER_ARCHIVE=""
 SSM_POLL_INTERVAL_SEC="${SSM_POLL_INTERVAL_SEC:-5}"
 SSM_POLL_TIMEOUT_SEC="${SSM_POLL_TIMEOUT_SEC:-600}"
+GPU_COMMAND_TIMEOUT_SEC="${GPU_COMMAND_TIMEOUT_SEC:-900}"
+GPU_CLEANUP_TIMEOUT_SEC="${GPU_CLEANUP_TIMEOUT_SEC:-1200}"
+GPU_KILL_AFTER_SEC="${GPU_KILL_AFTER_SEC:-10}"
 # shellcheck source=../bench/ssm_wait.sh disable=SC1091
 source "$SCRIPT_DIR/../bench/ssm_wait.sh"
 hivemind_ssm_assert_poll_bounds
@@ -35,6 +38,15 @@ if [[ "$REQUIRE_GPU" != "0" && "$REQUIRE_GPU" != "1" ]]; then
   echo "FAIL: REQUIRE_GPU must be 0 or 1" >&2
   exit 2
 fi
+for timeout_value in "$GPU_COMMAND_TIMEOUT_SEC" "$GPU_CLEANUP_TIMEOUT_SEC" "$GPU_KILL_AFTER_SEC"; do
+  [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: GPU timeout values must be positive integers" >&2; exit 2; }
+done
+(( GPU_CLEANUP_TIMEOUT_SEC >= 4 )) || { echo "FAIL: GPU_CLEANUP_TIMEOUT_SEC must be at least 4" >&2; exit 2; }
+run_bounded() {
+  local seconds="$1"
+  shift
+  timeout --signal=TERM --kill-after="${GPU_KILL_AFTER_SEC}s" "${seconds}s" "$@"
+}
 if [[ ! -d "$WORKER_DIR" ]]; then
   echo "FAIL: worker source not found at $WORKER_DIR" >&2
   exit 1
@@ -46,7 +58,7 @@ export TF_WORKSPACE="$RUN_WORKSPACE"
 
 cleanup() {
   local status=$?
-  local cleanup_failed=0
+  local cleanup_failed=0 cleanup_deadline=$((SECONDS + GPU_CLEANUP_TIMEOUT_SEC)) remaining command_budget=$((GPU_CLEANUP_TIMEOUT_SEC / 4))
   trap - EXIT INT TERM
   set +e
   if [[ "$KEEP_INFRA" == "1" ]]; then
@@ -57,20 +69,30 @@ cleanup() {
     rm -rf "$TF_DATA_DIR"
     exit "$status"
   fi
-  if [[ -n "$BUCKET" ]] && ! aws s3 rb "s3://$BUCKET" --force --region "$REGION"; then
-    echo "CLEANUP ERROR: s3 bucket removal failed: s3://$BUCKET" >&2
-    cleanup_failed=1
+  if [[ -n "$BUCKET" ]]; then
+    remaining=$((cleanup_deadline - SECONDS))
+    (( remaining <= command_budget )) || remaining=$command_budget
+    if (( remaining < 1 )) || ! run_bounded "$remaining" aws s3 rb "s3://$BUCKET" --force --region "$REGION"; then
+      echo "CLEANUP ERROR: s3 bucket removal failed: s3://$BUCKET" >&2
+      cleanup_failed=1
+    fi
   fi
   cd "$SCRIPT_DIR"
-  if ! terraform destroy -auto-approve; then
+  remaining=$((cleanup_deadline - SECONDS))
+  (( remaining <= command_budget )) || remaining=$command_budget
+  if (( remaining < 1 )) || ! run_bounded "$remaining" terraform destroy -auto-approve; then
     echo "CLEANUP ERROR: terraform destroy failed for workspace $RUN_WORKSPACE" >&2
     cleanup_failed=1
   fi
-  if ! env -u TF_WORKSPACE terraform workspace select default >/dev/null; then
+  remaining=$((cleanup_deadline - SECONDS))
+  (( remaining <= command_budget )) || remaining=$command_budget
+  if (( remaining < 1 )) || ! run_bounded "$remaining" env -u TF_WORKSPACE terraform workspace select default >/dev/null; then
     echo "CLEANUP ERROR: terraform workspace select default failed in isolated state $TF_DATA_DIR" >&2
     cleanup_failed=1
   fi
-  if ! env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null; then
+  remaining=$((cleanup_deadline - SECONDS))
+  (( remaining <= command_budget )) || remaining=$command_budget
+  if (( remaining < 1 )) || ! run_bounded "$remaining" env -u TF_WORKSPACE terraform workspace delete "$RUN_WORKSPACE" >/dev/null; then
     echo "CLEANUP ERROR: terraform workspace delete failed: $RUN_WORKSPACE" >&2
     cleanup_failed=1
   fi
@@ -91,19 +113,19 @@ echo "will compile on-instance (cross-compiling test binaries is unreliable)"
 echo ""
 echo "=== Step 2: Terraform apply ==="
 cd "$SCRIPT_DIR"
-terraform init -input=false 2>/dev/null
+run_bounded "$GPU_COMMAND_TIMEOUT_SEC" terraform init -input=false 2>/dev/null
 # Each invocation owns a unique Terraform workspace and local metadata directory.
 # Concurrent runs therefore cannot observe, mutate, or destroy each other's state.
-env -u TF_WORKSPACE terraform workspace new "$RUN_WORKSPACE" >/dev/null
+run_bounded "$GPU_COMMAND_TIMEOUT_SEC" env -u TF_WORKSPACE terraform workspace new "$RUN_WORKSPACE" >/dev/null
 if [[ "$CLEANUP_INSTALLED" -eq 0 ]]; then
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   CLEANUP_INSTALLED=1
 fi
-terraform apply -auto-approve
+run_bounded "$GPU_COMMAND_TIMEOUT_SEC" terraform apply -auto-approve
 
-INSTANCE_ID=$(terraform output -raw instance_id)
+INSTANCE_ID="$(run_bounded "$GPU_COMMAND_TIMEOUT_SEC" terraform output -raw instance_id)"
 echo "instance: $INSTANCE_ID"
 
 echo ""
@@ -119,13 +141,15 @@ else
 fi
 # Upload worker source and build on-instance (avoids cross-compilation issues)
 BUCKET_CANDIDATE="hivemind-gpu-test-${RUN_WORKSPACE#hivemind-gpu-}"
-aws s3 mb "s3://$BUCKET_CANDIDATE" --region "$REGION"
+# Record the unique owned name before creation. A timed-out create may still have
+# succeeded server-side, so cleanup must always reconcile this exact bucket.
 BUCKET="$BUCKET_CANDIDATE"
+run_bounded "$GPU_COMMAND_TIMEOUT_SEC" aws s3 mb "s3://$BUCKET" --region "$REGION"
 
 # Package the worker source
 cd "$WORKER_DIR"
 tar czf "$WORKER_ARCHIVE" --exclude target --exclude .git -C .. worker/
-aws s3 cp "$WORKER_ARCHIVE" "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
+run_bounded "$GPU_COMMAND_TIMEOUT_SEC" aws s3 cp "$WORKER_ARCHIVE" "s3://$BUCKET/worker-src.tar.gz" --region "$REGION"
 
 CMD_ID=$(hivemind_ssm_send_command "$SSM_POLL_TIMEOUT_SEC" --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \

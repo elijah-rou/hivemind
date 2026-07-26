@@ -65,6 +65,10 @@ done
 case "$cmd" in
   describe-instance-information)
     if [[ -f "$STUB_STATE/hang_describe" ]]; then /bin/sleep 5; fi
+    if [[ -f "$STUB_STATE/fail_describe" ]]; then
+      echo 'An error occurred (AccessDeniedException): simulated describe failure' >&2
+      exit 1
+    fi
     status_file="$STUB_STATE/ping.seq"
     status="None"
     if [[ -s "$status_file" ]]; then
@@ -149,6 +153,7 @@ export FAKE_NOW
 sleep() {
   local n="${1:-1}"
   FAKE_NOW=$((FAKE_NOW + n))
+  [[ -z "${SLEEP_LOG:-}" ]] || printf '%s\n' "$n" >>"$SLEEP_LOG"
 }
 export -f sleep
 
@@ -162,7 +167,15 @@ fi
 source "$WAIT_LIB"
 
 # Override after source so wall-clock deadline is deterministic.
-hivemind_ssm_now() { echo "$FAKE_NOW"; }
+hivemind_ssm_now() {
+  if [[ -s "$STUB_STATE/now.seq" ]]; then
+    head -n1 "$STUB_STATE/now.seq"
+    tail -n +2 "$STUB_STATE/now.seq" >"$STUB_STATE/now.seq.tmp"
+    mv "$STUB_STATE/now.seq.tmp" "$STUB_STATE/now.seq"
+  else
+    echo "$FAKE_NOW"
+  fi
+}
 
 reset_state() {
   rm -f "$STUB_STATE"/*
@@ -394,6 +407,29 @@ case_online_eventual_success() {
   [[ "$(grep -c 'describe-instance-information' "$STUB_STATE/calls.log")" -eq 3 ]]
 }
 
+case_online_api_error_fails_fast() {
+  touch "$STUB_STATE/fail_describe"
+  if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=5 \
+    hivemind_ssm_wait_online us-east-1 i-denied 2>"$TMP_DIR/online-api.err"; then
+    return 1
+  fi
+  grep -q 'AccessDeniedException' "$TMP_DIR/online-api.err"
+  [[ "$(grep -c 'describe-instance-information' "$STUB_STATE/calls.log")" -eq 1 ]]
+}
+
+case_online_recomputes_after_aws() {
+  printf '%s\n' Offline > "$STUB_STATE/ping.seq"
+  printf '%s\n' 1000 1000 1004 1005 > "$STUB_STATE/now.seq"
+  SLEEP_LOG="$STUB_STATE/sleep.log"
+  export SLEEP_LOG
+  if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=5 \
+    hivemind_ssm_wait_online us-east-1 i-slow 2>"$TMP_DIR/online-slow.err"; then
+    return 1
+  fi
+  unset SLEEP_LOG
+  [[ "$(cat "$STUB_STATE/sleep.log")" == 1 ]]
+}
+
 case_online_deadline_exhaustion() {
   yes Offline | head -n 20 > "$STUB_STATE/ping.seq"
   if SSM_POLL_INTERVAL_SEC=2 SSM_POLL_TIMEOUT_SEC=5 \
@@ -413,6 +449,8 @@ case_hung_cli_is_bounded() {
 }
 
 run_case "readiness eventual success" case_online_eventual_success
+run_case "readiness API error fails fast" case_online_api_error_fails_fast
+run_case "readiness recomputes deadline after AWS" case_online_recomputes_after_aws
 run_case "readiness deadline exhaustion" case_online_deadline_exhaustion
 run_case "hung AWS CLI bounded" case_hung_cli_is_bounded
 run_case "Pending/InProgress/Success" case_pending_inprogress_success
