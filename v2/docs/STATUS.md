@@ -174,10 +174,11 @@ FRAME_HEADER = 7 bytes
 - LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=1024 so dedup spans the retained journal
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
-- Full view change protocol: StartViewChange → DoViewChange → StartView
-- Log repair via RequestPrepare/SendPrepare
-- Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence (experimental): optional `--data-dir` selects layout-v2 `journal.bin` (`0600`) under the data directory (`0700`), with explicit little-endian codecs, staged `pwrite`, and an `fdatasync` group-commit barrier before acknowledgements/publication. Legacy or corrupt journals fail closed. Absent `--data-dir` is explicit volatile POC mode. No torn-write or power-loss guarantee.
+- Full view change protocol: StartViewChange → DoViewChange → StartView. Higher-view Prepare/Commit traffic requests the current leader's StartView instead of promoting a follower directly.
+- A DoViewChange quorum ranks valid sources by `(last_normal_view, op_number)`, separately computes the maximum exposed commit watermark, and rejects equal-rank identity conflicts. A validated source chain may replace durable speculative entries only above the immutable local committed prefix.
+- Log repair via RequestPrepare/SendPrepare; selection-bound repair fetches one certificate-bound retained chain, tries hinted then unhinted peers within a fixed candidate deadline, and rejects source mutation.
+- Field-by-field serialization (no struct padding UB in release builds); PrepareOk votes bind the exact durable `(view, op, entry_checksum)` identity.
+- Disk persistence (experimental): optional `--data-dir` selects layout-v2 `journal.bin` (`0600`) under the data directory (`0700`), with explicit little-endian codecs, staged `pwrite`, and an `fdatasync` group-commit barrier before acknowledgements/publication. Leader and follower StartView installation remains unpublished until its covering barrier. Legacy or corrupt journals fail closed. Absent `--data-dir` is explicit volatile POC mode. No torn-write or power-loss guarantee.
 - Crash recovery (experimental best-effort): validate the committed checksum chain and enter view change to rejoin; corrupt, missing, truncated, or wrong-sized journals fail-stop. This has not been validated under torn writes or power loss.
 - Retained log: without snapshots, `retention_floor` remains zero and every operation is retained until the `LOG_SIZE_MAX` (1024) lifetime cap returns `log_full` / HTTP 507.
 
