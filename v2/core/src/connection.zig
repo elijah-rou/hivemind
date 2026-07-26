@@ -1163,6 +1163,21 @@ pub const ConnectionManager = struct {
         // Frame format (plaintext): [4B len][1B flags=0x00][2B version][1B from_id][VRR bytes]
         // Frame format (encrypted): [4B len][1B flags=0x01][24B nonce][encrypted(version + from_id + VRR)][16B tag]
         while (consumed + 5 <= data.len) {
+            const declaration = data[consumed..][0..5];
+            const frame_len = std.mem.readInt(u32, declaration[0..4], .little);
+            const flags = declaration[4];
+            const key_configured = self.encryption != null and self.encryption.?.enabled;
+            const payload_min: usize = if (flags == 0x01) enc.NONCE_LEN + enc.TAG_LEN + 3 else 3;
+            const declaration_valid = frame_len <= MAX_FRAME_BYTES - 4 and
+                (flags == 0x00 or flags == 0x01) and
+                ((flags == 0x01) == key_configured) and
+                (flags != 0x01 or peer_key != null) and
+                frame_len >= 1 + payload_min;
+            if (!declaration_valid) {
+                disconnectPeer(peer);
+                return;
+            }
+
             var frame_consumed: usize = 0;
             const frame_payload = self.decodeFrame(peer_key, data[consumed..], &frame_consumed, &decrypt_buf, true) orelse {
                 if (frame_consumed == 0) break;
@@ -2904,11 +2919,12 @@ test "peer envelope socketpair rejects before identity binding and VRR dispatch"
         encrypt: bool = false,
         key_configured: bool = false,
         accepted: bool,
+        disconnected: bool = false,
     };
     const cases = [_]Case{
         .{ .name = "current-1", .version = PROTOCOL_VERSION - 1, .accepted = false },
         .{ .name = "malformed", .version = PROTOCOL_VERSION, .malformed = true, .accepted = false },
-        .{ .name = "plaintext on encrypted connection", .version = PROTOCOL_VERSION, .key_configured = true, .accepted = false },
+        .{ .name = "plaintext on encrypted connection", .version = PROTOCOL_VERSION, .key_configured = true, .accepted = false, .disconnected = true },
         .{ .name = "current v6 plaintext", .version = PROTOCOL_VERSION, .accepted = true },
         .{ .name = "current v6 deterministic encrypted", .version = PROTOCOL_VERSION, .encrypt = true, .key_configured = true, .accepted = true },
     };
@@ -2952,20 +2968,93 @@ test "peer envelope socketpair rejects before identity binding and VRR dispatch"
         try ConnectionManager.writeAll(sockets[1], frame[0..frame_len]);
         cm.readPeers();
 
-        try std.testing.expect(cm.peers[0].connected);
-        try std.testing.expectEqual(sockets[0], cm.peers[0].fd);
-        try std.testing.expectEqual(PeerDirection.outbound, cm.peers[0].peer_direction);
-        try std.testing.expect(cm.peers[0].configured_peer_id_known);
-        try std.testing.expectEqual(@as(u8, 1), cm.peers[0].configured_peer_id);
+        try std.testing.expectEqual(case.disconnected, !cm.peers[0].connected);
         try std.testing.expectEqual(case.accepted, cm.peers[0].peer_id_known);
-        if (case.accepted) {
-            try std.testing.expect(replica.start_vc_total > dispatch_before);
-            try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
-        } else {
-            try std.testing.expectEqual(PEER_IDENTITY_TIMEOUT_TICKS, cm.peers[0].peer_deadline_tick);
+        if (case.disconnected) {
+            try std.testing.expectEqual(@as(c_int, -1), cm.peers[0].fd);
             try std.testing.expectEqual(dispatch_before, replica.start_vc_total);
+        } else {
+            try std.testing.expectEqual(sockets[0], cm.peers[0].fd);
+            try std.testing.expectEqual(PeerDirection.outbound, cm.peers[0].peer_direction);
+            try std.testing.expect(cm.peers[0].configured_peer_id_known);
+            try std.testing.expectEqual(@as(u8, 1), cm.peers[0].configured_peer_id);
+            if (case.accepted) {
+                try std.testing.expect(replica.start_vc_total > dispatch_before);
+                try std.testing.expectEqual(@as(usize, 1), cm.peers[0].worker_idx);
+            } else {
+                try std.testing.expectEqual(PEER_IDENTITY_TIMEOUT_TICKS, cm.peers[0].peer_deadline_tick);
+                try std.testing.expectEqual(dispatch_before, replica.start_vc_total);
+            }
+            disconnectPeer(&cm.peers[0]);
         }
-        disconnectPeer(&cm.peers[0]);
+    }
+}
+
+test "peer invalid frame declarations disconnect before split tail can bind or dispatch" {
+    const allocator = std.testing.allocator;
+    var current_tick: i64 = 0;
+    const network = try allocator.create(net_mod.SimulatedNetwork);
+    defer allocator.destroy(network);
+    network.initInPlace(0xC2, 3, &current_tick);
+
+    var prng = @import("prng.zig").Prng.init(0xC2);
+    var sim_io = @import("vopr/simulated_io.zig").SimulatedIo.init(&prng, &current_tick, network, 0);
+    const state_machine = try allocator.create(sm_mod.StateMachine);
+    defer allocator.destroy(state_machine);
+    state_machine.initInPlace(0xC2);
+    const replica = try allocator.create(replica_mod.Replica);
+    defer allocator.destroy(replica);
+    replica.initInPlace(.{ .replica_id = 0, .replica_count = 3, .io = sim_io.io(), .state_machine = state_machine });
+    replica.status = .normal;
+
+    const cm = try allocator.create(ConnectionManager);
+    defer allocator.destroy(cm);
+    initTestConnectionManager(cm, replica);
+    cm.peer_count = 1;
+
+    const encryption_state = try enc.EncryptionState.init("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const Case = struct {
+        name: []const u8,
+        frame_len: u32,
+        flags: u8,
+        key_configured: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .name = "oversized", .frame_len = MAX_FRAME_BYTES, .flags = 0x00 },
+        .{ .name = "unknown flags", .frame_len = 4, .flags = 0x7F },
+        .{ .name = "encryption mode mismatch", .frame_len = 4, .flags = 0x00, .key_configured = true },
+        .{ .name = "undersized", .frame_len = 3, .flags = 0x00 },
+    };
+
+    for (cases) |case| {
+        replica.start_vc_count = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+        replica.start_vc_total = 0;
+
+        var sockets: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sockets));
+        try ConnectionManager.setNonBlocking(sockets[0]);
+        defer _ = libc.close(sockets[1]);
+
+        cm.peers[0] = .{
+            .fd = sockets[0],
+            .connected = true,
+            .peer_direction = .outbound,
+            .configured_peer_id = 1,
+            .configured_peer_id_known = true,
+            .peer_deadline_tick = PEER_IDENTITY_TIMEOUT_TICKS,
+        };
+        cm.encryption = if (case.key_configured) @constCast(&encryption_state) else null;
+
+        var header: [5]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], case.frame_len, .little);
+        header[4] = case.flags;
+        try ConnectionManager.writeAll(sockets[1], &header);
+        cm.readPeers();
+
+        try std.testing.expect(!cm.peers[0].connected);
+        try std.testing.expectEqual(@as(c_int, -1), cm.peers[0].fd);
+        try std.testing.expect(!cm.peers[0].peer_id_known);
+        try std.testing.expectEqual(@as(u8, 0), replica.start_vc_total);
     }
 }
 

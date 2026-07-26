@@ -48,6 +48,10 @@ run_phase "Rust tests (unit + integration)" \
 run_phase "Go build" \
     bash -c "cd '$REPO_ROOT/api' && go build ./..."
 
+# --- Phase 3b: Shared wire contract ---
+run_phase "Shared protocol-v6 wire contract" \
+    bash -c "'$SCRIPT_DIR/wire-contract-test.sh'"
+
 # --- Phase 4: Infra POC script tests ---
 run_phase "Infra POC script tests" \
     bash -c "'$REPO_ROOT/infra/poc/test-worker-env.sh'"

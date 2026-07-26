@@ -93,8 +93,8 @@ struct WirePodStatusEvent {
 }
 
 // -- Frame I/O --
-// Frame format: [4B LE len][2B LE version][1B tag][payload...]
-// len = 2 (version) + 1 (tag) + payload_len
+// Frame format: [4B LE len][1B flags][2B LE version][1B tag][payload...]
+// len = 1 (flags) + 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 pub const PROTOCOL_VERSION: u16 = 6;
