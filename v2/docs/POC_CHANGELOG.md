@@ -1,19 +1,24 @@
 # Hivemind POC Changelog
 
+<<<<<<< HEAD
 _Last updated: 2026-08-06_
+=======
+_Last updated: 2026-07-27_
+>>>>>>> ec19a3d (docs: record fresh restack acceptance evidence)
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Historical accepted local evidence: code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, passed `25 / 25` final gates on 2026-07-25. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `26` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. Containerd and every privileged/live capability were explicitly skipped or unexecuted.
+- Fresh accepted local evidence: PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865`, tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`, passed `25 / 25` final gates on 2026-07-27. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `26` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested docs-only descendant.
+- Historical accepted local evidence remains `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, `25 / 25` on 2026-07-25; it is not promoted to the rewritten stack.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The continuation's deterministic and local real-process gates are implemented. The historical accepted local matrix is green only for `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c`; fresh full acceptance of the rewritten ten-PR tip is pending the final matrix. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
+The continuation's deterministic and local real-process gates are implemented. The rewritten PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865` / tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77` has a fresh complete non-live matrix; the final docs-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
 Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
@@ -33,6 +38,27 @@ Historical AWS functional/resilience and benchmark results remain useful context
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-07-27 — Fresh complete restack-parent gate
+
+Evidence:
+- tested PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865`, tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`; run window `2026-07-27T00:38:20Z` through `00:46:34Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `486s`, complete wall time `494s`
+- Zig Debug (`37s`), ReleaseFast (`7s`), 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `170.4s` fuzzer elapsed
+- worker format/all-targets (`186 + 3 + 7 + 5`, containerd integration `0`), both recorded replays, and exact four-thread mutated seeds `0..999` passed; `1,000` tested, `0` failures, `1.9s` fuzzer elapsed
+- `./tests/run-all.sh --skip-containerd` passed all `26` invoked phases in `184s`; Go race/build, wire/schema, shell, all four offline Terraform roots, changed-doc layout/links, credential, residue, no-`v1`, and cleanliness gates passed
+- cleanup restored the pre-run generated-artifact state and left zero branch-owned processes, relevant listener delta, port-lock delta, generated-artifact delta, tracked/index change, or `v1` delta
+
+Preserved failed attempts and support corrections:
+- `20260726T233943Z-b08e7081bf8a` stopped after three passed gates because stdout-only `tee` missed the successful core sweep summary written to stderr; the summary reported `10,000` tested and `0` failures
+- `20260727T002042Z-b08e7081bf8a` restarted at gate 1 and stopped when the two-second deterministic systemd fixture transaction expired under aggregate load; the immediate bounded focused fixture rerun passed
+- `20260727T002955Z-b08e7081bf8a` restarted at gate 1 and stopped on an untracked link checker that included frozen/legacy relocation links; the checker was corrected to branch-changed Markdown
+- `20260727T003820Z-b08e7081bf8a` restarted at gate 1 and is the sole accepted fresh run; the bounded capture self-test proved stderr-only JSON capture and wrong-count rejection
+
+Explicit limits:
+- containerd component/full stack, Docker privileged mode, host namespace/cgroup work, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/remote systemd, providers, Terraform plan/apply/destroy, live entry points, and all cost-bearing/destructive work remained skipped or unexecuted
+- live-resource state remains unknown because no fresh authorized inventory ran
+- the final docs commit is recorded externally as a descendant of the tested parent; historical `bc9f5f63` evidence remains historical
 
 ### 2026-07-26 — Ten-PR thematic restack documentation boundary
 

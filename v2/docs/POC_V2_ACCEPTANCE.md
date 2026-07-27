@@ -2,7 +2,7 @@
 
 Status: **not accepted**. This is the current product gate, not a parity claim.
 
-POC v1 and continuation-era evidence is historical. Historical evidence can inform work, but cannot set a current criterion to `passed`. No fresh criterion evidence record containing an exact source SHA and UTC timestamp was available when this acceptance baseline was drafted at intermediate mega-PR commit `068c1561656dc033bd7a3a7134e73b7004c115ba` / tree `74cd908b6cf7add7c386907ffc70dcc73bd07e61`. That commit is not part of the reconstructed ten-PR ancestry; the only complete accepted matrix remains historical `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c`. Therefore no row below is passed.
+POC v1 and continuation-era evidence is historical. Historical evidence can inform work, but cannot set a current criterion to `passed`. The rewritten stack now has a fresh complete non-live matrix for PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865` / tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`, run from `2026-07-27T00:38:20Z` through `00:46:34Z`; the final evidence-docs tip is a separately recorded docs-only descendant. That matrix validates the deterministic, local-process, offline, credential, and cleanup boundaries it executed. It does not supply the missing product surfaces or required privileged/live evidence in the rows below, so no row is promoted to passed. Historical `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c` remains historical.
 
 ## Scope
 
