@@ -1,24 +1,20 @@
 # Hivemind POC Changelog
 
-<<<<<<< HEAD
 _Last updated: 2026-08-06_
-=======
-_Last updated: 2026-07-27_
->>>>>>> ec19a3d (docs: record fresh restack acceptance evidence)
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Fresh accepted local evidence: PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865`, tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`, passed `25 / 25` final gates on 2026-07-27. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `26` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested docs-only descendant.
+- Fresh accepted local evidence: evidence parent `3890ac40615b60e7775637a2f59d042c2d893c98`, tree `822a5c77c1e446058ca701e61c238bd132a246e0`, passed `25 / 25` final gates on 2026-08-06. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `28` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested documentation-only descendant.
 - Historical accepted local evidence remains `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, `25 / 25` on 2026-07-25; it is not promoted to the rewritten stack.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The continuation's deterministic and local real-process gates are implemented. The rewritten PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865` / tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77` has a fresh complete non-live matrix; the final docs-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
+The continuation's deterministic and local real-process gates are implemented. Evidence parent `3890ac40615b60e7775637a2f59d042c2d893c98` / tree `822a5c77c1e446058ca701e61c238bd132a246e0` has a fresh complete non-live matrix; the final documentation-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
 Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
@@ -38,6 +34,27 @@ Historical AWS functional/resilience and benchmark results remain useful context
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-08-06 — Reviewed ten-PR stack and final non-live gate
+
+Evidence:
+- tested evidence parent `3890ac40615b60e7775637a2f59d042c2d893c98`, tree `822a5c77c1e446058ca701e61c238bd132a246e0`; run window `2026-08-06T05:45:20Z` through `05:53:10Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `463s`, complete wall time `470s`
+- Zig Debug/ReleaseFast, 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `158.8s` fuzzer elapsed
+- worker format/all-targets (`190 + 3 + 11 + 1 CLI + 5`, containerd integration `0`), both recorded replays, and exact four-thread mutated seeds `0..999` passed; `1,000` tested, `0` failures, `1.9s` fuzzer elapsed
+- `./tests/run-all.sh --skip-containerd` passed all `28` invoked phases in `173s`; Go race/build, wire/schema, Bash/ShellCheck, all four offline Terraform roots, docs/links, credential, residue, no-`v1`, and cleanliness gates passed
+- cleanup restored pre-run generated artifacts and left zero branch-owned process, relevant listener, port-lock, or generated-artifact delta
+
+Review corrections:
+- secure journal/data-directory traversal pins component descriptors, rejects symlinks and multiply linked journals, and validates exact type/owner boundaries
+- VRR exhausts before the reserved all-ones view; worker and protocol boundaries now cover lost versus buffered replies, little-endian fixed payloads, disconnected shutdown, and fail-fast IP endpoint validation
+- offline S3 lifecycles pair exact markers with account-scoped no-overwrite leases; EKS and Hivemind teardown validate their independent state ownership and topology; benchmark cleanup is bounded and independently reconciled
+- guarded live preflight repeats non-mutating bucket absence checks and refuses unsupported `us-east-1` semantics before reporting preparation
+
+Explicit limits:
+- containerd component/full stack, Docker privileged mode, host namespace/cgroup work, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/remote systemd, providers, Terraform plan/apply/destroy, live entry points, and all cost-bearing/destructive work remained skipped or unexecuted
+- live-resource state remains unknown because no fresh authorized inventory ran
+- the final documentation commit is a descendant of the tested parent; historical 2026-07-27 and `bc9f5f63` evidence remains historical
 
 ### 2026-07-27 — Fresh complete restack-parent gate
 

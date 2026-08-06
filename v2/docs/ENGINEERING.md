@@ -43,11 +43,11 @@ See [STATUS.md](STATUS.md) for current implementation architecture and [frozen/A
 
 This section describes executable topology separately from future acceptance topology. Mutable limits, ports, and wire constants remain source-owned; follow the linked files instead of copying values from this document into automation. [TESTING.md](TESTING.md) defines evidence semantics, and the [harness catalog](../tests/README.md) defines script operation.
 
-### Fresh restack-parent accepted local evidence
+### Fresh reviewed-stack accepted local evidence
 
-The accepted non-live run on 2026-07-27 tested PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865`, tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`, from `00:38:20Z` through `00:46:34Z`. All `25 / 25` bounded gates passed (`0` failed), with `486s` summed gate time and `494s` wall time. Exact core seeds `0..9999`, worker seeds `0..999`, and all `26` invoked non-containerd aggregate phases passed. Language/race/build, protocol-v6, shell, four offline Terraform roots, changed-doc layout/links, credential, residue, no-`v1`, and cleanliness checks passed. Generated fuzz output was restored to the pre-run state; process, listener, port-lock, and generated-artifact deltas were zero.
+The accepted non-live run on 2026-08-06 tested evidence parent `3890ac40615b60e7775637a2f59d042c2d893c98`, tree `822a5c77c1e446058ca701e61c238bd132a246e0`, from `05:45:20Z` through `05:53:10Z`. All `25 / 25` bounded gates passed (`0` failed), with `463s` summed gate time and `470s` wall time. Exact core seeds `0..9999`, worker seeds `0..999`, and all `28` invoked non-containerd aggregate phases passed. Language/race/build, protocol-v6, shell, four offline Terraform roots, documentation layout/links, credential, residue, no-`v1`, and cleanliness checks passed. Generated fuzz output was restored to the pre-run state; process, listener, port-lock, and generated-artifact deltas were zero.
 
-This evidence crosses deterministic and local process/socket/filesystem boundaries only. Containerd, privileged host operations, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, provider/Terraform mutation, and live work remained skipped or unexecuted. The final evidence-docs commit is a separately recorded docs-only descendant of the tested parent.
+This evidence crosses deterministic and local process/socket/filesystem boundaries only. Containerd, privileged host operations, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, provider/Terraform mutation, and live work remained skipped or unexecuted. The final evidence-docs commit is a separately recorded documentation-only descendant of the tested parent.
 
 ### Historical accepted local evidence
 
