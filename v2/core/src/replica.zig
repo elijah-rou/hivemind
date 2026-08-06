@@ -32,6 +32,9 @@ pub const HEARTBEAT_INTERVAL: i64 = 100;
 pub const VIEW_CHANGE_TIMEOUT: i64 = 2000;
 pub const RECOVERED_VIEW_CHANGE_TIMEOUT: i64 = 50;
 pub const REPAIR_BATCH_MAX: usize = 8;
+/// Reserve the all-ones value so a timeout can never wrap a view to zero.
+const VIEW_NUMBER_SENTINEL: msg.ViewNumber = std.math.maxInt(msg.ViewNumber);
+const VIEW_NUMBER_MAX: msg.ViewNumber = VIEW_NUMBER_SENTINEL - 1;
 const DEFAULT_STOP_GRACE_MS: u64 = 30_000;
 const WORKER_DISPATCH_RETRY_INTERVAL: i64 = 5000;
 /// Bound on deferred stop-pod side effects waiting for a durability barrier.
@@ -45,7 +48,12 @@ pub fn journalSlot(op: msg.OpNumber) usize {
 }
 
 /// Prepare wire/semantics gate used before onPrepare mutates view/status/log.
+fn viewNumberValid(view_number: msg.ViewNumber) bool {
+    return view_number < VIEW_NUMBER_SENTINEL;
+}
+
 fn prepareSemanticsValid(prepare: msg.PrepareMsg) bool {
+    if (!viewNumberValid(prepare.view_number)) return false;
     if (prepare.op_number == 0 or prepare.op_number > LOG_SIZE_MAX) return false;
     if (prepare.commit_min > prepare.op_number) return false;
     if (prepare.retention_floor != 0) return false;
@@ -56,6 +64,7 @@ fn prepareSemanticsValid(prepare: msg.PrepareMsg) bool {
 
 /// Commit wire/semantics gate used before onCommit mutates view/status/log.
 fn commitSemanticsValid(commit: msg.CommitMsg) bool {
+    if (!viewNumberValid(commit.view_number)) return false;
     if (commit.op_number > LOG_SIZE_MAX) return false;
     if (commit.commit_min > LOG_SIZE_MAX) return false;
     if (commit.commit_max > LOG_SIZE_MAX) return false;
@@ -67,6 +76,7 @@ fn commitSemanticsValid(commit: msg.CommitMsg) bool {
 
 /// StartView entry-set gate: bounds, no op above sv.op_number, no duplicate/conflict identities.
 fn startViewEntriesValid(sv: msg.StartViewMsg) bool {
+    if (!viewNumberValid(sv.view_number)) return false;
     if (sv.commit_min > sv.op_number or sv.op_number > LOG_SIZE_MAX) return false;
     if (sv.retention_floor != 0) return false;
     if (sv.selected_last_normal_view > sv.view_number) return false;
@@ -534,6 +544,7 @@ pub const Replica = struct {
         var disk = self.disk orelse return false;
 
         const meta = disk.readMetadata() orelse return false;
+        if (!viewNumberValid(meta.view_number)) return error.CorruptMetadata;
         if (meta.commit_min > meta.commit_max) return error.CorruptMetadata;
         if (meta.commit_max > meta.op_number) return error.CorruptMetadata;
         if (meta.op_number > LOG_SIZE_MAX) return error.CorruptMetadata;
@@ -746,7 +757,7 @@ pub const Replica = struct {
 
     fn deferredHigherViewTarget(self: *const Replica, from: u8, message: msg.Message) ?msg.ViewNumber {
         return switch (message) {
-            .start_view_change => |m| if (m.replica_id == from) m.view_number else null,
+            .start_view_change => |m| if (m.replica_id == from and viewNumberValid(m.view_number)) m.view_number else null,
             .prepare => |m| if (from == self.leaderForView(m.view_number) and prepareSemanticsValid(m)) m.view_number else null,
             .commit => |m| if (from == self.leaderForView(m.view_number) and commitSemanticsValid(m)) m.view_number else null,
             .start_view => |m| if (from == self.leaderForView(m.view_number) and startViewEntriesValid(m)) m.view_number else null,
@@ -1075,10 +1086,14 @@ pub const Replica = struct {
     // -----------------------------------------------------------------------
 
     fn initiateViewChange(self: *Replica) void {
-        self.initiateViewChangeTo(self.view_number + 1);
+        if (self.view_number >= VIEW_NUMBER_MAX) return;
+        const new_view = self.view_number + 1;
+        std.debug.assert(viewNumberValid(new_view));
+        self.initiateViewChangeTo(new_view);
     }
 
     fn awaitStartView(self: *Replica, new_view: msg.ViewNumber) void {
+        std.debug.assert(viewNumberValid(new_view));
         std.debug.assert(new_view > self.view_number);
         std.debug.assert(!self.pending_start_view.active);
 
@@ -1099,6 +1114,7 @@ pub const Replica = struct {
     }
 
     fn initiateViewChangeTo(self: *Replica, new_view: msg.ViewNumber) void {
+        if (!viewNumberValid(new_view)) return;
         std.debug.assert(new_view > self.view_number);
         std.debug.assert(!self.pending_start_view.active);
 
@@ -1130,6 +1146,7 @@ pub const Replica = struct {
     }
 
     fn onStartViewChange(self: *Replica, from: u8, svc: msg.StartViewChangeMsg) void {
+        if (!viewNumberValid(svc.view_number)) return;
         if (svc.replica_id != from) return;
         if (svc.view_number < self.view_number) return;
         if (svc.view_number > self.view_number) {
@@ -1189,6 +1206,7 @@ pub const Replica = struct {
     }
 
     fn onDoViewChange(self: *Replica, from: u8, dvc: msg.DoViewChangeMsg) void {
+        if (!viewNumberValid(dvc.view_number)) return;
         if (self.status != .view_change) return;
         if (dvc.view_number != self.view_number) return;
         if (dvc.replica_id != from) return;

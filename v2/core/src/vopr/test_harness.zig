@@ -2497,6 +2497,69 @@ test "selected source crash times out candidate without changing active journal"
     try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
 }
 
+test "maximum view is rejected before message adoption and timeout increment" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x4D415856494557);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    const max_view = std.math.maxInt(msg.ViewNumber);
+    const max_view_leader: u8 = @intCast(max_view % @as(msg.ViewNumber, tc.replica_count));
+
+    tc.deliver(1, max_view_leader, .{ .start_view_change = .{
+        .view_number = max_view,
+        .replica_id = max_view_leader,
+    } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    var entry = msg.LogEntry{ .view_number = max_view, .op_number = 1 };
+    entry.checksum = entry.computeChecksum();
+    tc.deliver(1, max_view_leader, .{ .prepare = .{
+        .view_number = max_view,
+        .op_number = 1,
+        .entry = entry,
+    } });
+    tc.deliver(1, max_view_leader, .{ .commit = .{ .view_number = max_view } });
+    tc.deliver(1, max_view_leader, .{ .start_view = .{ .view_number = max_view } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    try tc.disks[2].writeMetadata(.{ .view_number = max_view });
+    try tc.disks[2].sync();
+    try std.testing.expectError(error.CorruptMetadata, tc.replicas[2].recoverFromDisk());
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[2].view_number);
+
+    const last_usable_view = max_view - 1;
+    follower.view_number = last_usable_view;
+    follower.status = .normal;
+    follower.last_heartbeat = 1;
+    follower.last_leader_activity = 1;
+    tc.current_tick = replica_mod.VIEW_CHANGE_TIMEOUT + 1;
+    follower.tick();
+    try std.testing.expectEqual(last_usable_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    follower.status = .view_change;
+    follower.last_leader_activity = 1;
+    tc.current_tick = replica_mod.VIEW_CHANGE_TIMEOUT * 2 + 1;
+    follower.tick();
+    try std.testing.expectEqual(last_usable_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+
+    // Defensive fail-closed behavior for legacy/corrupt in-memory state at the
+    // reserved sentinel itself: neither timeout branch may evaluate max + 1.
+    follower.view_number = max_view;
+    follower.status = .normal;
+    follower.last_leader_activity = 1;
+    follower.tick();
+    try std.testing.expectEqual(max_view, follower.view_number);
+
+    follower.status = .view_change;
+    follower.last_leader_activity = 1;
+    follower.tick();
+    try std.testing.expectEqual(max_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+}
+
 test "candidate allocation failure advances view without active mutation" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0xA110C);
     defer tc.deinit();
