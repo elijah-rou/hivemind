@@ -190,13 +190,18 @@ func (c *HivemindClient) dialCachedLeader(spans *[]TimedSpan) (net.Conn, string,
 	if cached != "" {
 		conn, err := net.DialTimeout("tcp", cached, 2*time.Second)
 		if err == nil {
-			return conn, cached, nil
+			probeStart := nowWallMS()
+			isLeader, probeErr := probeIsLeader(conn, c.crypto)
+			probeEnd := nowWallMS()
+			if spans != nil {
+				*spans = append(*spans, TimedSpan{Phase: "reconnect_probe", StartMS: probeStart, EndMS: probeEnd, Source: "api/client.go"})
+			}
+			if probeErr == nil && isLeader {
+				return conn, cached, nil
+			}
+			_ = conn.Close()
 		}
-		c.mu.Lock()
-		if c.leader == cached {
-			c.leader = ""
-		}
-		c.mu.Unlock()
+		c.invalidateLeader(cached)
 	}
 	return c.dialLeader(spans)
 }

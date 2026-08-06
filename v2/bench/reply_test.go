@@ -280,6 +280,14 @@ func TestReadRunResponseValidatesRequestID(t *testing.T) {
 		buf[8] = 0
 		return buf
 	}
+	encodeRunDetail := func(requestID uint64, status RunStatus, body []byte) []byte {
+		buf := make([]byte, 13+len(body))
+		binary.LittleEndian.PutUint64(buf[0:8], requestID)
+		buf[8] = byte(status)
+		binary.LittleEndian.PutUint32(buf[9:13], uint32(len(body)))
+		copy(buf[13:], body)
+		return buf
+	}
 	writeRun := func(w *io.PipeWriter, payload []byte) {
 		inner := make([]byte, 2+1+len(payload))
 		binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
@@ -304,6 +312,10 @@ func TestReadRunResponseValidatesRequestID(t *testing.T) {
 		{name: "body over max", payload: encodeRun(9, 0, MaxRunResponseBody+1), wantID: 9, wantErr: "exceeds max"},
 		{name: "mismatched request id", payload: encodeRun(8, 0, 0), wantID: 9, wantErr: "request_id mismatch"},
 		{name: "typed error status", payload: encodeRun(9, 1, 0), wantID: 9, wantStatus: RunStatusDeploymentNotFound},
+		{name: "typed error detail", payload: encodeRunDetail(9, RunStatusForwardingFailed, []byte("dial worker: refused")), wantID: 9, wantStatus: RunStatusForwardingFailed},
+		{name: "typed error max detail", payload: encodeRunDetail(9, RunStatusForwardingFailed, make([]byte, MaxRunResponseBody)), wantID: 9, wantStatus: RunStatusForwardingFailed},
+		{name: "typed error detail over max", payload: encodeRunDetail(9, RunStatusForwardingFailed, make([]byte, MaxRunResponseBody+1)), wantID: 9, wantErr: "exceeds max"},
+		{name: "typed error truncated detail", payload: encodeRunDetail(9, RunStatusForwardingFailed, []byte("lost"))[:16], wantID: 9, wantErr: "length"},
 		{name: "truncated header", payload: encodeRun(9, 0, 0)[:8], wantID: 9, wantErr: "too short"},
 		{name: "truncated success missing length", payload: encodeTruncSuccess(9), wantID: 9, wantErr: "truncated"},
 	}

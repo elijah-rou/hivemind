@@ -502,15 +502,16 @@ func parseRunResponseStatus(raw []byte, expectedRequestID uint64) (RunStatus, er
 	if status > RunStatusNotLeader {
 		return 0, fmt.Errorf("unknown run status %d", status)
 	}
-	if status != RunStatusOK {
-		if len(raw) != 9 {
-			return 0, fmt.Errorf("run error response length %d, want 9", len(raw))
+	if len(raw) == 9 {
+		if status == RunStatusOK {
+			return 0, fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
 		}
 		return status, nil
 	}
-	// Success requires explicit body length: request_id(8)+status(1)+len(4)+body.
+	// Worker responses, including explicit errors with detail, carry an exact bounded
+	// body length: request_id(8)+status(1)+len(4)+body.
 	if len(raw) < 13 {
-		return 0, fmt.Errorf("run success truncated: %d bytes, need length field", len(raw))
+		return 0, fmt.Errorf("run response truncated: %d bytes, need length field", len(raw))
 	}
 	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
 	if bodyLen > MaxRunResponseBody {
@@ -518,7 +519,7 @@ func parseRunResponseStatus(raw []byte, expectedRequestID uint64) (RunStatus, er
 	}
 	want := 13 + int(bodyLen)
 	if len(raw) != want {
-		return 0, fmt.Errorf("run success length %d, want %d", len(raw), want)
+		return 0, fmt.Errorf("run response length %d, want %d", len(raw), want)
 	}
 	return status, nil
 }

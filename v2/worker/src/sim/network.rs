@@ -22,6 +22,8 @@ pub struct MessageStats {
     pub control_bytes: u64,
     pub worker_sent: u64,
     pub worker_bytes: u64,
+    pub worker_failed_partition: u64,
+    pub worker_dropped: u64,
 }
 
 impl MessageStats {
@@ -31,6 +33,8 @@ impl MessageStats {
             control_bytes: 0,
             worker_sent: 0,
             worker_bytes: 0,
+            worker_failed_partition: 0,
+            worker_dropped: 0,
         }
     }
 }
@@ -129,7 +133,15 @@ impl SimulatedNetwork {
             }
             other => other,
         };
+        // Messages accepted before a partition remain queued, like bytes already
+        // handed to a socket. New sends after the partition boundary fail and are
+        // lost, so a completed run can have an ambiguous externally observed outcome.
+        if self.partitioned[agent_id] {
+            self.stats.worker_failed_partition += 1;
+            return;
+        }
         if self.drop_rate_percent > 0 && self.prng.chance(self.drop_rate_percent) {
+            self.stats.worker_dropped += 1;
             return;
         }
 
@@ -140,6 +152,9 @@ impl SimulatedNetwork {
                 msg,
                 deliver_at_tick: current_tick + delay,
             });
+            self.stats.worker_sent += 1;
+        } else {
+            self.stats.worker_dropped += 1;
         }
     }
 
@@ -275,6 +290,46 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn partition_buffers_accepted_outbound_and_fails_new_sends() {
+        let mut net = SimulatedNetwork::new(1, 0xB4_11);
+        net.min_delay = 2;
+        net.max_delay = 2;
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 51,
+                status: 0,
+                payload: b"accepted".to_vec(),
+            }),
+            0,
+        );
+        assert_eq!(net.stats.worker_sent, 1);
+
+        net.partition_agent(0, 1);
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 52,
+                status: 0,
+                payload: b"lost".to_vec(),
+            }),
+            1,
+        );
+        assert_eq!(net.stats.worker_failed_partition, 1);
+        assert!(net.pop_outbound(0, 3).is_none());
+
+        net.heal_all(3);
+        match net.pop_outbound(0, 3) {
+            Some(WorkerMessage::RunResponse(response)) => {
+                assert_eq!(response.request_id, 51);
+                assert_eq!(response.payload, b"accepted");
+            }
+            other => panic!("expected buffered response after heal, got {other:?}"),
+        }
+        assert!(net.pop_outbound(0, u64::MAX).is_none());
     }
 
     #[test]

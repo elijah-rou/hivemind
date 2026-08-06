@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -451,6 +452,108 @@ func TestSendCommandTimedAllowsConcurrentConsensusCommands(t *testing.T) {
 
 	listener.Close()
 	<-done
+}
+
+func TestSendCommandTimedReprobesStaleCachedLeaderBeforeConsensusWrite(t *testing.T) {
+	staleListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen stale: %v", err)
+	}
+	defer staleListener.Close()
+	currentListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen current: %v", err)
+	}
+	defer currentListener.Close()
+
+	staleDone := make(chan error, 1)
+	go func() {
+		conn, err := staleListener.Accept()
+		if err != nil {
+			staleDone <- err
+			return
+		}
+		defer conn.Close()
+		frame, err := readFrameGeneric(conn, make([]byte, 256), time.Second, nil)
+		if err != nil {
+			staleDone <- fmt.Errorf("read stale probe: %w", err)
+			return
+		}
+		if len(frame) != 3 || frame[2] != TagLeaderProbeRequest {
+			staleDone <- fmt.Errorf("stale endpoint received non-probe frame: %x", frame)
+			return
+		}
+		if _, err := conn.Write(buildClusterStateProbeFrame(false)); err != nil {
+			staleDone <- fmt.Errorf("write stale probe response: %w", err)
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		var one [1]byte
+		n, err := conn.Read(one[:])
+		if n != 0 || err == nil {
+			staleDone <- fmt.Errorf("consensus bytes reached stale endpoint: n=%d err=%v", n, err)
+			return
+		}
+		staleDone <- nil
+	}()
+
+	currentDone := make(chan error, 1)
+	go func() {
+		conn, err := currentListener.Accept()
+		if err != nil {
+			currentDone <- err
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		frame, err := readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil {
+			currentDone <- fmt.Errorf("read current probe: %w", err)
+			return
+		}
+		if len(frame) != 3 || frame[2] != TagLeaderProbeRequest {
+			currentDone <- fmt.Errorf("current endpoint expected probe, got %x", frame)
+			return
+		}
+		if _, err := conn.Write(buildClusterStateProbeFrame(true)); err != nil {
+			currentDone <- fmt.Errorf("write current probe response: %w", err)
+			return
+		}
+		frame, err = readFrameGeneric(conn, buf, time.Second, nil)
+		if err != nil {
+			currentDone <- fmt.Errorf("read consensus request: %w", err)
+			return
+		}
+		if len(frame) < 20 || frame[2] != TagRequest {
+			currentDone <- fmt.Errorf("current endpoint expected consensus request, got %x", frame)
+			return
+		}
+		requestID := binary.LittleEndian.Uint64(frame[11:19])
+		if _, err := conn.Write(buildCommandReplyFrame(requestID, 77)); err != nil {
+			currentDone <- fmt.Errorf("write consensus reply: %w", err)
+			return
+		}
+		currentDone <- nil
+	}()
+
+	client := NewClient([]string{currentListener.Addr().String()}, nil)
+	client.leader = staleListener.Addr().String()
+	result, _, err := client.SendCommandTimed(CmdNoop, nil)
+	if err != nil {
+		t.Fatalf("SendCommandTimed: %v", err)
+	}
+	if !result.OK || result.EntityID != 77 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if got := client.Leader(); got != currentListener.Addr().String() {
+		t.Fatalf("cached leader = %q, want %q", got, currentListener.Addr())
+	}
+	if err := <-staleDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-currentDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestParseResultRejectsMismatchedRequestID(t *testing.T) {
@@ -907,7 +1010,7 @@ func TestSendRunRequestRejectsOversizedPayloadAndRequestIDMismatch(t *testing.T)
 	}
 }
 
-func TestCommandBurstUsesFixedProbeOnceAndInvalidatesNotLeader(t *testing.T) {
+func TestCommandBurstVerifiesCachedLeaderAndInvalidatesNotLeader(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -986,8 +1089,13 @@ func TestCommandBurstUsesFixedProbeOnceAndInvalidatesNotLeader(t *testing.T) {
 	for tag := range seen {
 		tags = append(tags, tag)
 	}
-	want := []byte{TagLeaderProbeRequest, TagRequest, TagRequest, TagRequest, TagLeaderProbeRequest, TagRequest}
+	want := []byte{
+		TagLeaderProbeRequest, TagRequest,
+		TagLeaderProbeRequest, TagRequest,
+		TagLeaderProbeRequest, TagRequest,
+		TagLeaderProbeRequest, TagRequest,
+	}
 	if !bytes.Equal(tags, want) {
-		t.Fatalf("wire tags = %x, want %x; mutation burst must not request cluster state", tags, want)
+		t.Fatalf("wire tags = %x, want %x; every cached consensus endpoint must be verified with a fixed leader probe", tags, want)
 	}
 }

@@ -41,6 +41,7 @@ struct Inner {
     create_attempts: HashMap<u64, u64>,
     start_attempts: HashMap<u64, u64>,
     run_outcomes: HashMap<u64, VecDeque<RunOutcome>>,
+    run_attempts: HashMap<u64, u64>,
     crash_round: u64,
 }
 
@@ -62,6 +63,7 @@ impl SimulatedRuntime {
                 create_attempts: HashMap::new(),
                 start_attempts: HashMap::new(),
                 run_outcomes: HashMap::new(),
+                run_attempts: HashMap::new(),
                 crash_round: 0,
             }),
         }
@@ -83,6 +85,16 @@ impl SimulatedRuntime {
             previous.is_none(),
             "run script may only be set once per pod"
         );
+    }
+
+    pub fn run_attempt_count(&self, pod_id: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .run_attempts
+            .get(&pod_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn crash_pod(&self, pod_id: u64, exit_code: i32) {
@@ -264,6 +276,8 @@ impl Runtime for SimulatedRuntime {
             }
             None => return Err(RuntimeError::ContainerNotFound(handle.container_id.clone())),
         }
+        let run_attempts = inner.run_attempts.entry(handle.pod_id).or_insert(0);
+        *run_attempts = run_attempts.saturating_add(1);
         let outcome = match inner.run_outcomes.get_mut(&handle.pod_id) {
             Some(script) => script
                 .pop_front()

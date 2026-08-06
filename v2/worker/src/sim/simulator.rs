@@ -167,6 +167,7 @@ mod tests {
                 RunOutcome::ForwardingFailure,
                 RunOutcome::Timeout,
                 RunOutcome::Echo,
+                RunOutcome::Echo,
             ],
         );
 
@@ -240,13 +241,16 @@ mod tests {
             assert_eq!(resources(&sim), running_resources);
         }
 
+        // A response accepted by the outbound path before a partition remains
+        // buffered and is delivered exactly once after healing.
         sim.sim_ios[0].push_inbound(ControlMessage::RunRequest(RunRequestCmd {
             request_id: 826,
             deployment_id: 8_200,
-            payload: b"healed".to_vec(),
+            payload: b"buffered-before-partition".to_vec(),
         }));
-        sim.partition_agent(0);
         sim.tick();
+        sim.partition_agent(0);
+        sim.run(3);
         assert!(!sim
             .control_plane
             .received_messages()
@@ -256,7 +260,7 @@ mod tests {
                 WorkerMessage::RunResponse(response) if response.request_id == 826
             )));
         sim.heal_all();
-        sim.run(3);
+        sim.run(1);
         let healed_responses: Vec<_> = sim
             .control_plane
             .received_messages()
@@ -273,8 +277,36 @@ mod tests {
         assert_eq!(healed_responses.len(), 1);
         let healed = healed_responses[0];
         assert_eq!(healed.status, 0);
-        assert_eq!(healed.payload, b"healed");
+        assert_eq!(healed.payload, b"buffered-before-partition");
         assert!(healed.payload.len() <= MAX_RUN_RESPONSE_BODY);
+        assert_eq!(resources(&sim), running_resources);
+
+        // A request already accepted into worker I/O can execute after the link
+        // partitions while its response send fails. The caller observes no reply,
+        // so execution is provably ambiguous rather than safely retryable.
+        let run_attempts_before = sim.sim_runtimes[0].run_attempt_count(820);
+        sim.sim_ios[0].push_inbound(ControlMessage::RunRequest(RunRequestCmd {
+            request_id: 829,
+            deployment_id: 8_200,
+            payload: b"executed-but-response-lost".to_vec(),
+        }));
+        sim.partition_agent(0);
+        sim.tick();
+        assert_eq!(
+            sim.sim_runtimes[0].run_attempt_count(820),
+            run_attempts_before + 1
+        );
+        assert_eq!(sim.network.stats.worker_failed_partition, 1);
+        sim.heal_all();
+        sim.run(3);
+        assert!(!sim
+            .control_plane
+            .received_messages()
+            .iter()
+            .any(|(_, _, message)| matches!(
+                message,
+                WorkerMessage::RunResponse(response) if response.request_id == 829
+            )));
         assert_eq!(resources(&sim), running_resources);
 
         sim.sim_runtimes[0].crash_pod(820, 137);
