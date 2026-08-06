@@ -330,6 +330,174 @@ pub const SimulatedDisk = struct {
     }
 };
 
+const OpenedPathKind = enum {
+    directory,
+    regular_file,
+    other,
+};
+
+const OpenedPathStat = struct {
+    kind: OpenedPathKind,
+    owner: u32,
+    size: u64,
+    link_count: u64 = 1,
+};
+
+fn validateOpenedPathKind(stat: OpenedPathStat, expected_kind: OpenedPathKind) !void {
+    if (stat.kind != expected_kind) return switch (expected_kind) {
+        .directory => error.NotDirectory,
+        .regular_file => error.NotRegularFile,
+        .other => unreachable,
+    };
+}
+
+fn validateOpenedPath(stat: OpenedPathStat, expected_kind: OpenedPathKind, expected_owner: u32) !void {
+    if (stat.owner != expected_owner) return error.PathNotOwned;
+    try validateOpenedPathKind(stat, expected_kind);
+    if (expected_kind == .regular_file and stat.link_count != 1) return error.MultipleLinks;
+}
+
+fn fstatOpenedFd(fd: std.posix.fd_t) !OpenedPathStat {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .linux) {
+        // Zig 0.16 intentionally exposes Linux fd metadata through statx rather
+        // than the libc fstat ABI. AT_EMPTY_PATH makes this an fd-only query.
+        const linux = std.os.linux;
+        var statx = std.mem.zeroes(linux.Statx);
+        const requested: linux.STATX = .{ .TYPE = true, .UID = true, .SIZE = true, .NLINK = true };
+        if (std.c.statx(fd, "", linux.AT.EMPTY_PATH, requested, &statx) != 0) return error.StatFailed;
+        if (!statx.mask.TYPE or !statx.mask.UID or !statx.mask.SIZE or !statx.mask.NLINK) return error.StatIncomplete;
+        const file_type = statx.mode & linux.S.IFMT;
+        return .{
+            .kind = if (file_type == linux.S.IFDIR)
+                .directory
+            else if (file_type == linux.S.IFREG)
+                .regular_file
+            else
+                .other,
+            .owner = statx.uid,
+            .size = statx.size,
+            .link_count = statx.nlink,
+        };
+    } else if (comptime builtin.os.tag == .macos) {
+        var stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
+        const file_type = stat_buf.mode & std.c.S.IFMT;
+        return .{
+            .kind = if (file_type == std.c.S.IFDIR)
+                .directory
+            else if (file_type == std.c.S.IFREG)
+                .regular_file
+            else
+                .other,
+            .owner = @intCast(stat_buf.uid),
+            .size = @intCast(stat_buf.size),
+            .link_count = @intCast(stat_buf.nlink),
+        };
+    } else {
+        @compileError("secure journal fd validation supports Linux and macOS");
+    }
+}
+
+const DATA_DIR_PATH_MAX: usize = 4096;
+const DATA_DIR_COMPONENTS_MAX: usize = 64;
+
+fn openDirectoryAt(parent_fd: std.posix.fd_t, name: []const u8) !std.posix.fd_t {
+    const fd = std.posix.openat(parent_fd, name, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+    }, 0) catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => return error.NotDirectory,
+        else => return err,
+    };
+    errdefer _ = std.c.close(fd);
+
+    const stat = try fstatOpenedFd(fd);
+    try validateOpenedPathKind(stat, .directory);
+    return fd;
+}
+
+fn createDirectoryAt(parent_fd: std.posix.fd_t, name: []const u8) !void {
+    var name_buf: [std.posix.PATH_MAX]u8 = undefined;
+    if (name.len >= name_buf.len) return error.NameTooLong;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    const name_z: [*:0]const u8 = @ptrCast(&name_buf);
+
+    while (true) {
+        const rc = std.c.mkdirat(parent_fd, name_z, 0o700);
+        if (rc == 0) return;
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            .EXIST => return,
+            .ACCES, .PERM => return error.PermissionDenied,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOSPC => return error.NoSpaceLeft,
+            .ROFS => return error.ReadOnlyFileSystem,
+            else => return error.CreateDirFailed,
+        }
+    }
+}
+
+fn openOrCreateDirectoryAt(parent_fd: std.posix.fd_t, name: []const u8) !std.posix.fd_t {
+    return openDirectoryAt(parent_fd, name) catch |err| switch (err) {
+        error.FileNotFound => {
+            try createDirectoryAt(parent_fd, name);
+            // A concurrent creator can win mkdirat. Re-open with NOFOLLOW and
+            // validate the object actually installed in this pinned parent.
+            return openDirectoryAt(parent_fd, name);
+        },
+        else => return err,
+    };
+}
+
+fn validateDataDirPath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidDataDirPath;
+    if (path.len >= DATA_DIR_PATH_MAX) return error.NameTooLong;
+
+    var component_count: usize = 0;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) return error.ParentPathNotAllowed;
+        component_count += 1;
+        if (component_count > DATA_DIR_COMPONENTS_MAX) return error.TooManyPathComponents;
+    }
+    if (component_count == 0) return error.InvalidDataDirPath;
+}
+
+fn openOrCreateDataDirAt(start_fd: std.posix.fd_t, path: []const u8) !std.posix.fd_t {
+    if (std.fs.path.isAbsolute(path)) return error.AbsolutePathNotAllowed;
+    try validateDataDirPath(path);
+
+    var current_fd = try openDirectoryAt(start_fd, ".");
+    errdefer _ = std.c.close(current_fd);
+
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        const next_fd = try openOrCreateDirectoryAt(current_fd, component);
+        _ = std.c.close(current_fd);
+        current_fd = next_fd;
+    }
+
+    const stat = try fstatOpenedFd(current_fd);
+    try validateOpenedPath(stat, .directory, @intCast(std.c.geteuid()));
+    if (std.c.fchmod(current_fd, 0o700) != 0) return error.PermissionDenied;
+    return current_fd;
+}
+
+pub fn openOrCreateDataDir(path: []const u8) !std.posix.fd_t {
+    try validateDataDirPath(path);
+    if (!std.fs.path.isAbsolute(path)) return openOrCreateDataDirAt(std.posix.AT.FDCWD, path);
+
+    const root_fd = try openDirectoryAt(std.posix.AT.FDCWD, "/");
+    defer _ = std.c.close(root_fd);
+    return openOrCreateDataDirAt(root_fd, std.mem.trimStart(u8, path, "/"));
+}
+
 // ---------------------------------------------------------------------------
 // FileDisk -- experimental single-copy file-backed journal (layout v2).
 //
@@ -350,6 +518,7 @@ pub const SimulatedDisk = struct {
 // ---------------------------------------------------------------------------
 
 pub const FileDisk = struct {
+    pub const JOURNAL_NAME = "journal.bin";
     pub const MAGIC: u64 = 0x444E494D45564948; // little-endian bytes "HIVEMIND"
     pub const VERSION: u32 = 2;
     pub const LEGACY_VERSION: u32 = 1;
@@ -454,44 +623,61 @@ pub const FileDisk = struct {
     metadata_written: bool,
     fd: std.posix.fd_t,
 
-    /// Open or create a journal file. Initializes `self` in-place to avoid
-    /// stack overflow (the slots array is ~115KB).
+    /// Open or create `journal.bin` relative to an already-open data
+    /// directory. Initializes `self` in-place to avoid stack overflow.
     ///
-    /// New journals are created exclusively (O_CREAT|O_EXCL) with mode 0600.
-    /// Pre-existing files must already be exactly TOTAL_SIZE; truncated or
-    /// partial journals fail closed instead of being silently re-initialized.
-    pub fn openInPlace(self: *FileDisk, path: []const u8) !void {
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return error.PathTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    /// The directory fd and journal fd are validated after open, so path
+    /// replacement cannot redirect later I/O. New journals are created
+    /// exclusively with mode 0600. Existing journals must be owned by the
+    /// effective uid, regular files, and exactly TOTAL_SIZE.
+    pub fn openInDirInPlace(self: *FileDisk, dir_fd: std.posix.fd_t) !void {
+        const dir_stat = try fstatOpenedFd(dir_fd);
+        try validateOpenedPath(dir_stat, .directory, @intCast(std.c.geteuid()));
+        if (std.c.fchmod(dir_fd, 0o700) != 0) return error.PermissionDenied;
 
         self.slot_occupied = std.mem.zeroes([replica_mod.LOG_SIZE_MAX]bool);
         self.metadata = .{};
         self.metadata_written = false;
 
-        const excl_fd = std.c.open(path_z, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
-        if (excl_fd >= 0) {
-            self.fd = excl_fd;
+        const create_flags: std.posix.O = .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        };
+        const new_fd: ?std.posix.fd_t = std.posix.openat(dir_fd, JOURNAL_NAME, create_flags, 0o600) catch |err| switch (err) {
+            error.PathAlreadyExists => null,
+            else => return err,
+        };
+        if (new_fd) |fd| {
+            self.fd = fd;
             errdefer {
-                _ = std.c.close(self.fd);
-                _ = std.c.unlink(path_z);
+                _ = std.c.close(fd);
+                _ = std.c.unlinkat(dir_fd, JOURNAL_NAME, 0);
                 self.fd = -1;
             }
+            const stat = try fstatOpenedFd(fd);
+            try validateOpenedPath(stat, .regular_file, @intCast(std.c.geteuid()));
+            if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
             try self.initNewFile();
-            try fsyncParentDir(path);
+            try fsyncDirectoryFd(dir_fd);
             return;
         }
 
-        const fd = std.c.open(path_z, .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.OpenFailed;
+        const fd = try std.posix.openat(dir_fd, JOURNAL_NAME, .{
+            .ACCMODE = .RDWR,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, 0);
         errdefer _ = std.c.close(fd);
-        self.fd = fd;
-        if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
 
-        const file_size = try fileSizeFd(fd);
-        if (file_size != TOTAL_SIZE) return error.WrongSize;
+        const stat = try fstatOpenedFd(fd);
+        try validateOpenedPath(stat, .regular_file, @intCast(std.c.geteuid()));
+        if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
+        if (stat.size != TOTAL_SIZE) return error.WrongSize;
+
+        self.fd = fd;
         try self.loadExisting();
     }
 
@@ -690,48 +876,12 @@ pub const FileDisk = struct {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn fileSizeFd(fd: std.posix.fd_t) !usize {
-    if (comptime @import("builtin").os.tag == .macos) {
-        var stat_buf: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
-        return @intCast(stat_buf.size);
-    } else {
-        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (end < 0) return error.StatFailed;
-        if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.StatFailed;
-        return @intCast(end);
-    }
+fn fsyncDirectoryFd(fd: std.posix.fd_t) !void {
+    if (std.c.fsync(fd) != 0) return error.FsyncFailed;
 }
 
-fn fsyncParentDir(path: []const u8) !void {
-    const sync_dir = struct {
-        fn call(dir_z: [*:0]const u8) !void {
-            const dfd = std.c.open(dir_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-            if (dfd < 0) return error.OpenFailed;
-            defer _ = std.c.close(dfd);
-            if (std.c.fsync(dfd) != 0) return error.FsyncFailed;
-        }
-    }.call;
-
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse {
-        try sync_dir(".");
-        return;
-    };
-    var dir_buf: [4096]u8 = undefined;
-    const dir_path = if (slash == 0) "/" else path[0..slash];
-    if (dir_path.len >= dir_buf.len) return error.PathTooLong;
-    @memcpy(dir_buf[0..dir_path.len], dir_path);
-    dir_buf[dir_path.len] = 0;
-    try sync_dir(@ptrCast(&dir_buf));
-}
-
-fn unlinkFile(path: []const u8) void {
-    var path_buf: [4096]u8 = undefined;
-    if (path.len >= path_buf.len) return;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-    _ = std.c.unlink(path_z);
+fn createTestDataDir(parent_fd: std.posix.fd_t) !std.posix.fd_t {
+    return openOrCreateDataDirAt(parent_fd, "data");
 }
 
 // ---------------------------------------------------------------------------
@@ -768,12 +918,14 @@ test "SimulatedDisk through DiskInterface" {
 }
 
 test "FileDisk: write and read slot" {
-    const path = "/tmp/hivemind_test_slot.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
     defer fd.close();
 
     var entry = msg.LogEntry{ .op_number = 7, .view_number = 1, .command = .{ .noop = {} } };
@@ -791,12 +943,14 @@ test "FileDisk: write and read slot" {
 }
 
 test "FileDisk: metadata persistence" {
-    const path = "/tmp/hivemind_test_meta.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
     defer fd.close();
 
     try std.testing.expect(fd.readMetadata() == null);
@@ -815,13 +969,15 @@ test "FileDisk: metadata persistence" {
 }
 
 test "FileDisk: reopen preserves data" {
-    const path = "/tmp/hivemind_test_reopen.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
 
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
     var entry = msg.LogEntry{ .op_number = 99, .view_number = 2, .command = .{ .noop = {} } };
     entry.checksum = entry.computeChecksum();
     try fd.writeSlot(10, &entry);
@@ -831,7 +987,7 @@ test "FileDisk: reopen preserves data" {
     try fd.sync();
     fd.close();
 
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
     defer fd.close();
 
     const read_entry = fd.readSlot(10).?;
@@ -910,12 +1066,14 @@ test "durable storage: SimulatedDisk pending capacity covers LOG_SIZE_MAX" {
 }
 
 test "FileDisk: truncated journal fails closed" {
-    const path = "/tmp/hivemind_test_truncated.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
     var entry = msg.LogEntry{ .op_number = 1, .view_number = 0, .command = .{ .noop = {} } };
     entry.checksum = entry.computeChecksum();
     try fd.writeSlot(0, &entry);
@@ -924,20 +1082,22 @@ test "FileDisk: truncated journal fails closed" {
     fd.close();
 
     // Truncate below TOTAL_SIZE (non-empty corrupt/partial journal).
-    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    const raw = std.posix.openat(data_dir_fd, FileDisk.JOURNAL_NAME, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, 0) catch -1;
     try std.testing.expect(raw >= 0);
     defer _ = std.c.close(raw);
     try std.testing.expect(std.c.ftruncate(raw, 64) == 0);
 
-    try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
+    try std.testing.expectError(error.WrongSize, fd.openInDirInPlace(data_dir_fd));
 }
 
 test "FileDisk: creation-crash partial journal fails closed" {
-    const path = "/tmp/hivemind_test_partial.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     // Simulate exclusive create that crashed after writing a few bytes.
-    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    const raw = std.posix.openat(data_dir_fd, FileDisk.JOURNAL_NAME, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch -1;
     try std.testing.expect(raw >= 0);
     const junk = [_]u8{ 0x48, 0x49, 0x56, 0x45 };
     try std.testing.expect(std.c.pwrite(raw, &junk, junk.len, 0) == junk.len);
@@ -945,7 +1105,7 @@ test "FileDisk: creation-crash partial journal fails closed" {
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try std.testing.expectError(error.WrongSize, fd.openInPlace(path));
+    try std.testing.expectError(error.WrongSize, fd.openInDirInPlace(data_dir_fd));
 }
 
 test "durable storage: write_fault_rate applies to metadata writes" {
@@ -963,11 +1123,13 @@ test "durable storage: write_fault_rate applies to clearSlot" {
 }
 
 test "FileDisk: actual legacy native-layout journal is rejected fail closed" {
-    const path = "/tmp/hivemind_test_legacy_v1.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     // Reproduce layout v1's native LogEntry sizing, not layout v2's size.
-    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    const raw = std.posix.openat(data_dir_fd, FileDisk.JOURNAL_NAME, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, 0o600) catch -1;
     try std.testing.expect(raw >= 0);
     defer _ = std.c.close(raw);
     const legacy_total_size = FileDisk.JOURNAL_OFFSET + replica_mod.LOG_SIZE_MAX * @sizeOf(msg.LogEntry);
@@ -981,18 +1143,20 @@ test "FileDisk: actual legacy native-layout journal is rejected fail closed" {
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    if (fd.openInPlace(path)) {
+    if (fd.openInDirInPlace(data_dir_fd)) {
         return error.ExpectedIncompatibleJournalRejection;
     } else |_| {}
 }
 
 test "FileDisk: rejects corrupt command tag on open" {
-    const path = "/tmp/hivemind_test_corrupt_cmd_tag.bin";
-    defer unlinkFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
 
     const fd = try std.testing.allocator.create(FileDisk);
     defer std.testing.allocator.destroy(fd);
-    try fd.openInPlace(path);
+    try fd.openInDirInPlace(data_dir_fd);
 
     var entry = msg.LogEntry{
         .op_number = 1,
@@ -1009,12 +1173,12 @@ test "FileDisk: rejects corrupt command tag on open" {
     // Corrupt the on-disk Command tag (first byte of the command region).
     const tag_offset = FileDisk.JOURNAL_OFFSET + FileDisk.DISK_COMMAND_OFFSET;
     const bad_tag = [_]u8{0xFF};
-    const raw = std.c.open(path ++ "\x00", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    const raw = std.posix.openat(data_dir_fd, FileDisk.JOURNAL_NAME, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, 0) catch -1;
     try std.testing.expect(raw >= 0);
     defer _ = std.c.close(raw);
     try std.testing.expect(std.c.pwrite(raw, &bad_tag, 1, @intCast(tag_offset)) == 1);
 
-    try std.testing.expectError(error.InvalidCommandTag, fd.openInPlace(path));
+    try std.testing.expectError(error.InvalidCommandTag, fd.openInDirInPlace(data_dir_fd));
 }
 
 test "FileDisk: disk LogEntry codec roundtrips with tag-first Command" {
@@ -1051,6 +1215,130 @@ test "FileDisk: decode rejects corrupt command tag without materializing union" 
     var buf = [_]u8{0} ** FileDisk.ENTRY_SIZE;
     buf[FileDisk.DISK_COMMAND_OFFSET] = 0xFE; // invalid Command tag
     try std.testing.expectError(error.InvalidCommandTag, FileDisk.decodeLogEntry(&buf));
+}
+
+test "FileDisk: journal symlink is rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
+
+    const target_fd = try std.posix.openat(data_dir_fd, "target.bin", .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0o600);
+    _ = std.c.close(target_fd);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("target.bin", data_dir_fd, FileDisk.JOURNAL_NAME));
+
+    const fd = try std.testing.allocator.create(FileDisk);
+    defer std.testing.allocator.destroy(fd);
+    try std.testing.expectError(error.SymLinkLoop, fd.openInDirInPlace(data_dir_fd));
+}
+
+test "FileDisk: multiply linked journal is rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
+
+    const target_fd = try std.posix.openat(data_dir_fd, "target.bin", .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0o600);
+    defer _ = std.c.close(target_fd);
+    try std.testing.expect(std.c.ftruncate(target_fd, FileDisk.TOTAL_SIZE) == 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(
+        data_dir_fd,
+        "target.bin",
+        data_dir_fd,
+        FileDisk.JOURNAL_NAME,
+        0,
+    ));
+
+    const fd = try std.testing.allocator.create(FileDisk);
+    defer std.testing.allocator.destroy(fd);
+    try std.testing.expectError(error.MultipleLinks, fd.openInDirInPlace(data_dir_fd));
+}
+
+test "FileDisk: data directory symlink is rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "real", 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("real", tmp.dir.handle, "link"));
+    try std.testing.expectError(error.NotDirectory, openOrCreateDataDirAt(tmp.dir.handle, "link"));
+}
+
+test "FileDisk: nested parent symlink is rejected before directory creation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "real", 0o700));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("real", tmp.dir.handle, "link"));
+    try std.testing.expectError(error.NotDirectory, openOrCreateDataDirAt(tmp.dir.handle, "link/nested"));
+
+    const real_fd = try openDirectoryAt(tmp.dir.handle, "real");
+    defer _ = std.c.close(real_fd);
+    try std.testing.expectError(error.FileNotFound, openDirectoryAt(real_fd, "nested"));
+}
+
+test "FileDisk: component walk creates nested data directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data_dir_fd = try openOrCreateDataDirAt(tmp.dir.handle, "one/two");
+    defer _ = std.c.close(data_dir_fd);
+    const stat = try fstatOpenedFd(data_dir_fd);
+    try validateOpenedPath(stat, .directory, @intCast(std.c.geteuid()));
+}
+
+test "FileDisk: ownership and file type validation fail closed" {
+    try std.testing.expectError(error.PathNotOwned, validateOpenedPath(.{
+        .kind = .regular_file,
+        .owner = 8,
+        .size = FileDisk.TOTAL_SIZE,
+    }, .regular_file, 7));
+    try std.testing.expectError(error.MultipleLinks, validateOpenedPath(.{
+        .kind = .regular_file,
+        .owner = 7,
+        .size = FileDisk.TOTAL_SIZE,
+        .link_count = 2,
+    }, .regular_file, 7));
+    try std.testing.expectError(error.NotRegularFile, validateOpenedPath(.{
+        .kind = .other,
+        .owner = 7,
+        .size = FileDisk.TOTAL_SIZE,
+    }, .regular_file, 7));
+    try std.testing.expectError(error.NotDirectory, validateOpenedPath(.{
+        .kind = .regular_file,
+        .owner = 7,
+        .size = 0,
+    }, .directory, 7));
+}
+
+test "FileDisk: secure descriptors are close-on-exec" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_fd = try createTestDataDir(tmp.dir.handle);
+    defer _ = std.c.close(data_dir_fd);
+
+    const fd = try std.testing.allocator.create(FileDisk);
+    defer std.testing.allocator.destroy(fd);
+    try fd.openInDirInPlace(data_dir_fd);
+    defer fd.close();
+
+    const dir_flags = std.c.fcntl(data_dir_fd, std.c.F.GETFD);
+    const journal_flags = std.c.fcntl(fd.fd, std.c.F.GETFD);
+    try std.testing.expect(dir_flags >= 0);
+    try std.testing.expect(journal_flags >= 0);
+    try std.testing.expect(dir_flags & std.c.FD_CLOEXEC != 0);
+    try std.testing.expect(journal_flags & std.c.FD_CLOEXEC != 0);
 }
 
 test "FileDisk: layout version and entry size are explicit" {
