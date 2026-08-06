@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the exact Terraform state that guarded live cleanup may destroy."""
+"""Validate the exact state or saved destroy plan guarded cleanup may apply."""
 
 import json
 import re
@@ -47,9 +47,35 @@ def managed_resources(module: object) -> list[dict[str, object]]:
     return result
 
 
+def managed_resources_from_destroy_plan(changes: object) -> list[dict[str, object]]:
+    if not isinstance(changes, list):
+        fail("destroy plan resource changes are malformed")
+    result: list[dict[str, object]] = []
+    for resource in changes:
+        if not isinstance(resource, dict):
+            fail("destroy plan contains a malformed resource change")
+        if resource.get("mode") != "managed":
+            continue
+        change = resource.get("change")
+        if not isinstance(change, dict):
+            fail("destroy plan lacks managed change data")
+        if change.get("actions") != ["delete"] or change.get("after") is not None:
+            fail("destroy plan contains a managed action other than exact deletion")
+        before = change.get("before")
+        if not isinstance(before, dict):
+            fail("destroy plan deletion lacks prior resource values")
+        result.append({
+            "address": resource.get("address"),
+            "mode": "managed",
+            "type": resource.get("type"),
+            "values": before,
+        })
+    return result
+
+
 def main() -> None:
     if len(sys.argv) != 4:
-        fail("usage: validate-owned-state.py STATE_JSON RUN_TOKEN ECR_NAME")
+        fail("usage: validate-owned-state.py STATE_OR_DESTROY_PLAN_JSON RUN_TOKEN ECR_NAME")
     state_path, token, ecr_name = sys.argv[1:]
     if not TOKEN_RE.fullmatch(token):
         fail("invalid guarded run token")
@@ -59,11 +85,14 @@ def main() -> None:
     with open(state_path, encoding="utf-8") as source:
         state: object = json.load(source)
     if not isinstance(state, dict):
-        fail("Terraform state JSON must be an object")
-    values = state.get("values")
-    if not isinstance(values, dict):
-        fail("Terraform state lacks values")
-    resources = managed_resources(values.get("root_module"))
+        fail("Terraform state or plan JSON must be an object")
+    if "resource_changes" in state:
+        resources = managed_resources_from_destroy_plan(state.get("resource_changes"))
+    else:
+        values = state.get("values")
+        if not isinstance(values, dict):
+            fail("Terraform state lacks values")
+        resources = managed_resources(values.get("root_module"))
     by_address: dict[str, dict[str, object]] = {}
     for resource in resources:
         address = require_string(resource.get("address"), "resource address")
