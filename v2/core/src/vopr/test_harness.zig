@@ -114,7 +114,7 @@ pub const TestCluster = struct {
             var any = false;
             for (0..self.replica_count) |i| {
                 if (!self.replica_running[i] or self.replica_paused[i]) continue;
-                const received = self.network.queues[i].popReadyExcluding(self.current_tick, buf[1..], &self.replica_paused) orelse continue;
+                const received = self.network.queues[i].popReady(self.current_tick, buf[1..]) orelse continue;
                 buf[0] = received.from;
                 const n = received.len + 1;
                 const from = buf[0];
@@ -1080,7 +1080,7 @@ const ReplyCapture = struct {
     }
 };
 
-test "paused replica freezes queued inbound and outbound delivery" {
+test "paused replica retains inbound work while already-sent outbound traffic delivers" {
     const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A000);
     defer tc.deinit();
     tc.network.min_delay = 0;
@@ -1097,19 +1097,26 @@ test "paused replica freezes queued inbound and outbound delivery" {
         .entry = entry,
     } }, &wire);
     tc.network.enqueueSend(0, 1, wire[0..len]);
-    len = msg.serialize(.{ .start_view_change = .{ .view_number = 3, .replica_id = 1 } }, &wire);
+    len = msg.serialize(.{ .prepare_ok = .{
+        .view_number = 0,
+        .op_number = 1,
+        .replica_id = 1,
+        .entry_checksum = entry.checksum,
+    } }, &wire);
     tc.network.enqueueSend(1, 0, wire[0..len]);
 
     tc.pauseReplica(1);
     tc.tick();
-    try std.testing.expectEqual(@as(usize, 1), tc.network.queues[0].count);
+    // The paused receiver retains its queued inbound Prepare. The message that
+    // replica 1 already handed to the network remains in flight and reaches 0.
+    try std.testing.expectEqual(@as(usize, 0), tc.network.queues[0].count);
     try std.testing.expectEqual(@as(usize, 1), tc.network.queues[1].count);
     try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[0].view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[1].op_number);
 
     tc.resumeReplica(1);
     tc.deliverAll();
-    try std.testing.expectEqual(@as(msg.ViewNumber, 3), tc.replicas[0].view_number);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[0].view_number);
     try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
 }
 
