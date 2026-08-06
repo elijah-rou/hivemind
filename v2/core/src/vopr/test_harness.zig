@@ -9,6 +9,7 @@ const Prng = @import("../prng.zig").Prng;
 const StateChecker = @import("checker.zig").StateChecker;
 const SimulatedDisk = @import("../disk.zig").SimulatedDisk;
 const gossip_mod = @import("../gossip.zig");
+const view_candidate = @import("../view_change_candidate.zig");
 
 /// Lightweight test harness for a VRR cluster with integrated state checking.
 /// Every tick validates consensus safety invariants via the StateChecker.
@@ -22,6 +23,7 @@ pub const TestCluster = struct {
     replicas: [msg.REPLICA_COUNT_MAX]*replica_mod.Replica,
     disks: [msg.REPLICA_COUNT_MAX]SimulatedDisk,
     replica_running: [msg.REPLICA_COUNT_MAX]bool,
+    replica_paused: [msg.REPLICA_COUNT_MAX]bool,
     checker: StateChecker,
     replica_count: u8,
 
@@ -36,6 +38,7 @@ pub const TestCluster = struct {
         tc.current_tick = 0;
         tc.replica_count = replica_count;
         tc.replica_running = [_]bool{false} ** msg.REPLICA_COUNT_MAX;
+        tc.replica_paused = [_]bool{false} ** msg.REPLICA_COUNT_MAX;
         tc.checker = StateChecker.init(replica_count);
         tc.sim_agents = undefined;
         tc.sim_worker_count = 0;
@@ -51,6 +54,7 @@ pub const TestCluster = struct {
             tc.disks[i] = SimulatedDisk.init();
             tc.replicas[i] = try allocator.create(replica_mod.Replica);
             tc.replicas[i].initInPlace(.{
+                .allocator = allocator,
                 .replica_id = id,
                 .replica_count = replica_count,
                 .io = tc.sim_ios[i].io(),
@@ -64,6 +68,7 @@ pub const TestCluster = struct {
 
     pub fn deinit(self: *TestCluster) void {
         for (0..self.replica_count) |i| {
+            self.replicas[i].deinit();
             self.allocator.destroy(self.replicas[i]);
             self.allocator.destroy(self.state_machines[i]);
         }
@@ -76,7 +81,7 @@ pub const TestCluster = struct {
         self.current_tick += 1;
         self.deliverAll();
         for (0..self.replica_count) |i| {
-            if (!self.replica_running[i]) continue;
+            if (!self.replica_running[i] or self.replica_paused[i]) continue;
             self.replicas[i].tick();
         }
         // Run state checker after every tick
@@ -107,7 +112,7 @@ pub const TestCluster = struct {
         while (delivered < 256) {
             var any = false;
             for (0..self.replica_count) |i| {
-                if (!self.replica_running[i]) continue;
+                if (!self.replica_running[i] or self.replica_paused[i]) continue;
                 const io = self.sim_ios[i].io();
                 var bufs = [_][]u8{&buf};
                 const n = io.vtable.netRead(io.userdata, @intCast(i), &bufs) catch continue;
@@ -175,11 +180,22 @@ pub const TestCluster = struct {
         self.network.healAll();
     }
 
+    pub fn pauseReplica(self: *TestCluster, id: u8) void {
+        if (id >= self.replica_count or !self.replica_running[id]) return;
+        self.replica_paused[id] = true;
+    }
+
+    pub fn resumeReplica(self: *TestCluster, id: u8) void {
+        if (id >= self.replica_count or !self.replica_running[id]) return;
+        self.replica_paused[id] = false;
+    }
+
     /// Simulate process stop: replica no longer ticks or receives messages.
     /// Disk survives; queued inbound messages are dropped like closed TCP sockets.
     pub fn stopReplica(self: *TestCluster, id: u8) void {
         if (id >= self.replica_count) return;
         self.replica_running[id] = false;
+        self.replica_paused[id] = false;
         for (0..self.replica_count) |i| {
             self.network.partitioned[id][@intCast(i)] = true;
             self.network.partitioned[@intCast(i)][id] = true;
@@ -204,11 +220,13 @@ pub const TestCluster = struct {
     /// then recover from durable disk state.
     pub fn crashReplica(self: *TestCluster, id: u8) void {
         const i: usize = id;
+        self.replica_paused[i] = false;
 
         self.disks[i].crash();
         self.state_machines[i].initInPlace(self.state_machines[i].seed);
 
-        self.replicas[i].initInPlace(.{
+        self.replicas[i].resetInPlace(.{
+            .allocator = self.allocator,
             .replica_id = id,
             .replica_count = self.replica_count,
             .io = self.sim_ios[i].io(),
@@ -1103,7 +1121,8 @@ test "durable storage: corrupt committed slot fails recovery" {
     try tc.disks[0].sync();
 
     tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
-    tc.replicas[0].initInPlace(.{
+    tc.replicas[0].resetInPlace(.{
+        .allocator = tc.allocator,
         .replica_id = 0,
         .replica_count = 1,
         .io = tc.sim_ios[0].io(),
@@ -1381,6 +1400,17 @@ test "durable storage: replaced op cannot re-ack on stale durable watermark" {
     replacement.checksum = replacement.computeChecksum();
     try std.testing.expect(replacement.checksum != original.checksum);
 
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 0,
+        .op_number = 1,
+        .tip_checksum = replacement.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = replacement;
+
     // Leader must be able to accept a PrepareOk for op 1 if one is wrongly sent.
     tc.replicas[0].view_number = 3;
     tc.replicas[0].last_normal_view = 3;
@@ -1393,12 +1423,7 @@ test "durable storage: replaced op cannot re-ack on stale durable watermark" {
     tc.replicas[0].prepare_ok_from[slot] = 0;
     tc.replicas[0].prepare_ok_counts[slot] = 0;
 
-    // Replace the in-memory slot directly so this storage scenario does not own
-    // StartView installation/publication policy from the VRR slice.
-    tc.replicas[1].view_number = 3;
-    tc.replicas[1].status = .normal;
-    tc.replicas[1].journalPut(replacement);
-    tc.replicas[1].op_number = 1;
+    tc.deliver(1, 0, .{ .start_view = sv });
     try std.testing.expectEqual(replacement.checksum, tc.replicas[1].journalGet(1).?.checksum);
     try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
     try std.testing.expect(tc.replicas[1].durable_prepare_through >= 1);
@@ -1434,7 +1459,8 @@ test "recovery rejects metadata commit_max above op_number" {
     try tc.disks[0].sync();
 
     tc.state_machines[0].initInPlace(tc.state_machines[0].seed);
-    tc.replicas[0].initInPlace(.{
+    tc.replicas[0].resetInPlace(.{
+        .allocator = tc.allocator,
         .replica_id = 0,
         .replica_count = 1,
         .io = tc.sim_ios[0].io(),
@@ -1442,4 +1468,1188 @@ test "recovery rejects metadata commit_max above op_number" {
         .disk = tc.disks[0].diskInterface(),
     });
     try std.testing.expectError(error.CorruptMetadata, tc.replicas[0].recoverFromDisk());
+}
+
+test "paused follower defers pending Prepare barrier and acknowledgement" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A001);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    var entry = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+
+    tc.deliver(1, 0, .{ .prepare = .{
+        .view_number = 0,
+        .op_number = 1,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .entry = entry,
+    } });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.advance(100);
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.journal_dirty[slot]);
+    try std.testing.expect(follower.pending_prepare_ok[slot]);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.journal_dirty[slot]);
+    try std.testing.expect(!follower.pending_prepare_ok[slot]);
+}
+
+test "paused follower defers pending StartView barrier and publication" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA2A002);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+    tc.deliver(1, 0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_start_view.active);
+    const syncs_before = tc.disks[1].syncs;
+
+    tc.pauseReplica(1);
+    tc.current_tick = @intCast(follower.view_change_candidate.metadata.deadline_tick + 1);
+    tc.tick();
+    try std.testing.expectEqual(syncs_before, tc.disks[1].syncs);
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), follower.view_number);
+
+    tc.resumeReplica(1);
+    tc.tick();
+    try std.testing.expect(tc.disks[1].syncs > syncs_before);
+    try std.testing.expect(!follower.pending_start_view.active);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
+}
+
+test "durable storage: StartView PrepareOk waits for barrier" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x57A1);
+    defer tc.deinit();
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var entry = msg.LogEntry{
+        .view_number = tc.replicas[0].view_number,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+
+    var sv = msg.StartViewMsg{
+        .view_number = tc.replicas[0].view_number,
+        .selected_last_normal_view = tc.replicas[0].last_normal_view,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+
+    // Install via StartView without ticking (no durability barrier yet).
+    tc.replicas[1].status = .view_change;
+    tc.deliver(1, 0, .{ .start_view = sv });
+    const slot = replica_mod.journalSlot(1);
+    try std.testing.expect(tc.replicas[1].journalHas(1));
+    try std.testing.expect(tc.replicas[1].pending_start_view.active);
+    try std.testing.expect(tc.replicas[1].status == .view_change);
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(tc.replicas[1].journal_dirty[slot]);
+
+    // PrepareOk must not reach the leader until the follower flushes.
+    const from_bit = @as(u16, 1) << 1;
+    try std.testing.expect((tc.replicas[0].prepare_ok_from[slot] & from_bit) == 0);
+
+    tc.tick();
+    tc.deliverAll();
+    try std.testing.expect(!tc.replicas[1].pending_prepare_ok[slot]);
+    try std.testing.expect(!tc.replicas[1].journal_dirty[slot]);
+}
+
+test "follower StartView durable watermark relation table installs only after barrier" {
+    const Case = struct { name: []const u8, follower_commit: u64, leader_commit: u64, tip: u64, accepted: bool };
+    const cases = [_]Case{
+        .{ .name = "Cf below Cl below S", .follower_commit = 0, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cf equals Cl", .follower_commit = 1, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cl below Cf below S", .follower_commit = 2, .leader_commit = 1, .tip = 3, .accepted = true },
+        .{ .name = "Cf equals S", .follower_commit = 2, .leader_commit = 1, .tip = 2, .accepted = true },
+        .{ .name = "Cf above S", .follower_commit = 3, .leader_commit = 1, .tip = 2, .accepted = false },
+    };
+
+    for (cases, 0..) |case, case_index| {
+        _ = case.name;
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A70 + case_index);
+        defer tc.deinit();
+        const follower = tc.replicas[1];
+        follower.status = .view_change;
+        follower.view_number = 3;
+        follower.last_normal_view = 2;
+
+        var entries: [3]msg.LogEntry = undefined;
+        var parent: u64 = 0;
+        for (&entries, 0..) |*entry, index| {
+            entry.* = .{
+                .view_number = 2,
+                .op_number = index + 1,
+                .command = .{ .noop = {} },
+                .client_id = 0x5000 + index,
+                .request_id = 0x6000 + index,
+                .parent_checksum = parent,
+            };
+            entry.checksum = entry.computeChecksum();
+            parent = entry.checksum;
+        }
+
+        var op: u64 = 1;
+        while (op <= case.follower_commit) : (op += 1) {
+            follower.journalPut(entries[op - 1]);
+            const slot = replica_mod.journalSlot(op);
+            follower.journal_dirty[slot] = false;
+            follower.durable_prepare_op[slot] = op;
+            follower.durable_prepare_checksum[slot] = entries[op - 1].checksum;
+        }
+        follower.op_number = case.follower_commit;
+        follower.commit_min = case.follower_commit;
+        follower.commit_max = case.follower_commit;
+        follower.durable_prepare_through = case.follower_commit;
+
+        var sv = msg.StartViewMsg{
+            .view_number = 3,
+            .selected_last_normal_view = 2,
+            .op_number = case.tip,
+            .tip_checksum = entries[case.tip - 1].checksum,
+            .commit_min = case.leader_commit,
+            .retention_floor = 0,
+        };
+        op = case.follower_commit + 1;
+        while (op <= case.tip) : (op += 1) {
+            sv.log_entries[sv.log_entry_count] = entries[op - 1];
+            sv.log_entry_count += 1;
+        }
+
+        follower.onMessage(0, .{ .start_view = sv });
+        if (!case.accepted) {
+            try std.testing.expect(!follower.pending_start_view.active);
+            try std.testing.expectEqual(case.follower_commit, follower.commit_min);
+            continue;
+        }
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(view_candidate.PendingStartViewRole.follower, follower.pending_start_view.role);
+        try std.testing.expectEqual(msg.Status.view_change, follower.status);
+        try std.testing.expectEqual(case.follower_commit, follower.commit_min);
+        follower.tick();
+        try std.testing.expectEqual(msg.Status.normal, follower.status);
+        try std.testing.expectEqual(case.tip, follower.op_number);
+        try std.testing.expectEqual(@max(case.follower_commit, case.leader_commit), follower.commit_min);
+        try std.testing.expectEqual(entries[case.tip - 1].checksum, follower.journalGet(case.tip).?.checksum);
+    }
+}
+
+test "follower StartView slot metadata and sync failures preserve volatile coherence" {
+    inline for (.{ "slot", "metadata", "sync" }, 0..) |fault_kind, case_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0x5AF0 + case_index);
+        defer tc.deinit();
+        const follower = tc.replicas[1];
+        follower.status = .view_change;
+        follower.view_number = 3;
+
+        var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 4, .request_id = 1 };
+        entry.checksum = entry.computeChecksum();
+        var sv = msg.StartViewMsg{
+            .view_number = 3,
+            .selected_last_normal_view = 2,
+            .op_number = 1,
+            .tip_checksum = entry.checksum,
+            .commit_min = 0,
+            .log_entry_count = 1,
+        };
+        sv.log_entries[0] = entry;
+        follower.onMessage(0, .{ .start_view = sv });
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+        try std.testing.expectEqual(follower.op_number, follower.pending_start_view.op_number);
+
+        if (std.mem.eql(u8, fault_kind, "slot")) {
+            tc.disks[1].fail_next_write = true;
+        } else if (std.mem.eql(u8, fault_kind, "metadata")) {
+            for (0..replica_mod.LOG_SIZE_MAX) |slot| follower.journal_dirty[slot] = false;
+            tc.disks[1].fail_next_write = true;
+        } else {
+            tc.disks[1].fail_next_sync = true;
+        }
+
+        const prepare_ok_tag = @intFromEnum(msg.Tag.prepare_ok);
+        const before = tc.network.stats.sent[prepare_ok_tag];
+        follower.tick();
+        try std.testing.expect(follower.storage_failed);
+        try std.testing.expectEqual(msg.Status.view_change, follower.status);
+        try std.testing.expect(follower.pending_start_view.active);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), follower.op_number);
+        try std.testing.expectEqual(entry.checksum, follower.journalGet(1).?.checksum);
+        try std.testing.expectEqual(before, tc.network.stats.sent[prepare_ok_tag]);
+    }
+}
+
+test "recovered concurrent laggards keep candidate past generic timeout" {
+    const tc = try TestCluster.init(std.testing.allocator, 5, 0xCA7D1DA7E);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var first = msg.LogEntry{ .view_number = 4, .op_number = 1, .client_id = 1, .request_id = 1 };
+    first.checksum = first.computeChecksum();
+    var second = msg.LogEntry{ .view_number = 4, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = first.checksum };
+    second.checksum = second.computeChecksum();
+    const sv = msg.StartViewMsg{
+        .view_number = 5,
+        .selected_last_normal_view = 4,
+        .op_number = 2,
+        .tip_checksum = second.checksum,
+        .commit_min = 0,
+    };
+
+    for ([_]usize{ 1, 2 }) |replica_index| {
+        const follower = tc.replicas[replica_index];
+        follower.status = .view_change;
+        follower.view_number = 5;
+        follower.recovered_from_disk = true;
+        follower.onMessage(0, .{ .start_view = sv });
+        try std.testing.expect(follower.pending_view_selection);
+        try std.testing.expect(!follower.pending_start_view.active);
+    }
+
+    tc.current_tick = 60;
+    for ([_]usize{ 1, 2 }) |replica_index| {
+        const follower = tc.replicas[replica_index];
+        follower.tick();
+        try std.testing.expectEqual(@as(msg.ViewNumber, 5), follower.view_number);
+        try std.testing.expect(follower.pending_view_selection);
+        try std.testing.expect(!follower.pending_start_view.active);
+    }
+}
+
+test "follower fetches omitted StartView tail only from certificate-bound appended leader" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A71);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+
+    var entries: [3]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, index| {
+        entry.* = .{
+            .view_number = 2,
+            .op_number = index + 1,
+            .command = .{ .noop = {} },
+            .client_id = 0x7100 + index,
+            .request_id = 0x7200 + index,
+            .parent_checksum = parent,
+        };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+
+    const leader = tc.replicas[0];
+    leader.status = .normal;
+    leader.view_number = 3;
+    leader.last_normal_view = 3;
+    leader.selected_target_view = 3;
+    leader.selected_source = 0;
+    leader.selected_last_normal_view = 2;
+    leader.selected_tip_op = 2;
+    leader.selected_tip_checksum = entries[1].checksum;
+    leader.selected_commit_bound = 1;
+    for (entries) |entry| leader.journalPut(entry);
+    leader.op_number = 3;
+
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    const sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 2,
+        .tip_checksum = entries[1].checksum,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 0,
+    };
+    follower.onMessage(0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_view_selection);
+    try std.testing.expect(!follower.pending_start_view.active);
+
+    // Wrong source and wrong certificate cannot seed the candidate.
+    follower.onMessage(2, .{ .send_prepare = .{
+        .view_number = 3,
+        .entry = entries[0],
+        .selected_source = 0,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 2,
+        .selected_tip_checksum = entries[1].checksum,
+        .selected_commit_bound = 1,
+    } });
+    follower.onMessage(0, .{ .send_prepare = .{
+        .view_number = 3,
+        .entry = entries[0],
+        .selected_source = 0,
+        .selected_last_normal_view = 2,
+        .selected_tip_op = 2,
+        .selected_tip_checksum = entries[1].checksum,
+        .selected_commit_bound = 0,
+    } });
+    follower.onMessage(0, .{ .prepare = .{
+        .view_number = 3,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .entry = entries[0],
+    } });
+    try std.testing.expectEqual(@as(usize, 0), follower.view_change_candidate.present_count);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+    try std.testing.expect(!follower.journalHas(1));
+
+    // The leader has appended op 3, but serves only the frozen selected prefix.
+    tc.deliverAll();
+    try std.testing.expect(follower.pending_start_view.active);
+    try std.testing.expectEqual(@as(msg.OpNumber, 3), leader.op_number);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), follower.pending_start_view.op_number);
+    follower.tick();
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+    try std.testing.expectEqual(entries[1].checksum, follower.journalGet(2).?.checksum);
+    try std.testing.expect(!follower.journalHas(3));
+}
+
+test "follower StartView crash before barrier keeps old state and after barrier recovers candidate" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x5A72);
+    defer tc.deinit();
+    var entry = msg.LogEntry{
+        .view_number = 2,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 0x7300,
+        .request_id = 0x7400,
+        .parent_checksum = 0,
+    };
+    entry.checksum = entry.computeChecksum();
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 2,
+        .op_number = 1,
+        .tip_checksum = entry.checksum,
+        .commit_min = 0,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = entry;
+
+    const follower = tc.replicas[1];
+    follower.status = .view_change;
+    follower.view_number = 3;
+    follower.onMessage(0, .{ .start_view = sv });
+    try std.testing.expect(follower.pending_start_view.active);
+    tc.crashReplica(1);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), tc.replicas[1].op_number);
+    try std.testing.expect(!tc.replicas[1].journalHas(1));
+
+    tc.replicas[1].status = .view_change;
+    tc.replicas[1].view_number = 3;
+    tc.replicas[1].onMessage(0, .{ .start_view = sv });
+    tc.replicas[1].tick();
+    try std.testing.expectEqual(msg.Status.normal, tc.replicas[1].status);
+    tc.crashReplica(1);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].op_number);
+    try std.testing.expectEqual(entry.checksum, tc.replicas[1].journalGet(1).?.checksum);
+}
+
+test "StartView rejects conflicting committed prefix" {
+    // A StartView that conflicts with a locally committed op must not replace it.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x57C0);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var committed = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    committed.checksum = committed.computeChecksum();
+
+    // Install a locally committed prefix on follower 1.
+    tc.replicas[1].journalPut(committed);
+    tc.replicas[1].journal_dirty[replica_mod.journalSlot(1)] = false;
+    tc.replicas[1].op_number = 1;
+    tc.replicas[1].commit_min = 1;
+    tc.replicas[1].commit_max = 1;
+    tc.replicas[1].status = .view_change;
+    tc.replicas[1].view_number = 0;
+
+    var conflicting = committed;
+    conflicting.client_id = 42;
+    conflicting.request_id = 42;
+    conflicting.view_number = 3;
+    conflicting.checksum = conflicting.computeChecksum();
+    try std.testing.expect(conflicting.checksum != committed.checksum);
+
+    var sv = msg.StartViewMsg{
+        .view_number = 3,
+        .selected_last_normal_view = 0,
+        .op_number = 1,
+        .tip_checksum = conflicting.checksum,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    sv.log_entries[0] = conflicting;
+
+    tc.deliver(1, 0, .{ .start_view = sv });
+
+    try std.testing.expectEqual(committed.checksum, tc.replicas[1].journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[1].commit_min);
+    try std.testing.expect(tc.replicas[1].status == .view_change);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[1].view_number);
+}
+
+test "view change rejects conflicting committed DVC values" {
+    // Two DVCs reporting different committed identities for the same op must
+    // not let the new leader install either value and leave view_change.
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD7C1);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    tc.advance(50);
+    try std.testing.expect(tc.replicas[0].isLeader());
+
+    var entry_a = msg.LogEntry{
+        .view_number = 0,
+        .op_number = 1,
+        .command = .{ .noop = {} },
+        .client_id = 1,
+        .request_id = 1,
+        .parent_checksum = 0,
+    };
+    entry_a.checksum = entry_a.computeChecksum();
+
+    var entry_b = entry_a;
+    entry_b.client_id = 99;
+    entry_b.request_id = 99;
+    entry_b.checksum = entry_b.computeChecksum();
+    try std.testing.expect(entry_a.checksum != entry_b.checksum);
+
+    // Local committed prefix on the prospective new leader (view 3 → replica 0).
+    tc.replicas[0].journalPut(entry_a);
+    tc.replicas[0].journal_dirty[replica_mod.journalSlot(1)] = false;
+    tc.replicas[0].op_number = 1;
+    tc.replicas[0].commit_min = 1;
+    tc.replicas[0].commit_max = 1;
+    tc.replicas[0].view_number = 3;
+    tc.replicas[0].last_normal_view = 0;
+    tc.replicas[0].status = .view_change;
+    tc.replicas[0].do_vc_received = std.mem.zeroes([msg.REPLICA_COUNT_MAX]bool);
+    tc.replicas[0].do_vc_total = 0;
+
+    var dvc0 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 0,
+        .last_normal_view = 0,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc0.log_entries[0] = entry_a;
+
+    var dvc1 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 1,
+        .last_normal_view = 2,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc1.log_entries[0] = entry_b;
+
+    var dvc2 = msg.DoViewChangeMsg{
+        .view_number = 3,
+        .replica_id = 2,
+        .last_normal_view = 0,
+        .op_number = 1,
+        .commit_min = 1,
+        .retention_floor = 0,
+        .log_entry_count = 1,
+    };
+    dvc2.log_entries[0] = entry_a;
+
+    // Quorum of DVCs with a committed-identity conflict between 0 and 1.
+    tc.replicas[0].do_vc_msgs[0] = dvc0;
+    tc.replicas[0].do_vc_received[0] = true;
+    tc.replicas[0].do_vc_msgs[1] = dvc1;
+    tc.replicas[0].do_vc_received[1] = true;
+    tc.replicas[0].do_vc_msgs[2] = dvc2;
+    tc.replicas[0].do_vc_received[2] = true;
+    tc.replicas[0].do_vc_total = 3;
+
+    // Trigger selection via a duplicate DVC delivery (already counted).
+    tc.deliver(0, 1, .{ .do_view_change = dvc1 });
+
+    try std.testing.expect(tc.replicas[0].status == .view_change);
+    try std.testing.expectEqual(entry_a.checksum, tc.replicas[0].journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].commit_min);
+}
+
+test "view change rejects equal-rank conflicting tips" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xE0A1);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var a = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    a.checksum = a.computeChecksum();
+    var b = a;
+    b.client_id = 2;
+    b.checksum = b.computeChecksum();
+    var d0 = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 2, .op_number = 1, .log_entry_count = 1 };
+    d0.log_entries[0] = a;
+    var d1 = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .log_entry_count = 1 };
+    d1.log_entries[0] = b;
+
+    tc.deliver(0, 0, .{ .do_view_change = d0 });
+    tc.deliver(0, 1, .{ .do_view_change = d1 });
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expect(!leader.pending_view_selection);
+}
+
+fn stageTwoEntryLeaderStartView(tc: *TestCluster) [2]msg.LogEntry {
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [2]msg.LogEntry = undefined;
+    entries[0] = .{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entries[0].checksum = entries[0].computeChecksum();
+    entries[1] = .{ .view_number = 2, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = entries[0].checksum };
+    entries[1].checksum = entries[1].computeChecksum();
+
+    var selected = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 2, .log_entry_count = 2 };
+    selected.log_entries[0] = entries[1];
+    selected.log_entries[1] = entries[0];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = selected });
+    return entries;
+}
+
+test "view change selects one source chain instead of mixing per-op candidates" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x51A6E);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var a1 = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    a1.checksum = a1.computeChecksum();
+    var a2 = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 1, .request_id = 2, .parent_checksum = a1.checksum };
+    a2.checksum = a2.computeChecksum();
+    var b1 = a1;
+    b1.client_id = 9;
+    b1.checksum = b1.computeChecksum();
+
+    var selected = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 2, .log_entry_count = 2 };
+    selected.log_entries[0] = a2;
+    selected.log_entries[1] = a1;
+    var other = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 1, .log_entry_count = 1 };
+    other.log_entries[0] = b1;
+
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const prepare_tag = @intFromEnum(msg.Tag.prepare);
+    const start_view_before = tc.network.stats.sent[start_view_tag];
+    const prepare_before = tc.network.stats.sent[prepare_tag];
+    tc.deliver(0, 0, .{ .do_view_change = other });
+    tc.deliver(0, 1, .{ .do_view_change = selected });
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(start_view_before, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
+    tc.requestWithIdentity(0, 99, 99, .{ .noop = {} });
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.op_number);
+    try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
+    try std.testing.expectEqual(a1.checksum, leader.journalGet(1).?.checksum);
+    try std.testing.expectEqual(a2.checksum, leader.journalGet(2).?.checksum);
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expectEqual(start_view_before + 2, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(prepare_before, tc.network.stats.sent[prepare_tag]);
+    leader.tick();
+    try std.testing.expectEqual(start_view_before + 2, tc.network.stats.sent[start_view_tag]);
+}
+
+test "leader StartView slot metadata and sync failures preserve volatile coherence" {
+    inline for (.{ "slot", "metadata", "sync" }, 0..) |fault_kind, case_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0xD001 + case_index);
+        defer tc.deinit();
+        const leader = tc.replicas[0];
+        _ = stageTwoEntryLeaderStartView(tc);
+        const start_view_tag = @intFromEnum(msg.Tag.start_view);
+        const before = tc.network.stats.sent[start_view_tag];
+        if (std.mem.eql(u8, fault_kind, "slot")) {
+            tc.disks[0].fail_next_write = true;
+        } else if (std.mem.eql(u8, fault_kind, "metadata")) {
+            for (0..replica_mod.LOG_SIZE_MAX) |slot| leader.journal_dirty[slot] = false;
+            tc.disks[0].fail_next_write = true;
+        } else {
+            tc.disks[0].fail_next_sync = true;
+        }
+
+        try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
+        leader.tick();
+        try std.testing.expect(leader.storage_failed);
+        try std.testing.expectEqual(leader.op_number, leader.pending_start_view.op_number);
+        try std.testing.expectEqual(msg.Status.view_change, leader.status);
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(view_candidate.ViewSelectionPhase.persisting_start_view, leader.view_change_candidate.phase);
+        try std.testing.expectEqual(before, tc.network.stats.sent[start_view_tag]);
+    }
+}
+
+test "leader StartView volatile mode uses the same one-shot publication path" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD003);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.disk = null;
+    _ = stageTwoEntryLeaderStartView(tc);
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+    leader.tick();
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+}
+
+test "leader StartView defers higher view and timeout until durable publication" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xD004);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    _ = stageTwoEntryLeaderStartView(tc);
+    const start_view_tag = @intFromEnum(msg.Tag.start_view);
+    const before = tc.network.stats.sent[start_view_tag];
+
+    tc.current_tick = @intCast(leader.view_change_candidate.metadata.deadline_tick + 1);
+    tc.deliver(0, 1, .{ .start_view_change = .{ .view_number = 6, .replica_id = 2 } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), leader.deferred_view_target);
+    tc.deliver(0, 2, .{ .start_view_change = .{ .view_number = 5, .replica_id = 2 } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 5), leader.deferred_view_target);
+    try std.testing.expect(leader.pending_start_view.active);
+
+    leader.tick();
+    try std.testing.expectEqual(before + 2, tc.network.stats.sent[start_view_tag]);
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 5), leader.view_number);
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+}
+
+test "leader StartView crash before sync recovers old state and after sync recovers selected tip" {
+    const pre = try TestCluster.init(std.testing.allocator, 3, 0xD005);
+    defer pre.deinit();
+    _ = stageTwoEntryLeaderStartView(pre);
+    try std.testing.expect(pre.replicas[0].pending_start_view.active);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), pre.replicas[0].op_number);
+    try std.testing.expectEqual(pre.replicas[0].op_number, pre.replicas[0].pending_start_view.op_number);
+    pre.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), pre.replicas[0].op_number);
+    try std.testing.expect(pre.replicas[0].journalGet(1) == null);
+
+    const post = try TestCluster.init(std.testing.allocator, 3, 0xD006);
+    defer post.deinit();
+    const entries = stageTwoEntryLeaderStartView(post);
+    post.replicas[0].tick();
+    try std.testing.expectEqual(entries[1].checksum, post.disks[0].readSlot(replica_mod.journalSlot(2)).?.checksum);
+    post.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), post.replicas[0].op_number);
+    try std.testing.expectEqual(entries[1].checksum, post.replicas[0].journalGet(2).?.checksum);
+}
+
+test "DVC source rank is independent from commit watermark" {
+    inline for (.{ "higher last-normal view", "higher op at equal last-normal view" }, 0..) |case_name, case_index| {
+        _ = case_name;
+        const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB17 + case_index);
+        defer tc.deinit();
+        const leader = tc.replicas[0];
+        leader.status = .view_change;
+        leader.view_number = 3;
+
+        var committed = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
+        committed.checksum = committed.computeChecksum();
+        var extension = msg.LogEntry{ .view_number = 2, .op_number = 2, .client_id = 3, .request_id = 2, .parent_checksum = committed.checksum };
+        extension.checksum = extension.computeChecksum();
+
+        const selected_lnv: msg.ViewNumber = if (case_index == 0) 2 else 1;
+        var selected = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = selected_lnv, .op_number = 2, .commit_min = 0, .log_entry_count = 2 };
+        selected.log_entries[0] = extension;
+        selected.log_entries[1] = committed;
+        var committed_source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+        committed_source.log_entries[0] = committed;
+
+        tc.deliver(0, 1, .{ .do_view_change = selected });
+        tc.deliver(0, 2, .{ .do_view_change = committed_source });
+
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(@as(u8, 1), leader.pending_start_view.source_replica);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.pending_start_view.commit_min);
+        try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.pending_start_view.op_number);
+        try std.testing.expectEqual(extension.checksum, leader.journalGet(2).?.checksum);
+    }
+}
+
+test "DVC selected source tip below quorum commit bound aborts" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC0BB19);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var committed = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 2, .request_id = 1 };
+    committed.checksum = committed.computeChecksum();
+    const empty_high_rank = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 0, .commit_min = 0 };
+    var committed_source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 2, .last_normal_view = 1, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+    committed_source.log_entries[0] = committed;
+
+    tc.deliver(0, 1, .{ .do_view_change = empty_high_rank });
+    tc.deliver(0, 2, .{ .do_view_change = committed_source });
+
+    try std.testing.expect(!leader.pending_start_view.active);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
+}
+
+test "five rotating leaders replace speculative prepares with committed StartView chain" {
+    for (0..5) |leader_index| {
+        const tc = try TestCluster.init(std.testing.allocator, 5, 0xC0A017 + leader_index);
+        defer tc.deinit();
+        const leader = tc.replicas[leader_index];
+        const target_view: msg.ViewNumber = 5 + leader_index;
+        leader.status = .view_change;
+        leader.view_number = target_view;
+
+        var committed = msg.LogEntry{ .view_number = 0, .op_number = 1, .client_id = 10, .request_id = 1 };
+        committed.checksum = committed.computeChecksum();
+        var speculative = msg.LogEntry{ .view_number = leader_index + 1, .op_number = 2, .client_id = 20 + leader_index, .request_id = 2, .parent_checksum = committed.checksum };
+        speculative.checksum = speculative.computeChecksum();
+        var selected = msg.LogEntry{ .view_number = 4, .op_number = 2, .client_id = 99, .request_id = 2, .parent_checksum = committed.checksum };
+        selected.checksum = selected.computeChecksum();
+        try std.testing.expect(speculative.checksum != selected.checksum);
+
+        leader.journalPut(committed);
+        leader.journalPut(speculative);
+        leader.op_number = 2;
+        leader.commit_min = 1;
+        leader.commit_max = 1;
+        leader.durable_prepare_op[replica_mod.journalSlot(1)] = 1;
+        leader.durable_prepare_checksum[replica_mod.journalSlot(1)] = committed.checksum;
+        leader.durable_prepare_op[replica_mod.journalSlot(2)] = 2;
+        leader.durable_prepare_checksum[replica_mod.journalSlot(2)] = speculative.checksum;
+
+        const source_id: u8 = @intCast((leader_index + 1) % 5);
+        const third_id: u8 = @intCast((leader_index + 2) % 5);
+        var source = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = source_id, .last_normal_view = 4, .op_number = 2, .commit_min = 1, .log_entry_count = 2 };
+        source.log_entries[0] = selected;
+        source.log_entries[1] = committed;
+        var local = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = @intCast(leader_index), .last_normal_view = 3, .op_number = 2, .commit_min = 1, .log_entry_count = 2 };
+        local.log_entries[0] = speculative;
+        local.log_entries[1] = committed;
+        var third = msg.DoViewChangeMsg{ .view_number = target_view, .replica_id = third_id, .last_normal_view = 2, .op_number = 1, .commit_min = 1, .log_entry_count = 1 };
+        third.log_entries[0] = committed;
+
+        tc.deliver(@intCast(leader_index), @intCast(leader_index), .{ .do_view_change = local });
+        tc.deliver(@intCast(leader_index), third_id, .{ .do_view_change = third });
+        tc.deliver(@intCast(leader_index), source_id, .{ .do_view_change = source });
+
+        try std.testing.expect(leader.pending_start_view.active);
+        try std.testing.expectEqual(selected.checksum, leader.journalGet(2).?.checksum);
+        try std.testing.expectEqual(@as(msg.OpNumber, 1), leader.commit_min);
+        leader.tick();
+        try std.testing.expectEqual(msg.Status.normal, leader.status);
+        try std.testing.expectEqual(target_view, leader.view_number);
+        try std.testing.expectEqual(selected.checksum, leader.journalGet(2).?.checksum);
+    }
+}
+
+test "validated StartView replaces conflicting uncommitted durable prepare and survives crash" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x1A7E25EC7);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var prepared = msg.LogEntry{ .view_number = 1, .op_number = 1, .client_id = 1, .request_id = 1 };
+    prepared.checksum = prepared.computeChecksum();
+    var conflicting = prepared;
+    conflicting.view_number = 2;
+    conflicting.client_id = 2;
+    conflicting.checksum = conflicting.computeChecksum();
+    leader.journalPut(prepared);
+    leader.op_number = 1;
+    const slot = replica_mod.journalSlot(1);
+    leader.durable_prepare_op[slot] = 1;
+    leader.durable_prepare_checksum[slot] = prepared.checksum;
+
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .log_entry_count = 1 };
+    source.log_entries[0] = conflicting;
+    var intersection = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 1, .log_entry_count = 1 };
+    intersection.log_entries[0] = prepared;
+    tc.deliver(0, 0, .{ .do_view_change = intersection });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+
+    try std.testing.expectEqual(msg.Status.view_change, leader.status);
+    try std.testing.expectEqual(@as(msg.ViewNumber, 3), leader.view_number);
+    try std.testing.expect(leader.pending_start_view.active);
+    try std.testing.expectEqual(conflicting.checksum, leader.journalGet(1).?.checksum);
+    try std.testing.expectEqual(@as(u64, 0), leader.durable_prepare_checksum[slot]);
+
+    leader.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expectEqual(conflicting.checksum, leader.durable_prepare_checksum[slot]);
+    tc.crashReplica(0);
+    try std.testing.expectEqual(@as(msg.OpNumber, 1), tc.replicas[0].op_number);
+    try std.testing.expectEqual(conflicting.checksum, tc.replicas[0].journalGet(1).?.checksum);
+}
+
+test "five-replica gapped selection repairs through dropped false hint and unhinted holder" {
+    const tc = try TestCluster.init(std.testing.allocator, 5, 0xB0A0D);
+    defer tc.deinit();
+    tc.network.min_delay = 0;
+    tc.network.max_delay = 0;
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 5;
+
+    var entries: [10]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .view_number = 4, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+        if (i >= 2) tc.replicas[1].journalPut(entry.*);
+    }
+    tc.replicas[1].op_number = 10;
+    tc.replicas[1].last_normal_view = 4;
+    for (1..5) |i| {
+        tc.replicas[i].view_number = 5;
+        tc.replicas[i].status = .view_change;
+    }
+
+    // Replica 2 advertises a false retention hint. Replica 4 has the exact
+    // ancestors but contributes no hint or DVC.
+    var source = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 1, .last_normal_view = 4, .op_number = 10, .log_entry_count = 8 };
+    for (0..8) |i| source.log_entries[i] = entries[9 - i];
+    for (3..11) |op| msg.bitsetSet(&source.present_bitset, op % replica_mod.LOG_SIZE_MAX);
+    var false_hint = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 2, .last_normal_view = 1, .op_number = 0 };
+    msg.bitsetSet(&false_hint.present_bitset, 2);
+    tc.replicas[4].journalPut(entries[0]);
+    tc.replicas[4].journalPut(entries[1]);
+    tc.replicas[4].op_number = 2;
+
+    tc.network.armDropNext(0xB0A0D, 0, 2, @intFromEnum(msg.Tag.request_prepare));
+    const empty = msg.DoViewChangeMsg{ .view_number = 5, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    tc.deliver(0, 2, .{ .do_view_change = false_hint });
+
+    try std.testing.expect(leader.pending_view_selection);
+    try std.testing.expectEqual(@as(msg.OpNumber, 2), leader.selected_next_op);
+    try std.testing.expectEqual(@as(u64, 1), tc.network.drop_next_count);
+    try std.testing.expectEqual(@as(u64, 0xB0A0D), tc.network.last_drop_next_id);
+
+    // Inject a wrong identity from the requested false-hint replica through the
+    // real network. The leader rejects it and continues bounded peer fallback.
+    var wrong_identity = entries[1];
+    wrong_identity.client_id +%= 1;
+    wrong_identity.checksum = wrong_identity.computeChecksum();
+    var wire: [net_mod.MESSAGE_SIZE_MAX]u8 = undefined;
+    const wire_len = msg.serialize(.{ .send_prepare = .{
+        .view_number = 5,
+        .entry = wrong_identity,
+        .selected_source = 1,
+        .selected_last_normal_view = 4,
+        .selected_tip_op = 10,
+        .selected_tip_checksum = entries[9].checksum,
+        .expected_entry_checksum = entries[1].checksum,
+    } }, &wire);
+    tc.network.enqueueSend(2, 0, wire[0..wire_len]);
+
+    const deadline_ms = leader.view_change_candidate.metadata.deadline_tick;
+    const syncs_before = tc.disks[0].syncs;
+    while (leader.status != .normal and @as(u64, @intCast(tc.current_tick * 10)) < deadline_ms) tc.tick();
+    try std.testing.expectEqual(msg.Status.normal, leader.status);
+    try std.testing.expect(@as(u64, @intCast(tc.current_tick * 10)) < deadline_ms);
+    try std.testing.expect(tc.disks[0].syncs > syncs_before);
+    try std.testing.expectEqual(entries[9].checksum, leader.journalGet(10).?.checksum);
+    try std.testing.expectEqual(@as(msg.OpNumber, 10), tc.disks[0].readMetadata().?.op_number);
+
+    tc.crashReplica(0);
+    const recovered = tc.replicas[0];
+    try std.testing.expectEqual(@as(msg.OpNumber, 10), recovered.op_number);
+    var recovered_parent: u64 = 0;
+    for (entries, 1..) |expected, op| {
+        const actual = recovered.journalGet(op).?;
+        try std.testing.expectEqual(expected.checksum, actual.checksum);
+        try std.testing.expectEqual(recovered_parent, actual.parent_checksum);
+        recovered_parent = actual.checksum;
+    }
+}
+
+test "selected source mutation aborts candidate without changing active journal" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC4AD);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [10]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
+    for (0..8) |i| source.log_entries[i] = entries[9 - i];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    try std.testing.expect(leader.pending_view_selection);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+
+    source.log_entries[0].client_id = 99;
+    source.log_entries[0].checksum = source.log_entries[0].computeChecksum();
+    tc.deliver(0, 1, .{ .do_view_change = source });
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expect(leader.journalGet(10) == null);
+}
+
+test "selected source crash times out candidate without changing active journal" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xC2A5);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entries: [10]msg.LogEntry = undefined;
+    var parent: u64 = 0;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .view_number = 2, .op_number = i + 1, .client_id = 1, .request_id = i + 1, .parent_checksum = parent };
+        entry.checksum = entry.computeChecksum();
+        parent = entry.checksum;
+    }
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 10, .log_entry_count = 8 };
+    for (0..8) |i| source.log_entries[i] = entries[9 - i];
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    try std.testing.expect(leader.pending_view_selection);
+
+    tc.stopReplica(1);
+    tc.current_tick = @intCast(leader.view_change_candidate.metadata.deadline_tick);
+    leader.tick();
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+}
+
+test "maximum view is rejected before message adoption and timeout increment" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0x4D415856494557);
+    defer tc.deinit();
+    const follower = tc.replicas[1];
+    const max_view = std.math.maxInt(msg.ViewNumber);
+    const max_view_leader: u8 = @intCast(max_view % @as(msg.ViewNumber, tc.replica_count));
+
+    tc.deliver(1, max_view_leader, .{ .start_view_change = .{
+        .view_number = max_view,
+        .replica_id = max_view_leader,
+    } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    var entry = msg.LogEntry{ .view_number = max_view, .op_number = 1 };
+    entry.checksum = entry.computeChecksum();
+    tc.deliver(1, max_view_leader, .{ .prepare = .{
+        .view_number = max_view,
+        .op_number = 1,
+        .entry = entry,
+    } });
+    tc.deliver(1, max_view_leader, .{ .commit = .{ .view_number = max_view } });
+    tc.deliver(1, max_view_leader, .{ .start_view = .{ .view_number = max_view } });
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    try tc.disks[2].writeMetadata(.{ .view_number = max_view });
+    try tc.disks[2].sync();
+    try std.testing.expectError(error.CorruptMetadata, tc.replicas[2].recoverFromDisk());
+    try std.testing.expectEqual(@as(msg.ViewNumber, 0), tc.replicas[2].view_number);
+
+    const last_usable_view = max_view - 1;
+    follower.view_number = last_usable_view;
+    follower.status = .normal;
+    follower.last_heartbeat = 1;
+    follower.last_leader_activity = 1;
+    tc.current_tick = replica_mod.VIEW_CHANGE_TIMEOUT + 1;
+    follower.tick();
+    try std.testing.expectEqual(last_usable_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.normal, follower.status);
+
+    follower.status = .view_change;
+    follower.last_leader_activity = 1;
+    tc.current_tick = replica_mod.VIEW_CHANGE_TIMEOUT * 2 + 1;
+    follower.tick();
+    try std.testing.expectEqual(last_usable_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+
+    // Defensive fail-closed behavior for legacy/corrupt in-memory state at the
+    // reserved sentinel itself: neither timeout branch may evaluate max + 1.
+    follower.view_number = max_view;
+    follower.status = .normal;
+    follower.last_leader_activity = 1;
+    follower.tick();
+    try std.testing.expectEqual(max_view, follower.view_number);
+
+    follower.status = .view_change;
+    follower.last_leader_activity = 1;
+    follower.tick();
+    try std.testing.expectEqual(max_view, follower.view_number);
+    try std.testing.expectEqual(msg.Status.view_change, follower.status);
+}
+
+test "candidate allocation failure advances view without active mutation" {
+    const tc = try TestCluster.init(std.testing.allocator, 3, 0xA110C);
+    defer tc.deinit();
+    const leader = tc.replicas[0];
+    leader.status = .view_change;
+    leader.view_number = 3;
+
+    var entry = msg.LogEntry{ .view_number = 2, .op_number = 1, .client_id = 1, .request_id = 1 };
+    entry.checksum = entry.computeChecksum();
+    var source = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 1, .last_normal_view = 2, .op_number = 1, .log_entry_count = 1 };
+    source.log_entries[0] = entry;
+    const empty = msg.DoViewChangeMsg{ .view_number = 3, .replica_id = 0, .last_normal_view = 1, .op_number = 0 };
+
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    leader.allocator = fixed.allocator();
+    tc.deliver(0, 0, .{ .do_view_change = empty });
+    tc.deliver(0, 1, .{ .do_view_change = source });
+    leader.allocator = tc.allocator;
+
+    try std.testing.expectEqual(@as(msg.ViewNumber, 4), leader.view_number);
+    try std.testing.expect(!leader.pending_view_selection);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, leader.view_change_candidate.phase);
+    try std.testing.expectEqual(@as(msg.OpNumber, 0), leader.op_number);
+    try std.testing.expect(leader.journalGet(1) == null);
+}
+
+test "Replica candidate ownership survives crash reset and frees on teardown" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xCAAD1DA7E);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+    replica.view_change_candidate = try view_candidate.ViewChangeCandidate.allocate(replica.allocator, .{
+        .source_replica = 0,
+        .target_view = 1,
+        .source_last_normal_view = 0,
+        .base_op = 1,
+        .tip_op = 1,
+        .tip_checksum = 1,
+        .commit_bound = 0,
+        .deadline_tick = 10,
+    });
+    try std.testing.expect(replica.view_change_candidate.entries.len == 1);
+
+    tc.crashReplica(0);
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, tc.replicas[0].view_change_candidate.phase);
+    try std.testing.expectEqual(@as(usize, 0), tc.replicas[0].view_change_candidate.entries.len);
+    try std.testing.expect(tc.replicas[0].view_change_candidate.allocator != null);
+}
+
+test "Replica candidate deinit reset and allocation failure are leak free" {
+    const tc = try TestCluster.init(std.testing.allocator, 1, 0xA110CA7E);
+    defer tc.deinit();
+    const replica = tc.replicas[0];
+
+    replica.deinit();
+    replica.deinit();
+    try std.testing.expect(replica.view_change_candidate.allocator == null);
+    replica.initInPlace(.{
+        .allocator = tc.allocator,
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    replica.view_change_candidate.reset();
+    replica.allocator = fixed.allocator();
+    replica.view_change_candidate = .{ .allocator = replica.allocator };
+    try std.testing.expectError(error.OutOfMemory, view_candidate.ViewChangeCandidate.allocate(replica.allocator, .{
+        .source_replica = 0,
+        .target_view = 1,
+        .source_last_normal_view = 0,
+        .base_op = 1,
+        .tip_op = 1,
+        .tip_checksum = 1,
+        .commit_bound = 0,
+        .deadline_tick = 10,
+    }));
+    try std.testing.expectEqual(view_candidate.ViewSelectionPhase.idle, replica.view_change_candidate.phase);
+
+    replica.resetInPlace(.{
+        .allocator = tc.allocator,
+        .replica_id = 0,
+        .replica_count = 1,
+        .io = tc.sim_ios[0].io(),
+        .state_machine = tc.state_machines[0],
+        .disk = tc.disks[0].diskInterface(),
+    });
+    try std.testing.expect(replica.view_change_candidate.allocator != null);
 }
