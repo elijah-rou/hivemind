@@ -3136,8 +3136,9 @@ test "simultaneous reciprocal sockets converge and carry bidirectional VRR traff
 
 test "peer frame buffer fits largest serialized VRR view-change frame" {
     var serialized: [MAX_FRAME_BYTES]u8 = undefined;
-    const serialized_len = msg.serialize(.{ .do_view_change = .{} }, &serialized);
-    try std.testing.expectEqual(1 + @sizeOf(msg.DoViewChangeMsg), serialized_len);
+    const message = msg.Message{ .do_view_change = .{} };
+    const serialized_len = msg.serialize(message, &serialized);
+    try std.testing.expectEqual(msg.serializedSize(message), serialized_len);
 
     const peer_body_len = 2 + 1 + serialized_len; // version + from_id + tagged VRR message
     const plaintext_frame_len = 5 + peer_body_len; // len + flags + body

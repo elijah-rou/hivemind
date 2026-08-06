@@ -552,9 +552,11 @@ pub const COMMAND_PAYLOAD_MAX: usize = blk: {
     break :blk max;
 };
 
-fn canonicalSize(comptime T: type) usize {
+fn canonicalSize(comptime T: type) comptime_int {
     if (T == void) return 0;
     if (T == bool) return 1;
+    if (T == Command) return COMMAND_CANONICAL_SIZE;
+    if (T == Result) return RESULT_CANONICAL_SIZE;
     return switch (@typeInfo(T)) {
         .int, .float, .@"enum" => @sizeOf(T),
         .array => |array| array.len * canonicalSize(array.child),
@@ -567,6 +569,15 @@ fn canonicalSize(comptime T: type) usize {
     };
 }
 
+fn canonicalFieldOffset(comptime T: type, comptime field_name: []const u8) comptime_int {
+    comptime var offset: comptime_int = 0;
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime std.mem.eql(u8, field.name, field_name)) return offset;
+        offset += canonicalSize(field.type);
+    }
+    @compileError("unknown canonical field");
+}
+
 /// Stable tag-first little-endian Command size, independent of struct padding/ABI.
 pub const COMMAND_CANONICAL_SIZE: usize = blk: {
     var max: usize = 0;
@@ -576,17 +587,27 @@ pub const COMMAND_CANONICAL_SIZE: usize = blk: {
     break :blk 1 + max;
 };
 
+pub const RESULT_CANONICAL_SIZE: usize = 1 + canonicalSize(ResultData);
+
 comptime {
     // Tag + max payload must fit in the in-memory Command storage we reserve on the wire.
     if (1 + COMMAND_PAYLOAD_MAX > @sizeOf(Command)) @compileError("Command wire payload exceeds @sizeOf(Command)");
     if (1 + @sizeOf(ResultData) > @sizeOf(Result)) @compileError("Result wire payload exceeds @sizeOf(Result)");
 }
 
-pub fn serialize(msg: Message, buf: []u8) usize {
-    const tag_byte: u8 = @intFromEnum(std.meta.activeTag(msg));
-    buf[0] = tag_byte;
-    const payload_len = serializePayload(msg, buf[1..]);
-    return 1 + payload_len;
+pub fn serializedSize(message: Message) usize {
+    return switch (message) {
+        inline else => |payload| 1 + canonicalSize(@TypeOf(payload)),
+    };
+}
+
+pub fn serialize(message: Message, buf: []u8) usize {
+    const size = serializedSize(message);
+    std.debug.assert(buf.len >= size);
+    buf[0] = @intFromEnum(std.meta.activeTag(message));
+    const payload_len = serializePayload(message, buf[1..]);
+    std.debug.assert(size == 1 + payload_len);
+    return size;
 }
 
 pub fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) !E {
@@ -604,145 +625,6 @@ fn validateBoolByte(raw: u8) !bool {
     };
 }
 
-fn writeBool(dst: []u8, value: bool) void {
-    std.debug.assert(dst.len >= 1);
-    dst[0] = if (value) 1 else 0;
-}
-
-fn writeStructFields(comptime T: type, dst: []u8, value: T) void {
-    std.debug.assert(dst.len >= @sizeOf(T));
-    @memset(dst[0..@sizeOf(T)], 0);
-    inline for (std.meta.fields(T)) |field| {
-        const offset = @offsetOf(T, field.name);
-        const field_size = @sizeOf(field.type);
-        const field_val = @field(value, field.name);
-        writeValue(field.type, dst[offset..][0..field_size], field_val);
-    }
-}
-
-fn writeValue(comptime T: type, dst: []u8, value: T) void {
-    if (T == void) return;
-    if (T == bool) {
-        writeBool(dst, value);
-        return;
-    }
-    if (T == Command) {
-        writeCommand(dst, value);
-        return;
-    }
-    if (T == Result) {
-        writeResult(dst, value);
-        return;
-    }
-    if (T == LogEntry) {
-        writeLogEntry(dst, value);
-        return;
-    }
-    switch (@typeInfo(T)) {
-        .@"struct" => writeStructFields(T, dst, value),
-        .@"enum" => {
-            const raw: @typeInfo(T).@"enum".tag_type = @intFromEnum(value);
-            @memcpy(dst[0..@sizeOf(T)], std.mem.asBytes(&raw));
-        },
-        .array => |a| {
-            if (a.child == u8) {
-                @memcpy(dst[0..@sizeOf(T)], std.mem.asBytes(&value));
-                return;
-            }
-            var i: usize = 0;
-            while (i < a.len) : (i += 1) {
-                const elem_size = @sizeOf(a.child);
-                writeValue(a.child, dst[i * elem_size ..][0..elem_size], value[i]);
-            }
-        },
-        .int, .float => @memcpy(dst[0..@sizeOf(T)], std.mem.asBytes(&value)),
-        else => @memcpy(dst[0..@sizeOf(T)], std.mem.asBytes(&value)),
-    }
-}
-
-fn readStructFields(comptime T: type, src: []const u8) !T {
-    if (src.len < @sizeOf(T)) return error.MessageTooShort;
-    var out: T = undefined;
-    inline for (std.meta.fields(T)) |field| {
-        const offset = @offsetOf(T, field.name);
-        const field_size = @sizeOf(field.type);
-        @field(out, field.name) = try readValue(field.type, src[offset..][0..field_size]);
-    }
-    return out;
-}
-
-fn readValue(comptime T: type, src: []const u8) !T {
-    if (T == void) return {};
-    if (T == bool) {
-        if (src.len < 1) return error.MessageTooShort;
-        return try validateBoolByte(src[0]);
-    }
-    if (T == Command) return try readCommand(src);
-    if (T == Result) return try readResult(src);
-    if (T == LogEntry) return try readLogEntry(src);
-    switch (@typeInfo(T)) {
-        .@"struct" => return try readStructFields(T, src),
-        .@"enum" => {
-            if (src.len < @sizeOf(T)) return error.MessageTooShort;
-            const raw = std.mem.bytesToValue(@typeInfo(T).@"enum".tag_type, src[0..@sizeOf(@typeInfo(T).@"enum".tag_type)]);
-            return try enumFromIntChecked(T, raw);
-        },
-        .array => |a| {
-            if (src.len < @sizeOf(T)) return error.MessageTooShort;
-            if (a.child == u8) {
-                return std.mem.bytesToValue(T, src[0..@sizeOf(T)]);
-            }
-            var out: T = undefined;
-            var i: usize = 0;
-            while (i < a.len) : (i += 1) {
-                const elem_size = @sizeOf(a.child);
-                out[i] = try readValue(a.child, src[i * elem_size ..][0..elem_size]);
-            }
-            return out;
-        },
-        .int, .float => {
-            if (src.len < @sizeOf(T)) return error.MessageTooShort;
-            return std.mem.bytesToValue(T, src[0..@sizeOf(T)]);
-        },
-        else => {
-            if (src.len < @sizeOf(T)) return error.MessageTooShort;
-            return std.mem.bytesToValue(T, src[0..@sizeOf(T)]);
-        },
-    }
-}
-
-/// Fixed Command wire layout: [tag:u8][payload...][pad to @sizeOf(Command)].
-/// Tag is validated before any union is constructed.
-pub fn writeCommand(dst: []u8, command: Command) void {
-    std.debug.assert(dst.len >= @sizeOf(Command));
-    @memset(dst[0..@sizeOf(Command)], 0);
-    dst[0] = @intFromEnum(std.meta.activeTag(command));
-    switch (command) {
-        .noop => {},
-        inline else => |payload| {
-            writeStructFields(@TypeOf(payload), dst[1..][0..@sizeOf(@TypeOf(payload))], payload);
-        },
-    }
-}
-
-pub fn readCommand(src: []const u8) !Command {
-    if (src.len < @sizeOf(Command)) return error.MessageTooShort;
-    const tag = enumFromIntChecked(std.meta.Tag(Command), src[0]) catch return error.InvalidCommandTag;
-    switch (tag) {
-        inline else => |t| {
-            const name = @tagName(t);
-            inline for (std.meta.fields(Command)) |field| {
-                if (std.mem.eql(u8, field.name, name)) {
-                    if (field.type == void) return @unionInit(Command, field.name, {});
-                    const payload = try readStructFields(field.type, src[1..][0..@sizeOf(field.type)]);
-                    return @unionInit(Command, field.name, payload);
-                }
-            }
-            return error.InvalidCommandTag;
-        },
-    }
-}
-
 fn writeCanonicalValue(comptime T: type, dst: []u8, value: T) usize {
     const size = canonicalSize(T);
     std.debug.assert(dst.len >= size);
@@ -750,6 +632,14 @@ fn writeCanonicalValue(comptime T: type, dst: []u8, value: T) usize {
     if (T == bool) {
         dst[0] = if (value) 1 else 0;
         return 1;
+    }
+    if (T == Command) {
+        writeCanonicalCommand(dst, value);
+        return COMMAND_CANONICAL_SIZE;
+    }
+    if (T == Result) {
+        writeCanonicalResult(dst, value);
+        return RESULT_CANONICAL_SIZE;
     }
     switch (@typeInfo(T)) {
         .int => std.mem.writeInt(T, dst[0..@sizeOf(T)], value, .little),
@@ -783,6 +673,8 @@ fn readCanonicalValue(comptime T: type, src: []const u8) !T {
     if (src.len < size) return error.MessageTooShort;
     if (T == void) return {};
     if (T == bool) return try validateBoolByte(src[0]);
+    if (T == Command) return try readCanonicalCommand(src);
+    if (T == Result) return try readCanonicalResult(src);
     return switch (@typeInfo(T)) {
         .int => std.mem.readInt(T, src[0..@sizeOf(T)], .little),
         .float => blk: {
@@ -846,34 +738,48 @@ pub fn readCanonicalCommand(src: []const u8) !Command {
     }
 }
 
-/// Fixed Result wire layout: [tag:u8][payload...][pad to @sizeOf(Result)].
-pub fn writeResult(dst: []u8, result: Result) void {
-    std.debug.assert(dst.len >= @sizeOf(Result));
-    @memset(dst[0..@sizeOf(Result)], 0);
+/// Stable tag-first little-endian Result layout.
+fn writeCanonicalResult(dst: []u8, result: Result) void {
+    std.debug.assert(dst.len >= RESULT_CANONICAL_SIZE);
+    @memset(dst[0..RESULT_CANONICAL_SIZE], 0);
     dst[0] = @intFromEnum(std.meta.activeTag(result));
     switch (result) {
-        .ok => |data| writeStructFields(ResultData, dst[1..][0..@sizeOf(ResultData)], data),
-        .err => |code| {
-            dst[1] = @intFromEnum(code);
-        },
+        .ok => |data| _ = writeCanonicalValue(ResultData, dst[1..], data),
+        .err => |code| dst[1] = @intFromEnum(code),
     }
 }
 
-pub fn readResult(src: []const u8) !Result {
-    if (src.len < @sizeOf(Result)) return error.MessageTooShort;
+fn readCanonicalResult(src: []const u8) !Result {
+    if (src.len < RESULT_CANONICAL_SIZE) return error.MessageTooShort;
     const tag = enumFromIntChecked(std.meta.Tag(Result), src[0]) catch return error.InvalidResultTag;
     return switch (tag) {
-        .ok => .{ .ok = try readStructFields(ResultData, src[1..][0..@sizeOf(ResultData)]) },
+        .ok => .{ .ok = try readCanonicalValue(ResultData, src[1..]) },
         .err => .{ .err = try enumFromIntChecked(ErrorCode, src[1]) },
     };
 }
 
-fn writeLogEntry(dst: []u8, entry: LogEntry) void {
-    writeStructFields(LogEntry, dst, entry);
+/// Compatibility wrapper for callers that reserve the in-memory Command size.
+pub fn writeCommand(dst: []u8, command: Command) void {
+    std.debug.assert(dst.len >= @sizeOf(Command));
+    @memset(dst[0..@sizeOf(Command)], 0);
+    writeCanonicalCommand(dst[0..COMMAND_CANONICAL_SIZE], command);
 }
 
-fn readLogEntry(src: []const u8) !LogEntry {
-    return try readStructFields(LogEntry, src);
+pub fn readCommand(src: []const u8) !Command {
+    if (src.len < @sizeOf(Command)) return error.MessageTooShort;
+    return readCanonicalCommand(src[0..COMMAND_CANONICAL_SIZE]);
+}
+
+/// Compatibility wrapper for callers that reserve the in-memory Result size.
+pub fn writeResult(dst: []u8, result: Result) void {
+    std.debug.assert(dst.len >= @sizeOf(Result));
+    @memset(dst[0..@sizeOf(Result)], 0);
+    writeCanonicalResult(dst[0..RESULT_CANONICAL_SIZE], result);
+}
+
+pub fn readResult(src: []const u8) !Result {
+    if (src.len < @sizeOf(Result)) return error.MessageTooShort;
+    return readCanonicalResult(src[0..RESULT_CANONICAL_SIZE]);
 }
 
 pub fn validateCommand(command: Command) !void {
@@ -959,29 +865,9 @@ pub fn deserialize(buf: []const u8) !Message {
 }
 
 fn decodeExact(comptime T: type, data: []const u8) !T {
-    if (data.len != @sizeOf(T)) return error.InvalidMessageSize;
-    // Types that embed Command/Result must use the fixed nested codec — never bytesToValue.
-    const has_nested = comptime blk: {
-        break :blk typeContainsCommandOrResult(T);
-    };
-    if (has_nested) {
-        return try readStructFields(T, data);
-    }
-    return std.mem.bytesToValue(T, data[0..@sizeOf(T)]);
-}
-
-fn typeContainsCommandOrResult(comptime T: type) bool {
-    if (T == Command or T == Result or T == LogEntry) return true;
-    return switch (@typeInfo(T)) {
-        .@"struct" => {
-            inline for (std.meta.fields(T)) |field| {
-                if (typeContainsCommandOrResult(field.type)) return true;
-            }
-            return false;
-        },
-        .array => |a| typeContainsCommandOrResult(a.child),
-        else => false,
-    };
+    const size = canonicalSize(T);
+    if (data.len != size) return error.InvalidMessageSize;
+    return readCanonicalValue(T, data);
 }
 
 fn validateDecodedMessage(decoded: Message) !void {
@@ -1013,16 +899,11 @@ fn validateDecodedMessage(decoded: Message) !void {
     }
 }
 
-/// Serialize with zeroed padding and fixed nested Command/Result codecs.
-fn serializePayload(msg: Message, dst: []u8) usize {
-    switch (msg) {
-        inline else => |payload| {
-            const T = @TypeOf(payload);
-            const size = @sizeOf(T);
-            writeStructFields(T, dst[0..size], payload);
-            return size;
-        },
-    }
+/// Serialize every peer field in a packed, little-endian, ABI-independent layout.
+fn serializePayload(message: Message, dst: []u8) usize {
+    return switch (message) {
+        inline else => |payload| writeCanonicalValue(@TypeOf(payload), dst, payload),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,15 +976,17 @@ test "source-bound repair round-trip" {
 }
 
 test "RequestStartView round-trip" {
-    var buf: [1 + @sizeOf(RequestStartViewMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestStartViewMsg)]u8 = undefined;
     const message = Message{ .request_start_view = .{ .view_number = 17 } };
     const len = serialize(message, &buf);
+    const expected = [_]u8{ @intFromEnum(Tag.request_start_view), 17, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqualSlices(u8, &expected, buf[0..len]);
     const decoded = try deserialize(buf[0..len]);
     try std.testing.expectEqual(@as(ViewNumber, 17), decoded.request_start_view.view_number);
 }
 
 test "StartView certificate round-trip" {
-    var buf: [1 + @sizeOf(StartViewMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(StartViewMsg)]u8 = undefined;
     const message = Message{ .start_view = .{
         .view_number = 9,
         .selected_last_normal_view = 7,
@@ -1128,178 +1011,178 @@ test "deserialize rejects unknown tag" {
 }
 
 test "deserialize rejects invalid command tag in request before union switch" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
     // Fixed wire layout: Command tag is byte 0 of the command region.
-    const off = 1 + @offsetOf(RequestMsg, "command");
+    const off = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid command tag in prepare" {
-    var buf: [1 + @sizeOf(PrepareMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(PrepareMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.prepare);
-    const off = 1 + @offsetOf(PrepareMsg, "entry") + @offsetOf(LogEntry, "command");
+    const off = 1 + canonicalFieldOffset(PrepareMsg, "entry") + canonicalFieldOffset(LogEntry, "command");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid command tag in send_prepare" {
-    var buf: [1 + @sizeOf(SendPrepareMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(SendPrepareMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.send_prepare);
-    const off = 1 + @offsetOf(SendPrepareMsg, "entry") + @offsetOf(LogEntry, "command");
+    const off = 1 + canonicalFieldOffset(SendPrepareMsg, "entry") + canonicalFieldOffset(LogEntry, "command");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid command tag in do_view_change entry" {
-    var buf: [1 + @sizeOf(DoViewChangeMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(DoViewChangeMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.do_view_change);
-    const count_off = 1 + @offsetOf(DoViewChangeMsg, "log_entry_count");
+    const count_off = 1 + canonicalFieldOffset(DoViewChangeMsg, "log_entry_count");
     buf[count_off] = 1;
-    const off = 1 + @offsetOf(DoViewChangeMsg, "log_entries") + @offsetOf(LogEntry, "command");
+    const off = 1 + canonicalFieldOffset(DoViewChangeMsg, "log_entries") + canonicalFieldOffset(LogEntry, "command");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid command tag in start_view entry" {
-    var buf: [1 + @sizeOf(StartViewMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(StartViewMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.start_view);
-    const count_off = 1 + @offsetOf(StartViewMsg, "log_entry_count");
+    const count_off = 1 + canonicalFieldOffset(StartViewMsg, "log_entry_count");
     buf[count_off] = 1;
-    const off = 1 + @offsetOf(StartViewMsg, "log_entries") + @offsetOf(LogEntry, "command");
+    const off = 1 + canonicalFieldOffset(StartViewMsg, "log_entries") + canonicalFieldOffset(LogEntry, "command");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidCommandTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid result tag in reply" {
-    var buf: [1 + @sizeOf(ReplyMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(ReplyMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.reply);
-    const off = 1 + @offsetOf(ReplyMsg, "result");
+    const off = 1 + canonicalFieldOffset(ReplyMsg, "result");
     buf[off] = 0xFF;
     try std.testing.expectError(error.InvalidResultTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid ErrorCode in reply err" {
-    var buf: [1 + @sizeOf(ReplyMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(ReplyMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.reply);
-    const result_base = 1 + @offsetOf(ReplyMsg, "result");
+    const result_base = 1 + canonicalFieldOffset(ReplyMsg, "result");
     buf[result_base] = @intFromEnum(std.meta.Tag(Result).err);
     buf[result_base + 1] = 0xFF;
     try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid GpuType in request command" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).register_node);
-    const gpu_off = cmd_base + 1 + @offsetOf(RegisterNodeCmd, "gpu_type");
+    const gpu_off = cmd_base + 1 + canonicalFieldOffset(RegisterNodeCmd, "gpu_type");
     buf[gpu_off] = 0xFF;
     try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid NodeStatus in request command" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).update_node_status);
-    const status_off = cmd_base + 1 + @offsetOf(UpdateNodeStatusCmd, "new_status");
+    const status_off = cmd_base + 1 + canonicalFieldOffset(UpdateNodeStatusCmd, "new_status");
     buf[status_off] = 0xFF;
     try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
 }
 
 test "deserialize rejects invalid PodPhase in request command" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).update_pod_status);
-    const phase_off = cmd_base + 1 + @offsetOf(UpdatePodStatusCmd, "new_phase");
+    const phase_off = cmd_base + 1 + canonicalFieldOffset(UpdatePodStatusCmd, "new_phase");
     buf[phase_off] = 0xFF;
     try std.testing.expectError(error.InvalidEnumTag, deserialize(&buf));
 }
 
 test "deserialize rejects env_count above env_vars capacity" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).create_deployment);
-    const env_count_off = cmd_base + 1 + @offsetOf(CreateDeploymentCmd, "env_count");
+    const env_count_off = cmd_base + 1 + canonicalFieldOffset(CreateDeploymentCmd, "env_count");
     buf[env_count_off] = 255;
     try std.testing.expectError(error.InvalidEnvCount, deserialize(&buf));
 }
 
 test "deserialize rejects binding count above BIND_BATCH_MAX" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).bind_pods_to_nodes);
-    const count_off = cmd_base + 1 + @offsetOf(BindPodsToNodesCmd, "count");
+    const count_off = cmd_base + 1 + canonicalFieldOffset(BindPodsToNodesCmd, "count");
     buf[count_off] = 255;
     try std.testing.expectError(error.InvalidBindingCount, deserialize(&buf));
 }
 
 test "deserialize rejects rule_count above rules capacity" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).set_traffic_split);
-    const count_off = cmd_base + 1 + @offsetOf(SetTrafficSplitCmd, "rule_count");
+    const count_off = cmd_base + 1 + canonicalFieldOffset(SetTrafficSplitCmd, "rule_count");
     buf[count_off] = 9;
     try std.testing.expectError(error.InvalidRuleCount, deserialize(&buf));
 }
 
 test "deserialize rejects invalid bool in killswitch" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).set_killswitch);
-    const active_off = cmd_base + 1 + @offsetOf(SetKillswitchCmd, "active");
+    const active_off = cmd_base + 1 + canonicalFieldOffset(SetKillswitchCmd, "active");
     buf[active_off] = 2;
     try std.testing.expectError(error.InvalidBool, deserialize(&buf));
 }
 
 test "deserialize rejects invalid secret flag" {
-    var buf: [1 + @sizeOf(RequestMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(RequestMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.request);
-    const cmd_base = 1 + @offsetOf(RequestMsg, "command");
+    const cmd_base = 1 + canonicalFieldOffset(RequestMsg, "command");
     buf[cmd_base] = @intFromEnum(std.meta.Tag(Command).create_deployment);
-    const flag_off = cmd_base + 1 + @offsetOf(CreateDeploymentCmd, "image_pull_password_is_secret");
+    const flag_off = cmd_base + 1 + canonicalFieldOffset(CreateDeploymentCmd, "image_pull_password_is_secret");
     buf[flag_off] = 2;
     try std.testing.expectError(error.InvalidSecretFlag, deserialize(&buf));
 }
 
 test "deserialize rejects trailing payload bytes" {
-    var buf: [1 + @sizeOf(PrepareOkMsg) + 1]u8 = undefined;
+    var buf: [1 + canonicalSize(PrepareOkMsg) + 1]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.prepare_ok);
     try std.testing.expectError(error.InvalidMessageSize, deserialize(&buf));
 }
 
 test "deserialize rejects truncated prepare_ok" {
-    var buf: [1 + @sizeOf(PrepareOkMsg) - 1]u8 = undefined;
+    var buf: [1 + canonicalSize(PrepareOkMsg) - 1]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.prepare_ok);
     try std.testing.expectError(error.InvalidMessageSize, deserialize(&buf));
 }
 
 test "deserialize rejects protocol-v1 PrepareOk without checksum" {
-    const protocol_v1_size = @sizeOf(PrepareOkMsg) - @sizeOf(u64);
+    const protocol_v1_size: comptime_int = canonicalSize(PrepareOkMsg) - @sizeOf(u64);
     var buf: [1 + protocol_v1_size]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.prepare_ok);
@@ -1307,10 +1190,10 @@ test "deserialize rejects protocol-v1 PrepareOk without checksum" {
 }
 
 test "deserialize rejects oversized DVC log_entry_count" {
-    var buf: [1 + @sizeOf(DoViewChangeMsg)]u8 = undefined;
+    var buf: [1 + canonicalSize(DoViewChangeMsg)]u8 = undefined;
     @memset(&buf, 0);
     buf[0] = @intFromEnum(Tag.do_view_change);
-    const count_off = 1 + @offsetOf(DoViewChangeMsg, "log_entry_count");
+    const count_off = 1 + canonicalFieldOffset(DoViewChangeMsg, "log_entry_count");
     buf[count_off] = @as(u8, @intCast(DVC_LOG_MAX + 1));
     try std.testing.expectError(error.InvalidLogEntryCount, deserialize(&buf));
 }
