@@ -13,6 +13,7 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_PATH_MAX: usize = 1024;
 const HTTP_STATUS_LINE_MAX: usize = 1024;
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
+pub const TEST_PROCESS_PORT_COUNT: u16 = 4;
 
 struct RunningProcess {
     child: Child,
@@ -24,6 +25,9 @@ struct RunningProcess {
 pub struct ProcessRuntime {
     processes: Mutex<HashMap<String, RunningProcess>>,
     next_port: Mutex<u16>,
+    port_end_exclusive: Option<u16>,
+    test_controls_enabled: bool,
+    run_deadline: Duration,
 }
 
 impl ProcessRuntime {
@@ -35,6 +39,23 @@ impl ProcessRuntime {
         Self {
             processes: Mutex::new(HashMap::new()),
             next_port: Mutex::new(base_port),
+            port_end_exclusive: None,
+            test_controls_enabled: false,
+            run_deadline: Duration::from_secs(25),
+        }
+    }
+
+    pub fn with_test_controls(base_port: u16) -> Self {
+        assert!(base_port > 0, "test process base port must be nonzero");
+        let port_end_exclusive = base_port
+            .checked_add(TEST_PROCESS_PORT_COUNT)
+            .expect("test process port range must fit in u16");
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            next_port: Mutex::new(base_port),
+            port_end_exclusive: Some(port_end_exclusive),
+            test_controls_enabled: true,
+            run_deadline: Duration::from_millis(600),
         }
     }
 
@@ -64,7 +85,14 @@ impl Runtime for ProcessRuntime {
         }
         let mut next = self.next_port.lock().unwrap();
         let port = *next;
-        *next += 1;
+        if self.port_end_exclusive == Some(port) {
+            return Err(RuntimeError::ContainerCreate(format!(
+                "test process port range exhausted after {TEST_PROCESS_PORT_COUNT} pods"
+            )));
+        }
+        *next = next.checked_add(1).ok_or_else(|| {
+            RuntimeError::ContainerCreate("process runtime port range exhausted".into())
+        })?;
 
         let container_id = format!("proc-pod-{}:{}", spec.pod_id, port);
 
@@ -77,6 +105,9 @@ impl Runtime for ProcessRuntime {
                 r#"
 import http.server, json, os, sys
 class H(http.server.BaseHTTPRequestHandler):
+    last_body = None
+    execution_count = 0
+    test_controls = {}
     def do_GET(self):
         response = json.dumps(dict(os.environ))
         self.send_response(200)
@@ -86,15 +117,54 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('content-length', 0))
         body = self.rfile.read(length) if length > 0 else b''
-        response = json.dumps({{"status": "ok", "echo": body.decode('utf-8', errors='replace'), "pod_id": {}}})
+        key = body.decode('utf-8', errors='replace')
+        if H.test_controls:
+            if H.last_body == body:
+                H.execution_count += 1
+            else:
+                H.last_body = body
+                H.execution_count = 1
+        if H.test_controls and body == b'__hivemind_test_response_too_large__':
+            response = b'x' * {}
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            return
+        if H.test_controls and body == b'__hivemind_test_forwarding_failure__':
+            self.connection.shutdown(2)
+            self.connection.close()
+            return
+        if H.test_controls and body == b'__hivemind_test_trickle_deadline__':
+            self.send_response(200)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            for _ in range(10):
+                self.wfile.write(b'1\r\nx\r\n')
+                self.wfile.flush()
+                import time; time.sleep(0.2)
+            self.wfile.write(b'0\r\n\r\n')
+            return
+        result = {{"status": "ok", "echo": key, "pod_id": {}}}
+        if H.test_controls:
+            result["execution_count"] = H.execution_count
+        response = json.dumps(result)
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response.encode())
     def log_message(self, format, *args): pass
 http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
 "#,
-                spec.pod_id, port
+                if self.test_controls_enabled {
+                    "True"
+                } else {
+                    "False"
+                },
+                MAX_RUN_RESPONSE_BODY + 1,
+                spec.pod_id,
+                port
             ),
         ]);
 
@@ -148,7 +218,7 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
             .get_port(&handle.container_id)
             .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
 
-        crate::runtime::process::forward_run(port, payload)
+        forward_run_with_deadline(port, payload, self.run_deadline)
     }
 
     fn probe_pod(&self, handle: &PodHandle, _port: u16, path: &str) -> Result<bool, RuntimeError> {
@@ -542,6 +612,115 @@ mod tests {
     }
 
     #[test]
+    fn test_process_runtime_has_a_bounded_four_port_range() {
+        let runtime = ProcessRuntime::with_test_controls(24_300);
+        let mut handles = Vec::new();
+        for pod_id in 0..4 {
+            handles.push(
+                runtime
+                    .create_pod(&PodSpec {
+                        pod_id,
+                        deployment_id: 1,
+                        image: "process".into(),
+                        entrypoint: String::new(),
+                        port: 8080,
+                        gpu_count: 0,
+                        gpu_type: crate::types::GpuType::None,
+                        cpu_millicores: 100,
+                        memory_megabytes: 128,
+                        env_vars: Vec::new(),
+                        mounts: Vec::new(),
+                    })
+                    .unwrap(),
+            );
+        }
+        let overflow = runtime.create_pod(&PodSpec {
+            pod_id: 4,
+            deployment_id: 1,
+            image: "process".into(),
+            entrypoint: String::new(),
+            port: 8080,
+            gpu_count: 0,
+            gpu_type: crate::types::GpuType::None,
+            cpu_millicores: 100,
+            memory_megabytes: 128,
+            env_vars: Vec::new(),
+            mounts: Vec::new(),
+        });
+        assert!(matches!(overflow, Err(RuntimeError::ContainerCreate(_))));
+        for handle in handles {
+            runtime.remove_pod(&handle).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_kill_wait_is_bounded_when_exit_remains_unobservable() {
+        let started = Instant::now();
+        let status =
+            wait_for_child_exit_until(started + Duration::from_millis(20), || Ok(None)).unwrap();
+        assert!(status.is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn process_runtime_retains_owned_pod_across_control_plane_reconnect() {
+        let runtime = ProcessRuntime::with_base_port(24_600);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 80,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        // Control-plane reconnects must reuse this runtime instance. Its owned
+        // process remains forwardable instead of becoming an orphan.
+        let body = runtime
+            .forward_run(&handle, 8080, b"after-reconnect")
+            .unwrap();
+        assert!(body
+            .windows(b"after-reconnect".len())
+            .any(|part| part == b"after-reconnect"));
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn default_process_response_omits_test_execution_count() {
+        let runtime = ProcessRuntime::with_base_port(24_700);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 81,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        let body = runtime.forward_run(&handle, 8080, b"ordinary").unwrap();
+        let response = String::from_utf8(body).unwrap();
+        assert!(response.contains("\"echo\": \"ordinary\""));
+        assert!(!response.contains("execution_count"));
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
     fn stop_honors_graceful_sigterm_before_sigkill() {
         let runtime = ProcessRuntime::with_base_port(24_250);
         let container_id = "proc-grace".to_string();
@@ -659,15 +838,6 @@ mod tests {
             runtime.pod_status(&handle),
             Err(RuntimeError::ContainerNotFound(_))
         ));
-    }
-
-    #[test]
-    fn post_kill_wait_is_bounded_when_exit_remains_unobservable() {
-        let started = Instant::now();
-        let status =
-            wait_for_child_exit_until(started + Duration::from_millis(20), || Ok(None)).unwrap();
-        assert!(status.is_none());
-        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

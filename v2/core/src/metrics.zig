@@ -287,6 +287,10 @@ pub const MetricsServer = struct {
         pos += write(buf, pos, "# TYPE hivemind_consensus_op gauge\n");
         pos += writeFmt(buf, pos, "hivemind_consensus_op {d}\n", .{self.replica.op_number});
 
+        pos += write(buf, pos, "# HELP hivemind_committed_state_digest Deterministic digest of command-derived state\n");
+        pos += write(buf, pos, "# TYPE hivemind_committed_state_digest gauge\n");
+        pos += writeFmt(buf, pos, "hivemind_committed_state_digest {d}\n", .{sm.committedDigest()});
+
         pos += write(buf, pos, "# HELP hivemind_consensus_pipeline_guard_drops_total Requests dropped by the VRR pipeline guard\n");
         pos += write(buf, pos, "# TYPE hivemind_consensus_pipeline_guard_drops_total counter\n");
         pos += writeFmt(buf, pos, "hivemind_consensus_pipeline_guard_drops_total {d}\n", .{self.replica.pipeline_guard_drops});
@@ -768,6 +772,33 @@ test "metrics valid HTTP request completes across polls" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "hivemind_consensus_view") != null);
 }
 
+test "metrics render the exact committed state digest after mutation" {
+    const TestCluster = @import("vopr/test_harness.zig").TestCluster;
+
+    const tc = try TestCluster.init(std.testing.allocator, 1, 31);
+    defer tc.deinit();
+    const sm = tc.replicas[0].state_machine;
+    const digest_before = sm.committedDigest();
+    const result = sm.apply(.{ .create_deployment = .{
+        .name = msg.strToFixed(64, "digest-contract"),
+        .namespace = msg.strToFixed(64, "default"),
+        .image = msg.strToFixed(256, "process-test"),
+        .replicas = 1,
+        .gpu_type = .none,
+        .gpu_count = 0,
+    } });
+    try std.testing.expect(result == .ok);
+    const digest_after = sm.committedDigest();
+    try std.testing.expect(digest_after != digest_before);
+
+    var server = MetricsServer{ .listen_fd = -1, .replica = tc.replicas[0], .gossip = null, .connection_mgr = null };
+    var buf: [BUF_SIZE]u8 = undefined;
+    const len = server.formatMetrics(&buf);
+    var expected: [96]u8 = undefined;
+    const metric = try std.fmt.bufPrint(&expected, "hivemind_committed_state_digest {d}\n", .{digest_after});
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..len], metric) != null);
+}
+
 test "metrics include origin-aware gossip labels and cpu summaries" {
     const TestCluster = @import("vopr/test_harness.zig").TestCluster;
 
@@ -822,6 +853,7 @@ test "metrics include origin-aware gossip labels and cpu summaries" {
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_pipeline_guard_drops_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_log_full_rejections_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_consensus_storage_failures_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_committed_state_digest") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_queue_depth") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_available_millicores") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hivemind_peer_cpu_total_millicores") != null);
