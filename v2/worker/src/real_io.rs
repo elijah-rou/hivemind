@@ -1,5 +1,5 @@
 use std::io::{self, ErrorKind, Read};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::io::Io;
@@ -62,7 +62,9 @@ impl RealIo {
                 match protocol::decode_control_message(msg_type, &self.read_buf[..payload_len]) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
-                        eprintln!("decode failed: {e}");
+                        eprintln!("decode failed; terminating control session: {e}");
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                        self.connected = false;
                         None
                     }
                 }
@@ -218,6 +220,48 @@ mod tests {
         }
     }
 
+    fn assert_malformed_session_terminates(tag: u8, payload: &[u8]) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut io = RealIo::connect(&addr.to_string(), None).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mut frame = Vec::new();
+        protocol::write_frame(&mut frame, tag, payload).unwrap();
+        frame.extend_from_slice(&run_request_frame(9, 10, b"must-not-decode"));
+        server.write_all(&frame).unwrap();
+
+        for _ in 0..32 {
+            assert!(io.recv().is_none());
+            if !io.is_connected() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !io.is_connected(),
+            "malformed control frame must terminate session"
+        );
+        assert!(io.recv().is_none());
+    }
+
+    #[test]
+    fn malformed_control_message_disconnects_session() {
+        let mut malformed_start = vec![0u8; 797];
+        malformed_start[531] = 0xff;
+        assert_malformed_session_terminates(0x02, &malformed_start);
+    }
+
+    #[test]
+    fn trailing_stop_pod_payload_disconnects_session() {
+        assert_malformed_session_terminates(0x03, &[0u8; 17]);
+    }
+
+    #[test]
+    fn trailing_probe_pod_payload_disconnects_session() {
+        assert_malformed_session_terminates(0x05, &[0u8; 9]);
+    }
+
     #[test]
     fn recv_decodes_burst_larger_than_read_buffer_without_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -225,15 +269,16 @@ mod tests {
         let mut io = RealIo::connect(&addr.to_string(), None).unwrap();
         let (mut server, _) = listener.accept().unwrap();
 
-        let body = vec![0x5a; 1024];
+        // Stay within MAX_RUN_PAYLOAD while still exceeding the TCP read staging buffer.
+        let body = vec![0x5a; protocol::MAX_RUN_PAYLOAD];
         let mut burst = Vec::new();
-        for request_id in 0..50 {
+        for request_id in 0..80 {
             burst.extend_from_slice(&run_request_frame(request_id, 99, &body));
         }
         assert!(burst.len() > READ_BUFFER_SIZE);
         server.write_all(&burst).unwrap();
 
-        for request_id in 0..50 {
+        for request_id in 0..80 {
             match recv_until(&mut io) {
                 ControlMessage::RunRequest(cmd) => {
                     assert_eq!(cmd.request_id, request_id);

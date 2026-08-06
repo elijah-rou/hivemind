@@ -4,6 +4,8 @@ use crate::io::Io;
 use crate::message::{ControlMessage, WorkerMessage};
 use crate::prng::Prng;
 
+const STAGING_CAPACITY: usize = 256;
+
 /// Deterministic Io for simulation. The simulator fills `inbound`
 /// and drains `outbound` around each agent tick call.
 pub struct SimulatedIo {
@@ -17,10 +19,26 @@ impl SimulatedIo {
     pub fn new(seed: u64) -> Self {
         Self {
             current_tick: 0,
-            inbound: VecDeque::new(),
-            outbound: Vec::new(),
+            inbound: VecDeque::with_capacity(STAGING_CAPACITY),
+            outbound: Vec::with_capacity(STAGING_CAPACITY),
             prng: Prng::init(seed),
         }
+    }
+
+    pub fn push_inbound(&mut self, msg: ControlMessage) {
+        assert!(
+            self.inbound.len() < STAGING_CAPACITY,
+            "simulated I/O inbound staging capacity exceeded"
+        );
+        self.inbound.push_back(msg);
+    }
+
+    pub fn drain_outbound(&mut self) -> std::vec::Drain<'_, WorkerMessage> {
+        assert!(
+            self.outbound.len() <= STAGING_CAPACITY,
+            "simulated I/O outbound staging capacity exceeded"
+        );
+        self.outbound.drain(..)
     }
 }
 
@@ -30,6 +48,10 @@ impl Io for SimulatedIo {
     }
 
     fn send(&mut self, msg: WorkerMessage) {
+        assert!(
+            self.outbound.len() < STAGING_CAPACITY,
+            "simulated I/O outbound staging capacity exceeded"
+        );
         self.outbound.push(msg);
     }
 

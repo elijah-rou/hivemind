@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +22,9 @@ const (
 	TagRunResponse          byte = 0x23
 	TagClusterStateRequest  byte = 0x24
 	TagClusterStateResponse byte = 0x25
+	TagLeaderProbeRequest   byte = 0x26
+	TagLeaderProbeResponse  byte = 0x27
+	leaderProbeResponseLen       = 12
 )
 
 // Command tags (consensus operations)
@@ -159,7 +165,7 @@ func (c *HivemindClient) dialLeader(spans *[]TimedSpan) (net.Conn, string, error
 			continue
 		}
 
-		// Read-only leader probe via cluster_state_request. Does NOT mutate state.
+		// Fixed-size read-only leader probe. Does not serialize cluster state.
 		probeStart := nowWallMS()
 		isLeader, err := probeIsLeader(conn, c.crypto)
 		probeEnd := nowWallMS()
@@ -175,6 +181,37 @@ func (c *HivemindClient) dialLeader(spans *[]TimedSpan) (net.Conn, string, error
 	}
 
 	return nil, "", fmt.Errorf("no leader found among %v", c.addrs)
+}
+
+func (c *HivemindClient) dialCachedLeader(spans *[]TimedSpan) (net.Conn, string, error) {
+	c.mu.Lock()
+	cached := c.leader
+	c.mu.Unlock()
+	if cached != "" {
+		conn, err := net.DialTimeout("tcp", cached, 2*time.Second)
+		if err == nil {
+			probeStart := nowWallMS()
+			isLeader, probeErr := probeIsLeader(conn, c.crypto)
+			probeEnd := nowWallMS()
+			if spans != nil {
+				*spans = append(*spans, TimedSpan{Phase: "reconnect_probe", StartMS: probeStart, EndMS: probeEnd, Source: "api/client.go"})
+			}
+			if probeErr == nil && isLeader {
+				return conn, cached, nil
+			}
+			_ = conn.Close()
+		}
+		c.invalidateLeader(cached)
+	}
+	return c.dialLeader(spans)
+}
+
+func (c *HivemindClient) invalidateLeader(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.leader == addr {
+		c.leader = ""
+	}
 }
 
 func (c *HivemindClient) reconnect(spans *[]TimedSpan) error {
@@ -235,7 +272,7 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	copy(payload[17:], cmdPayload)
 
 	connectStart := nowWallMS()
-	conn, leader, err := c.dialLeader(&timings.SpansRaw)
+	conn, leader, err := c.dialCachedLeader(&timings.SpansRaw)
 	connectEnd := nowWallMS()
 	timings.SpansRaw = append(timings.SpansRaw, TimedSpan{Phase: "command_connect", StartMS: connectStart, EndMS: connectEnd, Source: "api/client.go"})
 	if err != nil {
@@ -264,21 +301,74 @@ func (c *HivemindClient) SendCommandTimed(cmdTag byte, cmdPayload []byte) (Comma
 	}
 
 	result, err := parseResult(reply, reqID)
+	if err == nil && !result.OK && result.ErrCode == ErrCodeNotLeader {
+		c.invalidateLeader(leader)
+	}
 	return result, timings, err
 }
 
-// Run-request error codes (match v2/src/connection.zig handleRunRequest + sendRunError).
+// RunStatus is the stable cross-language /run wire enum.
+type RunStatus byte
+
 const (
-	RunStatusOK        byte = 0
-	RunStatusNotFound  byte = 1 // deployment not found
-	RunStatusQueueFull byte = 2
+	RunStatusOK                 RunStatus = 0
+	RunStatusDeploymentNotFound RunStatus = 1
+	RunStatusQueueFull          RunStatus = 2
+	RunStatusInvalidPayload     RunStatus = 3
+	RunStatusResponseTooLarge   RunStatus = 4
+	RunStatusOutcomeAmbiguous   RunStatus = 5
+	RunStatusForwardingFailed   RunStatus = 6
+	RunStatusNoRunningPod       RunStatus = 7
+	RunStatusUnavailable        RunStatus = 8
+	RunStatusNotLeader          RunStatus = 9
 )
+
+func (s RunStatus) String() string {
+	switch s {
+	case RunStatusOK:
+		return "ok"
+	case RunStatusDeploymentNotFound:
+		return "deployment_not_found"
+	case RunStatusQueueFull:
+		return "queue_full"
+	case RunStatusInvalidPayload:
+		return "invalid_payload"
+	case RunStatusResponseTooLarge:
+		return "response_too_large"
+	case RunStatusOutcomeAmbiguous:
+		return "outcome_ambiguous"
+	case RunStatusForwardingFailed:
+		return "forwarding_failed"
+	case RunStatusNoRunningPod:
+		return "no_running_pod"
+	case RunStatusUnavailable:
+		return "unavailable"
+	case RunStatusNotLeader:
+		return "not_leader"
+	default:
+		return "unknown"
+	}
+}
+
+// MaxRunPayload is the shared run-request body bound (matches core request_queue.MAX_PAYLOAD).
+const MaxRunPayload = 512
+
+// MaxRunResponseBody matches the Rust worker and Zig gateway response bound.
+const MaxRunResponseBody = 16*1024 - 9
+
+// ErrRunOutcomeAmbiguous means the gateway attempted to write a run request but
+// could not prove whether the worker executed it. Callers must not retry unless
+// the workload operation is independently idempotent.
+var ErrRunOutcomeAmbiguous = errors.New("run outcome ambiguous")
+
+// ErrRunUnavailable means no request bytes were sent. Retrying is safe.
+var ErrRunUnavailable = errors.New("run unavailable before send")
 
 // RunResponse is the decoded worker reply to a /run request.
 type RunResponse struct {
 	RequestID uint64
-	Status    byte   // 0 = ok, nonzero = error (worker or gateway-side)
-	Body      []byte // status==0: container response body; status!=0: error detail (may be empty)
+	Status    RunStatus // ok or one explicit error outcome
+	Body      []byte    // status==0: container response body; status!=0: error detail (may be empty)
 }
 
 // SendRunRequest sends a workload request (no consensus) and returns the
@@ -286,8 +376,19 @@ type RunResponse struct {
 // appropriate HTTP (or other) outcome; Body is the raw container payload with
 // the wire header already stripped.
 func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunResponse, error) {
+	if len(depName) > 64 {
+		return nil, fmt.Errorf("run deployment name exceeds wire maximum 64 bytes")
+	}
+	if strings.ContainsRune(depName, '\x00') {
+		return nil, fmt.Errorf("run deployment name contains NUL")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if len(payload) > MaxRunPayload {
+		return nil, fmt.Errorf("run payload exceeds max %d bytes", MaxRunPayload)
+	}
 
 	reqID := c.requestID.Add(1)
 
@@ -298,55 +399,96 @@ func (c *HivemindClient) SendRunRequest(depName string, payload []byte) (*RunRes
 	binary.LittleEndian.PutUint32(data[72:76], uint32(len(payload)))
 	copy(data[76:], payload)
 
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if c.conn == nil {
-			if err := c.reconnect(nil); err != nil {
-				lastErr = err
-				continue
-			}
+	var connectErr error
+	for attempt := 0; attempt < 2 && c.conn == nil; attempt++ {
+		if err := c.reconnect(nil); err != nil {
+			connectErr = err
 		}
+	}
+	if c.conn == nil {
+		if connectErr == nil {
+			connectErr = errors.New("no leader connection")
+		}
+		return nil, fmt.Errorf("%w: %v", ErrRunUnavailable, connectErr)
+	}
 
+	for attempt := 0; attempt < 2; attempt++ {
+		// Calling writeFrameEncrypted may partially write before returning an error.
+		// Only explicit not_leader is guaranteed unexecuted and therefore retryable.
 		if err := writeFrameEncrypted(c.conn, TagRunRequest, data, c.crypto); err != nil {
-			lastErr = fmt.Errorf("send failed: %w", err)
 			c.closeLocked()
-			continue
+			var writeErr *frameWriteError
+			if errors.As(err, &writeErr) && writeErr.attempted {
+				return nil, fmt.Errorf("%w: send failed: %w", ErrRunOutcomeAmbiguous, err)
+			}
+			return nil, fmt.Errorf("%w: send failed before write: %v", ErrRunUnavailable, err)
 		}
 
 		buf := make([]byte, 65536)
 		raw, err := readRunResponseEncrypted(c.conn, buf, c.crypto)
 		if err != nil {
-			lastErr = fmt.Errorf("recv failed: %w", err)
 			c.closeLocked()
+			return nil, fmt.Errorf("%w: recv failed: %w", ErrRunOutcomeAmbiguous, err)
+		}
+		resp, err := parseRunResponse(raw)
+		if err != nil {
+			c.closeLocked()
+			return nil, fmt.Errorf("%w: invalid response: %w", ErrRunOutcomeAmbiguous, err)
+		}
+		if resp.RequestID != reqID {
+			c.closeLocked()
+			return nil, fmt.Errorf("%w: run response request_id mismatch: got %d want %d", ErrRunOutcomeAmbiguous, resp.RequestID, reqID)
+		}
+		if resp.Status == RunStatusNotLeader && attempt == 0 {
+			c.closeLocked()
+			if err := c.reconnect(nil); err != nil {
+				return nil, fmt.Errorf("%w: leader reprobe: %v", ErrRunUnavailable, err)
+			}
 			continue
 		}
-
-		return parseRunResponse(raw)
+		if resp.Status == RunStatusOutcomeAmbiguous {
+			return resp, ErrRunOutcomeAmbiguous
+		}
+		return resp, nil
 	}
-
-	return nil, lastErr
+	panic("bounded run retry exhausted")
 }
 
 // parseRunResponse decodes a run_response payload: [request_id(8)][status(1)][len(4)?][data?].
-// Short replies from sendRunError (9 bytes, no length/body) are allowed.
+// Gateway sendRunError replies are exactly 9 bytes (no length/body) and require nonzero status.
+// All other replies require an exact length prefix: declared body length == trailing bytes.
 func parseRunResponse(raw []byte) (*RunResponse, error) {
 	if len(raw) < 9 {
 		return nil, fmt.Errorf("run response too short: %d", len(raw))
 	}
 	resp := &RunResponse{
 		RequestID: binary.LittleEndian.Uint64(raw[0:8]),
-		Status:    raw[8],
+		Status:    RunStatus(raw[8]),
 	}
-	if len(raw) >= 13 {
-		bodyLen := binary.LittleEndian.Uint32(raw[9:13])
-		end := 13 + int(bodyLen)
-		if end > len(raw) {
-			end = len(raw)
+	if resp.Status > RunStatusNotLeader {
+		return nil, fmt.Errorf("unknown run status: %d", resp.Status)
+	}
+	if len(raw) == 9 {
+		if resp.Status == RunStatusOK {
+			return nil, fmt.Errorf("run response missing length")
 		}
-		if end > 13 {
-			// Copy out so the caller can outlive the shared read buffer.
-			resp.Body = append([]byte(nil), raw[13:end]...)
-		}
+		return resp, nil
+	}
+	if len(raw) < 13 {
+		return nil, fmt.Errorf("run response missing length")
+	}
+	bodyLen := binary.LittleEndian.Uint32(raw[9:13])
+	// Overflow-safe exact equality: compare body slice length to declared length.
+	body := raw[13:]
+	if bodyLen > MaxRunResponseBody {
+		return nil, fmt.Errorf("run response body exceeds max %d bytes", MaxRunResponseBody)
+	}
+	if uint64(len(body)) != uint64(bodyLen) {
+		return nil, fmt.Errorf("run response length mismatch: declared %d have %d", bodyLen, len(body))
+	}
+	if bodyLen > 0 {
+		// Copy out so the caller can outlive the shared read buffer.
+		resp.Body = append([]byte(nil), body...)
 	}
 	return resp, nil
 }
@@ -365,13 +507,51 @@ func (c *HivemindClient) Leader() string {
 
 // Wire helpers
 
-const ProtocolVersion uint16 = 1
+const ProtocolVersion uint16 = 5
+const frameWriteTimeout = 2 * time.Second
+
+type frameWriteError struct {
+	attempted bool
+	err       error
+}
+
+func (e *frameWriteError) Error() string { return e.err.Error() }
+func (e *frameWriteError) Unwrap() error { return e.err }
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n < 0 || n > len(data) {
+			return &frameWriteError{attempted: true, err: fmt.Errorf("invalid write count %d for %d bytes", n, len(data))}
+		}
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return &frameWriteError{attempted: true, err: err}
+		}
+		if n == 0 {
+			return &frameWriteError{attempted: true, err: io.ErrShortWrite}
+		}
+	}
+	return nil
+}
 
 func writeFrame(conn net.Conn, tag byte, payload []byte) error {
 	return writeFrameEncrypted(conn, tag, payload, nil)
 }
 
-func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *CryptoState) error {
+func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *CryptoState) (err error) {
+	if err := conn.SetWriteDeadline(time.Now().Add(frameWriteTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	attempted := false
+	defer func() {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); clearErr != nil && err == nil {
+			err = &frameWriteError{attempted: attempted, err: fmt.Errorf("clear write deadline: %w", clearErr)}
+		}
+	}()
+
 	// Build inner: [version(2)][tag(1)][payload...]
 	inner := make([]byte, 2+1+len(payload))
 	binary.LittleEndian.PutUint16(inner[0:2], ProtocolVersion)
@@ -392,11 +572,11 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 			return err
 		}
 
-		if _, err := conn.Write(header); err != nil {
+		attempted = true
+		if err := writeAll(conn, header); err != nil {
 			return err
 		}
-		_, err = conn.Write(encrypted)
-		return err
+		return writeAll(conn, encrypted)
 	}
 
 	frameLen := uint32(1 + len(inner)) // flags + inner
@@ -404,76 +584,129 @@ func writeFrameEncrypted(conn net.Conn, tag byte, payload []byte, crypto *Crypto
 	binary.LittleEndian.PutUint32(header[0:4], frameLen)
 	header[4] = 0x00 // plaintext
 
-	if _, err := conn.Write(header); err != nil {
+	attempted = true
+	if err := writeAll(conn, header); err != nil {
 		return err
 	}
-	_, err := conn.Write(inner)
-	return err
+	return writeAll(conn, inner)
 }
 
-// probeIsLeader sends a read-only cluster_state_request and returns whether
-// the peer self-identifies as the current VRR leader. No consensus, no state
-// mutation, no client_table entry — safe to call on every reconnect.
+type leaderProbeResponse struct {
+	Status     byte
+	IsLeader   bool
+	ReplicaID  byte
+	LeaderID   byte
+	ViewNumber uint64
+}
+
+func parseLeaderProbe(payload []byte) (leaderProbeResponse, error) {
+	if len(payload) != leaderProbeResponseLen {
+		return leaderProbeResponse{}, fmt.Errorf("leader probe response length %d, want %d", len(payload), leaderProbeResponseLen)
+	}
+	if payload[0] > 2 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid replica status %d", payload[0])
+	}
+	if payload[1] > 1 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid leader boolean %d", payload[1])
+	}
+	if payload[2] >= 11 || payload[3] >= 11 {
+		return leaderProbeResponse{}, fmt.Errorf("invalid replica identity %d/%d", payload[2], payload[3])
+	}
+	return leaderProbeResponse{
+		Status: payload[0], IsLeader: payload[1] == 1,
+		ReplicaID: payload[2], LeaderID: payload[3],
+		ViewNumber: binary.LittleEndian.Uint64(payload[4:12]),
+	}, nil
+}
+
 func probeIsLeader(conn net.Conn, crypto *CryptoState) (bool, error) {
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	defer conn.SetWriteDeadline(time.Time{})
-	if err := writeFrameEncrypted(conn, TagClusterStateRequest, []byte{0x01}, crypto); err != nil {
+	if err := writeFrameEncrypted(conn, TagLeaderProbeRequest, nil, crypto); err != nil {
 		return false, err
 	}
-
-	buf := make([]byte, 131072)
-	frame, err := readFrameGeneric(conn, buf, 2*time.Second, crypto)
+	var buf [4 + 1 + CryptoNonceLen + 2 + 1 + leaderProbeResponseLen + CryptoTagLen]byte
+	frame, err := readFrameGeneric(conn, buf[:], 2*time.Second, crypto)
 	if err != nil {
 		return false, err
 	}
-	if len(frame) < 3 || frame[2] != TagClusterStateResponse {
-		return false, fmt.Errorf("unexpected probe tag: 0x%02x", frame[2])
+	if len(frame) != 3+leaderProbeResponseLen || frame[2] != TagLeaderProbeResponse {
+		return false, fmt.Errorf("invalid leader probe frame tag/length: tag=0x%02x length=%d", frame[2], len(frame))
 	}
-
-	// payload layout: query_type(1) + view(8) + commit_min(8) + op(8) + status(1) + is_leader(1)
-	payload := frame[3:]
-	if len(payload) < 27 {
-		return false, fmt.Errorf("probe reply too short: %d", len(payload))
+	probe, err := parseLeaderProbe(frame[3:])
+	if err != nil {
+		return false, err
 	}
-	return payload[26] == 1, nil
+	return probe.IsLeader && probe.Status == 0 && probe.ReplicaID == probe.LeaderID, nil
 }
 
-// readFrameGeneric reads a frame, decrypts if needed, returns [version(2)][tag(1)][payload...].
-func readFrameGeneric(conn net.Conn, buf []byte, timeout time.Duration, crypto *CryptoState) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+// readFrameGeneric reads exactly one frame and returns [version(2)][tag(1)][payload...].
+func readFrameGeneric(conn net.Conn, buf []byte, timeout time.Duration, crypto *CryptoState) (frame []byte, err error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil {
+			_ = conn.Close()
+			frame = nil
+			err = fmt.Errorf("clear read deadline: %w", clearErr)
+		}
+	}()
 
-	// Read 4-byte length
+	if len(buf) < 4 {
+		return nil, fmt.Errorf("frame buffer too small: %d", len(buf))
+	}
 	if _, err := readFull(conn, buf[:4]); err != nil {
 		return nil, err
 	}
 	frameLen := binary.LittleEndian.Uint32(buf[:4])
-	if frameLen > uint32(len(buf)) || frameLen < 1 {
+	if frameLen < 1 || uint64(frameLen) > uint64(len(buf)-4) {
 		return nil, fmt.Errorf("bad frame len: %d", frameLen)
 	}
 
-	// Read rest of frame
-	if _, err := readFull(conn, buf[4:4+frameLen]); err != nil {
+	if _, err := readFull(conn, buf[4:4+int(frameLen)]); err != nil {
 		return nil, err
 	}
 
 	flags := buf[4]
-	if flags&0x01 != 0 {
-		// Encrypted
-		if crypto == nil || !crypto.Enabled {
+	if flags != 0x00 && flags != 0x01 {
+		return nil, fmt.Errorf("unknown frame flags: 0x%02x", flags)
+	}
+	keyConfigured := crypto != nil && crypto.Enabled
+	if (flags == 0x01) != keyConfigured {
+		if flags == 0x01 {
 			return nil, fmt.Errorf("encrypted frame but no key")
 		}
-		encData := buf[5 : 4+frameLen]
-		aad := buf[0:5] // len + flags
-		plaintext, err := DecryptFrame(&crypto.ClientKey, encData, aad)
+		return nil, fmt.Errorf("plaintext frame while key configured")
+	}
+
+	var plaintext []byte
+	if flags == 0x01 {
+		const encryptedMinimum = CryptoNonceLen + 3 + CryptoTagLen
+		if frameLen < 1+encryptedMinimum {
+			return nil, fmt.Errorf("encrypted frame too short: %d", frameLen)
+		}
+		encData := buf[5 : 4+int(frameLen)]
+		aad := buf[0:5]
+		var err error
+		plaintext, err = DecryptFrame(&crypto.ClientKey, encData, aad)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt failed: %w", err)
 		}
-		return plaintext, nil
+	} else {
+		if frameLen < 1+3 {
+			return nil, fmt.Errorf("plaintext frame too short: %d", frameLen)
+		}
+		plaintext = buf[5 : 4+int(frameLen)]
 	}
 
-	// Plaintext: buf[5..4+frameLen] = [version(2)][tag(1)][payload...]
-	return buf[5 : 4+frameLen], nil
+	if len(plaintext) < 3 {
+		return nil, fmt.Errorf("frame payload too short: %d", len(plaintext))
+	}
+	version := binary.LittleEndian.Uint16(plaintext[:2])
+	if version != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported protocol version: %d", version)
+	}
+	return plaintext, nil
 }
 
 func readReply(conn net.Conn, buf []byte) ([]byte, error) {
@@ -531,17 +764,15 @@ func parseResult(reply []byte, expectedRequestID uint64) (CommandResult, error) 
 	resultType := reply[8]
 	switch resultType {
 	case 0: // ok
-		var entityID uint64
-		if len(reply) >= 17 {
-			entityID = binary.LittleEndian.Uint64(reply[9:17])
+		if len(reply) != 17 {
+			return CommandResult{}, fmt.Errorf("ok reply length %d, want 17", len(reply))
 		}
-		return CommandResult{OK: true, EntityID: entityID}, nil
+		return CommandResult{OK: true, EntityID: binary.LittleEndian.Uint64(reply[9:17])}, nil
 	case 1: // error
-		var errCode byte
-		if len(reply) >= 10 {
-			errCode = reply[9]
+		if len(reply) != 10 {
+			return CommandResult{}, fmt.Errorf("err reply length %d, want 10", len(reply))
 		}
-		return CommandResult{OK: false, ErrCode: errCode}, nil
+		return CommandResult{OK: false, ErrCode: reply[9]}, nil
 	default:
 		return CommandResult{}, fmt.Errorf("unknown result type: %d", resultType)
 	}
@@ -652,12 +883,24 @@ func (c *HivemindClient) SendClusterStateRequest() (*ClusterState, error) {
 }
 
 func parseClusterState(data []byte) (*ClusterState, error) {
-	if len(data) < 29 {
+	const (
+		headerSize     = 29
+		nodeSize       = 148
+		deploymentSize = 215
+		podSize        = 25
+		agentSize      = 83
+		queueStatsSize = 40
+		maxNodes       = 128
+		maxDeployments = 64
+		maxPods        = 512
+		maxAgents      = 128
+	)
+	if len(data) < headerSize {
 		return nil, fmt.Errorf("cluster state too short: %d", len(data))
 	}
 
 	cs := &ClusterState{}
-	pos := 1 // skip query_type byte
+	pos := 1
 	cs.ViewNumber = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 	cs.CommitMin = binary.LittleEndian.Uint64(data[pos:])
@@ -669,14 +912,27 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 	cs.IsLeader = data[pos] == 1
 	pos++
 
-	// Nodes
-	nodeCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
+	readCount := func(kind string, max int, recordSize int) (int, error) {
+		if pos+2 > len(data) {
+			return 0, fmt.Errorf("cluster state truncated before %s count", kind)
+		}
+		count := int(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		if count > max {
+			return 0, fmt.Errorf("cluster state %s count %d exceeds max %d", kind, count, max)
+		}
+		if count > (len(data)-pos)/recordSize {
+			return 0, fmt.Errorf("cluster state truncated %s records: count=%d remaining=%d", kind, count, len(data)-pos)
+		}
+		return count, nil
+	}
+
+	nodeCount, err := readCount("node", maxNodes, nodeSize)
+	if err != nil {
+		return nil, err
+	}
 	cs.Nodes = make([]NodeInfo, nodeCount)
 	for i := range cs.Nodes {
-		if pos+140 > len(data) {
-			break
-		}
 		n := &cs.Nodes[i]
 		n.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -700,17 +956,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos += 32
 	}
 
-	// Deployments
-	if pos+2 > len(data) {
-		return cs, nil
+	deploymentCount, err := readCount("deployment", maxDeployments, deploymentSize)
+	if err != nil {
+		return nil, err
 	}
-	depCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
-	cs.Deployments = make([]DeploymentInfo, depCount)
+	cs.Deployments = make([]DeploymentInfo, deploymentCount)
 	for i := range cs.Deployments {
-		if pos+211 > len(data) {
-			break
-		} // 8+64+128+4+4+1+4+1+1 = 215, round to 211
 		d := &cs.Deployments[i]
 		d.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -732,17 +983,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Pods
-	if pos+2 > len(data) {
-		return cs, nil
+	podCount, err := readCount("pod", maxPods, podSize)
+	if err != nil {
+		return nil, err
 	}
-	podCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
 	cs.Pods = make([]PodInfo, podCount)
 	for i := range cs.Pods {
-		if pos+25 > len(data) {
-			break
-		}
 		p := &cs.Pods[i]
 		p.ID = binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
@@ -754,17 +1000,12 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Agents
-	if pos+2 > len(data) {
-		return cs, nil
+	agentCount, err := readCount("agent", maxAgents, agentSize)
+	if err != nil {
+		return nil, err
 	}
-	agentCount := binary.LittleEndian.Uint16(data[pos:])
-	pos += 2
 	cs.Agents = make([]WorkerInfo, agentCount)
 	for i := range cs.Agents {
-		if pos+83 > len(data) {
-			break
-		}
 		a := &cs.Agents[i]
 		a.Hostname = trimNull(data[pos : pos+64])
 		pos += 64
@@ -780,9 +1021,8 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 		pos++
 	}
 
-	// Queue stats
-	if pos+40 > len(data) {
-		return cs, nil
+	if len(data)-pos != queueStatsSize {
+		return nil, fmt.Errorf("cluster state queue stats length %d, want %d", len(data)-pos, queueStatsSize)
 	}
 	cs.QueueDepth = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
@@ -793,7 +1033,10 @@ func parseClusterState(data []byte) (*ClusterState, error) {
 	cs.DispatchTotal = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 	cs.ResolveTotal = binary.LittleEndian.Uint64(data[pos:])
-
+	pos += 8
+	if pos != len(data) {
+		panic("cluster state parser length invariant")
+	}
 	return cs, nil
 }
 

@@ -436,7 +436,60 @@ pub const ClientTag = enum(u8) {
     run_response = 0x23, // hivemind → client: run response
     cluster_state_request = 0x24, // client → hivemind: read-only state query
     cluster_state_response = 0x25, // hivemind → client: state snapshot
+    leader_probe_request = 0x26, // client → hivemind: fixed-size leader query
+    leader_probe_response = 0x27, // hivemind → client: fixed-size leader identity
 };
+
+pub const LEADER_PROBE_REQUEST_BYTES: usize = 0;
+pub const LEADER_PROBE_RESPONSE_BYTES: usize = 12;
+
+pub const LeaderProbeResponse = struct {
+    status: Status,
+    is_leader: bool,
+    replica_id: u8,
+    leader_id: u8,
+    view_number: ViewNumber,
+
+    pub fn encode(self: LeaderProbeResponse) [LEADER_PROBE_RESPONSE_BYTES]u8 {
+        var out: [LEADER_PROBE_RESPONSE_BYTES]u8 = undefined;
+        out[0] = @intFromEnum(self.status);
+        out[1] = @intFromBool(self.is_leader);
+        out[2] = self.replica_id;
+        out[3] = self.leader_id;
+        @memcpy(out[4..12], &std.mem.toBytes(std.mem.nativeToLittle(ViewNumber, self.view_number)));
+        return out;
+    }
+
+    pub fn decode(bytes: []const u8) !LeaderProbeResponse {
+        if (bytes.len != LEADER_PROBE_RESPONSE_BYTES) return error.InvalidLength;
+        const status = enumFromIntChecked(Status, bytes[0]) catch return error.InvalidStatus;
+        if (bytes[1] > 1) return error.InvalidBoolean;
+        if (bytes[2] >= REPLICA_COUNT_MAX) return error.InvalidReplica;
+        if (bytes[3] >= REPLICA_COUNT_MAX) return error.InvalidLeader;
+        return .{
+            .status = status,
+            .is_leader = bytes[1] == 1,
+            .replica_id = bytes[2],
+            .leader_id = bytes[3],
+            .view_number = std.mem.littleToNative(ViewNumber, std.mem.bytesToValue(ViewNumber, bytes[4..12])),
+        };
+    }
+};
+
+comptime {
+    std.debug.assert(LEADER_PROBE_RESPONSE_BYTES == 12);
+}
+
+test "leader probe response golden and malformed contract" {
+    const golden = [_]u8{ 0, 1, 2, 2, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 };
+    const response = LeaderProbeResponse{ .status = .normal, .is_leader = true, .replica_id = 2, .leader_id = 2, .view_number = 0x0102030405060708 };
+    try std.testing.expectEqualSlices(u8, &golden, &response.encode());
+    try std.testing.expectEqual(response, try LeaderProbeResponse.decode(&golden));
+    try std.testing.expectError(error.InvalidLength, LeaderProbeResponse.decode(golden[0..11]));
+    var malformed = golden;
+    malformed[1] = 2;
+    try std.testing.expectError(error.InvalidBoolean, LeaderProbeResponse.decode(&malformed));
+}
 
 // ---------------------------------------------------------------------------
 // Worker protocol messages (bidirectional over worker-initiated TCP)
@@ -1302,4 +1355,8 @@ test "worker tags stay wire compatible with rust agent" {
     try std.testing.expectEqual(@as(u8, 0x02), @intFromEnum(WorkerTag.start_pod));
     try std.testing.expectEqual(@as(u8, 0x03), @intFromEnum(WorkerTag.stop_pod));
     try std.testing.expectEqual(@as(u8, 0x04), @intFromEnum(WorkerTag.run_request));
+    try std.testing.expectEqual(@as(u8, 0x10), @intFromEnum(WorkerTag.register));
+    try std.testing.expectEqual(@as(u8, 0x11), @intFromEnum(WorkerTag.heartbeat));
+    try std.testing.expectEqual(@as(u8, 0x12), @intFromEnum(WorkerTag.pod_status));
+    try std.testing.expectEqual(@as(u8, 0x13), @intFromEnum(WorkerTag.run_response));
 }

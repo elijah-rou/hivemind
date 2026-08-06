@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::message::{ControlMessage, WorkerMessage};
 use crate::prng::Prng;
+use crate::protocol::{MAX_RUN_RESPONSE_BODY, RUN_STATUS_RESPONSE_TOO_LARGE};
 
 const QUEUE_CAPACITY: usize = 256;
 
@@ -21,6 +22,8 @@ pub struct MessageStats {
     pub control_bytes: u64,
     pub worker_sent: u64,
     pub worker_bytes: u64,
+    pub worker_failed_partition: u64,
+    pub worker_dropped: u64,
 }
 
 impl MessageStats {
@@ -30,6 +33,8 @@ impl MessageStats {
             control_bytes: 0,
             worker_sent: 0,
             worker_bytes: 0,
+            worker_failed_partition: 0,
+            worker_dropped: 0,
         }
     }
 }
@@ -118,10 +123,25 @@ impl SimulatedNetwork {
     }
 
     pub fn send_from_agent(&mut self, agent_id: usize, msg: WorkerMessage, current_tick: u64) {
+        let msg = match msg {
+            WorkerMessage::RunResponse(mut response)
+                if response.payload.len() > MAX_RUN_RESPONSE_BODY =>
+            {
+                response.status = RUN_STATUS_RESPONSE_TOO_LARGE;
+                response.payload.clear();
+                WorkerMessage::RunResponse(response)
+            }
+            other => other,
+        };
+        // Messages accepted before a partition remain queued, like bytes already
+        // handed to a socket. New sends after the partition boundary fail and are
+        // lost, so a completed run can have an ambiguous externally observed outcome.
         if self.partitioned[agent_id] {
+            self.stats.worker_failed_partition += 1;
             return;
         }
         if self.drop_rate_percent > 0 && self.prng.chance(self.drop_rate_percent) {
+            self.stats.worker_dropped += 1;
             return;
         }
 
@@ -132,16 +152,25 @@ impl SimulatedNetwork {
                 msg,
                 deliver_at_tick: current_tick + delay,
             });
+            self.stats.worker_sent += 1;
+        } else {
+            self.stats.worker_dropped += 1;
         }
     }
 
     pub fn pop_inbound(&mut self, agent_id: usize, now: u64) -> Option<ControlMessage> {
+        if self.partitioned[agent_id] {
+            return None;
+        }
         let queue = &mut self.inbound[agent_id];
         let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
         Some(queue.remove(pos).unwrap().msg)
     }
 
     pub fn pop_outbound(&mut self, agent_id: usize, now: u64) -> Option<WorkerMessage> {
+        if self.partitioned[agent_id] {
+            return None;
+        }
         let queue = &mut self.outbound[agent_id];
         let pos = queue.iter().position(|m| m.deliver_at_tick <= now)?;
         Some(queue.remove(pos).unwrap().msg)
@@ -233,6 +262,74 @@ mod tests {
 
         net.send_to_agent(0, test_start_cmd(1), 10);
         assert!(net.pop_inbound(0, 100).is_none());
+    }
+
+    #[test]
+    fn outbound_run_response_matches_wire_overflow_semantics() {
+        let mut net = SimulatedNetwork::new(1, 0xB4_10);
+        net.min_delay = 1;
+        net.max_delay = 1;
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 44,
+                status: 0,
+                payload: vec![0x5a; MAX_RUN_RESPONSE_BODY + 1],
+            }),
+            0,
+        );
+
+        let delivered = net
+            .pop_outbound(0, 1)
+            .expect("encoded run response must be delivered");
+        match delivered {
+            WorkerMessage::RunResponse(response) => {
+                assert_eq!(response.request_id, 44);
+                assert_eq!(response.status, RUN_STATUS_RESPONSE_TOO_LARGE);
+                assert!(response.payload.is_empty());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partition_buffers_accepted_outbound_and_fails_new_sends() {
+        let mut net = SimulatedNetwork::new(1, 0xB4_11);
+        net.min_delay = 2;
+        net.max_delay = 2;
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 51,
+                status: 0,
+                payload: b"accepted".to_vec(),
+            }),
+            0,
+        );
+        assert_eq!(net.stats.worker_sent, 1);
+
+        net.partition_agent(0, 1);
+        net.send_from_agent(
+            0,
+            WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 52,
+                status: 0,
+                payload: b"lost".to_vec(),
+            }),
+            1,
+        );
+        assert_eq!(net.stats.worker_failed_partition, 1);
+        assert!(net.pop_outbound(0, 3).is_none());
+
+        net.heal_all(3);
+        match net.pop_outbound(0, 3) {
+            Some(WorkerMessage::RunResponse(response)) => {
+                assert_eq!(response.request_id, 51);
+                assert_eq!(response.payload, b"accepted");
+            }
+            other => panic!("expected buffered response after heal, got {other:?}"),
+        }
+        assert!(net.pop_outbound(0, u64::MAX).is_none());
     }
 
     #[test]

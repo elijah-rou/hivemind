@@ -54,6 +54,7 @@ pub enum RuntimeError {
     ContainerStart(String),
     ContainerStop(String),
     ContainerNotFound(String),
+    ResponseTooLarge(String),
     Internal(String),
 }
 
@@ -65,6 +66,7 @@ impl std::fmt::Display for RuntimeError {
             Self::ContainerStart(msg) => write!(f, "container start failed: {msg}"),
             Self::ContainerStop(msg) => write!(f, "container stop failed: {msg}"),
             Self::ContainerNotFound(msg) => write!(f, "container not found: {msg}"),
+            Self::ResponseTooLarge(msg) => write!(f, "response too large: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }

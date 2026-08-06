@@ -5,11 +5,35 @@ use crate::types::GpuType;
 
 // -- Message type constants --
 
+#[cfg(test)]
 const MSG_REGISTER_ACK: u8 = 0x01;
 const MSG_START_POD: u8 = 0x02;
 const MSG_STOP_POD: u8 = 0x03;
 const MSG_PROBE_POD: u8 = 0x05;
 const MSG_RUN_REQUEST: u8 = 0x04;
+/// Must match v2/core/src/request_queue.zig MAX_PAYLOAD.
+pub const MAX_RUN_PAYLOAD: usize = 512;
+/// Shared worker response-body bound. RunResponse metadata consumes 9 frame-payload bytes.
+pub const MAX_RUN_RESPONSE_BODY: usize = MAX_FRAME_PAYLOAD - 9;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Ok = 0,
+    DeploymentNotFound = 1,
+    QueueFull = 2,
+    InvalidPayload = 3,
+    ResponseTooLarge = 4,
+    OutcomeAmbiguous = 5,
+    ForwardingFailed = 6,
+    NoRunningPod = 7,
+    Unavailable = 8,
+    /// Core-only. A worker must reject attempts to emit this status.
+    NotLeader = 9,
+}
+
+pub const RUN_STATUS_RESPONSE_TOO_LARGE: u8 = RunStatus::ResponseTooLarge as u8;
+pub const RUN_STATUS_FORWARDING_FAILED: u8 = RunStatus::ForwardingFailed as u8;
+pub const RUN_STATUS_NO_RUNNING_POD: u8 = RunStatus::NoRunningPod as u8;
 
 const MSG_NODE_REGISTER: u8 = 0x10;
 const MSG_NODE_HEARTBEAT: u8 = 0x11;
@@ -73,7 +97,72 @@ struct WirePodStatusEvent {
 // len = 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 5;
+const FRAME_FLAGS_LEN: usize = 1;
+const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
+const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;
+
+fn validate_frame_declaration(
+    total_len: usize,
+    flags: u8,
+    key_configured: bool,
+) -> io::Result<usize> {
+    if flags != 0x00 && flags != 0x01 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown frame flags: 0x{flags:02x}"),
+        ));
+    }
+    if (flags == 0x01) != key_configured {
+        let message = if flags == 0x01 {
+            "encrypted frame but no key"
+        } else {
+            "plaintext frame while key configured"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+
+    let remaining = total_len
+        .checked_sub(FRAME_FLAGS_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame too short"))?;
+    let overhead = if flags == 0x01 {
+        ENCRYPTED_FRAME_OVERHEAD
+    } else {
+        0
+    };
+    let minimum = overhead + FRAME_INNER_MIN;
+    let maximum = overhead + FRAME_INNER_MIN + MAX_FRAME_PAYLOAD;
+    if remaining < minimum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+    if remaining > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: declared={remaining} max={maximum}"),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn validate_protocol_version(inner: &[u8]) -> io::Result<()> {
+    if inner.len() < FRAME_INNER_MIN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame payload too short",
+        ));
+    }
+    let version = u16::from_le_bytes(inner[..2].try_into().unwrap());
+    if version != PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported protocol version: {version}"),
+        ));
+    }
+    Ok(())
+}
 
 pub fn write_frame(w: &mut impl Write, msg_type: u8, payload: &[u8]) -> io::Result<()> {
     write_frame_encrypted(w, msg_type, payload, None)
@@ -85,8 +174,19 @@ pub fn write_frame_encrypted(
     payload: &[u8],
     key: Option<&[u8; crate::crypto::KEY_LEN]>,
 ) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "frame payload too large: {} > {MAX_FRAME_PAYLOAD}",
+                payload.len()
+            ),
+        ));
+    }
     // Build inner: [version(2)][tag(1)][payload...]
-    let inner_len = 2 + 1 + payload.len();
+    let inner_len = FRAME_INNER_MIN
+        .checked_add(payload.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
     let mut inner = vec![0u8; inner_len];
     inner[0..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     inner[2] = msg_type;
@@ -94,8 +194,14 @@ pub fn write_frame_encrypted(
 
     if let Some(k) = key {
         // Build header first for AAD (must match Zig decodeFrame)
-        let enc_payload_len = crate::crypto::NONCE_LEN + inner.len() + crate::crypto::TAG_LEN;
-        let frame_len = (1 + enc_payload_len) as u32; // flags + encrypted
+        let enc_payload_len = crate::crypto::NONCE_LEN
+            .checked_add(inner.len())
+            .and_then(|len| len.checked_add(crate::crypto::TAG_LEN))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
+        let frame_len = FRAME_FLAGS_LEN
+            .checked_add(enc_payload_len)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
         let mut header = [0u8; 5];
         header[0..4].copy_from_slice(&frame_len.to_le_bytes());
         header[4] = 0x01; // encrypted
@@ -104,7 +210,10 @@ pub fn write_frame_encrypted(
         w.write_all(&header)?;
         w.write_all(&encrypted)?;
     } else {
-        let frame_len = (1 + inner_len) as u32; // flags + inner
+        let frame_len = FRAME_FLAGS_LEN
+            .checked_add(inner_len)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
         w.write_all(&frame_len.to_le_bytes())?;
         w.write_all(&[0x00])?; // flags: plaintext
         w.write_all(&inner)?;
@@ -126,58 +235,28 @@ pub fn try_decode_frame(
     }
 
     let total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    if total_len < 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-
-    let frame_len = 4 + total_len;
+    let flags = data[4];
+    let remaining = validate_frame_declaration(total_len, flags, key.is_some())?;
+    let frame_len = 4usize
+        .checked_add(total_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"))?;
     if data.len() < frame_len {
         return Ok(None);
     }
+    let frame_payload = &data[5..frame_len];
 
-    let flags = data[4];
-    let remaining = total_len - 1;
-    let payload = &data[5..frame_len];
-
-    if flags & 0x01 != 0 {
-        let k = key.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
-        })?;
-
-        let plaintext = crate::crypto::decrypt_frame(k, payload, &data[0..5])
+    let decrypted;
+    let plaintext = if flags == 0x01 {
+        decrypted = crate::crypto::decrypt_frame(key.unwrap(), frame_payload, &data[0..5])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if plaintext.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decrypted frame too short",
-            ));
-        }
-        let msg_type = plaintext[2];
-        let payload_len = plaintext.len() - 3;
-        if payload_len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "frame too large: payload={payload_len} buffer={}",
-                    buf.len()
-                ),
-            ));
-        }
-        buf[..payload_len].copy_from_slice(&plaintext[3..]);
-        return Ok(Some((msg_type, payload_len, frame_len)));
-    }
+        decrypted.as_slice()
+    } else {
+        frame_payload
+    };
+    validate_protocol_version(plaintext)?;
 
-    if remaining < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-    let msg_type = payload[2];
-    let payload_len = remaining - 3;
+    let msg_type = plaintext[2];
+    let payload_len = plaintext.len() - FRAME_INNER_MIN;
     if payload_len > buf.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -188,8 +267,9 @@ pub fn try_decode_frame(
         ));
     }
     if payload_len > 0 {
-        buf[..payload_len].copy_from_slice(&payload[3..]);
+        buf[..payload_len].copy_from_slice(&plaintext[FRAME_INNER_MIN..]);
     }
+    debug_assert_eq!(remaining, frame_payload.len());
     Ok(Some((msg_type, payload_len, frame_len)))
 }
 
@@ -202,43 +282,24 @@ pub fn read_frame_encrypted(
     r.read_exact(&mut len_bytes)?;
     let total_len = u32::from_le_bytes(len_bytes) as usize;
 
-    if total_len < 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-
-    // Read flags byte
     let mut flags = [0u8; 1];
     r.read_exact(&mut flags)?;
-    let remaining = total_len - 1;
+    let remaining = validate_frame_declaration(total_len, flags[0], key.is_some())?;
 
-    if flags[0] & 0x01 != 0 {
-        // Encrypted frame
-        let k = key.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "encrypted frame but no key")
-        })?;
+    if flags[0] == 0x01 {
+        // The declaration is bounded before this allocation.
         let mut enc_buf = vec![0u8; remaining];
         r.read_exact(&mut enc_buf)?;
 
-        // AAD = len_bytes + flags
         let mut aad = [0u8; 5];
         aad[0..4].copy_from_slice(&len_bytes);
         aad[4] = flags[0];
-
-        let plaintext = crate::crypto::decrypt_frame(k, &enc_buf, &aad)
+        let plaintext = crate::crypto::decrypt_frame(key.unwrap(), &enc_buf, &aad)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        validate_protocol_version(&plaintext)?;
 
-        // plaintext = [version(2)][tag(1)][payload...]
-        if plaintext.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decrypted frame too short",
-            ));
-        }
         let msg_type = plaintext[2];
-        let payload_len = plaintext.len() - 3;
+        let payload_len = plaintext.len() - FRAME_INNER_MIN;
         if payload_len > buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -248,35 +309,27 @@ pub fn read_frame_encrypted(
                 ),
             ));
         }
-        buf[..payload_len].copy_from_slice(&plaintext[3..]);
-        Ok((msg_type, payload_len))
-    } else {
-        // Plaintext frame: remaining = [version(2)][tag(1)][payload...]
-        if remaining < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame too short",
-            ));
-        }
-        let mut ver_bytes = [0u8; 2];
-        r.read_exact(&mut ver_bytes)?;
-        let mut type_byte = [0u8; 1];
-        r.read_exact(&mut type_byte)?;
-        let payload_len = remaining - 3;
-        if payload_len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "frame too large: payload={payload_len} buffer={}",
-                    buf.len()
-                ),
-            ));
-        }
-        if payload_len > 0 {
-            r.read_exact(&mut buf[..payload_len])?;
-        }
-        Ok((type_byte[0], payload_len))
+        buf[..payload_len].copy_from_slice(&plaintext[FRAME_INNER_MIN..]);
+        return Ok((msg_type, payload_len));
     }
+
+    let mut inner_header = [0u8; FRAME_INNER_MIN];
+    r.read_exact(&mut inner_header)?;
+    validate_protocol_version(&inner_header)?;
+    let payload_len = remaining - FRAME_INNER_MIN;
+    if payload_len > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame too large: payload={payload_len} buffer={}",
+                buf.len()
+            ),
+        ));
+    }
+    if payload_len > 0 {
+        r.read_exact(&mut buf[..payload_len])?;
+    }
+    Ok((inner_header[2], payload_len))
 }
 
 // -- Encode agent messages to wire bytes --
@@ -334,16 +387,35 @@ pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(
         }
 
         WorkerMessage::RunResponse(m) => {
-            // Payload: request_id(u64) + status(u8) + response_data
-            let mut pos = 0;
-            buf[pos..pos + 8].copy_from_slice(&m.request_id.to_le_bytes());
-            pos += 8;
-            buf[pos] = m.status;
-            pos += 1;
-            let copy_len = m.payload.len().min(buf.len() - pos);
-            buf[pos..pos + copy_len].copy_from_slice(&m.payload[..copy_len]);
-            pos += copy_len;
-            Ok((MSG_RUN_RESPONSE, pos))
+            // Payload: request_id(u64) + status(u8) + response_data.
+            // Oversize output is an explicit error response, never successful truncation.
+            const HEADER: usize = 9;
+            if buf.len() < HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RunResponse buffer too small",
+                ));
+            }
+            buf[0..8].copy_from_slice(&m.request_id.to_le_bytes());
+            if m.status >= RunStatus::NotLeader as u8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker RunResponse status must be in 0..=8",
+                ));
+            }
+            if m.payload.len() > MAX_RUN_RESPONSE_BODY {
+                buf[8] = RUN_STATUS_RESPONSE_TOO_LARGE;
+                return Ok((MSG_RUN_RESPONSE, HEADER));
+            }
+            if m.payload.len() > buf.len() - HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RunResponse buffer too small",
+                ));
+            }
+            buf[8] = m.status;
+            buf[HEADER..HEADER + m.payload.len()].copy_from_slice(&m.payload);
+            Ok((MSG_RUN_RESPONSE, HEADER + m.payload.len()))
         }
     }
 }
@@ -376,7 +448,7 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             pos += 2;
             let gpu_count = payload[pos];
             pos += 1;
-            let gpu_type = u8_to_gpu_type(payload[pos]);
+            let gpu_type = u8_to_gpu_type(payload[pos])?;
             pos += 1;
             let cpu_millicores = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
@@ -390,17 +462,26 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             pos += 64;
             let env_count = payload[pos] as usize;
             pos += 1;
-            let mut env_vars = Vec::with_capacity(env_count);
             const ENV_ENTRY_SIZE: usize = 64 + 256 + 1; // name + value + is_secret
+            let env_bytes = env_count.checked_mul(ENV_ENTRY_SIZE).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "StartPod env length overflow")
+            })?;
+            let env_end = pos.checked_add(env_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "StartPod env length overflow")
+            })?;
+            if env_end > payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StartPod env entries truncated",
+                ));
+            }
+            let mut env_vars = Vec::with_capacity(env_count);
             for _ in 0..env_count {
-                if pos + ENV_ENTRY_SIZE > payload.len() {
-                    break;
-                }
                 let name = fixed_to_string(&payload[pos..pos + 64]);
                 pos += 64;
                 let value = fixed_to_string(&payload[pos..pos + 256]);
                 pos += 256;
-                let is_secret_ref = payload[pos] != 0;
+                let is_secret_ref = decode_bool(payload[pos], "StartPod env secret flag")?;
                 pos += 1;
                 env_vars.push(EnvEntry {
                     name,
@@ -414,22 +495,31 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             let mut image_pull_password = String::new();
             let mut image_pull_password_is_secret = false;
 
-            if pos < payload.len() && payload[pos] == 0x01 {
-                pos += 1;
-                const REGISTRY_AUTH_TAIL: usize = 128 + 64 + 256 + 1;
-                if pos + REGISTRY_AUTH_TAIL > payload.len() {
+            const REGISTRY_AUTH_TRAILER_SIZE: usize = 1 + 128 + 64 + 256 + 1;
+            let remaining = payload.len() - pos;
+            if remaining != 0 {
+                if remaining != REGISTRY_AUTH_TRAILER_SIZE || payload[pos] != 0x01 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "StartPod registry auth truncated",
+                        "StartPod registry auth trailer invalid",
                     ));
                 }
+                pos += 1;
                 image_pull_registry = fixed_to_string(&payload[pos..pos + 128]);
                 pos += 128;
                 image_pull_username = fixed_to_string(&payload[pos..pos + 64]);
                 pos += 64;
                 image_pull_password = fixed_to_string(&payload[pos..pos + 256]);
                 pos += 256;
-                image_pull_password_is_secret = payload[pos] != 0;
+                image_pull_password_is_secret =
+                    decode_bool(payload[pos], "StartPod image pull secret flag")?;
+                pos += 1;
+            }
+            if pos != payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "StartPod payload has trailing bytes",
+                ));
             }
 
             Ok(ControlMessage::StartPod(StartPodCmd {
@@ -454,10 +544,10 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
         }
 
         MSG_STOP_POD => {
-            if payload.len() < std::mem::size_of::<WireStopPod>() {
+            if payload.len() != std::mem::size_of::<WireStopPod>() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "StopPod payload too short",
+                    "StopPod payload length invalid",
                 ));
             }
             let wire: WireStopPod = from_bytes(payload);
@@ -468,10 +558,10 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
         }
 
         MSG_PROBE_POD => {
-            if payload.len() < std::mem::size_of::<WireProbePod>() {
+            if payload.len() != std::mem::size_of::<WireProbePod>() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "ProbePod payload too short",
+                    "ProbePod payload length invalid",
                 ));
             }
             let wire: WireProbePod = from_bytes(payload);
@@ -482,7 +572,9 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
 
         MSG_RUN_REQUEST => {
             // Payload: request_id(u64) + deployment_id(u64) + payload_len(u32) + payload
-            if payload.len() < 20 {
+            // Exact length contract: declared len must match trailing bytes; <= MAX_RUN_PAYLOAD.
+            const HEADER: usize = 20;
+            if payload.len() < HEADER {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "RunRequest payload too short",
@@ -490,16 +582,18 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
             }
             let request_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             let deployment_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
-            let data = if payload.len() >= 20 + payload_len {
-                payload[20..20 + payload_len].to_vec()
-            } else {
-                payload[20..].to_vec()
-            };
+            let declared_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let body = &payload[HEADER..];
+            if declared_len > MAX_RUN_PAYLOAD || body.len() != declared_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RunRequest payload length mismatch",
+                ));
+            }
             Ok(ControlMessage::RunRequest(RunRequestCmd {
                 request_id,
                 deployment_id,
-                payload: data,
+                payload: body.to_vec(),
             }))
         }
 
@@ -524,12 +618,32 @@ fn fixed_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
-fn u8_to_gpu_type(v: u8) -> GpuType {
-    // SAFETY: GpuType is repr(u8) with values 0-8
-    if v <= 8 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        GpuType::None
+fn decode_bool(value: u8, field: &'static str) -> io::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} must be 0 or 1, got {value}"),
+        )),
+    }
+}
+
+fn u8_to_gpu_type(v: u8) -> io::Result<GpuType> {
+    match v {
+        0 => Ok(GpuType::None),
+        1 => Ok(GpuType::A100_40),
+        2 => Ok(GpuType::A100_80),
+        3 => Ok(GpuType::H100Sxm),
+        4 => Ok(GpuType::H100Pcie),
+        5 => Ok(GpuType::H200),
+        6 => Ok(GpuType::L40s),
+        7 => Ok(GpuType::A10g),
+        8 => Ok(GpuType::T4),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid StartPod GPU type: {v}"),
+        )),
     }
 }
 
@@ -580,6 +694,224 @@ mod tests {
 
         assert_eq!(msg_type, MSG_REGISTER_ACK);
         assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn frame_writer_rejects_oversize_before_writing() {
+        let mut output = Vec::new();
+        let payload = vec![0x5a; MAX_FRAME_PAYLOAD + 1];
+        let error = write_frame(&mut output, 0x42, &payload).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn run_status_wire_golden() {
+        let statuses = [
+            (RunStatus::Ok, 0),
+            (RunStatus::DeploymentNotFound, 1),
+            (RunStatus::QueueFull, 2),
+            (RunStatus::InvalidPayload, 3),
+            (RunStatus::ResponseTooLarge, 4),
+            (RunStatus::OutcomeAmbiguous, 5),
+            (RunStatus::ForwardingFailed, 6),
+            (RunStatus::NoRunningPod, 7),
+            (RunStatus::Unavailable, 8),
+            (RunStatus::NotLeader, 9),
+        ];
+        for (status, wire) in statuses {
+            assert_eq!(status as u8, wire);
+        }
+    }
+
+    #[test]
+    fn worker_rejects_core_only_and_unknown_run_statuses() {
+        let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+        for status in [RunStatus::NotLeader as u8, 10, u8::MAX] {
+            let response = WorkerMessage::RunResponse(RunResponseMsg {
+                request_id: 7,
+                status,
+                payload: Vec::new(),
+            });
+            let error = encode_agent_message(&response, &mut buf).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn run_response_exact_bound_and_overflow_status() {
+        let exact = WorkerMessage::RunResponse(RunResponseMsg {
+            request_id: 7,
+            status: 0,
+            payload: vec![0x5a; MAX_RUN_RESPONSE_BODY],
+        });
+        let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+        let (tag, len) = encode_agent_message(&exact, &mut buf).unwrap();
+        assert_eq!(tag, MSG_RUN_RESPONSE);
+        assert_eq!(len, MAX_FRAME_PAYLOAD);
+        assert_eq!(buf[8], 0);
+        assert_eq!(&buf[9..], vec![0x5a; MAX_RUN_RESPONSE_BODY]);
+
+        let overflow = WorkerMessage::RunResponse(RunResponseMsg {
+            request_id: 8,
+            status: 0,
+            payload: vec![0x6b; MAX_RUN_RESPONSE_BODY + 1],
+        });
+        let (_, len) = encode_agent_message(&overflow, &mut buf).unwrap();
+        assert_eq!(len, 9);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 8);
+        assert_eq!(buf[8], RUN_STATUS_RESPONSE_TOO_LARGE);
+    }
+
+    fn test_frame(
+        flags: u8,
+        version: u16,
+        msg_type: u8,
+        key: Option<&[u8; crate::crypto::KEY_LEN]>,
+    ) -> Vec<u8> {
+        let mut inner = Vec::from(version.to_le_bytes());
+        inner.push(msg_type);
+        if flags == 0x01 {
+            let key = key.expect("encrypted test frame requires key");
+            let total_len = 1 + crate::crypto::NONCE_LEN + inner.len() + crate::crypto::TAG_LEN;
+            let mut header = [0u8; 5];
+            header[..4].copy_from_slice(&(total_len as u32).to_le_bytes());
+            header[4] = flags;
+            let encrypted = crate::crypto::encrypt_frame(key, &inner, &header);
+            return header.into_iter().chain(encrypted).collect();
+        }
+
+        let mut frame = Vec::with_capacity(5 + inner.len());
+        frame.extend_from_slice(&(1u32 + inner.len() as u32).to_le_bytes());
+        frame.push(flags);
+        frame.extend_from_slice(&inner);
+        frame
+    }
+
+    #[test]
+    fn streaming_frame_contract_table() {
+        let state = crate::crypto::EncryptionState::from_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
+        let mut oversize = Vec::from(((MAX_FRAME_PAYLOAD + 45) as u32).to_le_bytes());
+        oversize.push(0x01);
+
+        let cases = [
+            (
+                "unknown flags",
+                test_frame(0x02, PROTOCOL_VERSION, 0x42, None),
+                None,
+                false,
+            ),
+            (
+                "bad plaintext version",
+                test_frame(0x00, PROTOCOL_VERSION + 1, 0x42, None),
+                None,
+                false,
+            ),
+            (
+                "bad encrypted version",
+                test_frame(0x01, PROTOCOL_VERSION + 1, 0x42, Some(&state.worker_key)),
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "plaintext while key configured",
+                test_frame(0x00, PROTOCOL_VERSION, 0x42, None),
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "encrypted without key",
+                test_frame(0x01, PROTOCOL_VERSION, 0x42, Some(&state.worker_key)),
+                None,
+                false,
+            ),
+            ("short plaintext", vec![1, 0, 0, 0, 0x00], None, false),
+            (
+                "short encrypted",
+                vec![1, 0, 0, 0, 0x01],
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "oversize declaration",
+                oversize,
+                Some(&state.worker_key),
+                false,
+            ),
+            (
+                "valid plaintext minimum",
+                test_frame(0x00, PROTOCOL_VERSION, 0x42, None),
+                None,
+                true,
+            ),
+            (
+                "valid encrypted minimum",
+                test_frame(0x01, PROTOCOL_VERSION, 0x42, Some(&state.worker_key)),
+                Some(&state.worker_key),
+                true,
+            ),
+        ];
+
+        for (name, frame, key, valid) in cases {
+            let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+            let streaming =
+                read_frame_encrypted(&mut std::io::Cursor::new(&frame), &mut payload, key);
+            assert_eq!(streaming.is_ok(), valid, "streaming {name}: {streaming:?}");
+
+            let buffered = try_decode_frame(&frame, &mut payload, key);
+            assert_eq!(
+                matches!(buffered, Ok(Some(_))),
+                valid,
+                "buffered {name}: {buffered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_frame_accepts_exact_payload_boundary() {
+        let payload = vec![0x5a; MAX_FRAME_PAYLOAD];
+        let mut frame = Vec::new();
+        write_frame(&mut frame, 0x42, &payload).unwrap();
+        let mut decoded = [0u8; MAX_FRAME_PAYLOAD];
+        let (msg_type, payload_len) =
+            read_frame(&mut std::io::Cursor::new(frame), &mut decoded).unwrap();
+        assert_eq!(msg_type, 0x42);
+        assert_eq!(payload_len, MAX_FRAME_PAYLOAD);
+        assert_eq!(decoded, payload.as_slice());
+    }
+
+    #[test]
+    fn buffered_frame_contract_rejects_oversize_before_full_frame_arrives() {
+        let mut declaration = [0u8; 5];
+        declaration[..4].copy_from_slice(&((MAX_FRAME_PAYLOAD + 5) as u32).to_le_bytes());
+        declaration[4] = 0x00;
+        let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+        let result = try_decode_frame(&declaration, &mut payload, None);
+        assert!(
+            result.is_err(),
+            "oversize declaration must fail immediately"
+        );
+    }
+
+    #[test]
+    fn buffered_frame_leaves_trailing_frame_for_next_decode() {
+        let first = test_frame(0x00, PROTOCOL_VERSION, 0x41, None);
+        let second = test_frame(0x00, PROTOCOL_VERSION, 0x42, None);
+        let stream: Vec<u8> = first.iter().chain(&second).copied().collect();
+        let mut payload = [0u8; MAX_FRAME_PAYLOAD];
+        let (_, _, consumed) = try_decode_frame(&stream, &mut payload, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, first.len());
+        let (msg_type, _, second_consumed) =
+            try_decode_frame(&stream[consumed..], &mut payload, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(msg_type, 0x42);
+        assert_eq!(second_consumed, second.len());
     }
 
     #[test]
@@ -751,23 +1083,49 @@ mod tests {
             "",
             "",
             "",
-            &[],
+            &[("TOKEN".into(), "doppler-token".into(), true)],
         );
-        append_start_pod_registry_trailer(&mut payload, "registry.io", "alice", "s3cr3t", false);
-        assert_eq!(payload.len(), 797 + 450);
+        append_start_pod_registry_trailer(&mut payload, "registry.io", "alice", "s3cr3t", true);
+        assert_eq!(payload.len(), 797 + 321 + 450);
 
         let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
         match msg {
             ControlMessage::StartPod(cmd) => {
                 assert_eq!(cmd.pod_id, 7);
                 assert_eq!(cmd.deployment_id, 200);
+                assert_eq!(cmd.env_vars.len(), 1);
+                assert!(cmd.env_vars[0].is_secret_ref);
                 assert_eq!(cmd.image_pull_registry, "registry.io");
                 assert_eq!(cmd.image_pull_username, "alice");
                 assert_eq!(cmd.image_pull_password, "s3cr3t");
-                assert!(!cmd.image_pull_password_is_secret);
+                assert!(cmd.image_pull_password_is_secret);
             }
             _ => panic!("expected StartPod"),
         }
+    }
+
+    #[test]
+    fn decode_start_pod_rejects_missing_env_secret_trailer_and_trailing_bytes() {
+        let mut missing_env =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        missing_env[796] = 1;
+        assert!(decode_control_message(MSG_START_POD, &missing_env).is_err());
+
+        let mut missing_secret_flag =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        append_start_pod_registry_trailer(
+            &mut missing_secret_flag,
+            "registry",
+            "user",
+            "secret",
+            true,
+        );
+        missing_secret_flag.pop();
+        assert!(decode_control_message(MSG_START_POD, &missing_secret_flag).is_err());
+
+        let mut trailing = build_start_pod_payload(1, 2, "img", "", 0, 0, 0, 1, 1, "", "", "", &[]);
+        trailing.push(0xff);
+        assert!(decode_control_message(MSG_START_POD, &trailing).is_err());
     }
 
     #[test]
@@ -786,6 +1144,26 @@ mod tests {
                 assert_eq!(cmd.grace_period_ms, 5000);
             }
             _ => panic!("expected StopPod"),
+        }
+    }
+
+    #[test]
+    fn fixed_control_payloads_require_exact_lengths() {
+        let stop = WireStopPod {
+            pod_id: 1,
+            grace_period_ms: 2,
+        };
+        let probe = WireProbePod { pod_id: 3 };
+
+        for (tag, exact) in [
+            (MSG_STOP_POD, as_bytes(&stop)),
+            (MSG_PROBE_POD, as_bytes(&probe)),
+        ] {
+            assert!(decode_control_message(tag, &exact[..exact.len() - 1]).is_err());
+            let mut trailing = exact.to_vec();
+            trailing.push(0xff);
+            assert!(decode_control_message(tag, &trailing).is_err());
+            assert!(decode_control_message(tag, exact).is_ok());
         }
     }
 
@@ -888,10 +1266,46 @@ mod tests {
     #[test]
     fn gpu_type_round_trip() {
         for v in 0u8..=8 {
-            let gt = u8_to_gpu_type(v);
+            let gt = u8_to_gpu_type(v).unwrap();
             assert_eq!(gt as u8, v);
         }
-        assert_eq!(u8_to_gpu_type(99), GpuType::None);
+        assert_eq!(
+            u8_to_gpu_type(99).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn decode_start_pod_rejects_noncanonical_scalars() {
+        let mut invalid_gpu =
+            build_start_pod_payload(1, 2, "img", "", 0, 0, 9, 1, 1, "", "", "", &[]);
+        let err = decode_control_message(MSG_START_POD, &invalid_gpu).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut invalid_env_flag = build_start_pod_payload(
+            1,
+            2,
+            "img",
+            "",
+            0,
+            0,
+            0,
+            1,
+            1,
+            "",
+            "",
+            "",
+            &[("TOKEN".into(), "value".into(), false)],
+        );
+        invalid_env_flag[797 + 64 + 256] = 2;
+        let err = decode_control_message(MSG_START_POD, &invalid_env_flag).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        invalid_gpu[531] = 0;
+        append_start_pod_registry_trailer(&mut invalid_gpu, "registry", "user", "secret", false);
+        *invalid_gpu.last_mut().unwrap() = 2;
+        let err = decode_control_message(MSG_START_POD, &invalid_gpu).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1085,5 +1499,55 @@ mod tests {
             u32::from_le_bytes(bytes[532..536].try_into().unwrap()),
             4000
         );
+    }
+
+    fn build_run_request_payload(
+        request_id: u64,
+        deployment_id: u64,
+        declared_len: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(20 + body.len());
+        payload.extend_from_slice(&request_id.to_le_bytes());
+        payload.extend_from_slice(&deployment_id.to_le_bytes());
+        payload.extend_from_slice(&declared_len.to_le_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    #[test]
+    fn run_request_requires_exact_declared_payload_length() {
+        let cases = [
+            ("exact zero", 0u32, 0usize, true),
+            ("exact max", MAX_RUN_PAYLOAD as u32, MAX_RUN_PAYLOAD, true),
+            ("declared short", 8u32, 4usize, false),
+            ("declared long trailing", 2u32, 4usize, false),
+            (
+                "513 byte payload",
+                (MAX_RUN_PAYLOAD + 1) as u32,
+                MAX_RUN_PAYLOAD + 1,
+                false,
+            ),
+            ("integer overflow size", u32::MAX, 4usize, false),
+        ];
+
+        for (name, declared, body_len, expect_ok) in cases {
+            let body = vec![0x22u8; body_len];
+            let payload = build_run_request_payload(9, 3, declared, &body);
+            let result = decode_control_message(MSG_RUN_REQUEST, &payload);
+            if expect_ok {
+                let msg = result.unwrap_or_else(|e| panic!("{name}: unexpected err {e}"));
+                match msg {
+                    ControlMessage::RunRequest(cmd) => {
+                        assert_eq!(cmd.request_id, 9, "{name}");
+                        assert_eq!(cmd.deployment_id, 3, "{name}");
+                        assert_eq!(cmd.payload.len(), body_len, "{name}");
+                    }
+                    _ => panic!("{name}: expected RunRequest"),
+                }
+            } else {
+                assert!(result.is_err(), "{name}: expected rejection");
+            }
+        }
     }
 }

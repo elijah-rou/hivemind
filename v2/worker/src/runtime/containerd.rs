@@ -269,21 +269,21 @@ impl ContainerdRuntime {
         Err(RuntimeError::ContainerNotFound(container_id.to_string()))
     }
 
-    fn with_task_netns<T, F>(&self, pid: i32, f: F) -> Result<T, String>
+    fn with_task_netns<T, F>(&self, pid: i32, f: F) -> Result<T, RuntimeError>
     where
-        F: FnOnce() -> Result<T, String>,
+        F: FnOnce() -> Result<T, RuntimeError>,
     {
-        let current_ns =
-            File::open("/proc/self/ns/net").map_err(|e| format!("open current netns: {e}"))?;
+        let current_ns = File::open("/proc/self/ns/net")
+            .map_err(|e| RuntimeError::Internal(format!("open current netns: {e}")))?;
         let target_ns = File::open(format!("/proc/{pid}/ns/net"))
-            .map_err(|e| format!("open task netns for pid {pid}: {e}"))?;
+            .map_err(|e| RuntimeError::Internal(format!("open task netns for pid {pid}: {e}")))?;
 
         unsafe {
             if libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
-                return Err(format!(
+                return Err(RuntimeError::Internal(format!(
                     "setns enter pid {pid}: {}",
                     std::io::Error::last_os_error()
-                ));
+                )));
             }
         }
 
@@ -291,10 +291,10 @@ impl ContainerdRuntime {
 
         let restore_result = unsafe {
             if libc::setns(current_ns.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
-                Err(format!(
+                Err(RuntimeError::Internal(format!(
                     "setns restore: {}",
                     std::io::Error::last_os_error()
-                ))
+                )))
             } else {
                 Ok(())
             }
@@ -304,7 +304,9 @@ impl ContainerdRuntime {
             (Ok(value), Ok(())) => Ok(value),
             (Err(err), Ok(())) => Err(err),
             (Ok(_), Err(err)) => Err(err),
-            (Err(run_err), Err(restore_err)) => Err(format!("{run_err}; {restore_err}")),
+            (Err(run_err), Err(restore_err)) => {
+                Err(RuntimeError::Internal(format!("{run_err}; {restore_err}")))
+            }
         }
     }
 }
@@ -459,8 +461,11 @@ impl Runtime for ContainerdRuntime {
     ) -> Result<Vec<u8>, RuntimeError> {
         let pid = self.task_pid(&handle.container_id)?;
         self.with_task_netns(pid, || crate::runtime::process::forward_run(port, payload))
-            .map_err(|e| {
-                RuntimeError::Internal(format!("forward run {}: {e}", handle.container_id))
+            .map_err(|e| match e {
+                RuntimeError::ResponseTooLarge(_) => e,
+                other => {
+                    RuntimeError::Internal(format!("forward run {}: {other}", handle.container_id))
+                }
             })
     }
 
