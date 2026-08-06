@@ -40,64 +40,23 @@ const MSG_NODE_HEARTBEAT: u8 = 0x11;
 const MSG_POD_STATUS_EVENT: u8 = 0x12;
 const MSG_RUN_RESPONSE: u8 = 0x13;
 
-// -- Wire structs: fixed-size, packed, little-endian byte-copy --
+// -- Fixed worker payload layouts --
 
-// StartPod is parsed field-by-field (no packed struct) to match the Zig
-// dispatchPodToAgent layout which includes entrypoint, port, juicefs_path,
-// probe paths, and env vars.
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct WireStopPod {
-    pod_id: u64,
-    grace_period_ms: u64,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct WireProbePod {
-    pod_id: u64,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct WireNodeRegister {
-    hostname: [u8; 64],
-    cpu_millicores: u32,
-    memory_megabytes: u32,
-    gpu_type: u8,
-    gpu_count: u8,
-    provider: [u8; 32],
-    region: [u8; 32],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct WireNodeHeartbeat {
-    timestamp: u64,
-    cpu_usage_pct: u8,
-    memory_used_mb: u32,
-    gpu_utilization: [u8; 8],
-    pods_running: u16,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct WirePodStatusEvent {
-    pod_id: u64,
-    old_phase: u8,
-    new_phase: u8,
-    timestamp: u64,
-    exit_code: i32,
-    message: [u8; 128],
-}
+// Every multi-byte integer is encoded or decoded explicitly as little-endian.
+// StartPod is also parsed field-by-field to match the Zig dispatchPodToAgent
+// layout, which includes entrypoint, port, juicefs_path, probe paths, and env vars.
+const STOP_POD_PAYLOAD_LEN: usize = 16;
+const PROBE_POD_PAYLOAD_LEN: usize = 8;
+const NODE_REGISTER_PAYLOAD_LEN: usize = 138;
+const NODE_HEARTBEAT_PAYLOAD_LEN: usize = 23;
+const POD_STATUS_EVENT_PAYLOAD_LEN: usize = 150;
 
 // -- Frame I/O --
-// Frame format: [4B LE len][2B LE version][1B tag][payload...]
-// len = 2 (version) + 1 (tag) + payload_len
+// Frame format: [4B LE len][1B flags][2B LE version][1B tag][payload...]
+// len = 1 (flags) + 2 (version) + 1 (tag) + payload_len
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 const FRAME_FLAGS_LEN: usize = 1;
 const FRAME_INNER_MIN: usize = 3; // version(2) + tag(1)
 const ENCRYPTED_FRAME_OVERHEAD: usize = crate::crypto::NONCE_LEN + crate::crypto::TAG_LEN;
@@ -337,31 +296,20 @@ pub fn read_frame_encrypted(
 pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(u8, usize)> {
     match msg {
         WorkerMessage::NodeRegister(m) => {
-            let wire = WireNodeRegister {
-                hostname: str_to_fixed(&m.node_name),
-                cpu_millicores: m.cpu_millicores,
-                memory_megabytes: m.memory_megabytes,
-                gpu_type: m.gpu_type as u8,
-                gpu_count: m.gpu_count,
-                provider: [0u8; 32],
-                region: [0u8; 32],
-            };
-            let bytes = as_bytes(&wire);
-            buf[..bytes.len()].copy_from_slice(bytes);
-            Ok((MSG_NODE_REGISTER, bytes.len()))
+            let payload = fixed_payload_mut(buf, NODE_REGISTER_PAYLOAD_LEN, "NodeRegister")?;
+            payload[0..64].copy_from_slice(&str_to_fixed::<64>(&m.node_name));
+            payload[64..68].copy_from_slice(&m.cpu_millicores.to_le_bytes());
+            payload[68..72].copy_from_slice(&m.memory_megabytes.to_le_bytes());
+            payload[72] = m.gpu_type as u8;
+            payload[73] = m.gpu_count;
+            Ok((MSG_NODE_REGISTER, NODE_REGISTER_PAYLOAD_LEN))
         }
 
         WorkerMessage::NodeHeartbeat(m) => {
-            let wire = WireNodeHeartbeat {
-                timestamp: m.tick,
-                cpu_usage_pct: 0,
-                memory_used_mb: 0,
-                gpu_utilization: [0u8; 8],
-                pods_running: m.active_pods as u16,
-            };
-            let bytes = as_bytes(&wire);
-            buf[..bytes.len()].copy_from_slice(bytes);
-            Ok((MSG_NODE_HEARTBEAT, bytes.len()))
+            let payload = fixed_payload_mut(buf, NODE_HEARTBEAT_PAYLOAD_LEN, "NodeHeartbeat")?;
+            payload[0..8].copy_from_slice(&m.tick.to_le_bytes());
+            payload[21..23].copy_from_slice(&(m.active_pods as u16).to_le_bytes());
+            Ok((MSG_NODE_HEARTBEAT, NODE_HEARTBEAT_PAYLOAD_LEN))
         }
 
         WorkerMessage::PodStatusEvent(m) => {
@@ -373,17 +321,12 @@ pub fn encode_agent_message(msg: &WorkerMessage, buf: &mut [u8]) -> io::Result<(
                 PodStatusReport::Failed { reason } => (4, 1, reason.as_str()),
             };
 
-            let wire = WirePodStatusEvent {
-                pod_id: m.pod_id,
-                old_phase: 0,
-                new_phase,
-                timestamp: 0,
-                exit_code,
-                message: str_to_fixed(message),
-            };
-            let bytes = as_bytes(&wire);
-            buf[..bytes.len()].copy_from_slice(bytes);
-            Ok((MSG_POD_STATUS_EVENT, bytes.len()))
+            let payload = fixed_payload_mut(buf, POD_STATUS_EVENT_PAYLOAD_LEN, "PodStatusEvent")?;
+            payload[0..8].copy_from_slice(&m.pod_id.to_le_bytes());
+            payload[9] = new_phase;
+            payload[18..22].copy_from_slice(&exit_code.to_le_bytes());
+            payload[22..150].copy_from_slice(&str_to_fixed::<128>(message));
+            Ok((MSG_POD_STATUS_EVENT, POD_STATUS_EVENT_PAYLOAD_LEN))
         }
 
         WorkerMessage::RunResponse(m) => {
@@ -544,30 +487,29 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
         }
 
         MSG_STOP_POD => {
-            if payload.len() != std::mem::size_of::<WireStopPod>() {
+            if payload.len() != STOP_POD_PAYLOAD_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "StopPod payload length invalid",
                 ));
             }
-            let wire: WireStopPod = from_bytes(payload);
+            let pod_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let grace_period_ms = u64::from_le_bytes(payload[8..16].try_into().unwrap());
             Ok(ControlMessage::StopPod(StopPodCmd {
-                pod_id: wire.pod_id,
-                grace_period_ms: wire.grace_period_ms,
+                pod_id,
+                grace_period_ms,
             }))
         }
 
         MSG_PROBE_POD => {
-            if payload.len() != std::mem::size_of::<WireProbePod>() {
+            if payload.len() != PROBE_POD_PAYLOAD_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "ProbePod payload length invalid",
                 ));
             }
-            let wire: WireProbePod = from_bytes(payload);
-            Ok(ControlMessage::ProbePod(ProbePodCmd {
-                pod_id: wire.pod_id,
-            }))
+            let pod_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            Ok(ControlMessage::ProbePod(ProbePodCmd { pod_id }))
         }
 
         MSG_RUN_REQUEST => {
@@ -605,6 +547,21 @@ pub fn decode_control_message(msg_type: u8, payload: &[u8]) -> io::Result<Contro
 }
 
 // -- Helpers --
+
+fn fixed_payload_mut<'a>(
+    buf: &'a mut [u8],
+    payload_len: usize,
+    message: &'static str,
+) -> io::Result<&'a mut [u8]> {
+    let payload = buf.get_mut(..payload_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("{message} buffer too small"),
+        )
+    })?;
+    payload.fill(0);
+    Ok(payload)
+}
 
 fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
     let mut buf = [0u8; N];
@@ -647,26 +604,17 @@ fn u8_to_gpu_type(v: u8) -> io::Result<GpuType> {
     }
 }
 
-fn as_bytes<T: Copy>(val: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>()) }
-}
-
-fn from_bytes<T: Copy>(data: &[u8]) -> T {
-    assert!(data.len() >= std::mem::size_of::<T>());
-    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const T) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn wire_struct_sizes() {
-        assert_eq!(std::mem::size_of::<WireStopPod>(), 16);
-        assert_eq!(std::mem::size_of::<WireProbePod>(), 8);
-        assert_eq!(std::mem::size_of::<WireNodeRegister>(), 138);
-        assert_eq!(std::mem::size_of::<WireNodeHeartbeat>(), 23);
-        assert_eq!(std::mem::size_of::<WirePodStatusEvent>(), 150);
+    fn fixed_payload_sizes_match_wire_layout() {
+        assert_eq!(STOP_POD_PAYLOAD_LEN, 16);
+        assert_eq!(PROBE_POD_PAYLOAD_LEN, 8);
+        assert_eq!(NODE_REGISTER_PAYLOAD_LEN, 138);
+        assert_eq!(NODE_HEARTBEAT_PAYLOAD_LEN, 23);
+        assert_eq!(POD_STATUS_EVENT_PAYLOAD_LEN, 150);
     }
 
     #[test]
@@ -1129,35 +1077,36 @@ mod tests {
     }
 
     #[test]
-    fn decode_stop_pod() {
-        let wire = WireStopPod {
-            pod_id: 99,
-            grace_period_ms: 5000,
-        };
-
-        let bytes = as_bytes(&wire);
-        let msg = decode_control_message(MSG_STOP_POD, bytes).unwrap();
-
-        match msg {
+    fn fixed_control_payloads_decode_little_endian_integers() {
+        let stop = [
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11,
+        ];
+        match decode_control_message(MSG_STOP_POD, &stop).unwrap() {
             ControlMessage::StopPod(cmd) => {
-                assert_eq!(cmd.pod_id, 99);
-                assert_eq!(cmd.grace_period_ms, 5000);
+                assert_eq!(cmd.pod_id, 0x0102_0304_0506_0708);
+                assert_eq!(cmd.grace_period_ms, 0x1112_1314_1516_1718);
             }
             _ => panic!("expected StopPod"),
+        }
+
+        let probe = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        match decode_control_message(MSG_PROBE_POD, &probe).unwrap() {
+            ControlMessage::ProbePod(cmd) => {
+                assert_eq!(cmd.pod_id, 0x1122_3344_5566_7788);
+            }
+            _ => panic!("expected ProbePod"),
         }
     }
 
     #[test]
     fn fixed_control_payloads_require_exact_lengths() {
-        let stop = WireStopPod {
-            pod_id: 1,
-            grace_period_ms: 2,
-        };
-        let probe = WireProbePod { pod_id: 3 };
+        let stop = [0u8; STOP_POD_PAYLOAD_LEN];
+        let probe = [0u8; PROBE_POD_PAYLOAD_LEN];
 
         for (tag, exact) in [
-            (MSG_STOP_POD, as_bytes(&stop)),
-            (MSG_PROBE_POD, as_bytes(&probe)),
+            (MSG_STOP_POD, stop.as_slice()),
+            (MSG_PROBE_POD, probe.as_slice()),
         ] {
             assert!(decode_control_message(tag, &exact[..exact.len() - 1]).is_err());
             let mut trailing = exact.to_vec();
@@ -1197,12 +1146,11 @@ mod tests {
 
     #[test]
     fn zig_stop_pod_tag_decodes_as_stop_pod() {
-        let wire = WireStopPod {
-            pod_id: 77,
-            grace_period_ms: 1234,
-        };
+        let mut payload = [0u8; STOP_POD_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&77u64.to_le_bytes());
+        payload[8..16].copy_from_slice(&1234u64.to_le_bytes());
 
-        let msg = decode_control_message(0x03, as_bytes(&wire)).unwrap();
+        let msg = decode_control_message(0x03, &payload).unwrap();
         match msg {
             ControlMessage::StopPod(cmd) => {
                 assert_eq!(cmd.pod_id, 77);
@@ -1247,6 +1195,100 @@ mod tests {
 
         // timestamp at offset 0
         assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 12345);
+    }
+
+    #[test]
+    fn fixed_agent_payloads_encode_little_endian_integers() {
+        let register = WorkerMessage::NodeRegister(NodeRegisterMsg {
+            node_name: "node".into(),
+            cpu_millicores: 0x0102_0304,
+            memory_megabytes: 0x0506_0708,
+            gpu_type: GpuType::T4,
+            gpu_count: 0x09,
+        });
+        let mut register_buf = [0xa5; NODE_REGISTER_PAYLOAD_LEN];
+        let (tag, len) = encode_agent_message(&register, &mut register_buf).unwrap();
+        assert_eq!((tag, len), (MSG_NODE_REGISTER, NODE_REGISTER_PAYLOAD_LEN));
+        let mut expected_register = [0u8; NODE_REGISTER_PAYLOAD_LEN];
+        expected_register[0..4].copy_from_slice(b"node");
+        expected_register[64..68].copy_from_slice(&[0x04, 0x03, 0x02, 0x01]);
+        expected_register[68..72].copy_from_slice(&[0x08, 0x07, 0x06, 0x05]);
+        expected_register[72] = 8;
+        expected_register[73] = 0x09;
+        assert_eq!(register_buf, expected_register);
+
+        let heartbeat = WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+            tick: 0x0102_0304_0506_0708,
+            active_pods: 0x1122,
+            gpu_free: 0,
+        });
+        let mut heartbeat_buf = [0xa5; NODE_HEARTBEAT_PAYLOAD_LEN];
+        let (tag, len) = encode_agent_message(&heartbeat, &mut heartbeat_buf).unwrap();
+        assert_eq!((tag, len), (MSG_NODE_HEARTBEAT, NODE_HEARTBEAT_PAYLOAD_LEN));
+        let mut expected_heartbeat = [0u8; NODE_HEARTBEAT_PAYLOAD_LEN];
+        expected_heartbeat[0..8].copy_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        expected_heartbeat[21..23].copy_from_slice(&[0x22, 0x11]);
+        assert_eq!(heartbeat_buf, expected_heartbeat);
+
+        let pod_status = WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+            pod_id: 0x1112_1314_1516_1718,
+            status: PodStatusReport::Stopped {
+                exit_code: 0x0102_0304,
+            },
+        });
+        let mut status_buf = [0xa5; POD_STATUS_EVENT_PAYLOAD_LEN];
+        let (tag, len) = encode_agent_message(&pod_status, &mut status_buf).unwrap();
+        assert_eq!(
+            (tag, len),
+            (MSG_POD_STATUS_EVENT, POD_STATUS_EVENT_PAYLOAD_LEN)
+        );
+        let mut expected_status = [0u8; POD_STATUS_EVENT_PAYLOAD_LEN];
+        expected_status[0..8].copy_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        expected_status[9] = 3;
+        expected_status[18..22].copy_from_slice(&[0x04, 0x03, 0x02, 0x01]);
+        expected_status[22..29].copy_from_slice(b"stopped");
+        assert_eq!(status_buf, expected_status);
+    }
+
+    #[test]
+    fn fixed_agent_payloads_reject_short_and_accept_exact_output_capacity() {
+        let cases = [
+            (
+                WorkerMessage::NodeRegister(NodeRegisterMsg {
+                    node_name: "node".into(),
+                    cpu_millicores: 1,
+                    memory_megabytes: 2,
+                    gpu_type: GpuType::None,
+                    gpu_count: 0,
+                }),
+                NODE_REGISTER_PAYLOAD_LEN,
+            ),
+            (
+                WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
+                    tick: 1,
+                    active_pods: 2,
+                    gpu_free: 0,
+                }),
+                NODE_HEARTBEAT_PAYLOAD_LEN,
+            ),
+            (
+                WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                    pod_id: 1,
+                    status: PodStatusReport::Running,
+                }),
+                POD_STATUS_EVENT_PAYLOAD_LEN,
+            ),
+        ];
+
+        for (message, payload_len) in cases {
+            let mut short = vec![0u8; payload_len - 1];
+            let error = encode_agent_message(&message, &mut short).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+
+            let mut exact = vec![0u8; payload_len];
+            let (_, encoded_len) = encode_agent_message(&message, &mut exact).unwrap();
+            assert_eq!(encoded_len, payload_len);
+        }
     }
 
     #[test]
@@ -1360,13 +1402,11 @@ mod tests {
     }
 
     // =================================================================
-    // Cross-language golden byte tests
-    //
-    // These use the same known values as src/wire_compat_test.zig.
-    // Both sides produce identical packed bytes for the same input.
+    // Local codec regressions. Cross-language claims come only from the shared
+    // contract-v6.json consumer below.
     // =================================================================
 
-    fn golden_register_msg() -> WorkerMessage {
+    fn fixture_register_msg() -> WorkerMessage {
         WorkerMessage::NodeRegister(NodeRegisterMsg {
             node_name: "test-agent-01".into(),
             cpu_millicores: 32000,
@@ -1376,7 +1416,7 @@ mod tests {
         })
     }
 
-    fn golden_heartbeat_msg() -> WorkerMessage {
+    fn fixture_heartbeat_msg() -> WorkerMessage {
         WorkerMessage::NodeHeartbeat(NodeHeartbeatMsg {
             tick: 1234567890,
             active_pods: 4,
@@ -1384,7 +1424,7 @@ mod tests {
         })
     }
 
-    fn golden_start_pod_payload() -> Vec<u8> {
+    fn local_start_pod_payload() -> Vec<u8> {
         build_start_pod_payload(
             42,
             100,
@@ -1403,8 +1443,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_register_payload_matches_zig() {
-        let msg = golden_register_msg();
+    fn local_register_payload_layout() {
+        let msg = fixture_register_msg();
         let mut buf = [0u8; 256];
         let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
 
@@ -1428,8 +1468,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_heartbeat_payload_matches_zig() {
-        let msg = golden_heartbeat_msg();
+    fn local_heartbeat_payload_layout() {
+        let msg = fixture_heartbeat_msg();
         let mut buf = [0u8; 64];
         let (msg_type, len) = encode_agent_message(&msg, &mut buf).unwrap();
 
@@ -1447,8 +1487,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_start_pod_decode_matches_zig() {
-        let payload = golden_start_pod_payload();
+    fn local_start_pod_decode() {
+        let payload = local_start_pod_payload();
 
         let msg = decode_control_message(MSG_START_POD, &payload).unwrap();
         match msg {
@@ -1470,8 +1510,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_start_pod_bytes_match_zig() {
-        let bytes = golden_start_pod_payload();
+    fn local_start_pod_byte_layout() {
+        let bytes = local_start_pod_payload();
 
         // Fixed header: 8+8+256+256+2+1+1+4+4+128+64+64+1 = 797 + 0 env entries
         assert_eq!(bytes.len(), 797);
@@ -1547,6 +1587,221 @@ mod tests {
                 }
             } else {
                 assert!(result.is_err(), "{name}: expected rejection");
+            }
+        }
+    }
+
+    fn fixture_hex(value: &str, max_bytes: usize) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        assert!(value.len() / 2 <= max_bytes);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn fixture_has_consumer(vector: &serde_json::Value, consumer: &str) -> bool {
+        vector["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(consumer))
+    }
+
+    #[test]
+    fn wire_contract_corpus_is_canonical_and_byte_identical() {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit, Payload},
+            XChaCha20Poly1305, XNonce,
+        };
+        use std::collections::BTreeSet;
+
+        let source = include_str!("../../tests/wire/contract-v6.json");
+        assert!(source.len() <= 256 * 1024);
+        let contract: serde_json::Value = serde_json::from_str(source).unwrap();
+        let keys: BTreeSet<_> = contract
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "encoding",
+                "protocol_version",
+                "schema",
+                "statuses",
+                "test_material",
+                "vectors",
+            ])
+        );
+        assert_eq!(contract["schema"], "hivemind-wire-contract-v1");
+        assert_eq!(contract["protocol_version"], PROTOCOL_VERSION);
+
+        let status_names = [
+            "ok",
+            "deployment_not_found",
+            "queue_full",
+            "invalid_payload",
+            "response_too_large",
+            "outcome_ambiguous",
+            "forwarding_failed",
+            "no_running_pod",
+            "unavailable",
+            "not_leader",
+        ];
+        let statuses = contract["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), status_names.len());
+        for (index, status) in statuses.iter().enumerate() {
+            assert_eq!(status["byte"], index);
+            assert_eq!(status["name"], status_names[index]);
+            if index < 9 {
+                let wire_statuses = [
+                    RunStatus::Ok,
+                    RunStatus::DeploymentNotFound,
+                    RunStatus::QueueFull,
+                    RunStatus::InvalidPayload,
+                    RunStatus::ResponseTooLarge,
+                    RunStatus::OutcomeAmbiguous,
+                    RunStatus::ForwardingFailed,
+                    RunStatus::NoRunningPod,
+                    RunStatus::Unavailable,
+                ];
+                assert_eq!(wire_statuses[index] as usize, index);
+            } else {
+                assert_eq!(status["origins"], serde_json::json!(["core"]));
+            }
+        }
+
+        let psk = contract["test_material"]["psk_hex"].as_str().unwrap();
+        let state = crate::crypto::EncryptionState::from_hex(psk).unwrap();
+        let nonce = fixture_hex(
+            contract["test_material"]["nonce_hex"].as_str().unwrap(),
+            crate::crypto::NONCE_LEN,
+        );
+        assert_eq!(nonce.len(), crate::crypto::NONCE_LEN);
+
+        let vectors = contract["vectors"].as_array().unwrap();
+        assert!(vectors.len() <= 32);
+        for vector in vectors {
+            let vector_keys: BTreeSet<_> = vector
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                vector_keys,
+                BTreeSet::from([
+                    "channel",
+                    "consumers",
+                    "direction",
+                    "flags",
+                    "frame_hex",
+                    "id",
+                    "key_purpose",
+                    "message",
+                    "payload_hex",
+                    "plaintext_hex",
+                    "tag",
+                ])
+            );
+            if !fixture_has_consumer(vector, "rust") {
+                continue;
+            }
+            let id = vector["id"].as_str().unwrap();
+            let frame = fixture_hex(vector["frame_hex"].as_str().unwrap(), 64 * 1024);
+            let plaintext = fixture_hex(vector["plaintext_hex"].as_str().unwrap(), 64 * 1024);
+            let payload = fixture_hex(vector["payload_hex"].as_str().unwrap(), MAX_FRAME_PAYLOAD);
+            let flags = vector["flags"].as_u64().unwrap() as u8;
+            let key = (flags == 1).then_some(&state.worker_key);
+            let mut decoded_payload = [0u8; MAX_FRAME_PAYLOAD];
+            let (tag, decoded_len, consumed) = try_decode_frame(&frame, &mut decoded_payload, key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(consumed, frame.len(), "{id}");
+            assert_eq!(tag, vector["tag"].as_u64().unwrap() as u8, "{id}");
+            assert_eq!(&decoded_payload[..decoded_len], payload.as_slice(), "{id}");
+            assert_eq!(&plaintext[3..], payload.as_slice(), "{id}");
+
+            if flags == 0 {
+                let mut reencoded = Vec::new();
+                write_frame(&mut reencoded, tag, &payload).unwrap();
+                assert_eq!(reencoded, frame, "{id}");
+            } else {
+                assert_eq!(vector["key_purpose"], "worker");
+                let mut aad = [0u8; 5];
+                aad.copy_from_slice(&frame[..5]);
+                let cipher = XChaCha20Poly1305::new((&state.worker_key).into());
+                let sealed = cipher
+                    .encrypt(
+                        XNonce::from_slice(&nonce),
+                        Payload {
+                            msg: &plaintext,
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                let mut reencoded = aad.to_vec();
+                reencoded.extend_from_slice(&nonce);
+                reencoded.extend_from_slice(&sealed);
+                assert_eq!(reencoded, frame, "{id}");
+            }
+
+            match vector["message"].as_str().unwrap() {
+                "register" => {
+                    let message = fixture_register_msg();
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "heartbeat" => {
+                    let message = fixture_heartbeat_msg();
+                    let mut encoded = [0u8; 64];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "pod-status" => {
+                    let message = WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                        pod_id: 42,
+                        status: PodStatusReport::Running,
+                    });
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                "start-pod" => match decode_control_message(tag, &payload).unwrap() {
+                    ControlMessage::StartPod(command) => {
+                        assert_eq!(command.pod_id, 42);
+                        assert_eq!(command.deployment_id, 100);
+                        assert_eq!(command.image, "registry.io/model:v1");
+                    }
+                    _ => panic!("{id}: expected StartPod"),
+                },
+                "run-request" => match decode_control_message(tag, &payload).unwrap() {
+                    ControlMessage::RunRequest(command) => {
+                        assert_eq!(command.request_id, 0x0102030405060708);
+                        assert_eq!(command.payload, b"ping");
+                    }
+                    _ => panic!("{id}: expected RunRequest"),
+                },
+                "run-response" => {
+                    assert!(payload.len() >= 9, "{id}");
+                    let message = WorkerMessage::RunResponse(RunResponseMsg {
+                        request_id: u64::from_le_bytes(payload[..8].try_into().unwrap()),
+                        status: payload[8],
+                        payload: payload[9..].to_vec(),
+                    });
+                    let mut encoded = [0u8; 256];
+                    let (encoded_tag, len) = encode_agent_message(&message, &mut encoded).unwrap();
+                    assert_eq!(encoded_tag, tag);
+                    assert_eq!(&encoded[..len], payload.as_slice());
+                }
+                other => panic!("{id}: unexpected Rust fixture message {other}"),
             }
         }
     }

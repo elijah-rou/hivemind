@@ -93,14 +93,16 @@ pub const SimulatedIo = struct {
     }
 
     /// netWrite: enqueue message to target replica's in-memory queue.
-    /// header is a framed message: [4-byte LE len][1-byte from_id][VRR bytes].
-    /// We extract the VRR payload and enqueue it with the from_id.
+    /// header is `[4-byte LE len][2-byte version][1-byte from_id][VRR bytes]`.
+    /// Validate the local producer's version, then enqueue the VRR payload.
     fn netWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []const u8, _: []const []const u8, _: usize) net.Stream.Writer.Error!usize {
         const self: *SimulatedIo = @ptrCast(@alignCast(userdata.?));
         const to: u8 = @intCast(dest);
 
-        if (header.len < 5) return header.len;
-        const vrr_payload = header[5..]; // skip 4-byte len + 1-byte from_id
+        if (header.len < 7) return header.len;
+        const version = std.mem.readInt(u16, header[4..6], .little);
+        std.debug.assert(version == msg.PROTOCOL_VERSION);
+        const vrr_payload = header[7..]; // skip length, version, and sender identity
         self.network.enqueueSend(self.replica_id, to, vrr_payload);
         return header.len;
     }

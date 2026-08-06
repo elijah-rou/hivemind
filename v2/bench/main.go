@@ -67,7 +67,7 @@ const (
 	ClientTagLeaderProbeResponse byte   = 0x27
 	LeaderProbeResponseBytes            = 12
 	CmdCreateDeploy              byte   = 3
-	ProtocolVersion              uint16 = 5
+	ProtocolVersion              uint16 = 6
 	MaxFrameBytes                       = 64 * 1024
 	MaxRunPayload                       = 512
 	MaxRunResponseBody                  = 16*1024 - 9

@@ -39,6 +39,21 @@ See `docs/STATUS.md` for current implementation architecture and `docs/frozen/AR
 
 ---
 
+## Protocol compatibility boundary
+
+| Surface | Current framing/version owner | Fixture state | Change rule |
+|---|---|---|---|
+| Zig client/worker | Versioned envelope; [`connection.zig`](../core/src/connection.zig) owns the current constant and frame limits | Consumes applicable shared vectors plus local boundary tests | Change atomically with Rust and both Go consumers |
+| Rust worker | Versioned envelope; [`protocol.rs`](../worker/src/protocol.rs) owns the current constant and codecs | Consumes worker vectors from the shared corpus | Same global client/worker version |
+| Go API | Versioned envelope; [`api/client.go`](../api/client.go) owns the current constant and codecs | Consumes client vectors, including deterministic encryption | Same global client/worker version |
+| Go bench | Versioned envelope; [`bench/main.go`](../bench/main.go) owns the current constant and codecs | Consumes applicable plaintext client vectors | Same global client/worker version |
+| Zig replica peers | Versioned body plus sender identity and serialized VRR message in [`replica.zig`](../core/src/replica.zig) | Shared plaintext/encrypted peer vectors plus socketpair rejection tests | Reject mismatch before sender binding, socket replacement/disconnect decisions, or VRR dispatch |
+| Shared corpus/gate | [`tests/wire/contract-v6.json`](../tests/wire/contract-v6.json) and [`wire-contract-test.sh`](../tests/wire-contract-test.sh) | Bounded schema, every legal status byte, all required message families, and deterministic worker/client/peer encryption | Fixture, consumers, gate, version, and docs change together |
+
+Protocol version 6 applies to client, worker, API, bench, and replica peer envelopes. Peer plaintext bodies are `[2B little-endian version][1B sender identity][VRR payload]`; encrypted bodies protect that same complete body. The shared corpus is canonical for its exact examples; consumer tests decode it and re-encode byte-identically where applicable. Deterministic fixture PSK/nonce material is insecure and fixture-only. Mixed-version rolling upgrades are unsupported: stop every replica, worker, API gateway, and bench client, replace every component, then restart the cluster. The version gate is compatibility validation, not authentication: peer identity remains unauthenticated unless the deployment separately supplies an authenticated transport such as mTLS.
+
+---
+
 ## POC v2 Engineering Gate
 
 POC v2 work follows the same simulation-first discipline as core Hivemind changes. Do not implement presentation-gate features as live-only glue when their behavior is simulatable.
