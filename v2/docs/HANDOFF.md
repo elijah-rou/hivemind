@@ -107,22 +107,21 @@ The local review stack is linear and each branch owns one boundary:
 9. `stack/09-guarded-live`: guarded capability execution and evidence
 10. `stack/10-evidence-docs`: aggregate evidence, governance, and navigation
 
-The accepted pre-publication evidence run started from these exact tips and trees. Its `stack/10-evidence-docs` value is the tested evidence parent, not the later docs-only evidence commit.
+The accepted pre-publication evidence run started from this exact merged base and these exact descendant tips and trees. Its `stack/10-evidence-docs` value is the tested evidence parent, not the later docs-only evidence commit.
 
 | Branch | Accepted-run tip | Tree |
 |---|---|---|
-| `stack/01-storage-journal` | `cd70cc046c373cb6ff9cd5fe8ec2c4c71ad1cf67` | `6a6aab6d9f9fecfd73f249cb8e095304c98031d8` |
-| `stack/02-vrr-view-change` | `21f940743f92485eeb4e2315db0019a2531804e5` | `32fbe3799100b74cacb0eb3e2777cf6d45c77553` |
-| `stack/03-core-ingress-run` | `7a99b5bc94ad92b29e3f37d89e3602de1f360d00` | `cdf5d0093b357ae0d068f87e3e99655a3016d29f` |
-| `stack/04-core-vopr-dst` | `5dca008d087861a941da7d0fa28d096d4bce3236` | `e888ebacae483e6f97c93a414d7a6a1d14304742` |
-| `stack/05-worker-runtime-sim` | `b8500b0ad2a1d3f8db32d6bdae3c954b1cc4852d` | `d0efed34e2a6a18e34117c9e636bf6e9c8b221fd` |
-| `stack/06-protocol-v6-contract` | `46b8fcb34b3a54d98b43fda0866a3d92eee96003` | `7063c59241730366a19f8e084b58d5374d55c9f7` |
-| `stack/07-local-durable-e2e` | `2453e231fc195bdc219a5771d33aec2437c62418` | `33cc293ccf739db24a437377a3f4204fd1a7449d` |
-| `stack/08-offline-ops-containerd` | `0caafbff2378e6cccc131c8e90eee2bfb3001295` | `619eaf020abab6b8e3fc40f5b733b80cf3818d5b` |
-| `stack/09-guarded-live` | `ceca050a3ab0866ef38cb67143313ca50ac52cd4` | `26a26fe27d6c22c2732d4d54443424dcfee312cb` |
-| `stack/10-evidence-docs` tested parent | `3890ac40615b60e7775637a2f59d042c2d893c98` | `822a5c77c1e446058ca701e61c238bd132a246e0` |
+| `master` after merged PRs #2 and #3 | `6c8378c27f999404456a592102e093306e6daf6e` | `32fbe3799100b74cacb0eb3e2777cf6d45c77553` |
+| `stack/03-core-ingress-run` | `4093da44a159126384581608909e5b3cd68ecfc3` | `cdf5d0093b357ae0d068f87e3e99655a3016d29f` |
+| `stack/04-core-vopr-dst` | `e5fc35127fc537f59bff9b3aec0f7410137e6ec9` | `e888ebacae483e6f97c93a414d7a6a1d14304742` |
+| `stack/05-worker-runtime-sim` | `1cfe516960e9860adc555f9fdd04eaf56172d62c` | `f870de0fb519ec7a23e164e2816c15ac13c7e571` |
+| `stack/06-protocol-v6-contract` | `7c74c9031e11405d8c96914da1aa604880e75bb5` | `f585a80528769bd1ab8cf0e67d47cbfb8771a1c8` |
+| `stack/07-local-durable-e2e` | `07622dc6c8141d3a92515f3ddced3e3dc3fab373` | `7ba82585a99f6d39300d525e45da23e9a84d6b61` |
+| `stack/08-offline-ops-containerd` | `f20cbe4a1d178445d59a9a08c0c1b58df6fcb82c` | `8ad398bc1afedc498a0288156a8ee32ac3d7de36` |
+| `stack/09-guarded-live` | `f6435fbb839c659e3153ef66c5954f84da68760a` | `032028e5a0583a3c6108159edc47b8af0e7bb4da` |
+| `stack/10-evidence-docs` tested parent | `73b7eca987731fd325b06f6bab419cd1b347668a` | `99d635554429d5c2e664c179478ebab1338a8f6f` |
 
-Accepted run `20260806T054520Z-3890ac40615b` covered `25 / 25` non-live gates, exact core `0..9999`, worker `0..999`, and `28 / 28` invoked aggregate phases. Gate duration sum was `463s`; wall time was `470s`. Containerd, privileged/runtime, GPU, private-registry, provider, Terraform mutation, and live boundaries remained skipped or unexecuted. Final local cleanup and tracked/index/`v1` checks passed. Publication evidence must add the final documentation tip and preserve this tested-parent distinction.
+Accepted run `20260806T061312Z-73b7eca98773` covered `25 / 25` non-live gates, exact core `0..9999`, worker `0..999`, and `28 / 28` invoked aggregate phases. Gate duration sum was `498s`; wall time was `507s`. Containerd, privileged/runtime, GPU, private-registry, provider, Terraform mutation, and live boundaries remained skipped or unexecuted. Final local cleanup and tracked/index/`v1` checks passed. Publication evidence must add the final documentation tip and preserve this tested-parent distinction.
 
 After a lower PR is squash-merged, verify the squash tree by applying that slice's archived parent-relative patch to the new upstream parent in a temporary index. Then rebase each descendant sequentially with explicit old/new parent tips, verify every projected tree and focused gate, and update remote refs bottom-up with per-ref leases. Update the retained top PR last. Never merge descendants, use a hosted “update branch” action, or claim absolute old-tree equality after upstream has legitimately advanced.
 
