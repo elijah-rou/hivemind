@@ -32,7 +32,9 @@ if [[ "$REGISTRY" == *.dkr.ecr.*.amazonaws.com* && "$PUSH" == "true" ]]; then
         echo "aws is required for ECR login" >&2
         exit 1
     fi
-    ECR_REGION="$(echo "$REGISTRY" | sed 's/.*\.dkr\.ecr\.\(.*\)\.amazonaws\.com.*/\1/')"
+    ECR_HOST="${REGISTRY%%/*}"
+    ECR_REGION="${ECR_HOST#*.dkr.ecr.}"
+    ECR_REGION="${ECR_REGION%%.amazonaws.com}"
     ECR_REPO="${REGISTRY#*/}"
     echo "Logging into ECR in $ECR_REGION..."
     aws ecr describe-repositories --region "$ECR_REGION" --repository-names "$ECR_REPO" >/dev/null

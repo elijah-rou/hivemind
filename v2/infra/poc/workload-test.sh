@@ -16,7 +16,11 @@ IMAGE_PULL_PASSWORD="${IMAGE_PULL_PASSWORD:-}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 CPU_NAME="poc-cpu-${RUN_ID}"
 GPU_NAME="poc-gpu-${RUN_ID}"
-mkdir -p "$OUT_DIR"
+install -d -m 700 "$OUT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=run_retry.sh
+# shellcheck disable=SC1091 # SCRIPT_DIR resolves to the known POC helper directory.
+source "$SCRIPT_DIR/run_retry.sh"
 
 TMP_FILES=()
 CPU_ID=""
@@ -69,35 +73,13 @@ run_once() {
     local expected_field="$5"
     local attempts="${6:-36}"
     local delay="${7:-5}"
-    local tmp_meta="$time_file.tmp"
-    local http_code time_total
-
-    for i in $(seq 1 "$attempts"); do
-        if curl -sS -w '%{http_code} %{time_total}\n' -o "$out_file" \
-            -X POST "$API_URL/v1/deployments/$name/run" \
-            -H 'Content-Type: application/json' \
-            --data-binary "@$payload_file" > "$tmp_meta"; then
-            read -r http_code time_total < "$tmp_meta"
-            if [[ "$http_code" == "200" ]] && grep -q "\"$expected_field\"" "$out_file"; then
-                printf '%s\n' "$time_total" > "$time_file"
-                rm -f "$tmp_meta"
-                echo "run ready: $name attempt=$i"
-                return 0
-            fi
-            echo "run not ready: $name attempt=$i/$attempts http=$http_code expected=$expected_field"
-        else
-            echo "run request failed: $name attempt=$i/$attempts"
-        fi
-        rm -f "$tmp_meta"
-        sleep "$delay"
-    done
-
-    echo "timeout waiting for run: $name" >&2
-    if [[ -f "$out_file" ]]; then
-        echo "last run response for $name:" >&2
-        cat "$out_file" >&2
+    if ! hivemind_run_with_retry "$name" \
+        "$API_URL/v1/deployments/$name/run" "@$payload_file" \
+        "\"$expected_field\"" "$attempts" "$delay" "$out_file"; then
+        return 1
     fi
-    return 1
+    printf '%s\n' "$HIVEMIND_RUN_TIME" > "$time_file"
+    return 0
 }
 
 require_response_field() {

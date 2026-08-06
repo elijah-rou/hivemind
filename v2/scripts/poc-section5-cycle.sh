@@ -9,9 +9,18 @@ set -euo pipefail
 #   SSH_KEY=$HOME/.ssh/id_ed25519 DESTROY_HIVEMIND_AFTER=true bash scripts/poc-section5-cycle.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../infra/poc/http.sh
+# shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
+source "$ROOT_DIR/infra/poc/http.sh"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc}"
+RUN_TOKEN="${HIVEMIND_RUN_TOKEN:-${TF_VAR_run_token:-}}"
+if [[ -z "$RUN_TOKEN" ]]; then
+    RUN_TOKEN="p$(date +%s)$(printf '%05d' "$$")$(printf '%05d' "$RANDOM")"
+fi
+[[ "$RUN_TOKEN" =~ ^[a-z][a-z0-9]{11,31}$ ]] || { echo "HIVEMIND_RUN_TOKEN must be 12..32 lowercase alphanumeric characters starting with a letter" >&2; exit 2; }
+ECR_REPOSITORY="${ECR_REPOSITORY:-hivemind-poc-$RUN_TOKEN}"
+[[ "$ECR_REPOSITORY" == *"$RUN_TOKEN"* ]] || { echo "ECR_REPOSITORY must contain the exact run token: $RUN_TOKEN" >&2; exit 2; }
 SSH_CIDR="${SSH_CIDR:-${TF_VAR_ssh_cidr:-}}"
 TAG="${TAG:-section5-$(date +%Y%m%d%H%M%S)}"
 DESTROY_HIVEMIND_AFTER="${DESTROY_HIVEMIND_AFTER:-true}"
@@ -25,6 +34,7 @@ PRELOAD_TIMEOUT_SECONDS="${PRELOAD_TIMEOUT_SECONDS:-600}"
 ARTIFACT_ROOT="$ROOT_DIR/artifacts/poc-final"
 LOG="$ARTIFACT_ROOT/00-runbook/section5-cycle-$TAG.log"
 mkdir -p "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra"
+chmod 700 "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra"
 exec > >(tee -a "$LOG") 2>&1
 
 CLEANUP_STARTED=false
@@ -124,7 +134,11 @@ configure_ssh_cidr() {
     fi
     export TF_VAR_ssh_cidr="$SSH_CIDR"
     export TF_VAR_region="$AWS_REGION"
+    export HIVEMIND_RUN_TOKEN="$RUN_TOKEN"
     export TF_VAR_ecr_repository_name="$ECR_REPOSITORY"
+    export TF_VAR_run_token="$RUN_TOKEN"
+    echo "run_token=$RUN_TOKEN"
+    echo "ecr_repository=$ECR_REPOSITORY"
     echo "ssh_cidr=$SSH_CIDR"
 }
 
@@ -186,8 +200,10 @@ preload_cpu_image() {
     for worker_ip in "$WORKER_CPU_PUBLIC_IP" "$WORKER_GPU_PUBLIC_IP"; do
         [[ -n "$worker_ip" ]] || continue
         echo "preload_cpu_image worker=$worker_ip image=$CPU_IMAGE"
-        docker image save "$CPU_IMAGE" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" \
-            "set -euo pipefail; tmp=/tmp/hivemind-cpu-$TAG.tar; trap 'rm -f \"\$tmp\"' EXIT; cat > \"\$tmp\"; sudo ctr -n hivemind images import \"\$tmp\" >/tmp/hivemind-cpu-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx '$CPU_IMAGE' >/dev/null"
+        local remote_command
+        remote_command="set -euo pipefail; tmp=/tmp/hivemind-cpu-$TAG.tar; trap 'rm -f \"\$tmp\"' EXIT; cat > \"\$tmp\"; sudo ctr -n hivemind images import \"\$tmp\" >/tmp/hivemind-cpu-image-import.log 2>&1; sudo ctr -n hivemind images ls -q | grep -Fx '$CPU_IMAGE' >/dev/null"
+        # shellcheck disable=SC2029 # Command is intentionally assembled from quoted local values; stdin carries the image tar.
+        docker image save "$CPU_IMAGE" | ssh "${ssh_opts[@]}" "ubuntu@$worker_ip" "$remote_command"
     done
 }
 

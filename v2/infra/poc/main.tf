@@ -15,6 +15,16 @@ variable "region" {
   default = "us-east-1"
 }
 
+variable "run_token" {
+  description = "Bounded per-run ownership token used in names and tags. Every plan/apply must supply a unique value."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9]{11,31}$", var.run_token))
+    error_message = "run_token must be 12..32 lowercase alphanumeric characters starting with a letter."
+  }
+}
+
 variable "replica_ami_id" {
   description = "Replica AMI (Amazon Linux 2023 recommended; deploy.sh defaults to ec2-user)"
   type        = string
@@ -47,9 +57,9 @@ variable "s3_backup_uri" {
 }
 
 variable "ecr_repository_name" {
-  description = "POC ECR repository for workload images. Terraform force-deletes it during teardown."
+  description = "Optional POC ECR repository override. Defaults to a run-token-scoped name; Terraform force-deletes it during teardown."
   type        = string
-  default     = "hivemind-poc"
+  default     = ""
 }
 
 variable "ssh_cidr" {
@@ -71,24 +81,36 @@ variable "subnet_id" {
 }
 
 locals {
-  name = "hivemind-poc"
+  name                = "hivemind-${var.run_token}"
+  ecr_repository_name = var.ecr_repository_name != "" ? var.ecr_repository_name : "hivemind-poc-${var.run_token}"
+  ownership_tags = {
+    HivemindRunToken = var.run_token
+  }
 }
 
 resource "aws_ecr_repository" "workloads" {
-  name                 = var.ecr_repository_name
+  name                 = local.ecr_repository_name
   image_tag_mutability = "MUTABLE"
   force_delete         = true
+
+  lifecycle {
+    precondition {
+      condition     = strcontains(local.ecr_repository_name, var.run_token)
+      error_message = "ecr_repository_name must contain the exact run_token."
+    }
+  }
 
   image_scanning_configuration {
     scan_on_push = false
   }
 
-  tags = { Name = "hivemind-poc-workloads" }
+  tags = merge(local.ownership_tags, { Name = "${local.name}-workloads" })
 }
 
 resource "aws_key_pair" "poc" {
   key_name   = "${local.name}-deployer"
   public_key = var.ssh_public_key
+  tags       = local.ownership_tags
 }
 
 # ----- Security Group -----
@@ -136,7 +158,7 @@ resource "aws_security_group" "hivemind" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "hivemind-poc" }
+  tags = merge(local.ownership_tags, { Name = local.name })
 }
 
 # ----- Replicas (c5.xlarge) -----
@@ -165,10 +187,11 @@ resource "aws_instance" "replica" {
     peers          = "" # filled by deploy.sh after IPs are known
   }))
 
-  tags = {
-    Name = "hivemind-replica-${count.index}"
+  volume_tags = local.ownership_tags
+  tags = merge(local.ownership_tags, {
+    Name = "${local.name}-replica-${count.index}"
     Role = "replica"
-  }
+  })
 }
 
 # ----- Worker instances -----
@@ -189,12 +212,14 @@ resource "aws_instance" "worker_cpu" {
   user_data = base64encode(templatefile("${path.module}/worker-init.sh", {
     replica_addr   = ""
     encryption_key = var.encryption_key
+    http_helper    = file("${path.module}/http.sh")
   }))
 
-  tags = {
-    Name = "hivemind-worker-cpu"
+  volume_tags = local.ownership_tags
+  tags = merge(local.ownership_tags, {
+    Name = "${local.name}-worker-cpu"
     Role = "worker"
-  }
+  })
 }
 
 resource "aws_instance" "worker_gpu" {
@@ -213,12 +238,14 @@ resource "aws_instance" "worker_gpu" {
   user_data = base64encode(templatefile("${path.module}/worker-init.sh", {
     replica_addr   = ""
     encryption_key = var.encryption_key
+    http_helper    = file("${path.module}/http.sh")
   }))
 
-  tags = {
-    Name = "hivemind-worker-gpu"
+  volume_tags = local.ownership_tags
+  tags = merge(local.ownership_tags, {
+    Name = "${local.name}-worker-gpu"
     Role = "worker"
-  }
+  })
 }
 
 # ----- Outputs -----

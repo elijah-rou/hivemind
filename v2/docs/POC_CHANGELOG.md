@@ -1,10 +1,6 @@
 # Hivemind POC Changelog
 
-<<<<<<< HEAD
 _Last updated: 2026-08-06_
-=======
-_Last updated: 2026-07-24_
->>>>>>> 84243f3 (fix(e2e): preserve runtime and cleanup ownership)
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
@@ -47,6 +43,30 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+### 2026-07-26 — Offline POC ownership and deadline contracts hardened
+
+What changed:
+- the POC Terraform module now derives its default ECR repository from the required run token
+- the full runbook and bounded Section 5 cycle generate or validate one token, export it to Terraform and evidence helpers, and derive the ECR repository consistently
+- GPU Terraform/S3 acquisition and cleanup, SSM readiness polling, and standalone containerd build/run/probe paths now have explicit deadlines
+- GPU and benchmark artifact cleanup requires both an account-scoped no-overwrite lease and exact account/token/claim markers, including reconciliation of committed create/write timeouts
+- POC teardown independently validates the supplied token and an allowlisted topology in both the Hivemind and EKS states before destroying either state; the EKS resources now persist that token in state and tags
+- local benchmark replicas commit complete process-group identities atomically and clean each proven group independently under one aggregate bounded TERM/KILL deadline
+- ECR cold-pull evidence is staged and published atomically only after all checks pass
+
+Why it matters:
+- default POC invocations no longer fail their own ownership precondition or risk sharing the old global repository name
+- hung cloud CLIs and local privileged runners cannot wait indefinitely, and failed evidence collection leaves no misleading partial directory
+
+Acceptance progress: unchanged (`6 / 8`); these are offline operational-safety corrections, not new live evidence.
+
+Next steps:
+1. run a fresh guarded live POC cycle when cloud execution is explicitly approved
+2. collect cold-cache ECR evidence using the run-token-scoped repository
+3. keep the benchmark verdict provisional until the clean EKS rerun
+
+Live infra status: unchanged from the prior recorded state (`up`); no cloud, provider, containerd, or privileged operations ran for this change.
+
 ### 2026-07-24 — D1 reusable local failover, recovery, and `/run` contracts
 
 What changed:
