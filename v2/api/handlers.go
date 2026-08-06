@@ -468,6 +468,7 @@ var errorCodeNames = map[byte]string{
 	ErrCodeCapacityExceeded:  "capacity_exceeded",
 	ErrCodeInvalidTransition: "invalid_transition",
 	ErrCodeNotLeader:         "not_leader",
+	ErrCodeLogFull:           "log_full",
 }
 
 var errorCodeHTTPStatus = map[byte]int{
@@ -476,6 +477,7 @@ var errorCodeHTTPStatus = map[byte]int{
 	ErrCodeCapacityExceeded:  http.StatusServiceUnavailable,
 	ErrCodeInvalidTransition: http.StatusConflict,
 	ErrCodeNotLeader:         http.StatusServiceUnavailable,
+	ErrCodeLogFull:           http.StatusInsufficientStorage,
 }
 
 func writeResult(w http.ResponseWriter, result CommandResult, successBody map[string]any) {

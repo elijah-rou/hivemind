@@ -137,8 +137,8 @@ Hivemind is a custom serverless AI/ML orchestrator replacing Kubernetes/Knative.
          │  │ State Machine       │   │  nodes, deployments, pods
          │  │ Scheduler           │   │  bin-packing on GPU/CPU/mem
          │  │ Request Queue       │   │  run requests (no consensus)
-         │  │ Disk Journal        │   │  mmap'd, crash recovery
-         │  │ S3 Backup           │   │  forked aws s3 cp, 60s interval
+         │  │ Disk Journal        │   │  experimental layout v2 single-copy; not torn-write safe
+         │  │ S3 Backup           │   │  forked aws s3 cp (not atomic restore)
          │  │ Gossip              │   │  UDP, 5s broadcast, 30s stale
          │  └─────────────────────┘   │
          └──────────────┬──────────────┘
@@ -171,14 +171,15 @@ FRAME_HEADER = 7 bytes
 ## VRR Consensus
 
 - 5-node clusters, regionally scoped
-- LOG_SIZE_MAX=256 circular slots, CLIENT_TABLE_MAX=64
+- LOG_SIZE_MAX=1024 retained slots (fail-closed, no committed overwrite), CLIENT_TABLE_MAX=1024 so dedup spans the retained journal
 - HEARTBEAT_INTERVAL=500ms, VIEW_CHANGE_TIMEOUT=2000ms
 - States: `.normal`, `.view_change`, `.recovering`
 - Full view change protocol: StartViewChange → DoViewChange → StartView
 - Log repair via RequestPrepare/SendPrepare
 - Field-by-field serialization (no struct padding UB in release builds)
-- Disk persistence: journal.bin (mmap'd), metadata write-through
-- Crash recovery: read journal + metadata, enter view_change to rejoin
+- Disk persistence (experimental): optional `--data-dir` selects layout-v2 `journal.bin` (`0600`) under the data directory (`0700`), with explicit little-endian codecs, staged `pwrite`, and an `fdatasync` group-commit barrier before acknowledgements/publication. Legacy or corrupt journals fail closed. Absent `--data-dir` is explicit volatile POC mode. No torn-write or power-loss guarantee.
+- Crash recovery (experimental best-effort): validate the committed checksum chain and enter view change to rejoin; corrupt, missing, truncated, or wrong-sized journals fail-stop. This has not been validated under torn writes or power loss.
+- Retained log: without snapshots, `retention_floor` remains zero and every operation is retained until the `LOG_SIZE_MAX` (1024) lifetime cap returns `log_full` / HTTP 507.
 
 ## State Machine Operations
 
@@ -319,23 +320,24 @@ Legacy deploy-mode benchmark, retained for historical context only:
 2. **Authentication** - No auth on API or agent connections. Need API keys + agent tokens.
 3. **Provider adapter** - No auto-provisioning of nodes. Manual VM setup required.
 4. **App spec model** - Current CreateDeployment is basic. Need full app spec (probes, scaling policy, env config, storage).
-5. **Log compaction** - 256-slot circular log works but needs compaction for long-running clusters.
+5. **Crash-consistent versioned storage** - Layout v2 is single-copy and fail-stop for modeled I/O errors; torn writes and power loss are not modeled or guaranteed.
+6. **Log compaction / snapshots** - The fail-closed retained log returns `log_full` / HTTP 507 after 1024 operations.
 
 ### Important (blocks Knative parity)
 
-6. **Thalamus integration** - POC branch now has locality/residency resolver tests and localhost smoke evidence against Hivemind federation JSON; production integration remains future work.
-7. **Axon integration** - CLI/SDK needs to target Hivemind API instead of Knative.
-8. **Image pull secrets** - No registry auth for private images.
-9. **Readiness probes** - Liveness works, readiness not wired to traffic routing.
-10. **Graceful agent shutdown** - SIGTERM handler, pod draining.
-11. **Blue-green/canary traffic** - TrafficSplit command exists but not wired to request routing.
+7. **Thalamus integration** - POC branch now has locality/residency resolver tests and localhost smoke evidence against Hivemind federation JSON; production integration remains future work.
+8. **Axon integration** - CLI/SDK needs to target Hivemind API instead of Knative.
+9. **Image pull secrets** - No registry auth for private images.
+10. **Readiness probes** - Liveness works, readiness not wired to traffic routing.
+11. **Graceful agent shutdown** - SIGTERM handler, pod draining.
+12. **Blue-green/canary traffic** - TrafficSplit command exists but not wired to request routing.
 
 ### Nice-to-have (polish)
 
-12. **Rate limiting** - No request rate limits.
-13. **Advanced scheduling** - Basic bin-packing; no affinity, spread, cost optimization.
-14. **Observability** - Metrics exist but no tracing, no structured logging.
-15. **Multi-cluster state transfer** - No mechanism to migrate state between clusters.
+13. **Rate limiting** - No request rate limits.
+14. **Advanced scheduling** - Basic bin-packing; no affinity, spread, cost optimization.
+15. **Observability** - Metrics exist but no tracing, no structured logging.
+16. **Multi-cluster state transfer** - No mechanism to migrate state between clusters.
 
 ## Recommended Roadmap (Next Sessions)
 
@@ -399,7 +401,7 @@ Recently trimmed/frozen:
 | `core/src/message.zig` | VRR message types, field-by-field serialization |
 | `core/src/gossip.zig` | Cross-region UDP gossip |
 | `core/src/s3_backup.zig` | Forked S3 journal upload |
-| `core/src/disk.zig` | mmap'd journal persistence |
+| `core/src/disk.zig` | layout-v2 journal persistence and recovery |
 | `core/src/metrics.zig` | Prometheus metrics export |
 | `core/src/request_queue.zig` | Leader-local run request queue |
 | `core/src/vopr/vopr.zig` | VOPR simulation scenarios |

@@ -5,17 +5,21 @@ const replica_mod = @import("../replica.zig");
 /// Observes commits across all replicas and verifies consensus safety.
 ///
 /// Invariant: if two replicas both commit operation N, they must have
-/// applied the same command. We track a canonical commit history --
-/// first replica to commit op N establishes truth, all others must match.
+/// applied the same complete log entry (checksum + client/request identity).
 ///
 /// Modeled after TigerBeetle's StateChecker.
 pub const StateChecker = struct {
-    pub const MAX_HISTORY: usize = 4096;
+    /// Bound checker history to the retained-log lifetime (no snapshots yet).
+    pub const MAX_HISTORY: usize = replica_mod.LOG_SIZE_MAX;
 
-    /// Canonical commit record: the command that was committed at each op.
+    comptime {
+        std.debug.assert(MAX_HISTORY == replica_mod.LOG_SIZE_MAX);
+    }
+
+    /// Canonical commit record: the complete entry identity at each op.
     const CommitRecord = struct {
         op: msg.OpNumber,
-        command_tag: u8,
+        checksum: u64,
         client_id: u128,
         request_id: msg.RequestId,
         /// Which replicas have committed this op (bitset).
@@ -73,18 +77,53 @@ pub const StateChecker = struct {
         // Check protocol invariants on the replica itself
         self.checkReplicaInvariants(replica_id, r);
 
-        // Check new commits
+        // Commit watermarks track durable history only. In-memory commit_min may
+        // advance before the metadata barrier.
+        if (r.storage_failed or r.metadata_dirty) return;
+
         const prev_commit = self.replica_commit_max[replica_id];
         const curr_commit = r.commit_min;
 
-        if (curr_commit <= prev_commit) return;
+        if (curr_commit < prev_commit) {
+            self.recordViolation(
+                "replica {d}: durable commit point regressed from {d} to {d}",
+                .{ replica_id, prev_commit, curr_commit },
+            );
+            return;
+        }
 
-        // Replica committed new operations. Validate each one.
+        if (curr_commit == prev_commit) return;
+
         var op = prev_commit + 1;
         while (op <= curr_commit) : (op += 1) {
             self.validateCommit(replica_id, r, op);
         }
 
+        self.replica_commit_max[replica_id] = curr_commit;
+    }
+
+    /// Validate recovered durable history before advancing the process watermark.
+    pub fn observeRecovery(
+        self: *StateChecker,
+        replica_id: u8,
+        r: *const replica_mod.Replica,
+    ) void {
+        std.debug.assert(replica_id < self.replica_count);
+
+        const prev_commit = self.replica_commit_max[replica_id];
+        const curr_commit = r.commit_min;
+        if (curr_commit < prev_commit) {
+            self.recordViolation(
+                "replica {d}: recovered commit point regressed from {d} to {d}",
+                .{ replica_id, prev_commit, curr_commit },
+            );
+            return;
+        }
+
+        var op: msg.OpNumber = 1;
+        while (op <= curr_commit) : (op += 1) {
+            self.validateCommit(replica_id, r, op);
+        }
         self.replica_commit_max[replica_id] = curr_commit;
     }
 
@@ -96,27 +135,23 @@ pub const StateChecker = struct {
     ) void {
         self.commits_checked += 1;
 
-        // Get the journal entry for this op
         const entry = r.journalGet(op) orelse {
             self.recordViolation("replica {d} committed op {d} but entry not in journal", .{
                 replica_id, op,
             });
             return;
         };
-        const command_tag: u8 = @intFromEnum(std.meta.activeTag(entry.command));
 
-        // Check against canonical history
         if (self.findRecord(op)) |record| {
-            // Another replica already committed this op. Must match.
-            if (record.command_tag != command_tag or
+            if (record.checksum != entry.checksum or
                 record.client_id != entry.client_id or
                 record.request_id != entry.request_id)
             {
                 self.recordViolation(
-                    "CONSENSUS VIOLATION: replica {d} committed op {d} with different command (tag {d} vs {d}, client {d} vs {d}, req {d} vs {d}, view {d}, committed_by 0b{b:0>3})",
+                    "CONSENSUS VIOLATION: replica {d} committed op {d} with different entry (checksum {d} vs {d}, client {d} vs {d}, req {d} vs {d}, view {d}, committed_by 0b{b:0>3})",
                     .{
-                        replica_id, op,
-                        command_tag,         record.command_tag,
+                        replica_id,          op,
+                        entry.checksum,      record.checksum,
                         entry.client_id,     record.client_id,
                         entry.request_id,    record.request_id,
                         entry.view_number,
@@ -125,16 +160,18 @@ pub const StateChecker = struct {
                 );
                 return;
             }
-            // Mark this replica as having committed
             record.committed_by |= @as(u8, 1) << @intCast(replica_id);
         } else {
-            // First replica to commit this op. Establish canonical record.
             if (self.history_len >= MAX_HISTORY) {
+                self.recordViolation(
+                    "checker history capacity exhausted at {d} (MAX_HISTORY={d}) while recording op {d}",
+                    .{ self.history_len, MAX_HISTORY, op },
+                );
                 return;
             }
             self.history[self.history_len] = .{
                 .op = op,
-                .command_tag = command_tag,
+                .checksum = entry.checksum,
                 .client_id = entry.client_id,
                 .request_id = entry.request_id,
                 .committed_by = @as(u8, 1) << @intCast(replica_id),
@@ -143,17 +180,13 @@ pub const StateChecker = struct {
         }
     }
 
-    /// Check per-replica protocol invariants.
     fn checkReplicaInvariants(self: *StateChecker, replica_id: u8, r: *const replica_mod.Replica) void {
-        // commit_min must never exceed op_number
         if (r.commit_min > r.op_number) {
             self.recordViolation("replica {d}: commit_min ({d}) > op_number ({d})", .{
                 replica_id, r.commit_min, r.op_number,
             });
         }
 
-        // Pipeline window must fit in circular journal.
-        // Bound is over own commit_min -- retention_floor is informational only.
         if (r.op_number > r.commit_min and
             r.op_number - r.commit_min > @as(msg.OpNumber, replica_mod.LOG_SIZE_MAX))
         {
@@ -164,7 +197,6 @@ pub const StateChecker = struct {
             });
         }
 
-        // Journal's highest op must not exceed op_number.
         const high_op = r.logHighOp();
         if (high_op > r.op_number) {
             self.recordViolation("replica {d}: highest journal op ({d}) > op_number ({d})", .{
@@ -172,7 +204,6 @@ pub const StateChecker = struct {
             });
         }
 
-        // GPU capacity accounting: allocated must never exceed total
         for (r.state_machine.nodes[0..r.state_machine.node_count]) |node| {
             if (!node.active) continue;
             if (node.allocatable_gpu > node.gpu_count) {
@@ -182,7 +213,6 @@ pub const StateChecker = struct {
             }
         }
 
-        // Leader in normal status must have view_number % replica_count == replica_id
         if (r.status == .normal and r.isLeader()) {
             if (r.view_number % r.replica_count != r.replica_id) {
                 self.recordViolation("replica {d}: claims leader but view {d} mod {d} != {d}", .{
@@ -206,12 +236,6 @@ pub const StateChecker = struct {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Liveness evaluation
-    // -----------------------------------------------------------------------
-
-    /// Check whether all (non-partitioned) replicas have converged to the
-    /// same commit point. Returns null if converged, or a reason string.
     pub fn checkConvergence(
         _: *const StateChecker,
         replicas: []*const replica_mod.Replica,
@@ -239,12 +263,8 @@ pub const StateChecker = struct {
             }
         }
 
-        return null; // converged
+        return null;
     }
-
-    // -----------------------------------------------------------------------
-    // Summary
-    // -----------------------------------------------------------------------
 
     pub fn summary(self: *const StateChecker) Summary {
         var max_commit: msg.OpNumber = 0;
