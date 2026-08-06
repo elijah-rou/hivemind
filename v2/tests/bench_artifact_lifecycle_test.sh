@@ -5,7 +5,7 @@ LIB="$ROOT_DIR/infra/bench/artifact_lifecycle.sh"
 DEPLOY="$ROOT_DIR/infra/bench/deploy.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-mkdir -p "$TMP_DIR/bin" "$TMP_DIR/state/buckets" "$TMP_DIR/state/random"
+mkdir -p "$TMP_DIR/bin" "$TMP_DIR/state/buckets" "$TMP_DIR/state/random" "$TMP_DIR/state/leases"
 : > "$TMP_DIR/calls"
 
 cat > "$TMP_DIR/bin/openssl" <<'EOF'
@@ -22,12 +22,14 @@ printf '%q ' "$@" >> "$AWS_CALLS"; echo >> "$AWS_CALLS"
 service="${1:-}" operation="${2:-}"
 shift 2 || true
 first_arg="${1:-}"
-bucket="" key="" metadata=""
+bucket="" key="" metadata="" name="" value=""
 while (( $# > 0 )); do
   case "$1" in
     --bucket) bucket="$2"; shift 2 ;;
     --key) key="$2"; shift 2 ;;
     --metadata) metadata="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    --value) value="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -38,11 +40,36 @@ bucket_dir="$AWS_STUB_STATE/buckets/$bucket"
 exec 7>"$AWS_STUB_STATE/aws.lock"; flock -x 7
 case "$service:$operation" in
   sts:get-caller-identity) printf '%s\n' "${AWS_ACCOUNT:-123456789012}" ;;
+  ssm:put-parameter)
+    lease="$AWS_STUB_STATE/leases/${name##*/}"
+    [[ ! -e "$lease" ]] || exit 1
+    printf '%s' "$value" >"$lease"
+    [[ "${AWS_SCENARIO:-success}" != lease-timeout-committed ]] || exit 124
+    ;;
+  ssm:get-parameter)
+    lease="$AWS_STUB_STATE/leases/${name##*/}"
+    [[ -f "$lease" ]] || exit 1
+    if [[ "${AWS_SCENARIO:-}" == lease-read-failure-once ]]; then
+      count_file="$lease.read-count"; count=0
+      [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
+      count=$((count + 1)); printf '%s' "$count" >"$count_file"
+      (( count > 1 )) || exit 1
+    fi
+    if [[ "${AWS_SCENARIO:-}" == lease-read-hang-cleanup ]]; then
+      count_file="$lease.hang-count"; count=0
+      [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
+      count=$((count + 1)); printf '%s' "$count" >"$count_file"
+      (( count == 1 )) || { trap '' TERM; /bin/sleep 10; }
+    fi
+    cat "$lease"
+    ;;
+  ssm:delete-parameter) rm -f "$AWS_STUB_STATE/leases/${name##*/}" ;;
   s3api:head-bucket) [[ -d "$bucket_dir" ]] ;;
   s3api:wait) [[ "$operation" == wait && ! -d "$bucket_dir" ]] ;;
   s3api:create-bucket)
     [[ "${AWS_SCENARIO:-success}" != creation-failure ]] || exit 1
     mkdir -p "$bucket_dir"
+    [[ "${AWS_SCENARIO:-success}" != creation-timeout-committed ]] || exit 124
     ;;
   s3api:put-object)
     exec 8>"$AWS_STUB_STATE/marker.lock"; flock -x 8
@@ -67,9 +94,10 @@ case "$service:$operation" in
       count=$((count + 1)); printf '%s' "$count" > "$verify_count"
       (( count > 1 )) || exit 1
     fi
+    account="$(sed -n 's/.*account=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
     token="$(sed -n 's/.*token=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
     claim="$(sed -n 's/.*claim=\([^,]*\).*/\1/p' "$bucket_dir/marker")"
-    printf '%s:%s\n' "$token" "$claim"
+    printf '%s:%s:%s\n' "$account" "$token" "$claim"
     ;;
   s3:cp)
     if [[ "${AWS_SCENARIO:-success}" == hung-upload ]]; then
@@ -126,12 +154,52 @@ if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
   echo 'prior bucket was touched without ownership' >&2; exit 1
 fi
 
+# The account-scoped no-overwrite lease rejects a competing same-token owner.
+printf '%s' '123456789012:feedfeedfeedfeedfeedfeedfeedfeed:foreignclaim0000000000000000000' \
+  >"$TMP_DIR/state/leases/feedfeedfeedfeedfeedfeedfeedfeed"
+if prepare feedfeedfeedfeedfeedfeedfeedfeed cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd; then
+  echo 'foreign account lease unexpectedly claimed' >&2; exit 1
+fi
+[[ ! -d "$TMP_DIR/state/buckets/hivemind-bench-123456789012-feedfeedfeedfeedfeedfeedfeedfeed" ]]
+
+# Definitive lease creation remains provisional cleanup authority if read-back fails.
+if AWS_SCENARIO=lease-read-failure-once prepare 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f 1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f; then
+  echo 'transient lease read unexpectedly passed' >&2; exit 1
+fi
+[[ "$HIVEMIND_ARTIFACT_LEASE_OWNED" == 1 ]]
+AWS_SCENARIO=lease-read-failure-once hivemind_artifact_cleanup 1 || true
+[[ ! -e "$TMP_DIR/state/leases/0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" ]]
+
 # A timed-out conditional write that committed is reconciled to exact ownership.
 AWS_SCENARIO=put-timeout-committed prepare 67676767676767676767676767676767 78787878787878787878787878787878
 [[ "$HIVEMIND_ARTIFACT_OWNED" == 1 ]]
 : > "$AWS_CALLS"
 hivemind_artifact_cleanup 0
 grep -q 'delete-bucket .*67676767676767676767676767676767' "$AWS_CALLS"
+
+# Cleanup never deletes S3 when the fresh remote lease proof is missing.
+prepare 2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f 3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f
+rm -f "$TMP_DIR/state/leases/2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f"
+: >"$AWS_CALLS"
+if hivemind_artifact_cleanup 0; then
+  echo 'cleanup without remote lease unexpectedly passed' >&2; exit 1
+fi
+if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+  echo 'cleanup without remote lease mutated S3' >&2; exit 1
+fi
+
+# A hung cleanup-time lease read is bounded and never falls through to S3 deletion.
+AWS_SCENARIO=lease-read-hang-cleanup prepare 4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f 5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
+: >"$AWS_CALLS"
+start="$SECONDS"
+if HIVEMIND_ARTIFACT_AWS_TIMEOUT_SEC=1 HIVEMIND_ARTIFACT_KILL_AFTER_SEC=1 \
+    AWS_SCENARIO=lease-read-hang-cleanup hivemind_artifact_cleanup 0; then
+  echo 'cleanup with hung remote lease unexpectedly passed' >&2; exit 1
+fi
+(( SECONDS - start < 5 ))
+if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
+  echo 'cleanup with hung remote lease mutated S3' >&2; exit 1
+fi
 
 # Conditional success establishes provisional ownership before later read failure.
 if AWS_SCENARIO=verify-failure-once prepare 89898989898989898989898989898989 90909090909090909090909090909090; then
@@ -191,7 +259,15 @@ if grep -Eq 's3 rm|delete-bucket' "$AWS_CALLS"; then
   echo 'same-token loser deleted the preserved bucket' >&2; exit 1
 fi
 
-# Creation/upload failures are fail-closed.
+# A timed-out bucket creation that committed is reconciled through the
+# invocation's conditional marker and remains cleanup-owned.
+AWS_SCENARIO=creation-timeout-committed prepare e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1 61616161616161616161616161616161
+[[ "$HIVEMIND_ARTIFACT_OWNED" == 1 ]]
+: > "$AWS_CALLS"
+hivemind_artifact_cleanup 0
+grep -q 'delete-bucket .*e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1' "$AWS_CALLS"
+
+# Definitive creation and upload failures are fail-closed.
 if AWS_SCENARIO=creation-failure prepare eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee 66666666666666666666666666666666; then
   echo 'creation failure unexpectedly passed' >&2; exit 1
 fi
@@ -244,6 +320,8 @@ assert_cleanup_partial_rejected() {
     echo "$label triggered deletion" >&2; exit 1
   fi
 }
+assert_cleanup_partial_rejected a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0 10101010101010101010101010101010 \
+  'account=999999999999,token=a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0,claim=10101010101010101010101010101010' account-only-mismatch
 assert_cleanup_partial_rejected abababababababababababababababab 12121212121212121212121212121212 \
   'account=123456789012,token=00000000000000000000000000000000,claim=12121212121212121212121212121212' token-only-mismatch
 assert_cleanup_partial_rejected acacacacacacacacacacacacacacacac 23232323232323232323232323232323 \

@@ -90,12 +90,16 @@ run_phase "Infra POC script tests" \
     bash -c "'$REPO_ROOT/infra/poc/test-worker-env.sh'"
 run_phase "POC deploy output fixtures" \
     bash -c "'$SCRIPT_DIR/poc_deploy_outputs_test.sh'"
+run_phase "POC teardown ownership fixtures" \
+    bash -c "'$SCRIPT_DIR/poc_teardown_ownership_test.sh'"
 run_phase "Launcher contract (smoke/bench/infra)" \
     bash -c "'$SCRIPT_DIR/launcher_contract_test.sh'"
 run_phase "Bench deploy SSM wait fixtures" \
     bash -c "'$SCRIPT_DIR/deploy_ssm_wait_test.sh'"
 run_phase "Bench systemd lifecycle fixtures" \
     bash -c "'$SCRIPT_DIR/bench_systemd_lifecycle_test.sh'"
+run_phase "Bench compare process-group cleanup fixtures" \
+    bash -c "'$SCRIPT_DIR/bench_compare_cleanup_test.sh'"
 run_phase "Bench artifact lifecycle fixtures" \
     bash -c "'$SCRIPT_DIR/bench_artifact_lifecycle_test.sh'"
 run_phase "GPU-test cleanup trap fixture" \

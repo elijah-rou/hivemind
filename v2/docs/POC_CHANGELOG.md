@@ -49,6 +49,9 @@ What changed:
 - the POC Terraform module now derives its default ECR repository from the required run token
 - the full runbook and bounded Section 5 cycle generate or validate one token, export it to Terraform and evidence helpers, and derive the ECR repository consistently
 - GPU Terraform/S3 acquisition and cleanup, SSM readiness polling, and standalone containerd build/run/probe paths now have explicit deadlines
+- GPU and benchmark artifact cleanup requires both an account-scoped no-overwrite lease and exact account/token/claim markers, including reconciliation of committed create/write timeouts
+- POC teardown independently validates the supplied token and an allowlisted topology in both the Hivemind and EKS states before destroying either state; the EKS resources now persist that token in state and tags
+- local benchmark replicas commit complete process-group identities atomically and clean each proven group independently under one aggregate bounded TERM/KILL deadline
 - ECR cold-pull evidence is staged and published atomically only after all checks pass
 
 Why it matters:

@@ -195,20 +195,30 @@ start=$SECONDS
 if ! flock -x -w 1 9 9>"$stubborn_lock"; then
   echo 'terminated descendant retained deploy lock' >&2; exit 1
 fi
-assert_process_gone() {
-  local pid_file="$1" pid
-  pid="$(cat "$pid_file")"
-  for _ in {1..100}; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      return 0
-    fi
+assert_processes_gone() {
+  local deadline=$((SECONDS + 3)) pid_file pid state pending
+  local -a pid_files=("$@")
+  while :; do
+    pending=0
+    for pid_file in "${pid_files[@]}"; do
+      pid="$(cat "$pid_file")"
+      if [[ -r "/proc/$pid/stat" ]]; then
+        state="$(awk '{print $3}' "/proc/$pid/stat")"
+        [[ "$state" == Z ]] || pending=$((pending + 1))
+      elif kill -0 "$pid" 2>/dev/null; then
+        pending=$((pending + 1))
+      fi
+    done
+    (( pending > 0 )) || return 0
+    (( SECONDS < deadline )) || break
     sleep 0.05
   done
-  echo "stubborn process survived forced termination: $pid" >&2
+  echo "stubborn process group retained $pending live process(es) after forced termination" >&2
   return 1
 }
-assert_process_gone "$STUBBORN_PARENT_PID"
-assert_process_gone "$STUBBORN_CHILD_PID"
+# One aggregate fixture deadline covers both descendants. Production retains
+# the same transaction and TERM-to-KILL bounds exercised above.
+assert_processes_gone "$STUBBORN_PARENT_PID" "$STUBBORN_CHILD_PID"
 grep -q -- '--signal=TERM' "$CALLS"
 grep -q -- '--kill-after=1s' "$CALLS"
 

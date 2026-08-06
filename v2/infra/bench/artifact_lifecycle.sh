@@ -27,17 +27,49 @@ hivemind_artifact_random_identity() {
     printf '%s\n' "$identity"
 }
 
+hivemind_artifact_lease_read() {
+    local value
+    value="$(hivemind_artifact_aws ssm get-parameter \
+        --name "$HIVEMIND_ARTIFACT_LEASE_PARAMETER" \
+        --query Parameter.Value --output text \
+        --region "$HIVEMIND_ARTIFACT_REGION")" || return 1
+    [[ "$value" == "$HIVEMIND_ARTIFACT_ACCOUNT:$HIVEMIND_ARTIFACT_TOKEN:$HIVEMIND_ARTIFACT_CLAIM" ]]
+}
+
+hivemind_artifact_lease_acquire() {
+    local status=0 value
+    value="$HIVEMIND_ARTIFACT_ACCOUNT:$HIVEMIND_ARTIFACT_TOKEN:$HIVEMIND_ARTIFACT_CLAIM"
+    hivemind_artifact_aws ssm put-parameter \
+        --name "$HIVEMIND_ARTIFACT_LEASE_PARAMETER" \
+        --type String --value "$value" --no-overwrite \
+        --region "$HIVEMIND_ARTIFACT_REGION" >/dev/null || status=$?
+    # Status zero is definitive provisional authority to remove this exact lease.
+    # A nonzero result is ambiguous and requires exact remote reconciliation.
+    if [[ "$status" -eq 0 ]]; then HIVEMIND_ARTIFACT_LEASE_OWNED=1; fi
+    if ! hivemind_artifact_lease_read; then
+        echo "FAIL: artifact ownership lease was not acquired (status $status)" >&2
+        return 1
+    fi
+    HIVEMIND_ARTIFACT_LEASE_OWNED=1
+}
+
 hivemind_artifact_marker_read() {
     local marker
+    HIVEMIND_ARTIFACT_OBSERVED_ACCOUNT=""
     HIVEMIND_ARTIFACT_OBSERVED_TOKEN=""
     HIVEMIND_ARTIFACT_OBSERVED_CLAIM=""
     marker="$(hivemind_artifact_aws s3api head-object \
         --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
         --key "$HIVEMIND_ARTIFACT_MARKER_KEY" \
-        --query "join(':', [Metadata.token,Metadata.claim])" --output text \
+        --query "join(':', [Metadata.account,Metadata.token,Metadata.claim])" --output text \
         --region "$HIVEMIND_ARTIFACT_REGION")" || return 1
+    HIVEMIND_ARTIFACT_OBSERVED_ACCOUNT="${marker%%:*}"
+    marker="${marker#*:}"
     HIVEMIND_ARTIFACT_OBSERVED_TOKEN="${marker%%:*}"
     HIVEMIND_ARTIFACT_OBSERVED_CLAIM="${marker#*:}"
+    if [[ -z "$HIVEMIND_ARTIFACT_OBSERVED_ACCOUNT" ]]; then
+        return 1
+    fi
     if [[ -z "$HIVEMIND_ARTIFACT_OBSERVED_TOKEN" ]]; then
         return 1
     fi
@@ -48,6 +80,9 @@ hivemind_artifact_marker_read() {
 }
 
 hivemind_artifact_marker_matches() {
+    if [[ "${HIVEMIND_ARTIFACT_OBSERVED_ACCOUNT:-}" != "$HIVEMIND_ARTIFACT_ACCOUNT" ]]; then
+        return 1
+    fi
     if [[ "${HIVEMIND_ARTIFACT_OBSERVED_TOKEN:-}" != "$HIVEMIND_ARTIFACT_TOKEN" ]]; then
         return 1
     fi
@@ -60,6 +95,7 @@ hivemind_artifact_marker_matches() {
 hivemind_artifact_prepare() {
     local region="$1" account identity token claim marker_key marker_write_ok=0
     HIVEMIND_ARTIFACT_OWNED=0
+    HIVEMIND_ARTIFACT_LEASE_OWNED=0
     account="$(hivemind_artifact_aws sts get-caller-identity --query Account --output text)" || {
         echo 'FAIL: unable to determine AWS account for artifact ownership' >&2
         return 1
@@ -77,6 +113,7 @@ hivemind_artifact_prepare() {
     export HIVEMIND_ARTIFACT_REGION="$region"
     marker_key="$HIVEMIND_ARTIFACT_PREFIX/.owner"
     export HIVEMIND_ARTIFACT_MARKER_KEY="$marker_key"
+    export HIVEMIND_ARTIFACT_LEASE_PARAMETER="/hivemind/s3-ownership/$token"
 
     if hivemind_artifact_aws s3api head-bucket --bucket "$HIVEMIND_ARTIFACT_BUCKET" --region "$region" >/dev/null 2>&1; then
         echo "FAIL: artifact bucket identity collision: $HIVEMIND_ARTIFACT_BUCKET" >&2
@@ -87,13 +124,17 @@ hivemind_artifact_prepare() {
         echo "FAIL: artifact bucket absence could not be verified: $HIVEMIND_ARTIFACT_BUCKET" >&2
         return 1
     fi
-    if ! hivemind_artifact_aws s3api create-bucket --bucket "$HIVEMIND_ARTIFACT_BUCKET" --region "$region" >/dev/null; then
-        echo "FAIL: unable to create owned artifact bucket: $HIVEMIND_ARTIFACT_BUCKET" >&2
-        return 1
+    hivemind_artifact_lease_acquire || return 1
+    local create_status=0
+    local -a create_args=(s3api create-bucket --bucket "$HIVEMIND_ARTIFACT_BUCKET" --region "$region")
+    if [[ "$region" != us-east-1 ]]; then
+        create_args+=(--create-bucket-configuration "LocationConstraint=$region")
     fi
+    hivemind_artifact_aws "${create_args[@]}" >/dev/null || create_status=$?
 
-    # S3 us-east-1 may report success for an already-owned bucket. The
-    # conditional marker is the atomic ownership boundary for same-token races.
+    # The account-scoped SSM no-overwrite lease serializes cooperative creators.
+    # The conditional S3 marker then binds the bucket to the exact lease value;
+    # ambiguous AWS replies are accepted only when both remote proofs read back.
     if hivemind_artifact_aws s3api put-object \
         --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
         --key "$marker_key" \
@@ -108,7 +149,7 @@ hivemind_artifact_prepare() {
 
     if ! hivemind_artifact_marker_read; then
         if [[ "$marker_write_ok" -eq 0 ]]; then
-            echo "FAIL: artifact ownership marker write was not confirmed: $HIVEMIND_ARTIFACT_BUCKET" >&2
+            echo "FAIL: artifact bucket create/marker was not confirmed (create status $create_status): $HIVEMIND_ARTIFACT_BUCKET" >&2
         else
             echo 'FAIL: unable to verify artifact ownership marker' >&2
         fi
@@ -144,16 +185,34 @@ PY
 }
 
 hivemind_artifact_cleanup() {
-    local prior_status="$1" cleanup_status=0
-    [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" == 1 ]] || return "$prior_status"
+    local prior_status="$1" cleanup_status=0 lease_verified=0
+    if [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" != 1 && "${HIVEMIND_ARTIFACT_LEASE_OWNED:-0}" != 1 ]]; then
+        return "$prior_status"
+    fi
     if [[ "${HIVEMIND_KEEP_ARTIFACTS:-0}" == 1 ]]; then
         echo "keeping owned artifact bucket: $HIVEMIND_ARTIFACT_BUCKET" >&2
         return "$prior_status"
     fi
 
+    if [[ "${HIVEMIND_ARTIFACT_OWNED:-0}" != 1 ]]; then
+        if hivemind_artifact_lease_read && hivemind_artifact_aws s3api wait bucket-not-exists \
+            --bucket "$HIVEMIND_ARTIFACT_BUCKET" --region "$HIVEMIND_ARTIFACT_REGION" >/dev/null 2>&1; then
+            hivemind_artifact_aws ssm delete-parameter \
+                --name "$HIVEMIND_ARTIFACT_LEASE_PARAMETER" \
+                --region "$HIVEMIND_ARTIFACT_REGION" >/dev/null || cleanup_status=1
+            [[ "$cleanup_status" -ne 0 ]] || HIVEMIND_ARTIFACT_LEASE_OWNED=0
+        else
+            echo 'FAIL: refusing lease release while bucket ownership is ambiguous' >&2
+            cleanup_status=1
+        fi
+        if [[ "$prior_status" -ne 0 ]]; then return "$prior_status"; fi
+        return "$cleanup_status"
+    fi
+
     hivemind_artifact_marker_read || cleanup_status=1
-    if ! hivemind_artifact_marker_matches; then
-        echo 'FAIL: refusing cleanup without exact artifact ownership marker' >&2
+    if hivemind_artifact_lease_read; then lease_verified=1; else cleanup_status=1; fi
+    if ! hivemind_artifact_marker_matches || [[ "$lease_verified" != 1 || "${HIVEMIND_ARTIFACT_LEASE_OWNED:-0}" != 1 ]]; then
+        echo 'FAIL: refusing cleanup without exact artifact marker and account lease' >&2
         cleanup_status=1
     else
         hivemind_artifact_aws s3 rm "s3://$HIVEMIND_ARTIFACT_BUCKET/$HIVEMIND_ARTIFACT_PREFIX" \
@@ -161,7 +220,13 @@ hivemind_artifact_cleanup() {
         hivemind_artifact_aws s3api delete-bucket --bucket "$HIVEMIND_ARTIFACT_BUCKET" \
             --region "$HIVEMIND_ARTIFACT_REGION" || cleanup_status=1
         if [[ "$cleanup_status" -eq 0 ]]; then
+            hivemind_artifact_aws ssm delete-parameter \
+                --name "$HIVEMIND_ARTIFACT_LEASE_PARAMETER" \
+                --region "$HIVEMIND_ARTIFACT_REGION" >/dev/null || cleanup_status=1
+        fi
+        if [[ "$cleanup_status" -eq 0 ]]; then
             HIVEMIND_ARTIFACT_OWNED=0
+            HIVEMIND_ARTIFACT_LEASE_OWNED=0
         fi
     fi
     if [[ "$prior_status" -ne 0 ]]; then

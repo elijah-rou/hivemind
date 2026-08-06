@@ -23,6 +23,22 @@ variable "kubernetes_version" {
   default = "1.30"
 }
 
+variable "run_token" {
+  type        = string
+  description = "Exact per-run ownership token required for guarded teardown"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9]{11,31}$", var.run_token))
+    error_message = "run_token must match ^[a-z][a-z0-9]{11,31}$."
+  }
+}
+
+locals {
+  ownership_tags = {
+    HivemindRunToken = var.run_token
+  }
+}
+
 variable "ssh_public_key" {
   type    = string
   default = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILralVpTQ0tgwve6HyxwiZ0bzY1wymH/lCm91uL5NjcP"
@@ -34,7 +50,7 @@ resource "aws_vpc" "eks" {
   cidr_block           = "10.99.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = { Name = "${var.cluster_name}-vpc" }
+  tags                 = merge(local.ownership_tags, { Name = "${var.cluster_name}-vpc" })
 }
 
 data "aws_availability_zones" "available" {
@@ -47,12 +63,12 @@ resource "aws_subnet" "eks" {
   cidr_block              = cidrsubnet(aws_vpc.eks.cidr_block, 8, count.index)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
-  tags                    = { Name = "${var.cluster_name}-subnet-${count.index}" }
+  tags                    = merge(local.ownership_tags, { Name = "${var.cluster_name}-subnet-${count.index}" })
 }
 
 resource "aws_internet_gateway" "eks" {
   vpc_id = aws_vpc.eks.id
-  tags   = { Name = "${var.cluster_name}-igw" }
+  tags   = merge(local.ownership_tags, { Name = "${var.cluster_name}-igw" })
 }
 
 resource "aws_route_table" "eks" {
@@ -61,7 +77,7 @@ resource "aws_route_table" "eks" {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.eks.id
   }
-  tags = { Name = "${var.cluster_name}-rt" }
+  tags = merge(local.ownership_tags, { Name = "${var.cluster_name}-rt" })
 }
 
 resource "aws_route_table_association" "eks" {
@@ -74,6 +90,7 @@ resource "aws_route_table_association" "eks" {
 
 resource "aws_iam_role" "eks_cluster" {
   name = "${var.cluster_name}-cluster-role"
+  tags = local.ownership_tags
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -91,6 +108,7 @@ resource "aws_iam_role_policy_attachment" "eks_cluster" {
 
 resource "aws_iam_role" "eks_nodes" {
   name = "${var.cluster_name}-node-role"
+  tags = local.ownership_tags
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -122,6 +140,7 @@ resource "aws_eks_cluster" "main" {
   name     = var.cluster_name
   role_arn = aws_iam_role.eks_cluster.arn
   version  = var.kubernetes_version
+  tags     = local.ownership_tags
 
   vpc_config {
     subnet_ids = aws_subnet.eks[*].id
@@ -138,6 +157,7 @@ resource "aws_eks_node_group" "cpu" {
   node_role_arn   = aws_iam_role.eks_nodes.arn
   subnet_ids      = aws_subnet.eks[*].id
   instance_types  = ["c5.xlarge"]
+  tags            = local.ownership_tags
 
   scaling_config {
     desired_size = 1
@@ -159,6 +179,7 @@ resource "aws_eks_node_group" "gpu" {
   subnet_ids      = aws_subnet.eks[*].id
   instance_types  = ["g4dn.xlarge"]
   ami_type        = "AL2_x86_64_GPU"
+  tags            = local.ownership_tags
 
   scaling_config {
     desired_size = 1
@@ -185,4 +206,10 @@ output "cluster_endpoint" {
 
 output "kubeconfig_cmd" {
   value = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.region}"
+}
+
+output "hivemind_run_token" {
+  value       = var.run_token
+  sensitive   = true
+  description = "Ownership token persisted in this independent EKS state"
 }
