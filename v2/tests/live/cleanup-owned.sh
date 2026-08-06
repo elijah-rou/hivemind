@@ -53,7 +53,8 @@ record_failure() {
 
 cleanup_tmp="$(mktemp -d)"
 trap 'rm -rf "$cleanup_tmp"' EXIT
-state_file="$cleanup_tmp/terraform-state.json"
+destroy_plan="$cleanup_tmp/terraform-destroy.tfplan"
+destroy_plan_json="$cleanup_tmp/terraform-destroy-plan.json"
 marker="$cleanup_tmp/bucket-marker"
 
 set +e
@@ -61,22 +62,31 @@ timeout --foreground --kill-after=5s "${HIVEMIND_TERRAFORM_SELECT_TIMEOUT_SECOND
     terraform -chdir="$TF_ROOT" workspace select "$WORKSPACE" >/dev/null
 select_status=$?
 record_failure terraform_workspace_select "$select_status"
-state_status=1
+plan_status=1
 if [[ "$select_status" == 0 ]]; then
-    timeout --foreground --kill-after=5s "${HIVEMIND_TERRAFORM_SHOW_TIMEOUT_SECONDS:-120}s" \
-        terraform -chdir="$TF_ROOT" show -json >"$state_file" 2>/dev/null
-    state_status=$?
-    if [[ "$state_status" == 0 ]]; then
+    timeout --foreground --kill-after=10s "${HIVEMIND_TERRAFORM_PLAN_TIMEOUT_SECONDS:-300}s" \
+        terraform -chdir="$TF_ROOT" plan -destroy -input=false -lock=true -lock-timeout=0s \
+        -out="$destroy_plan" -var "run_token=$RUN_TOKEN" \
+        -var "ecr_repository_name=${HIVEMIND_LIVE_ECR:?}" -var "region=$REGION" \
+        >"$RAW_DIR/terraform-destroy-plan.log" 2>&1
+    plan_status=$?
+    if [[ "$plan_status" == 0 ]]; then
+        timeout --foreground --kill-after=5s "${HIVEMIND_TERRAFORM_SHOW_TIMEOUT_SECONDS:-120}s" \
+            terraform -chdir="$TF_ROOT" show -json "$destroy_plan" >"$destroy_plan_json" 2>/dev/null
+        plan_status=$?
+    fi
+    if [[ "$plan_status" == 0 ]]; then
         python3 "$ROOT_DIR/tests/live/validate-owned-state.py" \
-            "$state_file" "$RUN_TOKEN" "${HIVEMIND_LIVE_ECR:?}" >/dev/null
-        state_status=$?
+            "$destroy_plan_json" "$RUN_TOKEN" "${HIVEMIND_LIVE_ECR:?}" >/dev/null
+        plan_status=$?
     fi
 fi
-record_failure terraform_state_ownership "$state_status"
-if [[ "$select_status" == 0 && "$state_status" == 0 ]]; then
+record_failure terraform_destroy_plan_ownership "$plan_status"
+if [[ "$select_status" == 0 && "$plan_status" == 0 ]]; then
+    # Saved-plan apply rejects a changed state lineage/serial instead of replanning
+    # an unreviewed destroy after the ownership check.
     timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_DESTROY_TIMEOUT_SECONDS:-1200}s" \
-        terraform -chdir="$TF_ROOT" destroy -auto-approve \
-        -var "run_token=$RUN_TOKEN" -var "ecr_repository_name=${HIVEMIND_LIVE_ECR:?}" -var "region=$REGION" 2>&1 | \
+        terraform -chdir="$TF_ROOT" apply -input=false -auto-approve "$destroy_plan" 2>&1 | \
         python3 -c 'import sys; p=open(sys.argv[1], "xb"); n=0
 for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
  sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
@@ -84,7 +94,7 @@ for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
 p.close()' "$RAW_DIR/terraform-destroy.log"
     destroy_status=${PIPESTATUS[0]}
 else
-    printf 'workspace state ownership/topology validation failed; destroy not attempted\n' >"$RAW_DIR/terraform-destroy.log"
+    printf 'saved destroy plan ownership/topology validation failed; destroy not attempted\n' >"$RAW_DIR/terraform-destroy.log"
     destroy_status=1
 fi
 record_failure terraform_destroy "$destroy_status"

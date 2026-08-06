@@ -7,14 +7,14 @@ Purpose: keep a running record of what changed, why it matters, how close the pr
 ## Progress Snapshot
 
 - Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
-- Fresh accepted local evidence: evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a`, tree `99d635554429d5c2e664c179478ebab1338a8f6f`, passed `25 / 25` final gates on 2026-08-06. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `28` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested documentation-only descendant.
+- Fresh accepted local evidence: evidence parent `7c798c99171cbc894ddf26e8f9c1e872af143401`, tree `671097ae849bdc7d7e4dc142353a111e70226345`, passed `25 / 25` final gates on 2026-08-06. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `28` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested documentation-only descendant.
 - Historical accepted local evidence remains `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, `25 / 25` on 2026-07-25; it is not promoted to the rewritten stack.
 - Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
 - Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The continuation's deterministic and local real-process gates are implemented. Evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a` / tree `99d635554429d5c2e664c179478ebab1338a8f6f` has a fresh complete non-live matrix; the final documentation-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
+The continuation's deterministic and local real-process gates are implemented. Evidence parent `7c798c99171cbc894ddf26e8f9c1e872af143401` / tree `671097ae849bdc7d7e4dc142353a111e70226345` has a fresh complete non-live matrix; the final documentation-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
 Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
@@ -38,11 +38,11 @@ Historical AWS functional/resilience and benchmark results remain useful context
 ### 2026-08-06 — Reviewed ten-PR stack and final non-live gate
 
 Evidence:
-- tested evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a`, tree `99d635554429d5c2e664c179478ebab1338a8f6f`; run window `2026-08-06T06:13:12Z` through `06:21:39Z`
-- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `498s`, complete wall time `507s`
-- Zig Debug/ReleaseFast, 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `161.9s` fuzzer elapsed
+- tested evidence parent `7c798c99171cbc894ddf26e8f9c1e872af143401`, tree `671097ae849bdc7d7e4dc142353a111e70226345`; run window `2026-08-06T06:30:04Z` through `06:37:46Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `455s`, complete wall time `462s`
+- Zig Debug/ReleaseFast, 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `163.4s` fuzzer elapsed
 - worker format/all-targets (`191 + 3 + 11 + 1 CLI + 5`, containerd integration `0`), both recorded replays, and exact four-thread mutated seeds `0..999` passed; `1,000` tested, `0` failures, `1.9s` fuzzer elapsed
-- `./tests/run-all.sh --skip-containerd` passed all `28` invoked phases in `184s`; Go race/build, wire/schema, Bash/ShellCheck, all four offline Terraform roots, docs/links, credential, residue, no-`v1`, and cleanliness gates passed
+- `./tests/run-all.sh --skip-containerd` passed all `28` invoked phases in `160s`; Go race/build, wire/schema, Bash/ShellCheck, all four offline Terraform roots, docs/links, credential, residue, no-`v1`, and cleanliness gates passed
 - cleanup restored pre-run generated artifacts and left zero branch-owned process, relevant listener, port-lock, or generated-artifact delta
 
 Review corrections:
@@ -51,7 +51,7 @@ Review corrections:
 - offline S3 lifecycles pair exact markers with account-scoped no-overwrite leases; EKS and Hivemind teardown validate their independent state ownership and topology; benchmark cleanup is bounded and independently reconciled
 - guarded live preflight repeats non-mutating bucket absence checks and refuses unsupported `us-east-1` semantics before reporting preparation
 - every replica VRR field now uses a packed little-endian codec independent of host ABI; duplicate worker starts replay current terminal state after session loss
-- guarded Terraform cleanup rereads state at the destructive boundary and requires the exact owned address set, identity tags, and instance topology before destroy
+- guarded Terraform cleanup creates a saved destroy plan, validates its exact owned address set, identity tags, deletion actions, and instance topology, then applies that same plan so a changed state lineage or serial fails closed
 
 Explicit limits:
 - containerd component/full stack, Docker privileged mode, host namespace/cgroup work, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/remote systemd, providers, Terraform plan/apply/destroy, live entry points, and all cost-bearing/destructive work remained skipped or unexecuted

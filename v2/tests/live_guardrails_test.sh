@@ -240,6 +240,33 @@ if python3 "$state_validator" "$TMP/mismatched-state.json" e1fixtureabc123 hm-e1
   echo "FAIL: mismatched Terraform state relationship accepted for cleanup" >&2; exit 1
 fi
 grep -q 'security-group relationship differs' "$TMP/mismatched-state.out"
+python3 - "$TMP/valid-state.json" "$TMP/valid-destroy-plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source: state = json.load(source)
+changes = []
+for resource in state["values"]["root_module"]["resources"]:
+    changes.append({
+        "address": resource["address"], "mode": resource["mode"], "type": resource["type"],
+        "change": {"actions": ["delete"], "before": resource["values"], "after": None},
+    })
+with open(sys.argv[2], "w", encoding="utf-8") as output: json.dump({"resource_changes": changes}, output)
+PY
+python3 "$state_validator" "$TMP/valid-destroy-plan.json" e1fixtureabc123 hm-e1fixtureabc123
+python3 - "$TMP/valid-destroy-plan.json" "$TMP/replanning-destroy-plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source: plan = json.load(source)
+plan["resource_changes"][0]["change"]["actions"] = ["delete", "create"]
+with open(sys.argv[2], "w", encoding="utf-8") as output: json.dump(plan, output)
+PY
+if python3 "$state_validator" "$TMP/replanning-destroy-plan.json" e1fixtureabc123 hm-e1fixtureabc123 >"$TMP/replanning-destroy-plan.out" 2>&1; then
+  echo "FAIL: non-delete saved plan accepted for cleanup" >&2; exit 1
+fi
+grep -q 'managed action other than exact deletion' "$TMP/replanning-destroy-plan.out"
+grep -Fq 'plan -destroy -input=false -lock=true -lock-timeout=0s' "$SCRIPT_DIR/live/cleanup-owned.sh"
+grep -Fq "apply -input=false -auto-approve \"\$destroy_plan\"" "$SCRIPT_DIR/live/cleanup-owned.sh"
+if grep -Eq 'terraform .* destroy -auto-approve' "$SCRIPT_DIR/live/cleanup-owned.sh"; then
+  echo "FAIL: live cleanup still replans destroy after ownership validation" >&2; exit 1
+fi
 
 base_env=(
   HIVEMIND_ALLOW_LIVE=1 HIVEMIND_LIVE_FIXTURE_MODE=1 HIVEMIND_AWS_ACCOUNT_ALLOWLIST="$FIXTURE_ACCOUNT"
