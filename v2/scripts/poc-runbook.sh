@@ -17,10 +17,38 @@ set -euo pipefail
 #   SSH_CIDR=<deployer-ip>/32     # auto-detected if omitted
 #   ADOPT_EXISTING_ECR=true       # import an existing same-name repo into Terraform state
 #
-# Typical full run with teardown:
-#   SSH_KEY=~/.ssh/id_ed25519 RUN_EKS=true DESTROY_HIVEMIND_AFTER=true DESTROY_EKS_AFTER=true bash scripts/poc-runbook.sh
+# This executor is invoked only by tests/live/execute-reviewed-plan.sh after
+# guarded authorization, reviewed-plan verification, and cleanup trap setup.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ "${HIVEMIND_GUARDRAILS_ACTIVE:-0}" == 1 && "${HIVEMIND_ALLOW_LIVE:-0}" == 1 && -r /proc/self/fd/9 ]] || {
+    echo "refusing live runbook outside tests/live/run.sh guardrails" >&2
+    exit 1
+}
+python3 - "$PPID" "$ROOT_DIR/tests/live/execute-reviewed-plan.sh" "$ROOT_DIR/tests/live/run.sh" <<'PY' || {
+import os, sys
+pid = int(sys.argv[1])
+required = {os.path.realpath(path) for path in sys.argv[2:]}
+seen = set()
+capability = os.stat("/proc/self/fd/9")
+for _ in range(6):
+    try:
+        script = os.path.realpath(f"/proc/{pid}/fd/255")
+        inherited = os.stat(f"/proc/{pid}/fd/9")
+        argv = [os.fsdecode(value) for value in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if value]
+        exact_script_arg = any("/" in value and os.path.realpath(value) == script for value in argv)
+        if exact_script_arg and "-c" not in argv and (inherited.st_dev, inherited.st_ino) == (capability.st_dev, capability.st_ino):
+            seen.add(script)
+        with open(f"/proc/{pid}/stat", encoding="ascii") as source:
+            pid = int(source.read().split()[3])
+    except (FileNotFoundError, PermissionError, ValueError):
+        break
+if not required.issubset(seen):
+    raise SystemExit(1)
+PY
+    echo "refusing live runbook outside tests/live/run.sh guardrails" >&2
+    exit 1
+}
 # shellcheck source=../infra/poc/http.sh
 # shellcheck disable=SC1091 # ROOT_DIR resolves to the known repository helper.
 source "$ROOT_DIR/infra/poc/http.sh"
@@ -71,7 +99,16 @@ ARTIFACT_ROOT="${ARTIFACT_ROOT:-$ROOT_DIR/artifacts/poc-final}"
 mkdir -p "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
 chmod 700 "$ARTIFACT_ROOT/00-runbook" "$ARTIFACT_ROOT/01-infra" "$ARTIFACT_ROOT/04-workloads" "$ARTIFACT_ROOT/05-operator" "$ARTIFACT_ROOT/05-failure-drills" "$ARTIFACT_ROOT/06-benchmarks"
 LOG="$ARTIFACT_ROOT/00-runbook/runbook-$TAG.log"
-exec > >(tee -a "$LOG") 2>&1
+bounded_tee() {
+    local path="$1"
+    python3 -c 'import sys
+path=sys.argv[1]; output=open(path, "xb"); written=0
+for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
+ sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+ if written < 1048576: data=chunk[:1048576-written]; output.write(data); written += len(data)
+output.close()' "$path"
+}
+exec > >(bounded_tee "$LOG") 2>&1
 
 CLEANUP_STARTED=false
 
@@ -404,8 +441,8 @@ export HIVEMIND_RUN_TOKEN="$RUN_TOKEN"
 export TF_VAR_run_token="$RUN_TOKEN"
 export TF_VAR_ecr_repository_name="$ECR_REPOSITORY_NAME"
 export TF_VAR_region="$AWS_REGION"
-echo "run_token=$RUN_TOKEN"
-echo "ecr_repository=$ECR_REPOSITORY_NAME"
+echo "ownership_hash=$(printf '%s' "$RUN_TOKEN" | sha256sum | awk '{print substr($1,1,16)}')"
+echo "ecr_repository=[REDACTED_TOKEN]"
 configure_ssh_cidr
 
 section "1. Apply isolated Hivemind POC infra"
@@ -420,11 +457,11 @@ REPLICA_PUBLIC_IPS="$(json_output_array_csv "$ROOT_DIR/infra/poc" replica_public
 WORKER_CPU_PUBLIC_IP="$(raw_output "$ROOT_DIR/infra/poc" worker_cpu_public_ip)"
 WORKER_GPU_PUBLIC_IP="$(raw_output "$ROOT_DIR/infra/poc" worker_gpu_public_ip)"
 REGISTRY="$(raw_output "$ROOT_DIR/infra/poc" ecr_repository_url)"
-echo "api_url=$API_URL"
-echo "replica_public_ips=$REPLICA_PUBLIC_IPS"
-echo "worker_cpu_public_ip=$WORKER_CPU_PUBLIC_IP"
-echo "worker_gpu_public_ip=$WORKER_GPU_PUBLIC_IP"
-echo "ecr_repository_url=$REGISTRY"
+echo "api_url=[REDACTED_IP]"
+echo "replica_public_ips=[REDACTED_IP]"
+echo "worker_cpu_public_ip=[REDACTED_IP]"
+echo "worker_gpu_public_ip=[REDACTED_IP]"
+echo "ecr_repository_url=[REDACTED_ACCOUNT].dkr.ecr.$AWS_REGION.amazonaws.com/[REDACTED_TOKEN]"
 
 section "2. Build and push workload images"
 if [[ "$SKIP_IMAGE_BUILD" == "true" ]]; then
@@ -443,7 +480,7 @@ write_env_file
 
 section "3. Deploy Hivemind binaries/services"
 if [[ "$SKIP_HIVEMIND_DEPLOY" != "true" ]]; then
-    (cd "$ROOT_DIR/infra/poc" && bash deploy.sh --build --key "$SSH_KEY") | tee "$ARTIFACT_ROOT/01-infra/deploy-$TAG.txt"
+    (cd "$ROOT_DIR/infra/poc" && bash deploy.sh --build --key "$SSH_KEY") | bounded_tee "$ARTIFACT_ROOT/01-infra/deploy-$TAG.txt"
 else
     echo "skip Hivemind deploy"
 fi
@@ -453,7 +490,7 @@ preload_worker_images
 
 section "5. Fresh Hivemind smoke"
 (cd "$ROOT_DIR/infra/poc" && bash smoke-test.sh "$API_URL" --gpu-worker "$WORKER_GPU_PUBLIC_IP" --ssh-key "$SSH_KEY" --gpu-type "$GPU_TYPE") \
-    | tee "$ARTIFACT_ROOT/01-infra/smoke-fresh-$TAG.txt"
+    | bounded_tee "$ARTIFACT_ROOT/01-infra/smoke-fresh-$TAG.txt"
 prove_worker_runtime_capabilities
 if [[ "$REQUIRE_ECR_COLD_PULL" == 1 ]]; then
     bash "$ROOT_DIR/infra/poc/ecr-cold-pull.sh" "$CPU_IMAGE" "${HIVEMIND_RUN_TOKEN:?}" \
@@ -464,12 +501,12 @@ fi
 
 section "6. Section 3 real workload validation"
 CPU_IMAGE="$CPU_IMAGE" GPU_IMAGE="$GPU_IMAGE" GPU_TYPE="$GPU_TYPE" OUT_DIR="$ARTIFACT_ROOT/04-workloads" \
-    bash "$ROOT_DIR/infra/poc/workload-test.sh" "$API_URL" | tee "$ARTIFACT_ROOT/04-workloads/workload-test-$TAG.txt"
+    bash "$ROOT_DIR/infra/poc/workload-test.sh" "$API_URL" | bounded_tee "$ARTIFACT_ROOT/04-workloads/workload-test-$TAG.txt"
 
 section "7. Section 4 operator workflow proof"
 if [[ "$SKIP_OPERATOR_WORKFLOW" != "true" ]]; then
     CPU_IMAGE="$CPU_IMAGE" GPU_IMAGE="$GPU_IMAGE" GPU_TYPE="$GPU_TYPE" OUT_DIR="$ARTIFACT_ROOT/05-operator" \
-        bash "$ROOT_DIR/infra/poc/operator-workflow.sh" "$API_URL" | tee "$ARTIFACT_ROOT/05-operator/operator-workflow-$TAG.txt"
+        bash "$ROOT_DIR/infra/poc/operator-workflow.sh" "$API_URL" | bounded_tee "$ARTIFACT_ROOT/05-operator/operator-workflow-$TAG.txt"
 else
     echo "skip operator workflow"
 fi
@@ -482,7 +519,7 @@ if [[ "$SKIP_FAILURE_DRILLS" != "true" ]]; then
         --replica-ips "$REPLICA_PUBLIC_IPS" \
         --cpu-worker-ip "$WORKER_CPU_PUBLIC_IP" \
         --gpu-worker-ip "$WORKER_GPU_PUBLIC_IP" \
-        --gpu-type "$GPU_TYPE" | tee "$ARTIFACT_ROOT/05-failure-drills/failure-drills-$TAG.txt"
+        --gpu-type "$GPU_TYPE" | bounded_tee "$ARTIFACT_ROOT/05-failure-drills/failure-drills-$TAG.txt"
 else
     echo "skip failure drills"
 fi
@@ -494,7 +531,7 @@ if [[ "$RUN_EKS" == "true" ]]; then
     aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
     preload_eks_images
     CPU_IMAGE="$CPU_IMAGE" GPU_IMAGE="$GPU_IMAGE" OUT_DIR="$ARTIFACT_ROOT/06-benchmarks" \
-        bash "$ROOT_DIR/infra/poc-eks/eks-workload-test.sh" | tee "$ARTIFACT_ROOT/06-benchmarks/eks-workload-test-$TAG.txt"
+        bash "$ROOT_DIR/infra/poc-eks/eks-workload-test.sh" | bounded_tee "$ARTIFACT_ROOT/06-benchmarks/eks-workload-test-$TAG.txt"
 else
     echo "skip EKS baseline. Set RUN_EKS=true to run it."
 fi
