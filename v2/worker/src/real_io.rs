@@ -1,6 +1,6 @@
 use std::io::{self, ErrorKind, Read};
-use std::net::{Shutdown, TcpStream};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::io::Io;
 use crate::message::{ControlMessage, WorkerMessage};
@@ -25,7 +25,29 @@ impl RealIo {
         addr: &str,
         encryption_key: Option<[u8; crate::crypto::KEY_LEN]>,
     ) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        Self::connect_timeout(addr, encryption_key, Duration::from_secs(2))
+    }
+
+    pub fn connect_timeout(
+        addr: &str,
+        encryption_key: Option<[u8; crate::crypto::KEY_LEN]>,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "connect timeout is zero",
+            ));
+        }
+        // Resolving hostnames can block outside the deadline. Replica endpoints
+        // are therefore explicit IP socket addresses at this runtime boundary.
+        let socket_addr: SocketAddr = addr.parse().map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "replica address must be an IP socket address",
+            )
+        })?;
+        let stream = TcpStream::connect_timeout(&socket_addr, timeout)?;
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
 
@@ -182,6 +204,20 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("timed out waiting for message");
+    }
+
+    #[test]
+    fn bounded_connect_rejects_unbounded_hostname_resolution_and_zero_timeout() {
+        let hostname_error =
+            RealIo::connect_timeout("replica.example:9000", None, Duration::from_secs(1))
+                .err()
+                .expect("hostname must be rejected");
+        assert_eq!(hostname_error.kind(), ErrorKind::InvalidInput);
+
+        let timeout_error = RealIo::connect_timeout("127.0.0.1:9000", None, Duration::ZERO)
+            .err()
+            .expect("zero timeout must be rejected");
+        assert_eq!(timeout_error.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

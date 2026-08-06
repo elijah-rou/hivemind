@@ -446,6 +446,39 @@ mod tests {
     }
 
     #[test]
+    fn terminal_status_lost_with_session_is_replayed_by_duplicate_start() {
+        let mut sim = WorkerSimulator::new(1, 0xB1_06);
+        let start = start_cmd(701, 7_001);
+        sim.sim_ios[0].push_inbound(start.clone());
+        sim.run(8);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&701].state,
+            TrackedPodState::Running
+        );
+
+        sim.partition_agent(0);
+        sim.sim_runtimes[0].crash_pod(701, 17);
+        sim.run(4);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&701].state,
+            TrackedPodState::Stopped { exit_code: 17 }
+        );
+        assert!(!received_pod_statuses(&sim, 701)
+            .iter()
+            .any(|status| { *status == PodStatusReport::Stopped { exit_code: 17 } }));
+
+        sim.lose_agent_session(0);
+        sim.heal_all();
+        sim.run(4);
+        sim.network.send_to_agent(0, start, sim.current_tick);
+        sim.run(20);
+
+        assert!(received_pod_statuses(&sim, 701)
+            .iter()
+            .any(|status| { *status == PodStatusReport::Stopped { exit_code: 17 } }));
+    }
+
+    #[test]
     fn session_loss_discards_old_epoch_and_reregisters_before_new_traffic() {
         let mut sim = WorkerSimulator::new(1, 0xB1_05);
         sim.run(6);

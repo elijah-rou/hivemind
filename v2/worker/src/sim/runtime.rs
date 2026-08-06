@@ -24,6 +24,13 @@ pub enum RunOutcome {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeOperationCounts {
+    pub stop: u64,
+    pub status: u64,
+    pub remove: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FaultConfig {
     pub image_pull_failure_rate: Ratio,
@@ -51,6 +58,8 @@ struct Inner {
     create_attempts: HashMap<u64, u64>,
     start_attempts: HashMap<u64, u64>,
     stop_attempts: HashMap<u64, u64>,
+    status_attempts: HashMap<u64, u64>,
+    remove_attempts: HashMap<u64, u64>,
     probe_outcomes: HashMap<u64, VecDeque<ProbeOutcome>>,
     run_outcomes: HashMap<u64, VecDeque<RunOutcome>>,
     run_attempts: HashMap<u64, u64>,
@@ -75,6 +84,8 @@ impl SimulatedRuntime {
                 create_attempts: HashMap::new(),
                 start_attempts: HashMap::new(),
                 stop_attempts: HashMap::new(),
+                status_attempts: HashMap::new(),
+                remove_attempts: HashMap::new(),
                 probe_outcomes: HashMap::new(),
                 run_outcomes: HashMap::new(),
                 run_attempts: HashMap::new(),
@@ -157,6 +168,15 @@ impl SimulatedRuntime {
             .get_mut(&format!("sim-pod-{pod_id}"))
             .expect("scripted unknown status requires an existing pod");
         *status = PodStatus::Unknown;
+    }
+
+    pub fn operation_counts(&self, pod_id: u64) -> RuntimeOperationCounts {
+        let inner = self.inner.lock().unwrap();
+        RuntimeOperationCounts {
+            stop: inner.stop_attempts.get(&pod_id).copied().unwrap_or(0),
+            status: inner.status_attempts.get(&pod_id).copied().unwrap_or(0),
+            remove: inner.remove_attempts.get(&pod_id).copied().unwrap_or(0),
+        }
     }
 
     /// Simulate spontaneous container crashes. Called by the simulator each tick.
@@ -391,7 +411,8 @@ impl Runtime for SimulatedRuntime {
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        next_attempt(&mut inner.status_attempts, handle.pod_id);
         inner
             .pods
             .get(&handle.container_id)
@@ -401,6 +422,7 @@ impl Runtime for SimulatedRuntime {
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
         let mut inner = self.inner.lock().unwrap();
+        next_attempt(&mut inner.remove_attempts, handle.pod_id);
         inner.pods.remove(&handle.container_id);
         Ok(())
     }

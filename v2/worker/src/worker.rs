@@ -266,7 +266,11 @@ impl Worker {
     }
 
     fn handle_start_pod(&mut self, io: &mut dyn Io, cmd: StartPodCmd, now: u64) {
-        if self.pods.contains_key(&cmd.pod_id) {
+        if let Some(pod) = self.pods.get(&cmd.pod_id) {
+            io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+                pod_id: cmd.pod_id,
+                status: Self::tracked_pod_status(&pod.state),
+            }));
             return;
         }
         self.prune_terminal_pods_to(MAX_TERMINAL_TOMBSTONES);
@@ -459,7 +463,14 @@ impl Worker {
             return;
         };
 
-        let status = match &pod.state {
+        io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
+            pod_id: cmd.pod_id,
+            status: Self::tracked_pod_status(&pod.state),
+        }));
+    }
+
+    fn tracked_pod_status(state: &TrackedPodState) -> PodStatusReport {
+        match state {
             TrackedPodState::Running => PodStatusReport::Running,
             TrackedPodState::Stopped { exit_code } => PodStatusReport::Stopped {
                 exit_code: *exit_code,
@@ -470,12 +481,7 @@ impl Worker {
             TrackedPodState::ImagePulling => PodStatusReport::ImagePulling,
             TrackedPodState::Creating | TrackedPodState::Starting => PodStatusReport::Creating,
             TrackedPodState::Stopping => PodStatusReport::Running,
-        };
-
-        io.send(WorkerMessage::PodStatusEvent(PodStatusEventMsg {
-            pod_id: cmd.pod_id,
-            status,
-        }));
+        }
     }
 
     fn drive_pods(&mut self, io: &mut dyn Io, runtime: &dyn Runtime, now: u64) {
