@@ -18,11 +18,11 @@
 | # | Item | Notes |
 |---|------|--------|
 | C1 | TLS/mTLS | Plaintext on client, agent, peer, gossip paths |
-| C2 | Authentication | API and agent connections previously had no auth |
+| C2 | Authentication | API Bearer authentication is optional; agent identity remains unauthenticated |
 | C3 | Provider adapter | Nodes are manual / out-of-band |
 | C4 | App spec model | CreateDeployment is minimal vs probes, scaling policy, env, storage |
-| C5 | Crash-consistent versioned storage + torn-write simulation | Layout v2 is a single-copy journal with write/sync-before-publication and I/O fail-stop behavior; torn writes and power loss are not modeled, so it does not establish production durability. |
-| C6 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) operations; `log_full` / HTTP 507 until snapshots exist. |
+| C5 | Crash-consistent versioned storage + torn-write simulation | Layout v2 single-copy journal: write/sync-before-publication and I/O fail-stop only; no torn-write/power-loss model or simulation; blocks any production durability claim |
+| C6 | Log compaction / snapshots | Fail-closed retained log of `LOG_SIZE_MAX` (1024) ops; `log_full` / HTTP 507 until snapshots exist |
 
 ### Important — Knative / platform parity
 
@@ -30,9 +30,9 @@
 |---|------|--------|
 | I1 | Thalamus integration | Router should consume gossip for cross-region routing |
 | I2 | Axon integration | CLI/SDK → Hivemind API |
-| I3 | Image pull secrets | Private registry auth |
+| I3 | Image pull secrets | Credential propagation exists; private ECR execution remains unverified |
 | I4 | Readiness probes | Liveness exists; readiness not tied to routing |
-| I5 | Graceful agent shutdown | SIGTERM, drain in flight |
+| I5 | Graceful agent shutdown | Bounded signal cleanup exists; complete in-flight drain semantics remain incomplete |
 | I6 | Blue-green / canary | TrafficSplit exists; not wired to run routing |
 
 ### Nice-to-have
@@ -109,9 +109,9 @@ This repo’s operational surface is the **Hivemind replica** (Zig), the **Go AP
 | Location | Note |
 |----------|------|
 | `docs/legacy/Edge Routing.md` | **Legacy** (not `core/` in-repo): edge/Thalamus sketch; see top banner + `docs/legacy/README.md` |
-| `v1/` | Removed old implementation; `core/` is now the only Zig control-plane implementation in-tree |
-| `hivemind/` | Removed zero-byte skeleton files |
-| `honeybee/` | Removed inactive prototype component |
+| repo-root `v1/` | Frozen POC V1 snapshot; active Zig control plane is `v2/core/` |
+| `hivemind/` | Removed zero-byte skeleton files from the active line |
+| `honeybee/` | Removed inactive prototype component from the active line |
 
 ## Recently completed (context)
 
@@ -124,7 +124,7 @@ This repo’s operational surface is the **Hivemind replica** (Zig), the **Go AP
 |------|--------|
 | Optional API gateway token (`HIVEMIND_API_TOKEN` + `Authorization: Bearer`) | Landed — see `api/main.go`; `GET /v1/health` stays unauthenticated when token is set (load balancer / probe friendly). Trailing slashes are stripped before auth so `/v1/health/` matches the health exemption. |
 | Agent SIGTERM drain (`I5` slice) | Landed — `Worker::shutdown` verifies stop/status/remove before unmounting JuiceFS, retains ownership and resource accounting when cleanup cannot be proven, and is invoked even when SIGTERM/SIGINT arrives during failed connect or reconnect backoff; see `worker/src/worker.rs` and `worker/src/main.rs` |
-| Image pull credentials (`I3` slice) | Landed — `CreateDeployment` wire extension (optional 449 bytes after the 398-byte base) carries `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`; replica appends StartPod trailer (`0x01` + fields); agent resolves secret-named passwords via Doppler like env vars and passes `ctr images pull --user user:pass` in `containerd` runtime. JSON fields on `POST /v1/deployments`: `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`. |
+| Image pull credentials (`I3` slice) | Landed — `CreateDeployment` wire extension (optional 449 bytes after the 398-byte base) carries `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`; replica appends the StartPod auth trailer; agent resolves secret-named passwords via Doppler and writes a per-pull protected hosts hierarchy (`0700` directories, `0600` `hosts.toml`). The `ctr` process receives only `--hosts-dir`, keeping credentials out of argv. JSON fields on `POST /v1/deployments`: `image_pull_registry`, `image_pull_username`, `image_pull_password`, `image_pull_password_is_secret`. Private-registry and ECR execution remain unverified. |
 | Reconnecting nodes / agents | Landed — `handleRegisterNode` dedupes by active hostname (returns existing `node_id`); `AgentConnection.register_seq` makes each agent (re)registration a fresh VRR `request_id`; `Replica.onAgentDisconnect` + `ConnectionManager` reuse agent TCP slots and sync disconnect; Rust agent calls `on_connection_lost()` so `NodeRegister` is resent after TCP loss. |
 | Simulation coverage for this session | Landed — Zig: `state_machine` tests for hostname dedupe + image-pull fields; VOPR tests for simulated agent reconnect + deployment image-pull retention; `TestCluster.request` now works for single-replica clusters; `disconnectSimAgent` + `getAgentNodeId` sync in harness. Rust: `protocol` trailer test (existing), `sim::runtime` pull with `ImagePullAuth`, `Agent::on_connection_lost` unit test. |
 | Real-node agent fingerprinting | Landed — `agent run` now fingerprints host CPU/memory/GPU and registers real inventory instead of fake `8000m/16Gi/0 GPU` defaults; falls back to conservative `1000m/1Gi/no GPU` only if fingerprinting fails. |
@@ -157,10 +157,11 @@ Potential Hivemind-side addenda from that repo:
 
 ## Repo cleanup decisions landed
 
-- `v2/` was renamed to `core/` because the old name encoded history, not purpose.
-- `v1/`, `hivemind/`, and `honeybee/` were removed from active tree.
+- At repo root, `v1/` is the frozen POC V1 snapshot and `v2/` is the active development line.
+- Within `v2/`, the historical nested `v2/` directory was renamed to `core/` because the old name encoded history, not purpose; `hivemind/` and `honeybee/` were removed from the active tree.
 - Build outputs and deploy binaries remain ignored; local generated artifacts should not be committed.
-- Historical/aspirational docs were moved under `docs/legacy/` or `docs/frozen/` so active truth is limited to `STATUS`, `POC_ACCEPTANCE`, `POC_CHANGELOG`, `FINDINGS_AND_ISSUES`, and `ENGINEERING`.
+- Historical/aspirational docs were moved under `docs/legacy/` or `docs/frozen/`.
+- Active ownership is split deliberately: `STATUS.md` records implementation/evidence state; `POC_V2_ACCEPTANCE.md` owns the current product gate; `TESTING.md` owns evidence semantics and authoritative commands; `tests/README.md` owns executable harness operation; `HANDOFF.md` owns continuation records and stack navigation; `POC_CHANGELOG.md` owns dated history; `FINDINGS_AND_ISSUES.md` owns the backlog; `ENGINEERING.md` owns design principles and boundaries. `POC_ACCEPTANCE.md` is historical v1 evidence.
 
 ## Suggested execution order (next engineering passes)
 
@@ -173,7 +174,8 @@ Use `docs/POC_V2_ACCEPTANCE.md` as the acceptance gate before team-facing replac
 5. **Security/isolation baseline** — auth, encrypted/authenticated component links, resource/device restrictions, explicit limitations.
 6. **Queue-aware serving/autoscaling** — queue-proxy/forwarder metrics, concurrency policy, scale-to-zero activation.
 7. **GitOps/integration** — declarative apply/status path and Thalamus routing integration.
-8. **Compaction / snapshots** — bounded replay time at restarts.
+8. **Compaction / snapshots** — bounded replay time at restarts (after crash-consistent storage).
+9. **Crash-consistent journal** — versioned dual-copy or append-safe publication plus torn-write simulation before production durability claims.
 
 ---
 

@@ -6,66 +6,201 @@ Purpose: keep a running record of what changed, why it matters, how close the pr
 
 ## Progress Snapshot
 
-- Acceptance sections complete: `6 / 8`
-  - Complete: `1. Fresh AWS Redeploy`, `2. Locality Federation Proof`, `3. Real Workload Validation`, `4. Operator Workflow Proof`, `5. Failure Drill Proof`, `6. Repeatability / No-Heroics Gate`
-  - Reopened: `7. Kubernetes Baseline Comparison`, `8. Final Evidence Pack`
-- Execution checklist complete: `16 / 16` for warm-cache evidence pack
-  - Complete: fresh redeploy, corrected smoke, origin -> locality map, Hivemind origin metadata + gossip visibility patch, local federated-origin proof surface, Thalamus POC branch locality/residency selector tests, localhost locality/failover smoke, CPU workload selection, GPU workload selection, real CPU/GPU workload validation, operator workflow proof, failure drills, repeatability / second fresh redeploy, initial EKS baseline collection, warm-cache Hivemind/EKS benchmark, final evidence pack/verdict refresh
-  - Remaining for economic confidence: clean EKS rerun after GPU-node sandbox failures, cold-cache rerun after Hivemind private ECR auth fix
-- Infra status: `up`: Hivemind live for reuse; EKS control plane and nodegroups left up after warm-cache rerun
-- Current phase: `Final benchmark docs refreshed; benchmark/economic verdict still provisional pending clean EKS rerun`
+- Current gate: `docs/POC_V2_ACCEPTANCE.md`; every required section remains blocked.
+- Fresh accepted local evidence: evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a`, tree `99d635554429d5c2e664c179478ebab1338a8f6f`, passed `25 / 25` final gates on 2026-08-06. This included exact mutated core seeds `0..9999`, worker seeds `0..999`, all `28` invoked non-containerd aggregate phases, and the language, shell, Terraform, wire, docs, credential, hygiene, and residue gates. The final evidence-docs tip is recorded separately as an untested documentation-only descendant.
+- Historical accepted local evidence remains `bc9f5f63fcf4f030177ceae321342d92b79ab613`, tree `78f4c95c28fca5233a25e57ec8179e969120779c`, `25 / 25` on 2026-07-25; it is not promoted to the rewritten stack.
+- Current live infrastructure state: **unknown and blocked pending fresh authorized inventory**. Historical entries below that report `up`, `mixed`, or `destroyed` describe only their dated runs and do not authorize reuse.
+- Historical POC v1 progress (`6 / 8`, warm-cache `16 / 16`) remains context only and does not satisfy the current v2 gate.
 
 ## Current Distance To Goal
 
-The functional/resilience POC is complete.
+The continuation's deterministic and local real-process gates are implemented. Evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a` / tree `99d635554429d5c2e664c179478ebab1338a8f6f` has a fresh complete non-live matrix; the final documentation-only descendant is not claimed as separately runtime-tested. Prepared E1 harnesses do not count as execution evidence. POC v2 remains unaccepted: required AppSpec, readiness/routability, logs/events, isolation, physical GPU reservation, JuiceFS, private-registry execution, privileged containerd, and guarded live evidence are incomplete.
 
-The basic live AWS plumbing gate is closed.
-
-The broad Hivemind-core deterministic blocker is also closed again: fresh mutated core sweep is clean at `10000/10000` after landing regression fixes.
-
-The local deterministic federated proof surface, localhost Thalamus/Hivemind smoke, focused fresh-AWS real workload run, operator workflow proof, live failure drills, and repeatability gate are complete.
-
-The benchmark/economic verdict remains provisional. Latest warm-cache nginx matrix favors Hivemind with granular phase attribution, but the EKS rerun was degraded by GPU-node sandbox failures, so broad speedup/economic claims still need a clean EKS rerun.
+Historical AWS functional/resilience and benchmark results remain useful context only. No current live plumbing, resource-state, GPU, or economic claim is made.
 
 ## Next 3 Concrete Steps
 
-1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
-2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
-3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+1. Implement concrete per-pod physical GPU reservation before enabling GPU runtimes or strict GPU acceptance.
+2. Run the privileged containerd component/full-stack gates on a suitable host and verify adoption PID continuity and cleanup.
+3. Inventory live resources only under explicit authorization before any AWS reuse, mutation, benchmark, or cleanup decision.
 
 ## Open Unknowns
 
 - Exact Nebius Europe region still needs confirmation for future live multi-provider work.
-- Temporary EKS baseline is intentionally isolated under `infra/poc-eks/`; EKS control plane and nodegroups are currently left up for follow-up artifact refresh.
-- Warm-cache Hivemind-vs-EKS reruns are collected and final benchmark docs refreshed, but benchmark/economic verdict remains provisional until clean EKS rerun.
+- Current AWS/EKS resource state is unknown; historical retained-resource records were not revalidated.
+- Warm-cache Hivemind-vs-EKS reruns are historical; benchmark/economic evidence requires a current feature-complete rerun.
 - Old Drill A timeout was partly a test/deploy bug: `hivemind-api.service` required local `hivemind.service`, so stopping the leader also killed the public API gateway.
 - Local live failover smoke is green for 3 and 5 replicas after fixing VRR frame sizing and API stale-reply handling.
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
-### 2026-07-26 — Offline POC ownership and deadline contracts hardened
+
+### 2026-08-06 — Reviewed ten-PR stack and final non-live gate
+
+Evidence:
+- tested evidence parent `73b7eca987731fd325b06f6bab419cd1b347668a`, tree `99d635554429d5c2e664c179478ebab1338a8f6f`; run window `2026-08-06T06:13:12Z` through `06:21:39Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `498s`, complete wall time `507s`
+- Zig Debug/ReleaseFast, 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `161.9s` fuzzer elapsed
+- worker format/all-targets (`191 + 3 + 11 + 1 CLI + 5`, containerd integration `0`), both recorded replays, and exact four-thread mutated seeds `0..999` passed; `1,000` tested, `0` failures, `1.9s` fuzzer elapsed
+- `./tests/run-all.sh --skip-containerd` passed all `28` invoked phases in `184s`; Go race/build, wire/schema, Bash/ShellCheck, all four offline Terraform roots, docs/links, credential, residue, no-`v1`, and cleanliness gates passed
+- cleanup restored pre-run generated artifacts and left zero branch-owned process, relevant listener, port-lock, or generated-artifact delta
+
+Review corrections:
+- secure journal/data-directory traversal pins component descriptors, rejects symlinks and multiply linked journals, and validates exact type/owner boundaries
+- VRR exhausts before the reserved all-ones view; worker and protocol boundaries now cover lost versus buffered replies, little-endian fixed payloads, disconnected shutdown, and fail-fast IP endpoint validation
+- offline S3 lifecycles pair exact markers with account-scoped no-overwrite leases; EKS and Hivemind teardown validate their independent state ownership and topology; benchmark cleanup is bounded and independently reconciled
+- guarded live preflight repeats non-mutating bucket absence checks and refuses unsupported `us-east-1` semantics before reporting preparation
+- every replica VRR field now uses a packed little-endian codec independent of host ABI; duplicate worker starts replay current terminal state after session loss
+- guarded Terraform cleanup rereads state at the destructive boundary and requires the exact owned address set, identity tags, and instance topology before destroy
+
+Explicit limits:
+- containerd component/full stack, Docker privileged mode, host namespace/cgroup work, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/remote systemd, providers, Terraform plan/apply/destroy, live entry points, and all cost-bearing/destructive work remained skipped or unexecuted
+- live-resource state remains unknown because no fresh authorized inventory ran
+- the final documentation commit is a descendant of the tested parent; historical 2026-07-27 and `bc9f5f63` evidence remains historical
+
+### 2026-07-27 — Fresh complete restack-parent gate
+
+Evidence:
+- tested PR10 evidence parent `b08e7081bf8ad894f2b97e617079a2e333ca6865`, tree `3a896d9009ba97cac9f3ed1fd4093fd05e89ad77`; run window `2026-07-27T00:38:20Z` through `00:46:34Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `486s`, complete wall time `494s`
+- Zig Debug (`37s`), ReleaseFast (`7s`), 29 replays, and exact four-thread mutated core seeds `0..9999` passed; `10,000` tested, `0` failures, `170.4s` fuzzer elapsed
+- worker format/all-targets (`186 + 3 + 7 + 5`, containerd integration `0`), both recorded replays, and exact four-thread mutated seeds `0..999` passed; `1,000` tested, `0` failures, `1.9s` fuzzer elapsed
+- `./tests/run-all.sh --skip-containerd` passed all `26` invoked phases in `184s`; Go race/build, wire/schema, shell, all four offline Terraform roots, changed-doc layout/links, credential, residue, no-`v1`, and cleanliness gates passed
+- cleanup restored the pre-run generated-artifact state and left zero branch-owned processes, relevant listener delta, port-lock delta, generated-artifact delta, tracked/index change, or `v1` delta
+
+Preserved failed attempts and support corrections:
+- `20260726T233943Z-b08e7081bf8a` stopped after three passed gates because stdout-only `tee` missed the successful core sweep summary written to stderr; the summary reported `10,000` tested and `0` failures
+- `20260727T002042Z-b08e7081bf8a` restarted at gate 1 and stopped when the two-second deterministic systemd fixture transaction expired under aggregate load; the immediate bounded focused fixture rerun passed
+- `20260727T002955Z-b08e7081bf8a` restarted at gate 1 and stopped on an untracked link checker that included frozen/legacy relocation links; the checker was corrected to branch-changed Markdown
+- `20260727T003820Z-b08e7081bf8a` restarted at gate 1 and is the sole accepted fresh run; the bounded capture self-test proved stderr-only JSON capture and wrong-count rejection
+
+Explicit limits:
+- containerd component/full stack, Docker privileged mode, host namespace/cgroup work, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/remote systemd, providers, Terraform plan/apply/destroy, live entry points, and all cost-bearing/destructive work remained skipped or unexecuted
+- live-resource state remains unknown because no fresh authorized inventory ran
+- the final docs commit is recorded externally as a descendant of the tested parent; historical `bc9f5f63` evidence remains historical
+
+### 2026-07-26 — Ten-PR thematic restack documentation boundary
 
 What changed:
+- partitioned the durability/safety work into ten linear reviewer-sized slices: storage journal, VRR view change, bounded ingress and `/run`, core VOPR, worker runtime simulation, protocol v6, local durable E2E, offline operations/containerd, guarded live evidence, and aggregate evidence/governance docs
+- retained historical `bc9f5f63fcf4f030177ceae321342d92b79ab613` / tree `78f4c95c28fca5233a25e57ec8179e969120779c` results as historical only
+- incorporated approved lower-slice corrections, including StartView initialization, runtime cleanup/deadline ownership, containerd workload-identity adoption, protocol declaration checks, local E2E ownership, offline launcher bounds, and guarded-live closed resource/action validation, bounded ownership reconciliation, aggregate cleanup, and semantic evidence validation
+- added contributor, navigation, handoff, acceptance, harness-catalog, and documentation-layout ownership for the complete stack
 - the POC Terraform module now derives its default ECR repository from the required run token
 - the full runbook and bounded Section 5 cycle generate or validate one token, export it to Terraform and evidence helpers, and derive the ECR repository consistently
 - GPU Terraform/S3 acquisition and cleanup, SSM readiness polling, and standalone containerd build/run/probe paths now have explicit deadlines
 - GPU and benchmark artifact cleanup requires both an account-scoped no-overwrite lease and exact account/token/claim markers, including reconciliation of committed create/write timeouts
-- POC teardown independently validates the supplied token and an allowlisted topology in both the Hivemind and EKS states before destroying either state; the EKS resources now persist that token in state and tags
+- POC teardown independently validates the supplied token and exact owned relationships in both the Hivemind and EKS states before destroying either state; the EKS resources persist that token in state and tags
 - local benchmark replicas commit complete process-group identities atomically and clean each proven group independently under one aggregate bounded TERM/KILL deadline
 - ECR cold-pull evidence is staged and published atomically only after all checks pass
 
-Why it matters:
-- default POC invocations no longer fail their own ownership precondition or risk sharing the old global repository name
-- hung cloud CLIs and local privileged runners cannot wait indefinitely, and failed evidence collection leaves no misleading partial directory
+Evidence state:
+- fresh full acceptance of the rewritten top is pending the final non-live matrix; no historical pass is promoted to this tip
+- deterministic fixtures and lower-slice focused gates are recorded in reconstruction artifacts, but aggregate passed/failed claims require the final exact-tip run
+- containerd, Docker privileged mode, GPU/CDI, Nydus, JuiceFS, Doppler, private pulls, AWS/ECR/EKS/S3/SSM/systemd, Terraform provider operations, and every live/cost/destructive path were not run
+- current live infrastructure is unknown because no fresh authorized inventory ran
 
-Acceptance progress: unchanged (`6 / 8`); these are offline operational-safety corrections, not new live evidence.
+Next actions:
+1. run the final bounded non-live matrix against the exact rewritten top
+2. record exact command, commit/tree, exits, durations, explicit skips, credential scan, and residue externally
+3. publish or restack only under separate push/GitHub authorization and per-ref leases
 
-Next steps:
-1. run a fresh guarded live POC cycle when cloud execution is explicitly approved
-2. collect cold-cache ECR evidence using the run-token-scoped repository
-3. keep the benchmark verdict provisional until the clean EKS rerun
+### 2026-07-25 — Fresh complete accepted local gate
 
-Live infra status: unchanged from the prior recorded state (`up`); no cloud, provider, containerd, or privileged operations ran for this change.
+Evidence:
+- tested code commit `bc9f5f63fcf4f030177ceae321342d92b79ab613`, exact tree `78f4c95c28fca5233a25e57ec8179e969120779c`; run window `2026-07-25T01:06:39Z` through `01:14:01Z`
+- `25 / 25` bounded gates passed, `0` failed; gate durations summed to `433s`, complete wall time `442s`
+- Zig Debug (`39s`), ReleaseFast (`7s`), and 29 regression replays passed; mutated four-thread core seeds `0..9999` tested `10,000`, found `0` failures, and completed in `164.9s`
+- worker format/all-targets passed (`176` library, `3` fuzz utility, `7` main, `5` integration; containerd-feature binary `0`); 27 worker regression replays passed; mutated four-thread worker seeds `0..999` tested `1,000`, found `0` failures, and completed in `6.6s`
+- `./tests/run-all.sh --skip-containerd` passed all `26` invoked phases in `139s`, including local cleanup, three-replica failover, retained-storage recovery, and real-process `/run`; containerd component/full-stack remained explicitly skipped
+- Go API and bench formatting/race/build, active Bash syntax, default ShellCheck, protocol-v6 wire consumers under `PYTHONOPTIMIZE=2`, docs/layout, Terraform recursive formatting, and backend-disabled readonly init/static validation for all four roots passed
+- bounded value-redacting credential scanner self-tests passed `12` safe, `6` unsafe, and `2` redacted-output fixtures; the changed-line scan found no reportable credential
+- final residue inventory found zero branch-owned processes, branch-attributable listener deltas, port locks, and lock owners; unrelated pre-existing host listeners remained outside run ownership, and the residue gate terminated no processes
+
+Explicit skips and limits:
+- no containerd/full-stack, Docker, privileged runtime or host namespace/cgroup operation, GPU/CDI, Nydus, JuiceFS, Doppler, private registry, or real image pull executed
+- no AWS, ECR, EKS, S3, SSM, systemd remote work, cloud/provider operation, Terraform plan/apply/destroy, cost-bearing action, or destructive action executed
+- `tests/live/run.sh` and `scripts/poc-runbook.sh` did not run; no live authorization was supplied or requested
+- prepared E1 containerd/GPU/JuiceFS/private-registry/live harnesses remain preparation, not execution evidence
+- live-resource state remains unknown pending fresh authorized inventory; existing product/runtime limitations and POC v2 blockers are unchanged
+
+### 2026-07-25 — Post-fix review closure and final deterministic sweeps
+
+What changed:
+- moved private-registry authentication out of `ctr` argv into a protected temporary containerd hosts configuration, removed it after each pull, and redacted username, password, and encoded authorization material from command errors
+- propagated one absolute shutdown deadline through process/containerd stop, status verification, runtime removal, and JuiceFS cleanup; deterministic pod ordering now decides which pods consume the shared budget
+- corrected the evidence-parent scope statement instead of promoting the older aggregate across worker behavior changes
+
+Evidence and limits:
+- RED: focused Rust tests failed to compile because protected hosts configuration, deadline-aware runtime methods, and the bounded shutdown entry point did not exist
+- GREEN tested source commit: `3b45927e35a059c51413fd4827b1f9951b2f3cb5`
+- `cd v2/worker && cargo fmt --check && cargo test --all-targets` exited `0`: `176` library, `3` fuzz utility, `7` main, and `5` integration tests passed
+- `cd v2/core && zig build fuzz -- sequential --seeds 10000 --threads 0 --mutate` exited `0` after seeds `0..9999`, with `10,000` tested and `0` failures
+- `cd v2/worker && cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` exited `0` after seeds `0..999`, with `1,000` tested and `0` failures
+- `git diff --name-only 9ca2a9c39229be3bfa362836401b2667cb7bf2af..3b45927e35a059c51413fd4827b1f9951b2f3cb5` lists four docs and five worker files, so the earlier aggregate attests only its named parent
+- privileged containerd, actual private-registry authentication, JuiceFS mounts, GPU/CDI, Nydus, Doppler, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted; live resource state was not inventoried and remains unknown
+
+### 2026-07-25 — Final review safety remediation
+
+What changed:
+- froze all simulated worker-to-replica delivery while a replica is paused and made convergence validate every active entry, checksum, and parent link
+- added explicit worker simulation session epochs and FIFO delivery under variable delay, with registration required before later same-session traffic
+- adopted one verified live containerd task before stale-family cleanup and added stable task PID continuity evidence to the privileged test
+- rejected process/containerd GPU workloads until concrete physical device reservation exists, bounded aggregate shutdown grace, polled containerd for early exit, and separated start concurrency from mixed lifecycle chunks
+- bound the live runbook to the guarded parent/nonce, expanded cleanup categories, and hashed reviewed-plan, apply/destroy, Terraform-output, and bounded runbook artifact evidence
+
+Evidence and limits:
+- RED: Zig Debug initially failed the paused-worker and non-tip convergence regressions; the variable-delay worker FIFO regression failed before queue ordering changed; live/evidence fixtures failed before the guard and manifest contracts were expanded
+- GREEN tested commit: `9ca2a9c39229be3bfa362836401b2667cb7bf2af`; `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `140s` with `26` invoked phases passed
+- focused Zig Debug, Rust all-targets (`174 + 3 + 7 + 5`), live guardrail, evidence-manifest, and shell syntax checks passed
+- containerd feature tests, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider operations, AWS, EKS, and all live/cloud boundaries remain unexecuted; live resource state was not inventoried and is unknown
+
+### 2026-07-24 — Lane E1 review remediation
+
+What changed:
+- made every subordinate aggregate strict flag imply required full-stack containerd mode; malformed flags and unavailable runners now fail before aggregate phases
+- bound GPU proof to the exact deployment task, removed ECR credentials from `ctr` argv via a temporary mode-0600 hosts file, added the disposable privileged-Docker probe, and bounded full-stack containerd inventory/daemon cleanup
+- made production live hooks canonical-only and private helpers guarded, moved executor descendants into a killable process group, bounded timeout configuration, required quota confirmation plus a regional quota/offering preflight, and bound workspace freshness to the reviewed plan
+- made live acceptance require all capabilities and no operator/drill/preload skips; the wrapper now refuses before ownership because required JuiceFS AppSpec semantics remain absent
+- removed raw ownership data from publishable output/path defaults, rejected oversized evidence, scanned for the raw token, ran redaction before recording success, expanded manifest metadata, and added network/workspace post-cleanup checks
+
+Evidence and limits:
+- RED fixtures reproduced aggregate strict-flag fallthrough, unrelated-task GPU acceptance, production hook substitution/direct-helper access, prospective redaction status, and oversized evidence omission
+- focused deterministic fixtures pass after remediation; no Docker/containerd, GPU/CDI, Nydus, JuiceFS, Doppler, ECR, AWS, Terraform provider, or other live/cloud boundary was executed
+- historical live state was not inventoried or changed; current guarded live acceptance remains blocked before ownership on the missing required JuiceFS AppSpec/API surface
+
+### 2026-07-24 — Lane E1 strict containerd/live harness preparation
+
+What changed:
+- added `--require-containerd` and literal strict capability semantics; optional absence records a skip, while required containerd/GPU/Nydus/JuiceFS absence or incomplete evidence is nonzero
+- prepared a privileged full-stack containerd variant with three real Zig replicas, Go API, Rust worker/containerd, requests, worker restart/adoption, and exact task/container inventory cleanup
+- replaced host-only GPU acceptance with exact CDI-selected task evidence and successful in-container `nvidia-smi`; added exact owned-image ECR cold-pull/auth/digest evidence mode
+- strengthened live leader-restart drills to require normal rejoin, equal committed watermark/state digest, and exact queue/in-flight zero on every replica
+- added a guarded reviewed-plan live wrapper with account/region allowlists, unique run ownership, default teardown, pre/post inventory, bounded manifest generation, and redaction scan; direct runbook use now fails closed
+
+Evidence and limits:
+- RED: the new strict capability fixture initially failed all 14 unavailable/success/conflict assertions because the helper and `--require-containerd` did not exist; GPU, manifest, ECR, and live-guard fixtures likewise failed before their entry points existed
+- GREEN: deterministic strict-capability, GPU CDI/`nvidia-smi`, ECR cold-pull, evidence-manifest, and live-guard fixtures pass without provider, GPU, containerd, registry, or cloud access
+- no privileged containerd image, GPU/CDI, Nydus, JuiceFS, Doppler, ECR, S3/SSM/systemd, Terraform provider, AWS, EKS, or other live resource was executed; all such harnesses are prepared only
+- `REQUIRE_JUICEFS=1` fails before apply because required AppSpec/API mount semantics remain a product blocker; private ECR success remains unclaimed until credentials and the exact cold pull execute
+- existing journal, snapshot, rolling-upgrade, authentication, AppSpec/readiness/logging/isolation, and production-readiness limits are unchanged; historical live state was not inventoried or changed
+
+### 2026-07-24 — D1 review remediation and current-head evidence
+
+What changed:
+- replaced the synthetic relay status 9 with a frame forwarded to the exact restarted old leader after bounded acquisition of that replica as a normal follower; the API reprobe now requires one aggregate dispatch delta
+- made abandonment require exact enqueue and dispatch counter deltas before zero gauges, added a lower bound to the trickle deadline, and changed failover to wait for readiness and issue the post-failover workload once without ambiguous retries
+- removed default process-runtime execution counting and response-schema changes; explicit test controls retain only one bounded last-payload counter slot
+- made runtime ownership explicit across control-plane sessions and added deterministic connection-loss ownership coverage; the committed-state digest test now requires the exact rendered value after a state mutation
+- cleanup now inventories every non-zombie PGID member after leader exit, requires `ss`, and has a stopped-group regression that proves graceful TERM delivery and descendant removal
+- aggregate phases now have 900-second deadlines and published quick commands include outer TERM/KILL bounds
+
+Evidence and limits:
+- RED: `cargo test --lib runtime::process::tests::default_process_response_omits_test_execution_count` failed because default responses exposed `execution_count`; the first post-fix aggregate at `2527c4e9667dcf110cda094d24cded2a5f2e39dd` exited `1` in `131s` after the new exact dispatch assertion exposed leader rotation
+- GREEN tested commit: `dc0dc633aa8bbdd94d86713f4b0669b648b0d715`
+- `cd v2/tests && timeout --foreground --kill-after=15s 3600s ./run-all.sh --skip-containerd` exited `0` in `149s`: `21` invoked phases passed and containerd was explicitly skipped
+- focused run contract passed three consecutive times in `37s` total after the bounded restarted-follower acquisition fix; focused failover passed in `56s`, retained-storage recovery in `23s`, and cleanup in under one second
+- no containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, Terraform provider, AWS, live, or cloud boundary ran; historical live state was not inventoried or changed
 
 ### 2026-07-24 — D1 reusable local failover, recovery, and `/run` contracts
 
@@ -79,13 +214,20 @@ Why it matters:
 - local evidence now crosses real processes, TCP sockets, retained journal directories, process runtime, and OS deadlines instead of treating startup text or API-only failover as recovery evidence
 - the leader is actually killed, followers elect, and the old replica restarts from its same journal; a real surviving follower returns status 9, then a bounded frame relay delivers that proven pre-enqueue outcome to the Go gateway and exercises its one safe reprobe without duplicate workload execution
 
+Evidence and limits:
+- RED: `timeout --foreground 10 ./local_cluster_cleanup_test.sh` exited `124` because the interrupted helper waited without a bound for a SIGSTOP'ed owned child
+- GREEN focused contracts: cleanup passed under `15s`; run contract passed in `9s`; failover passed in `20s`; retained-storage recovery passed in `14s`; three later run-contract stability repetitions passed in `49s`, `21s`, and `14s`; all commands had outer timeouts
+- Zig Debug/ReleaseFast, Rust formatting/all-targets (`167 + 3 + 6 + 5`), and Go API/bench race/build gates pass; `tests/run-all.sh --skip-containerd` passed `21` invoked phases with `0` failures in `151s`
+- containerd was explicitly skipped; no containerd, GPU/CDI, Nydus, JuiceFS, Doppler, private ECR, S3/SSM/systemd, AWS, or other live/cloud boundary ran
+- the journal remains experimental single-copy storage without torn-write or power-loss proof; POC acceptance remains `6 / 8`, and historical live infrastructure state was not revalidated or changed
+
 ### 2026-07-23 — Lane C2 canonical shared wire corpus
 
 What changed:
 - added one bounded canonical `tests/wire/contract-v6.json` corpus with exact little-endian/frame/AAD semantics and fixture-only deterministic PSK/nonce material
 - covered worker register, heartbeat, pod status, StartPod, worker/client run request and response, leader probe request and response, representative VRR peer envelopes, worker-origin statuses 0-8, core-origin statuses 0-9, plaintext, and deterministic encrypted worker/client/peer examples
 - Zig, Rust, Go API, and Go bench load this same repository-relative file, decode applicable vectors through production codecs, validate message semantics, and re-encode byte-identically where applicable; Zig compares the fixture StartPod bytes with the production serializer
-- `tests/wire-contract-test.sh` fails closed on schema/bound/encoding drift, exact origins, legal message/channel/direction/tag/consumer tuples, complete per-origin status-vector sets, and missing consumer coverage, proves all four protocol constants are exactly 6, and runs every consumer
+- `tests/wire-contract-test.sh` fails closed on schema/bound/encoding drift, exact origins, legal message/channel/direction/tag/consumer tuples, complete per-origin status-vector sets, and missing consumer coverage, proves all four protocol constants are exactly 6, and runs every consumer; the aggregate runner invokes this gate
 
 Why it matters:
 - replaces language-local self-generated-only compatibility claims with one reviewable normative byte corpus
@@ -94,6 +236,7 @@ Why it matters:
 Evidence and limits:
 - RED: the new shell contract failed with `FileNotFoundError` because `tests/wire/contract-v6.json` did not exist
 - GREEN: `tests/wire-contract-test.sh`; Zig Debug and ReleaseFast; Rust formatting and all targets; Go API/bench formatting, race tests, and builds; shell syntax/ShellCheck; and docs/layout gates pass on the C2 commit
+- `cd v2 && ./tests/run-all.sh --skip-containerd` passed `19` invoked phases and local smoke `16 passed, 0 failed`; it explicitly skipped containerd, so no containerd, live AWS, GPU/CDI, or cloud boundary is implied
 - upgrades remain stop-the-world: stop every replica, worker, API gateway, and bench client, replace all components, then restart; mixed-version rolling operation is unsupported
 - version compatibility is not authentication; TLS/mTLS remains required for authenticated peer identity
 
@@ -116,6 +259,544 @@ Evidence and limits:
 - version validation is not authentication; peer identity remains unauthenticated without TLS/mTLS, and no shared cross-language byte corpus exists until C2
 - no live, cloud, containerd, GPU/CDI, or external TCP environment ran
 
+### 2026-07-23 — Lane B final safety remediation
+
+What changed:
+- healed runner convergence and registration retries now ignore pre-session-loss recorder history and require a registration observed in the current liveness epoch
+- spontaneous crashes and failed transient-start cleanup retain runtime ownership and accounting until runtime removal and mount cleanup are verified
+- containerd cleanup verifies the exact task, container, and owned shim path are absent; stale-family inventory failure is fail-closed
+- stop grace is capped at 30 seconds; process runtime now uses TERM/grace/KILL parity, and shutdown exits nonzero after 30 unsuccessful reconciliation attempts without publishing cleanup
+- containerd network-namespace work runs in a disposable thread so restoration failure cannot contaminate subsequent caller-thread operations
+
+Why it matters:
+- prevents stale phase-1 registration from satisfying phase-2 liveness and prevents replacement capacity from being admitted while runtime or mount ownership remains unverified
+- bounds scheduler-controlled stop and process-shutdown time while preserving fail-closed accounting
+
+Evidence and limits:
+- RED: the first regression build failed because session-epoch and grace-bound contracts were absent; the bounded-shutdown regression separately failed to compile before its production helper existed
+- GREEN: `cargo test --all-targets` passed `165` library, `3` fuzz utility, `5` main, and `5` integration tests; `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0`
+- privileged containerd, actual JuiceFS mounts, GPU/CDI, real TCP reconnect timing, and cloud boundaries were not run; containerd and mount verification remain statically and locally tested rather than privileged/live evidence
+- POC v2 acceptance remains blocked; historical live infrastructure status was not revalidated
+
+### 2026-07-23 — Lane B4 review remediation
+
+What changed:
+- `/run` simulation now keeps a matching nonzero H100 allocation across every request and refunds it only after the deliberate runtime crash
+- simulated runtime responses exercise the exact body boundary and boundary-plus-one overflow; outbound simulation canonicalizes the queued object to the encoded status-4 empty-body wire result
+- ordinary requests and healed delivery require exactly one matching response, while crash-tick coverage distinguishes forwarding failure before reconciliation from no-running-pod afterward
+- workers select the lowest pod ID when multiple running pods match one deployment
+- timeout wording now states the tested contract precisely: scripted error-to-status mapping, not virtual deadline progression
+
+Why it matters:
+- closes false-positive coverage where GPU accounting stayed zero and the recorder could observe a different response than the wire encoder
+- removes randomized `HashMap` routing from per-pod outcomes and records the crash ordering explicitly
+
+Evidence and limits:
+- RED: `outbound_run_response_matches_wire_overflow_semantics` observed status `0` instead of `4`; `run_request_selects_lowest_running_pod_id` selected pod `8` instead of pod `1`
+- GREEN: `cargo test --all-targets` passed `159` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `17.0s`
+- no real TCP, process forwarding, containerd, GPU/CDI, or cloud boundary ran; duplicate delivery/idempotency and virtual run-deadline simulation remain outside B4
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status was not revalidated
+
+### 2026-07-23 — Lane B4 GPU admission and deterministic `/run` outcomes
+
+What changed:
+- worker admission rejects every nonzero GPU request whose requested type differs from the registered worker GPU type before reserving GPU, CPU, or memory
+- the simulated runtime provides bounded per-pod `/run` outcome scripts and an explicit deterministic crash operation
+- named worker scenarios cover success, response overflow, forwarding failure, timeout, crash/no-running-pod, and response delivery after a B1 outbound partition heals
+- the scenarios assert exact request IDs, only existing statuses `0`, `4`, `6`, and `7`, the shared response-body bound, and unchanged resource accounting around every request
+
+Why it matters:
+- prevents a scheduler or protocol mismatch from placing a GPU workload onto the wrong accelerator type even when the worker has enough GPU count
+- turns the worker `/run` status and failure contract into replayable deterministic evidence without bypassing the bidirectional simulated network
+
+Evidence and limits:
+- RED: `cargo test start_pod_rejects_nonzero_gpu_request_with_mismatched_type -- --nocapture` failed because a mismatched nonzero GPU request was inserted and allocated
+- GREEN: focused GPU-admission and `/run` scenarios passed; `cargo test --all-targets` passed `157` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `17.2s`
+- no real TCP, process forwarding, containerd, GPU/CDI, or cloud boundary ran; GPU hardware identity and runtime timeout behavior still require their respective real-boundary gates
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status was not revalidated
+
+### 2026-07-23 — Lane B1 liveness and session-epoch review remediation
+
+What changed:
+- worker-runner convergence now requires a control-plane-observed registration from every worker and a terminal pod status for every generated start command; unresolved registration and start commands retry through the configured network during the healed liveness phase
+- permanent 100% message loss now returns `LivenessFailure` instead of passing with no worker/control-plane traffic
+- delayed partitions no longer imply a connection reset; explicit session loss discards both old-session queues, calls `Worker::on_connection_lost`, and proves re-registration arrives before exact new-session heartbeat, pod-status, and run-response traffic
+- ratio replay is one-shot per accepted message, and registration, heartbeat, pod status, run response, replay, and session-loss tests assert exact identities, ordering, counts, and no extra delivery
+- per-worker simulated I/O inbound and outbound staging is fail-loud bounded at 256 messages
+
+Why it matters:
+- prevents worker fuzz runs from reporting convergence when all control-plane commands disappeared
+- prevents stale old-session frames from appearing after simulated reconnect, while preserving delayed partition coverage as a distinct network behavior
+
+Evidence and limits:
+- RED: the 100% drop case returned `Passed`; 100% replay continued indefinitely; outbound staging accepted a 257th message; and a delayed partition marked the worker disconnected
+- GREEN: focused simulation passed `35 / 35`; `cargo test --all-targets` passed `139` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `16.4s`
+- no real TCP, process, containerd, GPU/CDI, or cloud boundary ran; message-level session invalidation does not model partial frames or kernel socket state
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
+### 2026-07-23 — Lane B1 bidirectional worker simulation networking
+
+What changed:
+- worker registration, heartbeat, pod status, and run responses now enter the bounded worker-to-control-plane network queue and reach the recorder only through `pop_outbound` at the start of a later deterministic tick
+- partitions block queued delivery in both directions until healing; configured ratio drop, replay, and path capacity now apply to both directions
+- accepted worker messages and encoded payload bytes are counted; network queues remain capped at 256 messages per worker and control-plane schedule/recorder growth is fail-loud bounded
+- superseded by the review remediation above: delayed partition and explicit session loss are now separate, and only session loss calls `Worker::on_connection_lost`
+- delayed stop commands exposed valid ImagePulling/Creating-to-Stopped observations, which the simulation transition checker now accepts
+
+Why it matters:
+- removes the direct worker-output shortcut that previously made worker-side partition, delay, drop, replay, and capacity claims invalid
+- named deterministic seeds `0xB101`, `0xB102`, `0xB103`, and `0xB104` prove registration, heartbeat, pod status, and run response do not reach the control-plane recorder during a partition and arrive only after healing
+
+Evidence and limits:
+- RED: `cargo test outbound_partition_before_ -- --nocapture` failed all four named cases because the recorder received each worker message immediately
+- GREEN: `cargo test --lib sim::` passed `32 / 32`; `cargo test --all-targets` passed `135` library, `3` fuzz utility, `4` main, and `5` integration tests; `cargo fmt --check` passed
+- `cargo run --release --bin fuzz -- sequential --seeds 1000 --threads 0 --mutate` passed exact seeds `0..999` with `failures_found=0` in `19.6s`; mutation includes bounded drop, replay, and path-capacity configurations
+- no containerd, GPU/CDI, real TCP, real process, or live/cloud boundary ran; the simulator retains partitioned messages in bounded queues until healing and does not reproduce every real TCP/session loss mode
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
+### 2026-07-23 — Lane A4 deterministic ConnectionManager transitions
+
+What changed:
+- added a seeded, bounded AF_UNIX socketpair harness using the simulated replica clock and ConnectionManager logical poll clock
+- the fixed transition sequence covers a fragmented leader probe, client and three worker connections, a fragmented run request, dispatch, client abandonment, a foreign worker response, tombstone expiry, an explicit remaining-worker disconnect, leader change, and worker/client slot reconnect
+- every transition calls `RequestQueue.assertAccountingInvariants()` and asserts exact queue depth, occupied correlations, client-active correlations, busy workers, live client/worker connections, and enqueue/dispatch/resolve counters
+- exact Prometheus assertions at queued, dispatched, abandoned/client-disconnected, and final states prove live agent/client/peer gauges plus queue, in-flight, and lifetime counters; connection gauges count connected sockets rather than allocated-slot high-water marks
+
+Why it matters:
+- exercises the leader-local `/run` correlation and abandonment lifecycle through real stream framing instead of only RequestQueue calls
+- proves a foreign response cannot consume another worker's tombstone and that expiry releases ownership before slot reuse
+
+Evidence and limits:
+- focused deterministic seed `0xA4C011EC7100` passes as part of `330 / 330` core tests in Debug and ReleaseFast
+- partial inbound framing is covered before the probe header completes, immediately before the run frame completes, and immediately before a foreign worker response completes
+- socketpairs exercise kernel stream buffering, not real TCP connect/listen timing; packet loss, encrypted-frame fragmentation, forced short writes, and process scheduling remain outside this harness
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`; live infrastructure status is unchanged
+
+### 2026-07-23 — Lane A3 durability-cut review remediation
+
+What changed:
+- normal group-commit barriers now retain explicit pending Prepare and Commit causes, so a combined follower Prepare+Commit barrier can consume either selected cut and unrelated idle metadata flushes cannot consume Commit cuts
+- traced VOPR runs can schedule deterministic message or barrier cuts and emit exactly one identified JSONL event when each cut is consumed, including cuts first consumed during the healed liveness phase
+- the four-boundary cut tables now assert relevant Prepare, PrepareOk, SendStatus, StartView, and client publication counters plus complete recovered metadata and entry identity
+- the five-replica repair scenario enforces the candidate deadline in simulated milliseconds and crash-recovers the complete repaired chain; random sync-fault coverage stages both slot and metadata state before proving whole-operation failure and retry
+
+Why it matters:
+- closes review gaps where Commit coverage could be skipped by coalescing, candidate liveness used mismatched units, trace output reported zero-ID snapshots, and recovery assertions did not prove repaired ancestors were durable
+
+Progress:
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- faults still model whole-operation failure and process cuts, not torn sectors, filesystem reordering, or power-loss corruption
+- snapshots and operation beyond the 1024-entry lifetime cap remain unsupported
+
+### 2026-07-17 — Deterministic VOPR message and durability cuts
+
+What changed:
+- simulated networking can arm one bounded drop-next selection by cut ID, sender, receiver, and VRR tag; counters and JSONL traces expose the consumed cut
+- VOPR mutation includes random whole-sync failures in addition to read/write faults
+- one-shot barrier cut IDs cover Prepare, Commit, and leader/follower StartView before slot stage, metadata stage, sync, and publication; recovery tests distinguish old durable state from synced-but-unpublished state
+- a five-replica gapped selection test drives real RequestPrepare/SendPrepare traffic through a dropped false hint, rejected wrong identity, missing selected-source ancestor, and unhinted exact holder before durable StartView publication
+
+Why it matters:
+- deterministic cut IDs make barrier and repair failures reproducible without weakening durability or convergence checks
+- bounded peer fallback is now exercised against message loss and misleading retention metadata rather than direct handler injection
+
+Progress:
+- focused drop-next, sync-fault, sixteen barrier-cut, and five-replica repair tests pass
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- faults model whole operation failures and process cuts, not torn sectors or power-loss corruption
+- snapshot/compaction remains outside the 1024-op retained-log contract
+
+### 2026-07-17 — Strict VOPR convergence and true process pause
+
+What changed:
+- VOPR convergence now requires equal active op/tip/log high, contiguous retained journal occupancy, tip checksum, storage health, and bounded deterministic committed state-machine digest in addition to normal status, view, and commit watermark
+- the committed digest walks only bounded state-machine capacities, includes future deterministic PRNG state, and excludes deployment-local request timestamps
+- simulated pause is distinct from partition and crash: paused replicas preserve memory/disk but perform no inbound or outbound delivery, replica tick, durability barrier, or disk progress until resumed
+- JSONL state traces expose paused state, and pause/resume events remain explicit
+
+Why it matters:
+- the liveness gate can no longer declare convergence when active suffixes, state-machine output, retained occupancy, or storage state diverge
+- pause faults now model a stopped process rather than only a disconnected process that continues timers and disk publication
+
+Progress:
+- focused strict-convergence and pending Prepare/StartView pause tests pass
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used deterministic local simulation only
+
+Residual risks:
+- committed digest intentionally excludes local timestamps and transient transport/timer state
+- torn-write and power-loss durability remain outside the simulation contract
+
+### 2026-07-17 — Ownership-scoped bench artifacts and retry cleanup
+
+What changed:
+- bench deploy artifacts now use an internally generated AWS-account-scoped 128-bit random run identity and immutable SHA-256 object keys; callers cannot supply a reusable production identity
+- the exit trap is installed before preparation and remains inert until an atomic conditional marker succeeds or an ambiguous write reconciles to the exact token and claim; cleanup revalidates that claim, so later failures are cleaned without letting us-east-1 already-owned success or same-token races delete a prior bucket
+- artifact AWS calls use GNU `timeout` to TERM and then KILL the complete process group on a bounded deadline; all exits remove only the owned run prefix and bucket unless `HIVEMIND_KEEP_ARTIFACTS=1`
+- creation/upload failures are fatal and remote nodes receive the exact immutable object URIs
+- `/run` retry workspaces are cleaned on every post-creation return; requested response artifact copy/read failures cannot report success
+- active status now records protocol version 5 and one fresh local verification result
+
+Why it matters:
+- concurrent deploys cannot share second-resolution buckets or overwrite shared keys, and failed deploys no longer leak owned transfer artifacts
+- evidence scripts cannot leave retry workspaces or claim a preserved response that was never written
+
+Progress:
+- POC acceptance remains `6 / 8`; warm-cache execution remains `16 / 16`
+- live infrastructure status is unchanged; this work used only local stubs and tests
+
+Residual risks:
+- no live AWS deploy was performed
+- containerd-in-Docker was intentionally skipped; provider-dependent Terraform validation may remain unavailable offline
+
+### 2026-07-16 — Durable StartView adoption and bounded catch-up liveness
+
+What changed:
+- higher-view Prepare/Commit/StartView traffic cannot promote a replica directly; StartView adoption remains behind its durability barrier
+- validated StartView chains may supersede durable prepares strictly above the local committed prefix, while committed conflicts remain fail-closed
+- selection-bound RequestPrepare can serve an older target view from the exact retained source/LNV/tip identity; ordinary repair remains current-view only
+- without snapshots, retention floor is fixed at zero and all 1024 lifetime-capped log entries remain available for repair; a three-replica boundary test commits and recovers op 1024, then rejects op 1025 without mutation
+- active candidate fetch uses only its fixed candidate deadline instead of being preempted by the shorter recovered/view-change timeout
+- DVC source selection ranks the entire valid quorum by `(last_normal_view, op_number)` while carrying the independently computed maximum commit watermark as the candidate adoption bound
+- deterministic gate passed Debug and ReleaseFast, all six final-10k safety regressions, all 20 historical safety/liveness seeds, and `1000 / 1000` mutated threaded seeds with zero failures
+
+Why it matters:
+- recovered and concurrently lagging replicas can finish a bounded selected-chain fetch instead of repeatedly advancing the view
+- durable speculative suffixes remain replaceable only through quorum-selected StartView validation and sync
+
+Progress:
+- POC acceptance remains `6 / 8` sections complete
+- warm-cache execution checklist remains `16 / 16`
+- live infra status remains `up`; no live infrastructure was changed for this deterministic fix
+
+Next:
+1. rerun the broader 10k mutated core gate after parent review before refreshing the durable-safety evidence claim
+2. keep snapshot/compaction work separate from the fail-closed 1024-op lifetime contract
+3. continue the clean EKS and private-registry benchmark follow-ups
+
+Blockers / unknowns:
+- snapshots and post-1024 operation remain unsupported
+- torn-write and power-loss durability remain unvalidated
+
+### 2026-07-16 — Phase 2 single-source DVC selection and bound suffix repair
+
+What changed:
+- view change selects exactly one DVC source by highest `(last_normal_view, op_number)` instead of composing per-op candidates; equal-rank sources must agree on tip and every overlapping entry before source-ID tie-break
+- the prospective leader retains a bounded pending selection binding source, source last-normal view, target view, commit bound, and tip identity
+- incomplete eight-entry DVC tails remain in view_change and fetch each missing operation only from the bound source; wrong source/view/tip responses fail closed
+- `startViewCandidateReady` is the sole handoff after the selected parent-checksum chain is complete; protocol version 3 carries repair binding fields
+
+Why it matters:
+- StartView can no longer publish a synthetic log assembled from unrelated DVC sources or enter normal while the selected suffix is incomplete
+
+Current acceptance progress: unchanged. This unpublished phase does not add the phase-3 disk barrier before StartView publication, so no final safety or 10k claim is made.
+
+### 2026-07-16 — Phase 1 durable prepare identity binding
+
+What changed:
+- peer protocol version 2 adds `entry_checksum` to PrepareOk; v1 mixed peers/workers fail closed at frame version validation
+- followers publish PrepareOk only after the exact current journal identity crosses the durability barrier, while leaders count only matching sender/view/op/checksum votes and deduplicate sender identity
+- same-view conflicting Prepare is rejected before state mutation; durable prepared identities resist normal journal replacement/truncation, with replacement isolated to the fully preflighted later StartView install path
+
+Why it matters:
+- delayed votes for one entry cannot be relabeled as quorum evidence for another entry at the same operation
+
+Current acceptance progress: unchanged. This is unpublished phase 1 only; DVC source selection, bounded full-suffix repair, and pending durable StartView publication remain phase 2 blockers. No full-sweep safety claim is made.
+
+### 2026-07-16 — Bench replacement deadline and fixed-wire string boundaries
+
+What changed:
+- bench remote replacement uses one wall-clock deadline across bounded lock acquisition, systemctl state queries, stop/reset, transient start, stabilization, and diagnostics; GNU timeout sends TERM to the command process group then KILLs TERM-ignoring descendants so they cannot retain the deploy lock
+- transient units must remain active with the same nonzero `MainPID` through stabilization before deploy success
+- Go API and client reject `/run` deployment names beyond 64 bytes or containing NUL before frame construction; mutation endpoints reject NUL in every JSON string copied into fixed-width wire fields
+
+Why it matters:
+- prevents blocked remote replacements and false-success transient starts, and prevents HTTP strings from being silently truncated at the core `fixedToSlice` boundary
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps: independent review, then live validation only when explicitly scheduled. Live infra status remains `up` from prior runs and was not touched.
+
+### 2026-07-16 — Static safety findings closed at process and HTTP boundaries
+
+What changed:
+- bench deploy now serializes replacements and manages one transient systemd unit per node; bounded stop and inactive-state verification precede each `systemd-run`, with journal/status diagnostics on failure and no raw PID signaling
+- metrics listener initialization treats both `F_GETFL` and `F_SETFL` failures as fatal and closes the new descriptor
+- JSON mutation endpoints enforce endpoint-specific body limits, exact single-value decoding, wire string/array maxima, and stable 400/413 errors
+- active POC curl callers cross one connect/max-time helper while retaining narrower operation deadlines
+- fixed worker register, heartbeat, and pod-status payloads require exact lengths; malformed frames disconnect the sender and release its request correlations
+
+Why it matters:
+- removes PID-reuse/process replacement risk and prevents unbounded or ambiguous input at network boundaries without changing the POC architecture
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps: independent review, then live validation only when explicitly scheduled. Live infra status remains `up` from prior runs and was not touched.
+
+### 2026-07-16 — Static safety gate follow-up: retries, dedup, statuses, launch PID, and nonblocking sockets
+
+What changed:
+- all active Hivemind `/run` retry loops use one fail-closed helper that retries only valid JSON `unavailable` and `queue_full`; transport, malformed, ambiguous, and all other responses abort
+- the `/run` wire status enum is explicit and identical across Zig, Rust, Go API/bench, HTTP JSON, scripts, tests, and docs; forwarding failure and no-running-pod are distinct
+- stale client request IDs are ignored instead of receiving newer cached results, while exact IDs replay the exact cached result
+- the fixed dedup table now matches the full 1,024-operation retained journal; per-replica memory rises from 4,096 to 65,536 bytes (+61,440 bytes)
+- bench launches use a run-scoped binary path, a per-node `flock`, and verified PID state; a PID is killed only when `/proc/$pid/exe`, the recorded token, and expected run binary all match
+- SSM polling requires `timeout(1)` before any AWS call; socket nonblocking setup reports either `fcntl` failure and closes before connect/accept registration
+
+Why it matters:
+- prevents unsafe workload replay, stale-result mislabeling, dedup loss after 64 clients, reused-PID kills, unbounded AWS calls, and accidental blocking peer connects
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
+### 2026-07-16 — Ambiguous run outcomes, bounded peer handshakes, and StartPod parsing closed
+
+What changed:
+- `/run` status `5` is now the cross-language `outcome_ambiguous` result for any worker write attempt or disconnect that may follow acceptance; status `4` remains response-too-large only
+- the Go gateway emits stable machine-readable `outcome_ambiguous` and pre-send `unavailable` errors; operator workflow retries only `unavailable` and `queue_full`, never ambiguous or generic failures
+- peer TCP connect is nonblocking with bounded connect/identity deadlines; configured targets remain separate from validated identities, silent sockets expire, and validated bindings are never evicted
+- Rust StartPod parsing requires every declared env record, validates the optional registry-auth trailer exactly, and rejects truncation, overflow, and trailing bytes
+
+Why it matters:
+- prevents automated duplicate workload execution, bounds black-hole/silent peer resource use without suppressing liveness retries, and closes fail-open StartPod env/secret parsing
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. retain application-level idempotency keys and authenticated per-peer identity as future protocol work
+2. rerun independent safety review after the deterministic and local failover gates
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
+### 2026-07-16 — `/run` ambiguous outcomes and worker response ownership hardened
+
+What changed:
+- the Go gateway never resends a `/run` request after any write attempt; read, parse, request-ID, and write failures after that boundary return `ErrRunOutcomeAmbiguous`
+- worker responses resolve only when both the opaque correlation ID and sender worker index match one active entry
+- malformed, oversized, foreign, and unknown worker responses disconnect only the sender through centralized worker cleanup, releasing all sender-owned correlations with deterministic client errors
+- deterministic saturation coverage proves malformed-response cleanup, 1024-slot reuse, ownership isolation, unknown-ID isolation, and valid response boundaries
+
+Why it matters:
+- prevents duplicate workload execution after an accepted request loses its response and prevents one worker from resolving or leaking another worker's client correlation
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. rerun independent `/run` safety review
+2. retain application-level idempotency keys as future protocol scope; ambiguous requests are not automatically replayed
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
+### 2026-07-16 — Adversarial safety gate follow-up
+
+What changed:
+- run requests select a connected worker before dequeue; explicit send failure and post-dispatch worker disconnect atomically release all worker-owned correlations and return unavailable without unsafe automatic requeue; the 1024-entry bound and slot reuse remain deterministic
+- peer startup uses one connection direction per configured pair (lower ID outbound, higher ID inbound); established bindings are immutable, and the unauthenticated initial-bind/TLS-auth limitation plus no mixed-version rolling support are explicit
+- Go cluster-state parsing validates exact record sizes and bounded counts before allocation; workload benchmarks reprobe the configured replica list; GPU source archives are per-run and workspace-owned
+- run requests now use gateway-unique worker correlation IDs and restore the original client/request identity on reply; a full 1024-entry table backpressures before dequeue instead of evicting unrelated work
+- reciprocal peer sockets converge deterministically by replica ID and direction (lower ID outbound, higher ID inbound) only after a fully validated frame; invalid Prepare, Commit, and StartView frames leave the healthy binding intact
+- worker response bodies have one 16 KiB-minus-metadata bound across Rust, Zig, and Go; overflow becomes explicit status 4 instead of successful truncation; frame writers reject oversize before allocation/write
+- GPU tests use per-run Terraform workspaces and local metadata directories; a concurrent barrier fixture proves overlapping runs destroy only their own workspaces; S3/Terraform teardown failures are recorded and fail an otherwise successful run without replacing the original test status
+- layout-v2 header, metadata, Command, LogEntry, and checksum inputs now use fixed-size little-endian codecs with static golden bytes
+- active storage docs retain the full-cluster-stop/fresh-data boundary and no rolling migration/incarnation claim
+
+Why it matters:
+- closes cross-client response disclosure/loss, duplicate-peer eviction, concurrent infra destruction, successful response corruption, and ABI/endian-dependent journal risks found by the adversarial gate
+
+Current acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack)
+
+Next steps:
+1. rerun the independent publish/adversarial gates
+2. retain the torn-write, dual-copy, migration, and snapshot work as separate production-hardening scope
+
+Live infra status: unchanged (`up` from prior entries; deterministic/offline verification only)
+
+### 2026-07-16 — Exact /run request-response length contract
+
+What changed:
+- Go API, Zig core/RequestQueue, and Rust worker now require exact declared run payload length with shared `MAX_PAYLOAD = 512`
+- Oversized, short/long declared lengths, trailing bytes, and truncated/extra response bodies are rejected (no clamp)
+- Go run responses require request-id match; gateway 9-byte errors remain valid
+
+Why it matters:
+- closes a fail-open wire contract gap on the POC `/run` path before publish
+
+Current acceptance progress:
+- publish-gate blocker on run-length clamping addressed in this worktree; remaining blockers unchanged
+
+Next steps:
+- re-run readiness/publish gate on updated HEAD
+
+Live infra status: unchanged by this change
+
+### 2026-07-16 — FileDisk journal layout v2 with explicit LogEntry codec
+
+What changed:
+- FileDisk journal format bumped to layout version 2
+- on-disk LogEntry uses an explicit little-endian codec with checked tag-first Command decoding (never native `@sizeOf(LogEntry)` / `asBytes`)
+- actual legacy layout v1 journals are rejected fail-closed as incompatible; no migration or specific error category is promised
+- corrupt Command tags fail during open/decode without materializing invalid unions
+- 1024-slot lifetime cap and complete-write/sync-before-publication semantics unchanged
+
+Why it matters:
+- after the nested Command wire codec change, persisting native tagged-union bytes under version 1 was an unsafe layout mismatch; v2 makes the durable format explicit and fail-closed
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; deterministic journal codec only — no new live durability evidence)
+
+### 2026-07-16 — Fixed nested wire codec and fail-closed bench/deploy gates
+
+What changed:
+- nested `Command`/`Result` deserialize now uses a fixed tag-first wire codec (validate raw tag before union construction) with bound/boolean checks for env/rule/binding counts, probe/killswitch bools, and secret flags
+- `Prepare` semantic preflight (`commit_min <= op <= LOG_SIZE_MAX`, `retention_floor <= commit_min`, `entry.op_number` match, checksum) runs before view/status/log mutation
+- outer message deserialize requires exact payload size; gateway run errors route through `sendFrame`
+- bench rejects truncated command/run successes and non-exact plaintext flags/version; deploy dead-process path exits nonzero; SSM wait uses a wall-clock deadline
+
+Why it matters:
+- closes the re-review release blockers for malformed peer traffic UB, benchmark false-success samples, and deploy reporting healthy clusters when processes are dead
+
+Progress after change:
+- Acceptance sections complete: `6 / 8` (unchanged)
+- Execution checklist complete: `16 / 16` for warm-cache evidence pack (unchanged)
+- Infra status: `up` (unchanged)
+
+Next steps:
+1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
+2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
+3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+
+Blockers / unknowns:
+- crash-consistent torn-write / power-loss durability remains unvalidated (experimental journal)
+
+### 2026-07-16 — Peer-input safety and launcher fail-closed hardening
+
+What changed:
+- checked VRR deserialize (invalid tag / short payload / oversized DVC count) and peer identity/bound validation before vote and journal mutation
+- secret-bearing env files and journal paths fail-closed on permissions; GPU and bench launchers no longer fail-open on test status, broad `pkill`, or caller CWD
+- VOPR liveness retries recovery after clearing transient faults without wiping durable state; checker `committed_by` widened to `u16` for 11-replica topologies
+
+Why it matters:
+- peer identity/bound checks and launcher fail-closed paths reduce forged votes and false-success deploy reports
+- nested Command/Result wire safety was still incomplete at this entry; do not treat panic/UB immunity as landed until the fixed nested codec lands
+
+Progress after change:
+- Acceptance sections complete: `6 / 8` (unchanged)
+- Execution checklist complete: `16 / 16` for warm-cache evidence pack (unchanged)
+- Infra status: `up` (unchanged)
+
+Next steps:
+1. Resolve or avoid EKS GPU-node sandbox failures and rerun the warm-cache EKS matrix.
+2. Fix Hivemind private ECR auth contract so cold-cache private image benchmarks can run.
+3. Decide whether to destroy or retain Hivemind/EKS after the clean EKS rerun.
+
+Blockers / unknowns:
+- nested `Command` union tags still lack a stable wire-byte layout for deserialize-time validation; handlers continue to rely on `LogEntry.valid()` and apply-time checks
+
+### 2026-07-16 — Withdraw unvalidated crash-durability claims
+
+What changed:
+- at this entry, active docs narrowed the validated contract to write/sync success before publication, fail-stop on complete I/O errors, fail-closed 1024-op retention, and the then-current experimental layout-v1 single-copy best-effort restart recovery; the later layout-v2 entry supersedes that format version
+- recorded canonical recovered-prefix (`observeRecovery`) and immutable committed-prefix validation; recorded HM-BLK-04/05 launcher repairs against maintained smoke/failover/bench paths
+- explicit non-claims: no torn-write/power-loss guarantee or simulation; S3 `journal.bin` copy is not an atomic restore artifact; no production crash-durability wording
+- FINDINGS adds crash-consistent versioned storage + torn-write simulation as a production blocker separate from snapshots
+
+Why it matters:
+- keeps POC safety hardenings reviewable without overclaiming production crash durability
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; execution checklist `16 / 16` warm-cache pack; POC v2 still the presentation gate)
+
+Next steps:
+1. option-A crash-consistent journal + torn-write simulation before any production durability claim
+2. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; docs-only — no new live durability evidence)
+
+### 2026-07-16 — Repair active smoke and benchmark launchers
+
+What changed:
+- stale `tests/smoke_test.sh` / `tests/multi_node_smoke_test.sh` are `exec` wrappers to `local-smoke.sh --build` / `local-failover-smoke.sh --build`
+- `bench/compare.sh`, `infra/bench/{deploy.sh,main.tf}`, `infra/poc/hivemind.service`, `infra/gpu-test/run-tests.sh` use current `core/`/`worker/` roots and `--worker-port`
+- bench client speaks flags-byte framing; `HIVEMIND_ONLY=1` runs offline without kind
+- `tests/launcher_contract_test.sh` wired into `tests/run-all.sh`
+
+Why it matters:
+- active ops surfaces exercise current binaries instead of removed `agent/` / `--agent-port` / positional `cluster` paths
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; local launcher/bench verification only — no new live durability evidence)
+
+### 2026-07-16 — Preserve canonical committed prefixes across recovery
+
+What changed:
+- VOPR `StateChecker.observeRecovery` rejects recovered commit regression and divergent recovered canonical prefixes
+- `journalPut` / `onStartView` / `maybeStartView` reject same-op different-checksum replacement of locally committed slots; conflicting committed DVC values stay in view_change
+- deterministic regressions: `checker rejects: recovered commit regression`, `checker rejects: divergent recovered canonical prefix`, `StartView rejects conflicting committed prefix`, `view change rejects conflicting committed DVC values`
+
+Why it matters:
+- recovery and view installation no longer silently mutate or escape the canonical committed prefix under adversarial deterministic tests
+
+Acceptance progress: unchanged (`6 / 8`)
+
+Live infra status: unchanged (`up` from prior entries; deterministic safety only — no new live durability evidence)
+
+### 2026-07-16 — Narrow experimental journal runtime contract
+
+What changed:
+- `--data-dir` is optional again: absent logs explicit volatile POC mode; present logs an experimental single-copy journal warning that torn writes and power loss are not validated
+- disk/simulation comments narrowed to whole write/sync failures and unsynced-write loss only (no torn-write claim)
+- deterministic real-binary `tests/storage_mode_smoke_test.sh` covers both modes and is wired into `tests/run-all.sh`
+- FileDisk remains layout version 1 with fail-closed 1024-op lifetime cap, checksums, sync-before-publication, and I/O fail-stop
+
+Why it matters:
+- avoids overclaiming production torn-write / power-loss durability while keeping the experimental journal path usable for POC
+- makes storage mode operator-visible at startup without requiring live infrastructure to verify
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; POC v2 still the presentation gate)
+
+Next steps:
+1. keep HM-BLK-01 torn-write-safe production durability out of scope until a real design lands
+2. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; this change is contract/docs + local smoke only)
+
+### 2026-07-16 — Write/sync-before-publication VRR storage, fail-closed retained log, stronger VOPR checker
+- Re-review hardenings: per-slot prepare identity after sync, fail-closed truncated journals, launcher `--data-dir`, journal/data-dir modes, sim write faults on metadata/clear.
+
+What changed:
+- PrepareOk, client replies, and worker effects wait for a successful journal/metadata write/sync barrier (synchronous group commit on the core loop)
+- complete write/sync I/O failures fail-stop the replica (`storage_failed`) and exit nonzero in production
+- recovery validates the metadata-declared committed prefix (checksum chain); corrupt/missing slots refuse to continue as a fresh replica
+- retained log is fail-closed at `LOG_SIZE_MAX` (1024) with Zig `log_full`, API `ErrCodeLogFull`, and HTTP 507; no circular overwrite without snapshots
+- VOPR checker compares full entry checksums, treats commit regression as a violation, and fails loudly on history capacity exhaustion
+- deterministic filters: `durable storage`, `journal retention`, `group commit`, `checker rejects`
+- explicit non-claims at this entry: no torn-write/power-loss model; S3 journal copy is not an atomic restore; restart recovery was limited to the then-current experimental layout-v1 single-copy journal (later superseded by layout v2)
+
+Why it matters:
+- closes previously acknowledged in-memory prepares/replies and wrap-around committed-overwrite classes under the validated write/sync and retention contract
+- makes the finite-log blocker explicit to operators via metrics and HTTP 507 instead of silent overwrite
+
+Acceptance progress: unchanged (`6 / 8` POC v1 sections; POC v2 still the presentation gate)
+
+Next steps:
+1. snapshot + snapshot-transfer PR to remove the 1024-op lifetime cap
+2. keep codec/padding-free journal serialization as a separate coordinated PR
+3. continue POC v2 AppSpec / workload parity work
+
+Live infra status: unchanged (`up` from prior entries; this change is deterministic storage-safety only — no new live failure evidence)
 
 ### 2026-08-06 — Reconcile worker shutdown without a control-plane session
 

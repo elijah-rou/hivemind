@@ -1,17 +1,27 @@
-# Hivemind
+# Hivemind v2
 
-Deterministic workload orchestration for serverless AI/ML inference.
+Hivemind v2 is the active deterministic workload-orchestration development line. POC v1 evidence is historical and does not establish v2 parity or readiness.
 
-Current project phase: POC v1 proved functional/resilience basics and a warm-cache nginx control-plane benchmark; POC v2 is the team-presentation gate for current-system parity plus Hivemind-native serving semantics.
+## Start here
 
-## Active Components
+1. [Contributor rules](AGENTS.md)
+2. [Testing and evidence semantics](docs/TESTING.md)
+3. [Handoff contract](docs/HANDOFF.md)
+4. [Executable harness catalog](tests/README.md)
+5. [POC v2 acceptance gate](docs/POC_V2_ACCEPTANCE.md)
+6. [Engineering principles and test boundaries](docs/ENGINEERING.md)
+7. [Control-plane contract](docs/design/CONTROL_PLANE_CONTRACT.md)
 
-- `core/` — Zig control plane: VRR consensus, scheduler, gossip, persistence, VOPR simulation
-- `worker/` — Rust node agent: containerd runtime, GPU allocation, secrets, volumes, runtime simulation
-- `api/` — Go REST/dashboard gateway over the replica binary protocol
-- `tests/` — local smoke/build checks
-- `bench/` — benchmark tooling
-- `infra/` — frozen/local-use deployment glue; do not touch cloud unless explicitly reopened
+The [wire fixture contract](tests/wire/README.md) is the current bounded normative protocol-v6 corpus consumed by Zig, Rust, Go API, and Go bench. The [live safety contract](tests/live/README.md) documents the prepared, fail-closed guarded entry point. Wire fixtures are deterministic compatibility evidence; the live path remains unexecuted and blocked before ownership on missing strict capabilities.
+
+## Components
+
+- `core/`: Zig control plane, VRR consensus, scheduler, persistence, gossip, and VOPR simulation
+- `worker/`: Rust node agent, runtimes, GPU/resource accounting, secrets, volumes, and worker simulation
+- `api/`: Go REST/dashboard gateway
+- `bench/`: Go benchmark tooling
+- `tests/`: deterministic fixtures and local/runtime harnesses
+- `infra/`: deployment and benchmark tooling; live use requires separate authorization
 
 ## Build
 
@@ -21,26 +31,19 @@ cd ../worker && cargo build
 cd ../api && go build ./...
 ```
 
-## Test
+## Current versus historical material
 
-```bash
-cd core && zig test src/unit_tests.zig
-cd core && zig test src/unit_tests.zig -OReleaseFast
-cd core && zig build test
-cd worker && cargo test --quiet
-cd api && go test ./...
-```
+Active status and product guidance:
 
-## Source Of Truth
+- [Current implementation status](docs/STATUS.md)
+- [POC v2 acceptance](docs/POC_V2_ACCEPTANCE.md)
+- [Findings and production gaps](docs/FINDINGS_AND_ISSUES.md)
+- [Hivemind-native platform design](docs/design/HIVEMIND_NATIVE_PLATFORM.md)
 
-Read these first:
+Historical records, not current-head evidence:
 
-1. `docs/STATUS.md` — current implementation state
-2. `docs/POC_V2_ACCEPTANCE.md` — current team-presentation/replacement gate
-3. `docs/design/HIVEMIND_NATIVE_PLATFORM.md` — Hivemind-native revisions/routability/rollout model
-4. `docs/POC_ACCEPTANCE.md` — POC v1 historical pass/fail checklist
-5. `docs/POC_CHANGELOG.md` — dated POC progress
-6. `docs/FINDINGS_AND_ISSUES.md` — production gaps and backlog
-7. `docs/ENGINEERING.md` — engineering principles
+- [POC v1 acceptance](docs/POC_ACCEPTANCE.md)
+- [POC changelog](docs/POC_CHANGELOG.md)
+- [`docs/frozen/`](docs/frozen/) and [`docs/legacy/`](docs/legacy/)
 
-Historical or aspirational material lives under `docs/legacy/` and `docs/frozen/`. It is not authoritative when it disagrees with `core/` or `docs/STATUS.md`.
+When prose conflicts with source or a maintained harness, source and harness behavior win. No POC v2 parity claim is made.

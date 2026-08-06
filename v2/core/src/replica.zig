@@ -3312,7 +3312,6 @@ comptime {
     std.debug.assert(@sizeOf(view_candidate.ViewChangeCandidate) <= 256);
 }
 
-
 test "restart rebuild preserves dedup beyond 64 unique clients" {
     const allocator = std.testing.allocator;
     var prng = @import("prng.zig").Prng.init(1202);

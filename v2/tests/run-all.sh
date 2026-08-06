@@ -114,6 +114,8 @@ run_phase "Live guardrail fixtures" \
     bash -c "'$SCRIPT_DIR/live_guardrails_test.sh'"
 run_phase "Evidence manifest fixtures" \
     bash -c "'$SCRIPT_DIR/evidence_manifest_test.sh'"
+run_phase "Documentation layout contract" \
+    bash -c "'$SCRIPT_DIR/docs_layout_paths_test.sh'"
 run_phase "Shared protocol-v6 wire contract" \
     bash -c "'$SCRIPT_DIR/wire-contract-test.sh'"
 run_phase "Run retry fixtures" \
