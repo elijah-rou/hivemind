@@ -169,8 +169,8 @@ test "wrong AAD fails authentication" {
     const state = try EncryptionState.init(psk_hex);
 
     const plaintext = "data";
-    const aad1 = &[_]u8{ 0x01 };
-    const aad2 = &[_]u8{ 0x02 };
+    const aad1 = &[_]u8{0x01};
+    const aad2 = &[_]u8{0x02};
 
     var encrypted: [NONCE_LEN + plaintext.len + TAG_LEN]u8 = undefined;
     _ = encryptFrame(&state.worker_key, plaintext, aad1, &encrypted);
