@@ -85,6 +85,39 @@ fn expectMetric(metrics_text: []const u8, line: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, metrics_text, line) != null);
 }
 
+fn expectMetricsState(
+    cm: *connection.ConnectionManager,
+    replica: anytype,
+    worker_connections: usize,
+    client_connections: usize,
+    queue_depth: usize,
+    occupied: usize,
+    enqueued: u64,
+    dispatched: u64,
+    resolved: u64,
+) !void {
+    var server = metrics.MetricsServer{
+        .listen_fd = -1,
+        .replica = replica,
+        .gossip = null,
+        .connection_mgr = cm,
+    };
+    var metrics_buf: [metrics.BUF_SIZE_FOR_TESTING]u8 = undefined;
+    const metrics_len = server.formatMetricsForTesting(&metrics_buf);
+    const metrics_text = metrics_buf[0..metrics_len];
+
+    var expected: [128]u8 = undefined;
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_connections{{type=\"agents\"}} {d}\n", .{worker_connections}));
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_connections{{type=\"clients\"}} {d}\n", .{client_connections}));
+    try expectMetric(metrics_text, "hivemind_connections{type=\"peers\"} 0\n");
+    try expectMetric(metrics_text, "hivemind_connections{type=\"identified_peers\"} 0\n");
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_queue_depth_total {d}\n", .{queue_depth}));
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_queue_in_flight {d}\n", .{occupied}));
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_requests_enqueued_total {d}\n", .{enqueued}));
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_requests_dispatched_total {d}\n", .{dispatched}));
+    try expectMetric(metrics_text, try std.fmt.bufPrint(&expected, "hivemind_requests_resolved_total {d}\n", .{resolved}));
+}
+
 test "connection harness: seeded abandonment expiry leader change and reconnect" {
     const cluster = try TestCluster.init(std.testing.allocator, 3, SEED);
     defer cluster.deinit();
@@ -111,10 +144,12 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     defer std.testing.allocator.destroy(cm);
     cm.initForTesting(replica);
     defer cm.deinitForTesting();
+    try expectState(cm, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
     var probe = try SocketPair.init();
     defer probe.closePeer();
     _ = try cm.attachClientForTesting(probe.manager_fd, 100);
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 0, 0, 0);
 
     // Leader probe is split before the fixed header completes. No response may
     // escape until the remaining bytes arrive.
@@ -122,15 +157,16 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     const leader_probe = frame(@intFromEnum(msg.ClientTag.leader_probe_request), "", &leader_probe_buf);
     try writeExact(probe.peer_fd, leader_probe[0..3]);
     cm.readClientsForTesting();
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 0, 0, 0);
     var response_buf: [MAX_TEST_FRAME_BYTES]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), try readAvailable(probe.peer_fd, &response_buf));
     try writeExact(probe.peer_fd, leader_probe[3..]);
     cm.readClientsForTesting();
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 0, 0, 0);
     const probe_len = try readAvailable(probe.peer_fd, &response_buf);
     try std.testing.expect(probe_len >= 8 + msg.LEADER_PROBE_RESPONSE_BYTES);
     try std.testing.expectEqual(@as(u8, @intFromEnum(msg.ClientTag.leader_probe_response)), response_buf[7]);
     try std.testing.expectEqual(@as(u8, 1), response_buf[9]);
-    try expectState(cm, 0, 0, 0, 0, 0, 1, 0, 0, 0);
 
     var run_client = try SocketPair.init();
     defer run_client.closePeer();
@@ -140,7 +176,9 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     for (&workers, 0..) |*worker, worker_idx| {
         worker.* = try SocketPair.init();
         _ = try cm.attachWorkerForTesting(worker.manager_fd);
+        try expectState(cm, 0, 0, 0, 0, worker_idx + 1, 2, 0, 0, 0);
         replica.workers[worker_idx] = .{ .connected = true, .node_id = node_id };
+        try expectState(cm, 0, 0, 0, 0, worker_idx + 1, 2, 0, 0, 0);
         replica.worker_count = worker_idx + 1;
         try expectState(cm, 0, 0, 0, 0, worker_idx + 1, 2, 0, 0, 0);
     }
@@ -160,16 +198,19 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     try writeExact(run_client.peer_fd, run_frame[split..]);
     cm.readClientsForTesting();
     try expectState(cm, 1, 0, 0, 0, 3, 2, 1, 0, 0);
+    try expectMetricsState(cm, replica, 3, 2, 1, 0, 1, 0, 0);
 
     cm.dispatchRun();
+    try expectState(cm, 0, 1, 1, 1, 3, 2, 1, 1, 0);
     const worker_frame_len = try readAvailable(workers[0].peer_fd, &response_buf);
     try std.testing.expect(worker_frame_len >= 28);
     const worker_request_id = std.mem.readInt(u64, response_buf[8..16], .little);
     try std.testing.expectEqual(deployment_id, std.mem.readInt(u64, response_buf[16..24], .little));
-    try expectState(cm, 0, 1, 1, 1, 3, 2, 1, 1, 0);
+    try expectMetricsState(cm, replica, 3, 2, 0, 1, 1, 1, 0);
 
     cm.disconnectClientForTesting(run_client_idx);
     try expectState(cm, 0, 1, 0, 1, 3, 1, 1, 1, 0);
+    try expectMetricsState(cm, replica, 3, 1, 0, 1, 1, 1, 0);
 
     // A foreign response disconnects only its sender and cannot consume the
     // owning worker's abandoned correlation.
@@ -185,6 +226,7 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     try expectState(cm, 0, 1, 0, 1, 2, 1, 1, 1, 0);
 
     cm.poll_count = rq.ABANDONED_TTL_TICKS;
+    try expectState(cm, 0, 1, 0, 1, 2, 1, 1, 1, 0);
     cm.expireAbandonedForTesting();
     try expectState(cm, 0, 0, 0, 0, 1, 1, 1, 1, 1);
 
@@ -192,29 +234,33 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
 
     replica.view_number = 1;
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
     replica.status = .normal;
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
     try std.testing.expect(!replica.isLeader());
     try writeExact(probe.peer_fd, leader_probe);
     cm.readClientsForTesting();
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
     const follower_probe_len = try readAvailable(probe.peer_fd, &response_buf);
     try std.testing.expect(follower_probe_len >= 8 + msg.LEADER_PROBE_RESPONSE_BYTES);
     try std.testing.expectEqual(@as(u8, 0), response_buf[9]);
     try std.testing.expectEqual(@as(u8, 1), response_buf[11]);
-    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
 
     replica.view_number = 3;
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
     try std.testing.expect(replica.isLeader());
     try writeExact(probe.peer_fd, leader_probe);
     cm.readClientsForTesting();
+    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
     const restored_probe_len = try readAvailable(probe.peer_fd, &response_buf);
     try std.testing.expect(restored_probe_len >= 8 + msg.LEADER_PROBE_RESPONSE_BYTES);
     try std.testing.expectEqual(@as(u8, 1), response_buf[9]);
     try std.testing.expectEqual(@as(u8, 0), response_buf[11]);
-    try expectState(cm, 0, 0, 0, 0, 0, 1, 1, 1, 1);
 
     var reconnected_worker = try SocketPair.init();
     defer reconnected_worker.closePeer();
     _ = try cm.attachWorkerForTesting(reconnected_worker.manager_fd);
+    try expectState(cm, 0, 0, 0, 0, 1, 1, 1, 1, 1);
     replica.workers[0] = .{ .connected = true, .node_id = node_id };
     try expectState(cm, 0, 0, 0, 0, 1, 1, 1, 1, 1);
     var reconnected_client = try SocketPair.init();
@@ -222,20 +268,5 @@ test "connection harness: seeded abandonment expiry leader change and reconnect"
     _ = try cm.attachClientForTesting(reconnected_client.manager_fd, 201);
     try expectState(cm, 0, 0, 0, 0, 1, 2, 1, 1, 1);
 
-    var server = metrics.MetricsServer{
-        .listen_fd = -1,
-        .replica = replica,
-        .gossip = null,
-        .connection_mgr = cm,
-    };
-    var metrics_buf: [metrics.BUF_SIZE_FOR_TESTING]u8 = undefined;
-    const metrics_len = server.formatMetricsForTesting(&metrics_buf);
-    const metrics_text = metrics_buf[0..metrics_len];
-    try expectMetric(metrics_text, "hivemind_connections{type=\"agents\"} 1\n");
-    try expectMetric(metrics_text, "hivemind_connections{type=\"clients\"} 2\n");
-    try expectMetric(metrics_text, "hivemind_queue_depth_total 0\n");
-    try expectMetric(metrics_text, "hivemind_queue_in_flight 0\n");
-    try expectMetric(metrics_text, "hivemind_requests_enqueued_total 1\n");
-    try expectMetric(metrics_text, "hivemind_requests_dispatched_total 1\n");
-    try expectMetric(metrics_text, "hivemind_requests_resolved_total 1\n");
+    try expectMetricsState(cm, replica, 1, 2, 0, 0, 1, 1, 1);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const msg = @import("../message.zig");
 const prng_mod = @import("../prng.zig");
 const Prng = prng_mod.Prng;
@@ -6,8 +7,21 @@ const Ratio = prng_mod.Ratio;
 const StateChecker = @import("checker.zig").StateChecker;
 const test_harness = @import("test_harness.zig");
 const TestCluster = test_harness.TestCluster;
+const replica_mod = @import("../replica.zig");
 const FederatedGossipHarness = test_harness.FederatedGossipHarness;
 const FederatedOriginConfig = test_harness.FederatedOriginConfig;
+
+pub const ScheduledDropNext = struct {
+    id: u64,
+    from: u8,
+    to: u8,
+    tag: msg.Tag,
+};
+
+pub const ScheduledBarrierCut = struct {
+    replica: u8,
+    cut: replica_mod.BarrierCut,
+};
 
 /// VOPR - Viewstamped Operation Protocol Replay
 ///
@@ -42,6 +56,11 @@ pub const VoprConfig = struct {
     // Storage faults
     disk_read_fault_rate: Ratio = Ratio.zero(),
     disk_write_fault_rate: Ratio = Ratio.zero(),
+    disk_sync_fault_rate: Ratio = Ratio.zero(),
+
+    // Deterministic one-shot cuts used by replay and focused acceptance runs.
+    scheduled_drop_next: ?ScheduledDropNext = null,
+    scheduled_barrier_cut: ?ScheduledBarrierCut = null,
 
     // Workload
     deployment_count: u8 = 0,
@@ -67,6 +86,19 @@ pub const VoprResult = struct {
     };
 };
 
+fn armScheduledCuts(tc: *TestCluster, config: VoprConfig) void {
+    if (config.scheduled_drop_next) |drop| {
+        std.debug.assert(drop.id > 0);
+        std.debug.assert(drop.from < config.replica_count);
+        std.debug.assert(drop.to < config.replica_count);
+        tc.network.armDropNext(drop.id, drop.from, drop.to, @intFromEnum(drop.tag));
+    }
+    if (config.scheduled_barrier_cut) |scheduled| {
+        std.debug.assert(scheduled.replica < config.replica_count);
+        tc.replicas[scheduled.replica].armBarrierCut(scheduled.cut);
+    }
+}
+
 fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
     tc.network.drop_rate = Ratio.zero();
     tc.network.replay_rate = Ratio.zero();
@@ -76,12 +108,15 @@ fn prepareLivenessPhase(tc: *TestCluster, config: VoprConfig) void {
     tc.network.partitioned = std.mem.zeroes([msg.REPLICA_COUNT_MAX][msg.REPLICA_COUNT_MAX]bool);
 
     for (0..config.replica_count) |i| {
+        tc.resumeReplica(@intCast(i));
+        // Clear transient disk faults first. Production/systemd restart does not
+        // wipe durable state; only an explicit operator action would. Retrying
+        // recovery with faults disabled models the healed network phase.
         tc.disks[i].read_fault_rate = Ratio.zero();
         tc.disks[i].write_fault_rate = Ratio.zero();
+        tc.disks[i].sync_fault_rate = Ratio.zero();
         tc.disks[i].fail_next_write = false;
         tc.disks[i].fail_next_sync = false;
-        // Production restart does not erase durable state. Retry recovery after
-        // transient faults clear; corrupt durable state remains fail-stopped.
         if (!tc.replica_running[i] or tc.replicas[i].storage_failed) {
             tc.crashReplica(@intCast(i));
         }
@@ -94,6 +129,8 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
     const tc = try TestCluster.init(allocator, config.replica_count, config.seed);
     defer tc.deinit();
 
+    armScheduledCuts(tc, config);
+
     // Configure network with fault parameters
     tc.network.drop_rate = config.drop_rate;
     tc.network.replay_rate = config.replay_rate;
@@ -105,6 +142,7 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
     for (0..config.replica_count) |i| {
         tc.disks[i].read_fault_rate = config.disk_read_fault_rate;
         tc.disks[i].write_fault_rate = config.disk_write_fault_rate;
+        tc.disks[i].sync_fault_rate = config.disk_sync_fault_rate;
         // Seed each disk's fault PRNG differently
         tc.disks[i].fault_prng = Prng.init(config.seed +% 0xD15C +% @as(u64, i));
     }
@@ -171,14 +209,14 @@ pub fn run(allocator: std.mem.Allocator, config: VoprConfig) !VoprResult {
             if (pause_until[target] <= now) {
                 const pause_duration = config.pause_stability + @as(u16, @intCast(prng.bounded(50)));
                 pause_until[target] = now + @as(i64, pause_duration);
-                tc.partition(target);
+                tc.pauseReplica(target);
             }
         }
         // Resume paused replicas
         for (0..config.replica_count) |i| {
             if (pause_until[i] > 0 and now >= pause_until[i]) {
                 pause_until[i] = 0;
-                tc.network.healOne(@intCast(i));
+                tc.resumeReplica(@intCast(i));
             }
         }
 
@@ -293,11 +331,142 @@ pub fn run_traced_collected(allocator: std.mem.Allocator, config: VoprConfig, co
     return run_traced_with_collector(allocator, config, collector);
 }
 
+test "traced scheduled barrier cut emits one identified event" {
+    const collector = try std.testing.allocator.create(TraceCollector);
+    collector.initInPlace(1);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    const cut = replica_mod.BarrierCut{
+        .id = 0xA3C017,
+        .kind = .prepare,
+        .point = .before_sync,
+    };
+    _ = try run_traced_collected(std.testing.allocator, .{
+        .seed = 0xA3C017,
+        .replica_count = 1,
+        .safety_ticks = 1,
+        .request_count = 1,
+        .liveness_ticks = 1,
+        .partition_probability = Ratio.zero(),
+        .heal_probability = Ratio.zero(),
+        .scheduled_barrier_cut = .{ .replica = 0, .cut = cut },
+    }, collector);
+
+    var cut_events: usize = 0;
+    for (collector.events[0..collector.count]) |event| {
+        switch (event.kind) {
+            .barrier_cut => |observed| {
+                cut_events += 1;
+                try std.testing.expectEqual(@as(u8, 0), observed.replica);
+                try std.testing.expectEqual(cut.id, observed.id);
+                try std.testing.expectEqual(cut.kind, observed.kind);
+                try std.testing.expectEqual(cut.point, observed.point);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cut_events);
+}
+
+test "traced scheduled cuts consumed during liveness emit identified events" {
+    const collector = try std.testing.allocator.create(TraceCollector);
+    collector.initInPlace(3);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    const drop = ScheduledDropNext{
+        .id = 0xA3D012,
+        .from = 0,
+        .to = 1,
+        .tag = .prepare,
+    };
+    const cut = replica_mod.BarrierCut{
+        .id = 0xA3C012,
+        .kind = .prepare,
+        .point = .before_sync,
+    };
+    _ = try run_traced_collected(std.testing.allocator, .{
+        .seed = 0xA3C012,
+        .replica_count = 3,
+        .safety_ticks = 0,
+        .request_count = 0,
+        .liveness_ticks = 200,
+        .partition_probability = Ratio.zero(),
+        .heal_probability = Ratio.zero(),
+        .deployment_count = 1,
+        .scheduled_drop_next = drop,
+        .scheduled_barrier_cut = .{ .replica = 2, .cut = cut },
+    }, collector);
+
+    var drop_events: usize = 0;
+    var cut_events: usize = 0;
+    for (collector.events[0..collector.count]) |event| {
+        switch (event.kind) {
+            .drop_next => |observed| {
+                drop_events += 1;
+                try std.testing.expectEqual(drop.id, observed.id);
+                try std.testing.expectEqual(drop.from, observed.from);
+                try std.testing.expectEqual(drop.to, observed.to);
+                try std.testing.expectEqual(@intFromEnum(drop.tag), observed.tag);
+            },
+            .barrier_cut => |observed| {
+                cut_events += 1;
+                try std.testing.expectEqual(@as(u8, 2), observed.replica);
+                try std.testing.expectEqual(cut.id, observed.id);
+                try std.testing.expectEqual(cut.kind, observed.kind);
+                try std.testing.expectEqual(cut.point, observed.point);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), drop_events);
+    try std.testing.expectEqual(@as(usize, 1), cut_events);
+}
+
+fn observeScheduledCuts(
+    tc: *const TestCluster,
+    config: VoprConfig,
+    collector: ?*TraceCollector,
+    tick: u64,
+    observed_drop_next_count: *u64,
+    observed_barrier_cut_count: *[msg.REPLICA_COUNT_MAX]u64,
+) void {
+    const c = collector orelse return;
+
+    if (tc.network.drop_next_count > observed_drop_next_count.*) {
+        std.debug.assert(tc.network.drop_next_count == observed_drop_next_count.* + 1);
+        const scheduled = config.scheduled_drop_next orelse unreachable;
+        std.debug.assert(tc.network.last_drop_next_id == scheduled.id);
+        std.debug.assert(tc.network.last_drop_next_from == scheduled.from);
+        std.debug.assert(tc.network.last_drop_next_to == scheduled.to);
+        std.debug.assert(tc.network.last_drop_next_tag == @intFromEnum(scheduled.tag));
+        c.addDropNext(tick, tc.network.drop_next_count, scheduled.id, scheduled.from, scheduled.to, @intFromEnum(scheduled.tag));
+        observed_drop_next_count.* = tc.network.drop_next_count;
+    }
+
+    for (0..config.replica_count) |i| {
+        if (tc.replicas[i].barrier_cut_count <= observed_barrier_cut_count[i]) continue;
+        std.debug.assert(tc.replicas[i].barrier_cut_count == observed_barrier_cut_count[i] + 1);
+        const scheduled = config.scheduled_barrier_cut orelse unreachable;
+        std.debug.assert(scheduled.replica == i);
+        std.debug.assert(tc.replicas[i].last_barrier_cut_id == scheduled.cut.id);
+        c.addBarrierCut(tick, @intCast(i), scheduled.cut);
+        observed_barrier_cut_count[i] = tc.replicas[i].barrier_cut_count;
+    }
+}
+
 fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, collector: ?*TraceCollector) !VoprResult {
     var prng = Prng.init(config.seed +% 0xF00D);
 
     const tc = try TestCluster.init(allocator, config.replica_count, config.seed);
     defer tc.deinit();
+
+    armScheduledCuts(tc, config);
 
     // Configure network and storage faults (must match run() for determinism)
     tc.network.drop_rate = config.drop_rate;
@@ -308,6 +477,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
     for (0..config.replica_count) |i| {
         tc.disks[i].read_fault_rate = config.disk_read_fault_rate;
         tc.disks[i].write_fault_rate = config.disk_write_fault_rate;
+        tc.disks[i].sync_fault_rate = config.disk_sync_fault_rate;
         tc.disks[i].fault_prng = Prng.init(config.seed +% 0xD15C +% @as(u64, i));
     }
 
@@ -339,6 +509,8 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
     // Crash/pause stability tracking (must match run() for determinism)
     var crash_stable_until: [msg.REPLICA_COUNT_MAX]i64 = std.mem.zeroes([msg.REPLICA_COUNT_MAX]i64);
     var pause_until: [msg.REPLICA_COUNT_MAX]i64 = std.mem.zeroes([msg.REPLICA_COUNT_MAX]i64);
+    var observed_drop_next_count: u64 = 0;
+    var observed_barrier_cut_count: [msg.REPLICA_COUNT_MAX]u64 = std.mem.zeroes([msg.REPLICA_COUNT_MAX]u64);
 
     trace("=== PHASE 1: SAFETY ({d} ticks) ===\n", .{config.safety_ticks});
 
@@ -402,16 +574,18 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
             if (pause_until[target] <= now) {
                 const pause_duration = config.pause_stability + @as(u16, @intCast(prng.bounded(50)));
                 pause_until[target] = now + @as(i64, pause_duration);
-                tc.partition(target);
+                tc.pauseReplica(target);
                 trace("T={d:>4} PAUSE replica={d} for {d} ticks\n", .{ tick_count, target, pause_duration });
+                if (collector) |c| c.push(.{ .tick = tick_count, .kind = .{ .pause = .{ .replica = target, .duration = pause_duration } } });
             }
         }
         // Resume paused replicas
         for (0..config.replica_count) |i| {
             if (pause_until[i] > 0 and now >= pause_until[i]) {
                 pause_until[i] = 0;
-                tc.network.healOne(@intCast(i));
+                tc.resumeReplica(@intCast(i));
                 trace("T={d:>4} RESUME replica={d}\n", .{ tick_count, i });
+                if (collector) |c| c.push(.{ .tick = tick_count, .kind = .{ .unpause = .{ .replica = @intCast(i) } } });
             }
         }
 
@@ -440,6 +614,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         }
 
         tc.tick();
+        observeScheduledCuts(tc, config, collector, tick_count, &observed_drop_next_count, &observed_barrier_cut_count);
         tc.restartStorageFailed();
         tc.tickWorkers();
 
@@ -448,7 +623,9 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
         // Periodic state dump (every 50 ticks)
         if (tick_count % 50 == 0) {
             traceClusterState(tc, tick_count);
-            if (collector) |c| c.addState(tick_count, &tc.replicas, tc.replica_count);
+            if (collector) |c| {
+                c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
+            }
         }
 
         // Check for new violations
@@ -457,7 +634,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
             traceClusterState(tc, tick_count);
             traceJournalState(tc);
             if (collector) |c| {
-                c.addState(tick_count, &tc.replicas, tc.replica_count);
+                c.addState(tick_count, &tc.replicas, &tc.replica_paused, tc.replica_count);
                 c.addViolation(tick_count, 0, "safety violation detected");
                 for (0..tc.replica_count) |i| {
                     c.addJournal(tick_count, @intCast(i), tc.replicas[i]);
@@ -485,6 +662,7 @@ fn run_traced_with_collector(allocator: std.mem.Allocator, config: VoprConfig, c
 
     while (tick_count < config.liveness_ticks) : (tick_count += 1) {
         tc.tick();
+        observeScheduledCuts(tc, config, collector, config.safety_ticks + tick_count, &observed_drop_next_count, &observed_barrier_cut_count);
         tc.restartStorageFailed();
         tc.tickWorkers();
         phase2_ticks = tick_count + 1;
@@ -576,6 +754,7 @@ fn traceJournalState(tc: *const TestCluster) void {
 }
 
 fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
     std.debug.print(fmt, args);
 }
 

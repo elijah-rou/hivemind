@@ -118,6 +118,46 @@ pub const Backend = struct {
 
 pub const MAX_BACKENDS: usize = 32;
 
+const CommittedDigest = struct {
+    value: u64 = 0xcbf29ce484222325,
+
+    fn addByte(self: *CommittedDigest, byte: u8) void {
+        self.value ^= byte;
+        self.value *%= 0x100000001b3;
+    }
+
+    fn addValue(self: *CommittedDigest, value: anytype) void {
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .bool => self.addByte(@intFromBool(value)),
+            .int => |int_info| {
+                const U = std.meta.Int(.unsigned, int_info.bits);
+                var bits: u128 = @intCast(@as(U, @bitCast(value)));
+                for (0..@sizeOf(T)) |_| {
+                    self.addByte(@truncate(bits));
+                    bits >>= 8;
+                }
+            },
+            .@"enum" => self.addValue(@intFromEnum(value)),
+            .array => {
+                for (value) |element| self.addValue(element);
+            },
+            .@"struct" => |struct_info| {
+                inline for (struct_info.fields) |field| self.addValue(@field(value, field.name));
+            },
+            else => @compileError("unsupported committed digest type: " ++ @typeName(T)),
+        }
+    }
+
+    fn addDeployment(self: *CommittedDigest, deployment: Deployment) void {
+        inline for (@typeInfo(Deployment).@"struct".fields) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "last_request_tick")) {
+                self.addValue(@field(deployment, field.name));
+            }
+        }
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Valid NodeStatus transitions
 // ---------------------------------------------------------------------------
@@ -176,6 +216,27 @@ pub const StateMachine = struct {
         self.deployment_count = 0;
         self.pod_count = 0;
         self.killswitch_count = 0;
+    }
+
+    /// Bounded digest of command-derived state. Local scheduling timestamps are
+    /// excluded; PRNG state is included because it determines future IDs.
+    pub fn committedDigest(self: *const StateMachine) u64 {
+        std.debug.assert(self.node_count <= MAX_NODES);
+        std.debug.assert(self.deployment_count <= MAX_DEPLOYMENTS);
+        std.debug.assert(self.pod_count <= MAX_PODS);
+        std.debug.assert(self.killswitch_count <= MAX_KILLSWITCHES);
+
+        var digest = CommittedDigest{};
+        digest.addValue(self.prng.state);
+        digest.addValue(self.node_count);
+        for (self.nodes[0..self.node_count]) |node| digest.addValue(node);
+        digest.addValue(self.deployment_count);
+        for (self.deployments[0..self.deployment_count]) |deployment| digest.addDeployment(deployment);
+        digest.addValue(self.pod_count);
+        for (self.pods[0..self.pod_count]) |pod| digest.addValue(pod);
+        digest.addValue(self.killswitch_count);
+        for (self.killswitches[0..self.killswitch_count]) |killswitch| digest.addValue(killswitch);
+        return digest.value;
     }
 
     /// Apply a committed command. MUST produce identical results on all
@@ -927,6 +988,31 @@ test "determinism: same seed same results" {
 
     try std.testing.expectEqual(r1.ok.entity_id, r2.ok.entity_id);
     try std.testing.expectEqual(a.node_count, b.node_count);
+}
+
+test "committed digest excludes local timestamps and includes deterministic future state" {
+    const allocator = std.testing.allocator;
+    const a = try allocator.create(StateMachine);
+    defer allocator.destroy(a);
+    const b = try allocator.create(StateMachine);
+    defer allocator.destroy(b);
+    a.initInPlace(77);
+    b.initInPlace(77);
+
+    const command = msg.Command{ .create_deployment = .{
+        .name = msg.strToFixed(64, "digest"),
+        .namespace = msg.strToFixed(64, "default"),
+        .image = msg.strToFixed(256, "image:v1"),
+        .replicas = 1,
+    } };
+    _ = a.apply(command);
+    _ = b.apply(command);
+    try std.testing.expectEqual(a.committedDigest(), b.committedDigest());
+
+    b.deployments[0].last_request_tick = 999;
+    try std.testing.expectEqual(a.committedDigest(), b.committedDigest());
+    _ = b.prng.next();
+    try std.testing.expect(a.committedDigest() != b.committedDigest());
 }
 
 test "register node and deregister" {
@@ -1728,7 +1814,6 @@ test "batch bind rejects aggregate capacity overflow without mutation" {
     try std.testing.expectEqual(msg.PodPhase.pending, sm.findPod(pod_buf[0]).?.phase);
     try std.testing.expectEqual(msg.PodPhase.pending, sm.findPod(pod_buf[1]).?.phase);
 }
-
 
 test "deleted deployments and pods free fixed state-machine slots" {
     var sm = StateMachine.init(20260503);

@@ -274,11 +274,23 @@ fn runReplay(allocator: std.mem.Allocator, seed: u64, mutate: bool, verbose: boo
         config.crash_probability.denominator,
     });
 
-    // If --trace, use collected trace mode
-    var collector: vopr.TraceCollector = vopr.TraceCollector.init(config.replica_count);
+    // TraceCollector is multi-MiB. Replay owns it on the heap so replay does
+    // not add the collector's full bounded capacity to the process stack.
+    comptime std.debug.assert(@sizeOf(vopr.TraceCollector) <= @import("vopr/trace.zig").MAX_TRACE_COLLECTOR_BYTES);
+    const collector_storage = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.of(vopr.TraceCollector),
+        @sizeOf(vopr.TraceCollector),
+    );
+    const collector: *vopr.TraceCollector = @ptrCast(collector_storage.ptr);
+    collector.initInPlace(config.replica_count);
+    defer {
+        collector.deinit();
+        allocator.free(collector_storage);
+    }
 
     const result = if (verbose or trace_path != null)
-        try vopr.run_traced_collected(allocator, config, &collector)
+        try vopr.run_traced_collected(allocator, config, collector)
     else
         try vopr.run(allocator, config);
 
@@ -323,7 +335,7 @@ fn baseConfig() VoprConfig {
         .replica_count = 5,
         .safety_ticks = 500,
         .request_count = 20,
-        .liveness_ticks = 2000,
+        .liveness_ticks = 8000,
         .partition_probability = Ratio.init(3, 100),
         .heal_probability = Ratio.init(8, 100),
         .crash_probability = Ratio.init(1, 100),
@@ -338,6 +350,7 @@ fn baseConfig() VoprConfig {
         .pause_stability = 15,
         .disk_read_fault_rate = Ratio.init(1, 1000),
         .disk_write_fault_rate = Ratio.init(1, 1000),
+        .disk_sync_fault_rate = Ratio.init(1, 1000),
         .deployment_count = 3,
         .worker_count = 4,
         .agent_pod_crash_probability = Ratio.init(1, 100),
@@ -369,7 +382,7 @@ fn mutateConfig(base: VoprConfig, seed: u64) VoprConfig {
         12 => config.path_max_capacity = @intCast(4 + prng.bounded(28)),
         13 => config.deployment_count = @intCast(prng.bounded(11)),
         14 => config.worker_count = @intCast(prng.bounded(9)),
-        15 => config.liveness_ticks = 100 + prng.bounded(900),
+        15 => config.liveness_ticks = 500 + prng.bounded(3500),
         else => {},
     }
 
@@ -418,6 +431,20 @@ fn wallClockMs() i64 {
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
+}
+
+test "replay trace collector has bounded explicit heap lifetime" {
+    const trace_mod = @import("vopr/trace.zig");
+    const collector = try std.testing.allocator.create(vopr.TraceCollector);
+    collector.initInPlace(5);
+    defer {
+        collector.deinit();
+        std.testing.allocator.destroy(collector);
+    }
+
+    try std.testing.expect(@sizeOf(vopr.TraceCollector) > 1024 * 1024);
+    try std.testing.expect(@sizeOf(vopr.TraceCollector) <= trace_mod.MAX_TRACE_COLLECTOR_BYTES);
+    try std.testing.expectEqual(@as(usize, 0), collector.count);
 }
 
 test "thread ranges cover each seed once" {

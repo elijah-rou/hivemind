@@ -41,18 +41,17 @@ pub const MessageQueue = struct {
 
     pub fn popReady(self: *MessageQueue, now: i64, buf: []u8) ?RecvResult {
         for (self.items[0..self.count], 0..) |*item, i| {
-            if (item.deliver_at_tick <= now) {
-                const result = RecvResult{
-                    .from = item.from,
-                    .len = item.len,
-                };
-                @memcpy(buf[0..item.len], item.data[0..item.len]);
-                if (i < self.count - 1) {
-                    self.items[i] = self.items[self.count - 1];
-                }
-                self.count -= 1;
-                return result;
+            if (item.deliver_at_tick > now) continue;
+            const result = RecvResult{
+                .from = item.from,
+                .len = item.len,
+            };
+            @memcpy(buf[0..item.len], item.data[0..item.len]);
+            if (i < self.count - 1) {
+                self.items[i] = self.items[self.count - 1];
             }
+            self.count -= 1;
+            return result;
         }
         return null;
     }
@@ -88,7 +87,7 @@ pub const MessageStats = struct {
     }
 };
 
-const DropNext = struct {
+pub const DropNext = struct {
     id: u64,
     from: u8,
     to: u8,
@@ -118,10 +117,13 @@ pub const SimulatedNetwork = struct {
     partition_stability: i64, // minimum ticks a partition persists
     heal_stability: i64, // minimum ticks after heal before next partition
 
-    // Deterministic one-shot drop used by bounded VRR repair scenarios.
+    // Deterministic one-shot message fault and accounting.
     drop_next: ?DropNext,
     drop_next_count: u64,
     last_drop_next_id: u64,
+    last_drop_next_from: u8,
+    last_drop_next_to: u8,
+    last_drop_next_tag: u8,
 
     // Message accounting
     stats: MessageStats,
@@ -145,6 +147,9 @@ pub const SimulatedNetwork = struct {
             .drop_next = null,
             .drop_next_count = 0,
             .last_drop_next_id = 0,
+            .last_drop_next_from = 0,
+            .last_drop_next_to = 0,
+            .last_drop_next_tag = 0,
             .stats = MessageStats.init(),
         };
         for (&network.queues) |*q| {
@@ -170,6 +175,9 @@ pub const SimulatedNetwork = struct {
         self.drop_next = null;
         self.drop_next_count = 0;
         self.last_drop_next_id = 0;
+        self.last_drop_next_from = 0;
+        self.last_drop_next_to = 0;
+        self.last_drop_next_tag = 0;
         self.stats = MessageStats.init();
         for (&self.queues) |*q| {
             q.* = MessageQueue.init();
@@ -194,6 +202,9 @@ pub const SimulatedNetwork = struct {
                 self.drop_next = null;
                 self.drop_next_count += 1;
                 self.last_drop_next_id = selection.id;
+                self.last_drop_next_from = from;
+                self.last_drop_next_to = to;
+                self.last_drop_next_tag = tag;
                 return;
             }
         }
@@ -288,3 +299,25 @@ pub const SimulatedNetwork = struct {
         }
     }
 };
+
+test "drop-next selection matches sender receiver and message tag once" {
+    var tick: i64 = 0;
+    const network = try std.testing.allocator.create(SimulatedNetwork);
+    defer std.testing.allocator.destroy(network);
+    network.initInPlace(1, 3, &tick);
+    network.min_delay = 0;
+    network.max_delay = 0;
+    network.armDropNext(77, 1, 2, @intFromEnum(msg.Tag.request_prepare));
+
+    const matching = [_]u8{@intFromEnum(msg.Tag.request_prepare)};
+    const other = [_]u8{@intFromEnum(msg.Tag.commit)};
+    network.enqueueSend(0, 2, &matching);
+    network.enqueueSend(1, 2, &other);
+    try std.testing.expectEqual(@as(u64, 0), network.drop_next_count);
+    network.enqueueSend(1, 2, &matching);
+    try std.testing.expectEqual(@as(u64, 1), network.drop_next_count);
+    try std.testing.expectEqual(@as(u64, 77), network.last_drop_next_id);
+    try std.testing.expect(network.drop_next == null);
+    network.enqueueSend(1, 2, &matching);
+    try std.testing.expectEqual(@as(usize, 3), network.queues[2].count);
+}
