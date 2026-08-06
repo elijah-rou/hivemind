@@ -5,7 +5,15 @@ use crate::prng::{Prng, Ratio};
 use crate::protocol::MAX_RUN_RESPONSE_BODY;
 use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
 
+const PROBE_SCRIPT_MAX: usize = 64;
 const RUN_SCRIPT_MAX: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Healthy,
+    Unhealthy,
+    Error,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -16,12 +24,20 @@ pub enum RunOutcome {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeOperationCounts {
+    pub stop: u64,
+    pub status: u64,
+    pub remove: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FaultConfig {
     pub image_pull_failure_rate: Ratio,
     pub container_crash_rate: Ratio,
     pub gpu_failure_rate: Ratio,
     pub create_failure_rate: Ratio,
+    pub stop_failure_rate: Ratio,
 }
 
 impl Default for FaultConfig {
@@ -31,6 +47,7 @@ impl Default for FaultConfig {
             container_crash_rate: Ratio::zero(),
             gpu_failure_rate: Ratio::zero(),
             create_failure_rate: Ratio::zero(),
+            stop_failure_rate: Ratio::zero(),
         }
     }
 }
@@ -40,6 +57,10 @@ struct Inner {
     pull_attempts: HashMap<String, u64>,
     create_attempts: HashMap<u64, u64>,
     start_attempts: HashMap<u64, u64>,
+    stop_attempts: HashMap<u64, u64>,
+    status_attempts: HashMap<u64, u64>,
+    remove_attempts: HashMap<u64, u64>,
+    probe_outcomes: HashMap<u64, VecDeque<ProbeOutcome>>,
     run_outcomes: HashMap<u64, VecDeque<RunOutcome>>,
     run_attempts: HashMap<u64, u64>,
     crash_round: u64,
@@ -62,11 +83,33 @@ impl SimulatedRuntime {
                 pull_attempts: HashMap::new(),
                 create_attempts: HashMap::new(),
                 start_attempts: HashMap::new(),
+                stop_attempts: HashMap::new(),
+                status_attempts: HashMap::new(),
+                remove_attempts: HashMap::new(),
+                probe_outcomes: HashMap::new(),
                 run_outcomes: HashMap::new(),
                 run_attempts: HashMap::new(),
                 crash_round: 0,
             }),
         }
+    }
+
+    pub fn script_probe_outcomes(&self, pod_id: u64, outcomes: &[ProbeOutcome]) {
+        assert!(!outcomes.is_empty(), "probe script must not be empty");
+        assert!(
+            outcomes.len() <= PROBE_SCRIPT_MAX,
+            "probe script exceeds bounded capacity"
+        );
+        let previous = self
+            .inner
+            .lock()
+            .unwrap()
+            .probe_outcomes
+            .insert(pod_id, outcomes.iter().copied().collect());
+        assert!(
+            previous.is_none(),
+            "probe script may only be set once per pod"
+        );
     }
 
     pub fn script_run_outcomes(&self, pod_id: u64, outcomes: &[RunOutcome]) {
@@ -106,6 +149,34 @@ impl SimulatedRuntime {
             .expect("scripted crash requires an existing pod");
         assert_eq!(*status, PodStatus::Running);
         *status = PodStatus::Stopped { exit_code };
+    }
+
+    pub fn lose_pod(&self, pod_id: u64) {
+        let removed = self
+            .inner
+            .lock()
+            .unwrap()
+            .pods
+            .remove(&format!("sim-pod-{pod_id}"));
+        assert!(removed.is_some(), "scripted loss requires an existing pod");
+    }
+
+    pub fn make_pod_status_unknown(&self, pod_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let status = inner
+            .pods
+            .get_mut(&format!("sim-pod-{pod_id}"))
+            .expect("scripted unknown status requires an existing pod");
+        *status = PodStatus::Unknown;
+    }
+
+    pub fn operation_counts(&self, pod_id: u64) -> RuntimeOperationCounts {
+        let inner = self.inner.lock().unwrap();
+        RuntimeOperationCounts {
+            stop: inner.stop_attempts.get(&pod_id).copied().unwrap_or(0),
+            status: inner.status_attempts.get(&pod_id).copied().unwrap_or(0),
+            remove: inner.remove_attempts.get(&pod_id).copied().unwrap_or(0),
+        }
     }
 
     /// Simulate spontaneous container crashes. Called by the simulator each tick.
@@ -297,17 +368,51 @@ impl Runtime for SimulatedRuntime {
         }
     }
 
+    fn probe_pod(&self, handle: &PodHandle, _port: u16, _path: &str) -> Result<bool, RuntimeError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !matches!(
+            inner.pods.get(&handle.container_id),
+            Some(PodStatus::Running)
+        ) {
+            return Err(RuntimeError::ContainerNotFound(handle.container_id.clone()));
+        }
+        let outcome = match inner.probe_outcomes.get_mut(&handle.pod_id) {
+            Some(script) => script.pop_front().ok_or_else(|| {
+                RuntimeError::Internal("scripted probe outcomes exhausted".into())
+            })?,
+            None => ProbeOutcome::Healthy,
+        };
+        match outcome {
+            ProbeOutcome::Healthy => Ok(true),
+            ProbeOutcome::Unhealthy => Ok(false),
+            ProbeOutcome::Error => Err(RuntimeError::Internal("scripted probe error".into())),
+        }
+    }
+
     fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
         let mut inner = self.inner.lock().unwrap();
-        inner.pods.insert(
-            handle.container_id.clone(),
-            PodStatus::Stopped { exit_code: 0 },
-        );
+        let attempt = next_attempt(&mut inner.stop_attempts, handle.pod_id);
+        if attempt == 0
+            && deterministic_chance(
+                self.seed,
+                0x5354_4f50_0000_0000,
+                handle.pod_id,
+                self.fault_config.stop_failure_rate,
+            )
+        {
+            return Err(RuntimeError::ContainerStop("simulated stop failure".into()));
+        }
+        let status = inner
+            .pods
+            .get_mut(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+        *status = PodStatus::Stopped { exit_code: 0 };
         Ok(())
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        next_attempt(&mut inner.status_attempts, handle.pod_id);
         inner
             .pods
             .get(&handle.container_id)
@@ -317,6 +422,7 @@ impl Runtime for SimulatedRuntime {
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
         let mut inner = self.inner.lock().unwrap();
+        next_attempt(&mut inner.remove_attempts, handle.pod_id);
         inner.pods.remove(&handle.container_id);
         Ok(())
     }
@@ -393,6 +499,31 @@ mod tests {
             },
         );
         assert!(rt.pull_image("test:latest", None).is_err());
+    }
+
+    #[test]
+    fn deterministic_stop_failure_keeps_runtime_running_until_retry() {
+        let rt = SimulatedRuntime::new(
+            0xB2_01,
+            FaultConfig {
+                stop_failure_rate: Ratio::new(1, 1),
+                ..Default::default()
+            },
+        );
+        let handle = rt.create_pod(&test_spec(1)).unwrap();
+        rt.start_pod(&handle).unwrap();
+
+        assert!(matches!(
+            rt.stop_pod(&handle, 0),
+            Err(RuntimeError::ContainerStop(_))
+        ));
+        assert_eq!(rt.pod_status(&handle).unwrap(), PodStatus::Running);
+
+        rt.stop_pod(&handle, 0).unwrap();
+        assert_eq!(
+            rt.pod_status(&handle).unwrap(),
+            PodStatus::Stopped { exit_code: 0 }
+        );
     }
 
     #[test]

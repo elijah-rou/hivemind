@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::MAX_RUN_RESPONSE_BODY;
-use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError};
+use crate::runtime::{PodHandle, PodSpec, PodStatus, Runtime, RuntimeError, MAX_STOP_GRACE_MS};
 
 const BASE_PORT: u16 = 15000;
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+const PROBE_PATH_MAX: usize = 1024;
+const HTTP_STATUS_LINE_MAX: usize = 1024;
+const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 
 struct RunningProcess {
     child: Child,
@@ -53,6 +57,11 @@ impl Runtime for ProcessRuntime {
     }
 
     fn create_pod(&self, spec: &PodSpec) -> Result<PodHandle, RuntimeError> {
+        if spec.gpu_count > 0 {
+            return Err(RuntimeError::ContainerCreate(
+                "GPU workload rejected: process runtime cannot isolate physical devices".into(),
+            ));
+        }
         let mut next = self.next_port.lock().unwrap();
         let port = *next;
         *next += 1;
@@ -142,12 +151,120 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
         crate::runtime::process::forward_run(port, payload)
     }
 
-    fn stop_pod(&self, handle: &PodHandle, _grace_period_ms: u64) -> Result<(), RuntimeError> {
-        if let Some(mut proc) = self.processes.lock().unwrap().remove(&handle.container_id) {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
+    fn probe_pod(&self, handle: &PodHandle, _port: u16, path: &str) -> Result<bool, RuntimeError> {
+        let port = self
+            .get_port(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+        probe_http(port, path).map_err(RuntimeError::Internal)
+    }
+
+    fn stop_pod(&self, handle: &PodHandle, grace_period_ms: u64) -> Result<(), RuntimeError> {
+        self.stop_pod_until(
+            handle,
+            grace_period_ms,
+            Instant::now()
+                + Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS))
+                + POST_KILL_WAIT,
+        )
+    }
+
+    fn stop_pod_until(
+        &self,
+        handle: &PodHandle,
+        grace_period_ms: u64,
+        shutdown_deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        const TERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        if Instant::now() >= shutdown_deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
         }
-        Ok(())
+        let mut process = self
+            .processes
+            .lock()
+            .unwrap()
+            .remove(&handle.container_id)
+            .ok_or_else(|| RuntimeError::ContainerNotFound(handle.container_id.clone()))?;
+
+        // The map lock protects ownership transfer only. Waiting while holding it
+        // would serialize unrelated lifecycle, status, and forwarding operations.
+        let result = (|| {
+            match process.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(RuntimeError::ContainerStop(format!(
+                        "{} status before TERM: {error}",
+                        handle.container_id
+                    )))
+                }
+            }
+
+            let pid = i32::try_from(process.child.id()).map_err(|error| {
+                RuntimeError::ContainerStop(format!(
+                    "{} pid conversion: {error}",
+                    handle.container_id
+                ))
+            })?;
+            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                return Err(RuntimeError::ContainerStop(format!(
+                    "{} TERM: {}",
+                    handle.container_id,
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            let grace = Duration::from_millis(grace_period_ms.min(MAX_STOP_GRACE_MS));
+            let deadline = (Instant::now() + grace).min(shutdown_deadline);
+            loop {
+                match process.child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(
+                            TERM_POLL_INTERVAL
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(RuntimeError::ContainerStop(format!(
+                            "{} status after TERM: {error}",
+                            handle.container_id
+                        )))
+                    }
+                }
+            }
+
+            process.child.kill().map_err(|error| {
+                RuntimeError::ContainerStop(format!("{} KILL: {error}", handle.container_id))
+            })?;
+            let deadline = (Instant::now() + POST_KILL_WAIT).min(shutdown_deadline);
+            match wait_for_child_exit_until(deadline, || process.child.try_wait()) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(RuntimeError::ContainerStop(format!(
+                    "{} did not exit within {}ms after KILL",
+                    handle.container_id,
+                    POST_KILL_WAIT.as_millis()
+                ))),
+                Err(error) => Err(RuntimeError::ContainerStop(format!(
+                    "{} status after KILL: {error}",
+                    handle.container_id
+                ))),
+            }
+        })();
+
+        let previous = self
+            .processes
+            .lock()
+            .unwrap()
+            .insert(handle.container_id.clone(), process);
+        assert!(
+            previous.is_none(),
+            "stopped process ownership must be unique"
+        );
+        result
     }
 
     fn pod_status(&self, handle: &PodHandle) -> Result<PodStatus, RuntimeError> {
@@ -166,29 +283,152 @@ http.server.HTTPServer(('127.0.0.1', {}), H).serve_forever()
     }
 
     fn remove_pod(&self, handle: &PodHandle) -> Result<(), RuntimeError> {
-        self.stop_pod(handle, 0)
+        self.remove_pod_until(handle, Instant::now() + POST_KILL_WAIT)
+    }
+
+    fn pod_status_until(
+        &self,
+        handle: &PodHandle,
+        deadline: Instant,
+    ) -> Result<PodStatus, RuntimeError> {
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerNotFound(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        self.pod_status(handle)
+    }
+
+    fn remove_pod_until(&self, handle: &PodHandle, deadline: Instant) -> Result<(), RuntimeError> {
+        self.stop_pod_until(handle, 0, deadline)?;
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::ContainerStop(
+                "shutdown deadline reached".into(),
+            ));
+        }
+        let removed = self.processes.lock().unwrap().remove(&handle.container_id);
+        assert!(
+            removed.is_some(),
+            "stopped process must remain owned until removal"
+        );
+        Ok(())
     }
 }
 
-/// Send an HTTP GET to a process "container" health endpoint and check for 200.
+fn wait_for_child_exit_until<F>(
+    deadline: Instant,
+    mut try_wait: F,
+) -> std::io::Result<Option<ExitStatus>>
+where
+    F: FnMut() -> std::io::Result<Option<ExitStatus>>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    loop {
+        if let Some(status) = try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+}
+
+/// Send a bounded HTTP GET and accept exactly a well-formed `200` status line.
 pub fn probe_http(port: u16, path: &str) -> Result<bool, String> {
-    let mut stream =
-        TcpStream::connect(format!("127.0.0.1:{port}")).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    validate_probe_path(path)?;
+    let started = Instant::now();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, PROBE_DEADLINE)
+        .map_err(|e| format!("connect: {e}"))?;
 
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream
+        .set_write_timeout(Some(probe_time_remaining(started)?))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
 
-    let mut response = [0u8; 1024];
-    let n = stream
-        .read(&mut response)
-        .map_err(|e| format!("read: {e}"))?;
+    let mut status_line = [0u8; HTTP_STATUS_LINE_MAX + 1];
+    let mut length = 0;
+    loop {
+        if length == status_line.len() {
+            return Err(format!(
+                "HTTP status line exceeds {HTTP_STATUS_LINE_MAX} bytes"
+            ));
+        }
+        stream
+            .set_read_timeout(Some(probe_time_remaining(started)?))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        let read = stream
+            .read(&mut status_line[length..])
+            .map_err(|e| format!("read status line: {e}"))?;
+        if read == 0 {
+            return Err("HTTP response ended before status line".into());
+        }
+        length += read;
+        if let Some(line_end) = status_line[..length].iter().position(|byte| *byte == b'\n') {
+            if line_end + 1 > HTTP_STATUS_LINE_MAX {
+                return Err(format!(
+                    "HTTP status line exceeds {HTTP_STATUS_LINE_MAX} bytes"
+                ));
+            }
+            return parse_http_status_line(&status_line[..=line_end]);
+        }
+    }
+}
 
-    let resp_str = String::from_utf8_lossy(&response[..n]);
-    Ok(resp_str.contains("200"))
+fn probe_time_remaining(started: Instant) -> Result<Duration, String> {
+    PROBE_DEADLINE
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "HTTP probe exceeded total deadline".into())
+}
+
+fn validate_probe_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > PROBE_PATH_MAX || !path.starts_with('/') {
+        return Err(format!(
+            "probe path must start with '/' and contain at most {PROBE_PATH_MAX} bytes"
+        ));
+    }
+    if !path.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+        return Err("probe path contains unsafe request-target bytes".into());
+    }
+    Ok(())
+}
+
+fn parse_http_status_line(line: &[u8]) -> Result<bool, String> {
+    let line = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| "HTTP status line must end with CRLF".to_string())?;
+    let Some(version_end) = line.iter().position(|byte| *byte == b' ') else {
+        return Err("HTTP status line is missing status code".into());
+    };
+    let version = &line[..version_end];
+    if version != b"HTTP/1.0" && version != b"HTTP/1.1" {
+        return Err("HTTP status line has unsupported version".into());
+    }
+
+    let status_and_reason = &line[version_end + 1..];
+    if status_and_reason.len() < 3 {
+        return Err("HTTP status code must contain three digits".into());
+    }
+    let status = &status_and_reason[..3];
+    if !status.iter().all(u8::is_ascii_digit) {
+        return Err("HTTP status code must contain three digits".into());
+    }
+    let reason = &status_and_reason[3..];
+    if reason.first() != Some(&b' ') {
+        return Err("HTTP status code must be followed by one space".into());
+    }
+    if !reason[1..].iter().all(|byte| (b' '..=b'~').contains(byte)) {
+        return Err("HTTP reason phrase contains unsafe bytes".into());
+    }
+    Ok(status == b"200")
 }
 
 /// Send an HTTP POST to a process "container" and return the response body.
@@ -250,8 +490,185 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_runtime_rejects_gpu_without_device_isolation() {
+        let runtime = ProcessRuntime::with_base_port(24_400);
+        let error = runtime
+            .create_pod(&PodSpec {
+                pod_id: 77,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 0,
+                gpu_count: 1,
+                gpu_type: crate::types::GpuType::T4,
+                cpu_millicores: 1,
+                memory_megabytes: 1,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .expect_err("GPU process workload must fail closed");
+        assert!(error
+            .to_string()
+            .contains("cannot isolate physical devices"));
+    }
+
+    #[test]
+    fn process_runtime_probe_uses_owned_process_port() {
+        let runtime = ProcessRuntime::with_base_port(24_500);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 78,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+        runtime.start_pod(&handle).unwrap();
+
+        assert!(runtime.probe_pod(&handle, 1, "/health").unwrap());
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn stop_honors_graceful_sigterm_before_sigkill() {
+        let runtime = ProcessRuntime::with_base_port(24_250);
+        let container_id = "proc-grace".to_string();
+        let child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal,sys,time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(60)",
+            ])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            container_id.clone(),
+            RunningProcess {
+                child,
+                port: 24_250,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let handle = PodHandle {
+            pod_id: 79,
+            container_id,
+        };
+
+        runtime.stop_pod(&handle, 500).unwrap();
+
+        assert_eq!(
+            runtime.pod_status(&handle).unwrap(),
+            PodStatus::Stopped { exit_code: 0 },
+            "cooperative process must exit from SIGTERM before SIGKILL"
+        );
+        runtime.remove_pod(&handle).unwrap();
+    }
+
+    #[test]
+    fn stop_wait_does_not_hold_global_process_map_lock() {
+        let runtime = Arc::new(ProcessRuntime::with_base_port(24_100));
+        let slow_id = "proc-slow-stop".to_string();
+        let slow_child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            ])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            slow_id.clone(),
+            RunningProcess {
+                child: slow_child,
+                port: 24_100,
+            },
+        );
+        let other_id = "proc-other".to_string();
+        let other_child = Command::new("python3")
+            .args(["-c", "import time; time.sleep(60)"])
+            .spawn()
+            .unwrap();
+        runtime.processes.lock().unwrap().insert(
+            other_id.clone(),
+            RunningProcess {
+                child: other_child,
+                port: 24_101,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        let stop_runtime = Arc::clone(&runtime);
+        let slow_handle = PodHandle {
+            pod_id: 80,
+            container_id: slow_id,
+        };
+        let stop_handle = slow_handle.clone();
+        let stop = thread::spawn(move || stop_runtime.stop_pod(&stop_handle, 300));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        assert_eq!(runtime.get_port(&other_id), Some(24_101));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        stop.join().unwrap().unwrap();
+        runtime.remove_pod(&slow_handle).unwrap();
+        runtime
+            .remove_pod(&PodHandle {
+                pod_id: 81,
+                container_id: other_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stopped_process_remains_queryable_until_remove() {
+        let runtime = ProcessRuntime::with_base_port(24_000);
+        let handle = runtime
+            .create_pod(&PodSpec {
+                pod_id: 77,
+                deployment_id: 1,
+                image: "process".into(),
+                entrypoint: String::new(),
+                port: 0,
+                gpu_count: 0,
+                gpu_type: crate::types::GpuType::None,
+                cpu_millicores: 100,
+                memory_megabytes: 128,
+                env_vars: Vec::new(),
+                mounts: Vec::new(),
+            })
+            .unwrap();
+
+        runtime.stop_pod(&handle, 0).unwrap();
+        assert!(matches!(
+            runtime.pod_status(&handle),
+            Ok(PodStatus::Stopped { .. })
+        ));
+        runtime.remove_pod(&handle).unwrap();
+        assert!(matches!(
+            runtime.pod_status(&handle),
+            Err(RuntimeError::ContainerNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn post_kill_wait_is_bounded_when_exit_remains_unobservable() {
+        let started = Instant::now();
+        let status =
+            wait_for_child_exit_until(started + Duration::from_millis(20), || Ok(None)).unwrap();
+        assert!(status.is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 
     #[test]
     fn forward_run_reads_content_length_without_waiting_for_eof() {
@@ -298,6 +715,75 @@ mod tests {
             let _ = stream.write_all(&response);
         });
         port
+    }
+
+    #[test]
+    fn probe_accepts_only_exact_200_status() {
+        assert!(probe_http(
+            serve_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            "/health?full=1"
+        )
+        .unwrap());
+        assert!(!probe_http(
+            serve_response(b"HTTP/1.0 204 No Content\r\n\r\n".to_vec()),
+            "/health"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn probe_rejects_500_response_with_200_in_body() {
+        let response =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\n\r\n200".to_vec();
+        assert!(!probe_http(serve_response(response), "/health").unwrap());
+    }
+
+    #[test]
+    fn probe_rejects_malformed_oversized_and_unsafe_status_lines() {
+        for response in [
+            b"not-http 200\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200\r\n".to_vec(),
+            {
+                let mut line = b"HTTP/1.1 200 ".to_vec();
+                line.extend(std::iter::repeat_n(b'x', 1024));
+                line.extend_from_slice(b"\r\n\r\n");
+                line
+            },
+            b"HTTP/1.1 200 OK\0unsafe\r\n\r\n".to_vec(),
+        ] {
+            assert!(probe_http(serve_response(response), "/health").is_err());
+        }
+    }
+
+    #[test]
+    fn probe_total_deadline_stops_trickle_status_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            for byte in b"HTTP/1.1 200 OK\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(350));
+            }
+        });
+
+        let started = Instant::now();
+        assert!(probe_http(port, "/health").is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(5_750),
+            "probe exceeded its total deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn probe_rejects_request_target_header_injection() {
+        let error = probe_http(1, "/health\r\nX-Injected: yes").unwrap_err();
+        assert!(error.contains("unsafe request-target bytes"));
     }
 
     #[test]

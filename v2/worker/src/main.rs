@@ -1,16 +1,41 @@
-use hivemind_worker::{crypto, fingerprint, metrics, real_io, runtime, sim, types, worker};
+use hivemind_worker::{
+    crypto, fingerprint,
+    io::Io,
+    message::{ControlMessage, WorkerMessage},
+    metrics, real_io, runtime, sim, types, worker,
+};
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+const REPLICA_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 extern "C" fn handle_signal(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
 const MAX_REPLICA_ADDRS: usize = 64;
+const MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS: usize = 1;
+
+struct RuntimeOwner {
+    runtime: Box<dyn runtime::Runtime>,
+}
+
+impl RuntimeOwner {
+    fn new<F>(build: F) -> Self
+    where
+        F: FnOnce() -> Box<dyn runtime::Runtime>,
+    {
+        Self { runtime: build() }
+    }
+
+    fn runtime(&self) -> &dyn runtime::Runtime {
+        self.runtime.as_ref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunConfig {
@@ -34,6 +59,15 @@ fn parse_replica_addrs(replica_addr: &str) -> Vec<String> {
         addrs.push(addr.to_string());
     }
     addrs
+}
+
+fn validate_replica_addrs(replica_addrs: &[String]) -> Result<(), String> {
+    for replica_addr in replica_addrs {
+        replica_addr
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("replica address must be an IP socket address: {replica_addr}"))?;
+    }
+    Ok(())
 }
 
 fn parse_run_config<F>(args: &[String], env: F) -> RunConfig
@@ -158,7 +192,11 @@ fn cmd_run(args: &[String]) {
 
     let replica_addrs = parse_replica_addrs(&replica_addr);
     if replica_addrs.is_empty() {
-        eprintln!("usage: hivemind-worker run <replica-host:port>[,<replica-host:port>...] [--runtime process|simulated|containerd] [--snapshotter overlayfs|nydus] [--metrics-port PORT] [--encryption-key HEX]");
+        eprintln!("usage: hivemind-worker run <replica-ip:port>[,<replica-ip:port>...] [--runtime process|simulated|containerd] [--snapshotter overlayfs|nydus] [--metrics-port PORT] [--encryption-key HEX]");
+        std::process::exit(1);
+    }
+    if let Err(error) = validate_replica_addrs(&replica_addrs) {
+        eprintln!("hivemind-worker: {error}");
         std::process::exit(1);
     }
 
@@ -230,6 +268,29 @@ fn cmd_run(args: &[String]) {
         );
     }
 
+    // Runtime ownership spans control-plane sessions. Reconnects reset transport
+    // registration only; recreating the runtime would orphan retained pod handles.
+    let runtime_owner = RuntimeOwner::new(|| match runtime_mode.as_str() {
+        "process" => Box::new(runtime::process::ProcessRuntime::new()),
+        "simulated" => Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())),
+        #[cfg(target_os = "linux")]
+        "containerd" => {
+            let snap = if snapshotter == "overlayfs" {
+                None
+            } else {
+                Some(snapshotter.as_str())
+            };
+            Box::new(
+                runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
+                    .expect("failed to init containerd runtime"),
+            )
+        }
+        other => {
+            eprintln!("unknown runtime: {other}");
+            std::process::exit(1);
+        }
+    });
+
     let mut backoff_ms: u64 = 100;
     let max_backoff_ms: u64 = 10_000;
     let mut replica_idx: usize = 0;
@@ -240,41 +301,23 @@ fn cmd_run(args: &[String]) {
         }
 
         let current_replica_addr = replica_addrs[replica_idx].clone();
-        match real_io::RealIo::connect(&current_replica_addr, encryption_key) {
+        match real_io::RealIo::connect_timeout(
+            &current_replica_addr,
+            encryption_key,
+            REPLICA_CONNECT_TIMEOUT,
+        ) {
             Ok(mut rio) => {
                 eprintln!("worker {node_name}: connected to {current_replica_addr}");
                 backoff_ms = 100;
 
-                match runtime_mode.as_str() {
-                    "process" => {
-                        let rt = runtime::process::ProcessRuntime::new();
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    "simulated" => {
-                        let rt = sim::runtime::SimulatedRuntime::new(0, Default::default());
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    #[cfg(target_os = "linux")]
-                    "containerd" => {
-                        let snap = if snapshotter == "overlayfs" {
-                            None
-                        } else {
-                            Some(snapshotter.as_str())
-                        };
-                        let rt =
-                            runtime::containerd::ContainerdRuntime::new(None, None, None, snap)
-                                .expect("failed to init containerd runtime");
-                        run_worker_loop(&mut node_worker, &mut rio, &rt, &metrics_server);
-                    }
-                    other => {
-                        eprintln!("unknown runtime: {other}");
-                        std::process::exit(1);
-                    }
-                }
+                run_worker_loop(
+                    &mut node_worker,
+                    &mut rio,
+                    runtime_owner.runtime(),
+                    &metrics_server,
+                );
 
-                if SHUTDOWN.load(Ordering::SeqCst) {
-                    eprintln!("worker {node_name}: shutdown complete");
-                } else {
+                if !SHUTDOWN.load(Ordering::SeqCst) {
                     node_worker.on_connection_lost();
                     replica_idx = (replica_idx + 1) % replica_addrs.len();
                     eprintln!("worker {node_name}: disconnected from {current_replica_addr}");
@@ -290,14 +333,38 @@ fn cmd_run(args: &[String]) {
             break;
         }
         eprintln!("worker {node_name}: reconnecting in {backoff_ms}ms");
-        thread::sleep(Duration::from_millis(backoff_ms));
+        wait_for_reconnect_or_shutdown(Duration::from_millis(backoff_ms));
         backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
     }
+
+    // A signal can arrive while no control-plane session exists: during a failed
+    // connect or reconnect backoff. Runtime ownership outlives those sessions, so
+    // local shutdown reconciliation must not depend on having a RealIo available.
+    if !shutdown_disconnected_worker(&mut node_worker, runtime_owner.runtime(), || {
+        thread::sleep(Duration::from_secs(1));
+    }) {
+        eprintln!(
+            "worker: shutdown cleanup remains unverified after {} reconciliation attempts",
+            MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS
+        );
+        std::process::exit(1);
+    }
+    eprintln!("worker {node_name}: shutdown complete");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_replica_addrs, parse_run_config, RunConfig, MAX_REPLICA_ADDRS};
+    use super::{
+        parse_replica_addrs, parse_run_config, reconcile_shutdown, shutdown_disconnected_worker,
+        validate_replica_addrs, wait_for_reconnect_or_shutdown_with, RunConfig, RuntimeOwner,
+        MAX_REPLICA_ADDRS, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS,
+    };
+    use hivemind_worker::message::{ControlMessage, StartPodCmd};
+    use hivemind_worker::runtime::Runtime;
+    use hivemind_worker::sim;
+    use hivemind_worker::types::GpuType;
+    use hivemind_worker::worker::TrackedPodState;
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     fn parse(args: &[&str], env_pairs: &[(&str, &str)]) -> RunConfig {
@@ -329,6 +396,18 @@ mod tests {
     }
 
     #[test]
+    fn replica_addresses_require_ip_socket_addresses() {
+        assert!(
+            validate_replica_addrs(&["127.0.0.1:9000".to_string(), "[::1]:9001".to_string(),])
+                .is_ok()
+        );
+        assert_eq!(
+            validate_replica_addrs(&["localhost:9000".to_string()]),
+            Err("replica address must be an IP socket address: localhost:9000".to_string())
+        );
+    }
+
+    #[test]
     fn snapshotter_flag_beats_env_var() {
         let cfg = parse(
             &["127.0.0.1:9000", "--snapshotter", "nydus"],
@@ -344,6 +423,22 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reconciliation_is_bounded() {
+        let mut attempts = 0;
+        let mut waits = 0;
+
+        assert!(!reconcile_shutdown(
+            || {
+                attempts += 1;
+                false
+            },
+            || waits += 1,
+        ));
+        assert_eq!(attempts, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS);
+        assert_eq!(waits, MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS - 1);
+    }
+
+    #[test]
     fn metrics_port_still_uses_env_when_flag_missing() {
         let cfg = parse(
             &["127.0.0.1:9000"],
@@ -351,6 +446,207 @@ mod tests {
         );
         assert_eq!(cfg.metrics_port, Some(8081));
     }
+
+    #[test]
+    fn runtime_owner_is_constructed_once_across_sessions() {
+        let constructions = Cell::new(0);
+        let owner = RuntimeOwner::new(|| {
+            constructions.set(constructions.get() + 1);
+            Box::new(sim::runtime::SimulatedRuntime::new(0, Default::default())) as Box<dyn Runtime>
+        });
+        let first = owner.runtime() as *const dyn Runtime as *const ();
+        let second = owner.runtime() as *const dyn Runtime as *const ();
+
+        assert_eq!(constructions.get(), 1);
+        assert_eq!(first, second);
+    }
+
+    fn running_pod_sim(pod_id: u64) -> sim::simulator::WorkerSimulator {
+        let mut sim = sim::simulator::WorkerSimulator::new(1, 0xD1_5C_0A);
+        sim.network.min_delay = 1;
+        sim.network.max_delay = 1;
+        sim.run(5);
+        sim.network.send_to_agent(
+            0,
+            ControlMessage::StartPod(StartPodCmd {
+                pod_id,
+                deployment_id: pod_id + 1_000,
+                image: "shutdown-test:latest".into(),
+                entrypoint: String::new(),
+                port: 8080,
+                gpu_count: 1,
+                gpu_type: GpuType::H100Sxm,
+                cpu_millicores: 500,
+                memory_megabytes: 512,
+                juicefs_path: String::new(),
+                liveness_path: String::new(),
+                readiness_path: String::new(),
+                env_vars: vec![],
+                image_pull_registry: String::new(),
+                image_pull_username: String::new(),
+                image_pull_password: String::new(),
+                image_pull_password_is_secret: false,
+            }),
+            sim.current_tick,
+        );
+        sim.run(10);
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&pod_id].state,
+            TrackedPodState::Running
+        );
+        sim
+    }
+
+    #[test]
+    fn disconnected_shutdown_verifies_cleanup_during_reconnect_backoff() {
+        let pod_id = 60_006;
+        let mut sim = running_pod_sim(pod_id);
+        sim.lose_agent_session(0);
+        let before = sim.sim_runtimes[0].operation_counts(pod_id);
+
+        assert!(shutdown_disconnected_worker(
+            &mut sim.workers[0],
+            &sim.sim_runtimes[0],
+            || {},
+        ));
+        assert!(sim.workers[0].tracked_pods().is_empty());
+        let after = sim.sim_runtimes[0].operation_counts(pod_id);
+        assert_eq!(after.stop - before.stop, 1);
+        assert_eq!(after.status - before.status, 1);
+        assert_eq!(after.remove - before.remove, 1);
+
+        assert!(shutdown_disconnected_worker(
+            &mut sim.workers[0],
+            &sim.sim_runtimes[0],
+            || {},
+        ));
+        assert_eq!(sim.sim_runtimes[0].operation_counts(pod_id), after);
+    }
+
+    #[test]
+    fn reconnect_backoff_observes_shutdown_without_waiting_for_full_delay() {
+        let polls = Cell::new(0usize);
+        let sleeps = Cell::new(0usize);
+        let observed = wait_for_reconnect_or_shutdown_with(
+            std::time::Duration::from_secs(10),
+            || {
+                let next = polls.get() + 1;
+                polls.set(next);
+                next >= 3
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        );
+        assert!(observed);
+        assert_eq!(polls.get(), 3);
+        assert_eq!(sleeps.get(), 2);
+    }
+
+    #[test]
+    fn disconnected_shutdown_retains_ownership_when_runtime_is_unavailable() {
+        let pod_id = 60_007;
+        let mut sim = running_pod_sim(pod_id);
+        sim.lose_agent_session(0);
+        sim.sim_runtimes[0].lose_pod(pod_id);
+        let before = sim.sim_runtimes[0].operation_counts(pod_id);
+
+        assert!(!shutdown_disconnected_worker(
+            &mut sim.workers[0],
+            &sim.sim_runtimes[0],
+            || {},
+        ));
+        assert_eq!(
+            sim.workers[0].tracked_pods()[&pod_id].state,
+            TrackedPodState::Stopping
+        );
+        assert_eq!(sim.workers[0].gpu_allocated(), 1);
+        assert_eq!(sim.workers[0].cpu_allocated_millicores(), 500);
+        assert_eq!(sim.workers[0].memory_allocated_megabytes(), 512);
+        let after = sim.sim_runtimes[0].operation_counts(pod_id);
+        assert!(after.stop > before.stop);
+        assert_eq!(after.status - before.status, after.stop - before.stop);
+        assert_eq!(after.remove - before.remove, 0);
+    }
+}
+
+fn reconcile_shutdown<F, S>(mut shutdown: F, mut wait: S) -> bool
+where
+    F: FnMut() -> bool,
+    S: FnMut(),
+{
+    for attempt in 0..MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS {
+        if shutdown() {
+            return true;
+        }
+        if attempt + 1 < MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS {
+            wait();
+        }
+    }
+    false
+}
+
+struct DisconnectedShutdownIo;
+
+impl Io for DisconnectedShutdownIo {
+    fn now(&self) -> u64 {
+        0
+    }
+
+    fn send(&mut self, _msg: WorkerMessage) {
+        // The control plane observes the node loss and cannot receive terminal
+        // status on this dead session. Local runtime cleanup remains mandatory.
+    }
+
+    fn recv(&mut self) -> Option<ControlMessage> {
+        None
+    }
+
+    fn random_u64(&mut self) -> u64 {
+        0
+    }
+}
+
+fn shutdown_disconnected_worker<W>(
+    node_worker: &mut worker::Worker,
+    runtime: &dyn runtime::Runtime,
+    mut wait: W,
+) -> bool
+where
+    W: FnMut(),
+{
+    let mut io = DisconnectedShutdownIo;
+    reconcile_shutdown(|| node_worker.shutdown(&mut io, runtime), || wait())
+}
+
+fn wait_for_reconnect_or_shutdown_with<F, S>(
+    duration: Duration,
+    mut shutdown_requested: F,
+    mut sleep: S,
+) -> bool
+where
+    F: FnMut() -> bool,
+    S: FnMut(Duration),
+{
+    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let deadline = Instant::now() + duration;
+    loop {
+        if shutdown_requested() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
+    }
+}
+
+fn wait_for_reconnect_or_shutdown(duration: Duration) {
+    let _ = wait_for_reconnect_or_shutdown_with(
+        duration,
+        || SHUTDOWN.load(Ordering::SeqCst),
+        thread::sleep,
+    );
 }
 
 fn run_worker_loop(
@@ -369,6 +665,15 @@ fn run_worker_loop(
 
     if SHUTDOWN.load(Ordering::SeqCst) {
         eprintln!("worker: shutting down gracefully...");
-        node_worker.shutdown(rio, rt);
+        if !reconcile_shutdown(
+            || node_worker.shutdown(rio, rt),
+            || thread::sleep(Duration::from_secs(1)),
+        ) {
+            eprintln!(
+                "worker: shutdown cleanup remains unverified after {} reconciliation attempts",
+                MAX_SHUTDOWN_RECONCILIATION_ATTEMPTS
+            );
+            std::process::exit(1);
+        }
     }
 }

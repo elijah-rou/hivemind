@@ -1,6 +1,6 @@
 # Hivemind POC Changelog
 
-_Last updated: 2026-07-16_
+_Last updated: 2026-08-06_
 
 Purpose: keep a running record of what changed, why it matters, how close the project is to the federated POC goal, and what should happen next.
 
@@ -43,6 +43,25 @@ The benchmark/economic verdict remains provisional. Latest warm-cache nginx matr
 - Targeted cloud Section 5 and repeatability are green for the functional/resilience POC.
 
 ## Entries
+
+### 2026-08-06 — Reconcile worker shutdown without a control-plane session
+
+What changed:
+- routed SIGTERM/SIGINT received during failed connect or reconnect backoff through the same bounded worker shutdown reconciliation used by connected sessions
+- made reconnect backoff observe shutdown within a bounded polling interval
+- added deterministic coverage for bounded IP-only connect setup, signal-aware reconnect backoff, idempotent connected/disconnected reconciliation, and a running pod whose session is lost before verified stop/status/remove or fail-closed retained ownership
+
+Why it matters:
+- losing the control-plane session must not orphan locally owned pod runtime or JuiceFS state when the worker is then terminated
+- unavailable runtime state remains owned and accounted instead of being reported as cleaned up without proof
+
+Acceptance progress: unchanged; POC v2 remains blocked in every required acceptance section
+
+Next steps:
+1. retain the disconnected-shutdown scenario in worker simulation sweeps
+2. exercise the same signal timing in a future live worker failure drill
+
+Live infra status: unknown; no inventory or live action ran for this change
 
 ### 2026-07-16 — Remove former platform association branding
 
