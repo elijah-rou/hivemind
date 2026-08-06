@@ -6,6 +6,8 @@ set -euo pipefail
 # hooks receive the validated environment and must use exact run-token ownership.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=v2/tests/live/bucket-ownership.sh
+source "$SCRIPT_DIR/bucket-ownership.sh"
 ALLOW_LIVE="${HIVEMIND_ALLOW_LIVE:-0}"
 ACCOUNT_ALLOWLIST="${HIVEMIND_AWS_ACCOUNT_ALLOWLIST:-}"
 REGION="${AWS_REGION:-}"
@@ -140,7 +142,6 @@ if [[ "$FIXTURE_MODE" == 0 ]]; then
     timeout --kill-after=5s 60s "$SCRIPT_DIR/quota-preflight.sh" >"${TMPDIR:-/tmp}/hivemind-quota-${RUN_TOKEN_HASH:0:16}.txt" ||
         fail "bounded quota/capability preflight failed"
     rm -f "${TMPDIR:-/tmp}/hivemind-quota-${RUN_TOKEN_HASH:0:16}.txt"
-    fail "strict pre-mutation JuiceFS/containerd/GPU/Nydus capability evidence is unavailable; refusing before ownership"
 fi
 
 umask 077
@@ -245,6 +246,7 @@ finish() {
         fi
     fi
     rm -rf -- "${RAW_DIR:-}"
+    if [[ "$OWNERSHIP_STARTED" == 0 ]]; then rm -rf -- "$EVIDENCE_DIR"; fi
     exit "$status"
 }
 trap finish EXIT
@@ -262,11 +264,22 @@ if [[ "$pre_inventory_status" != 0 ]] || ! validate_zero_inventory "$PRE_INVENTO
     fail "pre-ownership inventory is not zero for every owned category"
 fi
 
+if ! hivemind_live_bucket_preflight "$BUCKET" "$REGION" "$RAW_DIR/s3-preflight-check.log"; then
+    fail "S3 bucket preflight failed before ownership"
+fi
+printf 's3_bucket_preflight	0
+' >>"$STATUS_FILE"
+
 printf 'guardrails=passed region=%s ownership_hash=%s KEEP_INFRA=%s max_duration_seconds=%s max_estimated_cost_usd=%s scope=EC2,EBS,EIP,ECR,S3,SSM,data-transfer\n' \
     "$REGION" "${RUN_TOKEN_HASH:0:16}" "$KEEP_INFRA" "${HIVEMIND_LIVE_TIMEOUT_SECONDS:-14400}" "$APPROVED_COST"
 if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
     echo "PREPARED ONLY: no ownership or live executor invocation"
+    rm -rf -- "$RAW_DIR" "$EVIDENCE_DIR"
+    RAW_DIR=""
     exit 0
+fi
+if [[ "$FIXTURE_MODE" == 0 ]]; then
+    fail "strict pre-mutation JuiceFS/containerd/GPU/Nydus capability evidence is unavailable; refusing before ownership"
 fi
 [[ -x "$EXECUTOR" ]] || fail "live executor is not executable: $EXECUTOR"
 [[ -x "$CLEANUP" ]] || fail "live cleanup hook is not executable: $CLEANUP"

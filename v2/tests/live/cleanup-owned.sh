@@ -33,6 +33,8 @@ REGION="${AWS_REGION:?}"
 KEEP_INFRA="${KEEP_INFRA:-0}"
 EVIDENCE_DIR="${HIVEMIND_LIVE_EVIDENCE_DIR:?}"
 RAW_DIR="${HIVEMIND_LIVE_RAW_DIR:?}"
+# shellcheck source=v2/tests/live/bucket-ownership.sh
+source "$ROOT_DIR/tests/live/bucket-ownership.sh"
 [[ "$WORKSPACE" == *"$RUN_TOKEN"* && "$BUCKET" == *"$RUN_TOKEN"* ]]
 
 if [[ "$KEEP_INFRA" == 1 ]]; then
@@ -49,12 +51,29 @@ record_failure() {
     fi
 }
 
+cleanup_tmp="$(mktemp -d)"
+trap 'rm -rf "$cleanup_tmp"' EXIT
+state_file="$cleanup_tmp/terraform-state.json"
+marker="$cleanup_tmp/bucket-marker"
+
 set +e
 timeout --foreground --kill-after=5s "${HIVEMIND_TERRAFORM_SELECT_TIMEOUT_SECONDS:-60}s" \
     terraform -chdir="$TF_ROOT" workspace select "$WORKSPACE" >/dev/null
 select_status=$?
 record_failure terraform_workspace_select "$select_status"
+state_status=1
 if [[ "$select_status" == 0 ]]; then
+    timeout --foreground --kill-after=5s "${HIVEMIND_TERRAFORM_SHOW_TIMEOUT_SECONDS:-120}s" \
+        terraform -chdir="$TF_ROOT" show -json >"$state_file" 2>/dev/null
+    state_status=$?
+    if [[ "$state_status" == 0 ]]; then
+        python3 "$ROOT_DIR/tests/live/validate-owned-state.py" \
+            "$state_file" "$RUN_TOKEN" "${HIVEMIND_LIVE_ECR:?}" >/dev/null
+        state_status=$?
+    fi
+fi
+record_failure terraform_state_ownership "$state_status"
+if [[ "$select_status" == 0 && "$state_status" == 0 ]]; then
     timeout --foreground --kill-after=30s "${HIVEMIND_TERRAFORM_DESTROY_TIMEOUT_SECONDS:-1200}s" \
         terraform -chdir="$TF_ROOT" destroy -auto-approve \
         -var "run_token=$RUN_TOKEN" -var "ecr_repository_name=${HIVEMIND_LIVE_ECR:?}" -var "region=$REGION" 2>&1 | \
@@ -65,7 +84,7 @@ for chunk in iter(lambda: sys.stdin.buffer.read(65536), b""):
 p.close()' "$RAW_DIR/terraform-destroy.log"
     destroy_status=${PIPESTATUS[0]}
 else
-    printf 'workspace selection failed; destroy not attempted\n' >"$RAW_DIR/terraform-destroy.log"
+    printf 'workspace state ownership/topology validation failed; destroy not attempted\n' >"$RAW_DIR/terraform-destroy.log"
     destroy_status=1
 fi
 record_failure terraform_destroy "$destroy_status"
@@ -73,31 +92,12 @@ HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh"
     "$RAW_DIR/terraform-destroy.log" "$EVIDENCE_DIR/terraform-destroy.log"
 record_failure terraform_destroy_log "$?"
 
-marker="$(mktemp)"
-trap 'rm -f "$marker"' EXIT
-claim_file="$RAW_DIR/s3-ownership-claim"
 bucket_check="$RAW_DIR/s3-cleanup-head.log"
 timeout --foreground --kill-after=2s 30s aws s3api head-bucket --bucket "$BUCKET" \
     >"$bucket_check" 2>&1
 bucket_status=$?
 if [[ "$bucket_status" == 0 ]]; then
-    timeout --foreground --kill-after=2s 30s aws s3api get-object --bucket "$BUCKET" \
-        --key .hivemind-owner "$marker" >/dev/null 2>&1
-    marker_status=$?
-    if [[ "$marker_status" != 0 || "$(cat "$marker" 2>/dev/null)" != "$RUN_TOKEN" ]]; then
-        if [[ -f "$claim_file" && "$(cat "$claim_file")" == "$RUN_TOKEN" ]]; then
-            timeout --foreground --kill-after=2s 30s aws s3api put-object --bucket "$BUCKET" \
-                --key .hivemind-owner --body "$claim_file" --region "$REGION" >/dev/null
-            marker_status=$?
-            : >"$marker"
-            if [[ "$marker_status" == 0 ]]; then
-                timeout --foreground --kill-after=2s 30s aws s3api get-object --bucket "$BUCKET" \
-                    --key .hivemind-owner "$marker" >/dev/null
-                marker_status=$?
-            fi
-        fi
-    fi
-    if [[ "$marker_status" == 0 && "$(cat "$marker")" == "$RUN_TOKEN" ]]; then
+    if hivemind_live_bucket_verify_owned "$BUCKET" "$REGION" "$RUN_TOKEN" "$RAW_DIR" "$marker"; then
         timeout --foreground --kill-after=10s "${HIVEMIND_S3_EMPTY_TIMEOUT_SECONDS:-300}s" \
             aws s3 rm "s3://$BUCKET" --recursive --region "$REGION"
         record_failure s3_empty "$?"
@@ -105,7 +105,7 @@ if [[ "$bucket_status" == 0 ]]; then
             aws s3 rb "s3://$BUCKET" --region "$REGION"
         record_failure s3_delete "$?"
     else
-        echo "FAIL: refusing cleanup of bucket without exact ownership claim" >&2
+        echo "FAIL: refusing cleanup of bucket without exact local and remote ownership claims" >&2
         overall_status=1
     fi
 elif ! grep -Eq '(404|Not Found|NoSuchBucket)' "$bucket_check"; then

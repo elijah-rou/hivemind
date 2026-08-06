@@ -9,8 +9,21 @@ cat >"$TMP/bin/aws" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'aws:%s\n' "$*" >>"${FIXTURE_LOG:?}"
-[[ "$*" == 'sts get-caller-identity --query Account --output text --region us-test-1' ]] || exit 8
-printf '%s\n' "${FIXTURE_ACCOUNT:?}"
+case "${1:-}:${2:-}" in
+  sts:get-caller-identity)
+    [[ "$*" == 'sts get-caller-identity --query Account --output text --region us-test-1' ]] || exit 8
+    printf '%s\n' "${FIXTURE_ACCOUNT:?}"
+    ;;
+  s3api:head-bucket)
+    case "${PREFLIGHT_BUCKET_SCENARIO:-absent}" in
+      absent) echo 'An error occurred (404) when calling HeadBucket: Not Found' >&2; exit 254 ;;
+      preexisting) exit 0 ;;
+      unavailable) echo 'An error occurred (403) when calling HeadBucket: Forbidden' >&2; exit 254 ;;
+      *) exit 9 ;;
+    esac
+    ;;
+  *) exit 8 ;;
+esac
 STUB
 cat >"$TMP/executor" <<'STUB'
 #!/usr/bin/env bash
@@ -58,6 +71,101 @@ export PATH="$TMP/bin:/usr/bin:/bin" FIXTURE_LOG="$TMP/calls.log"
 FIXTURE_ACCOUNT="$(printf '1%.0s' {1..12})"
 export FIXTURE_ACCOUNT
 
+# Exercise bucket ownership separately from the private live helper guard.
+mkdir -p "$TMP/bucket-bin" "$TMP/bucket-state"
+cat >"$TMP/bucket-bin/aws" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${BUCKET_STUB_STATE:?}" "${BUCKET_SCENARIO:?}"
+printf 'aws:%s\n' "$*" >>"$BUCKET_STUB_STATE/calls"
+operation="${1:-}:${2:-}"
+shift 2
+case "$operation" in
+  s3api:head-bucket)
+    if [[ "$BUCKET_SCENARIO" == preexisting || -d "$BUCKET_STUB_STATE/bucket" ]]; then exit 0; fi
+    echo 'An error occurred (404) when calling HeadBucket: Not Found' >&2
+    exit 254
+    ;;
+  s3api:create-bucket)
+    [[ "$*" == *"--create-bucket-configuration LocationConstraint=us-test-1"* ]] || exit 10
+    mkdir -p "$BUCKET_STUB_STATE/bucket"
+    if [[ "$BUCKET_SCENARIO" == ambiguous-create ]]; then exit 124; fi
+    if [[ "$BUCKET_SCENARIO" == marker-race ]]; then printf 'foreign' >"$BUCKET_STUB_STATE/bucket/marker"; fi
+    ;;
+  s3api:put-object)
+    body=''
+    while (( $# > 0 )); do
+      if [[ "$1" == --body ]]; then body="$2"; shift 2; continue; fi
+      shift
+    done
+    [[ -f "$BUCKET_STUB_STATE/bucket/marker" ]] && exit 1
+    cp "$body" "$BUCKET_STUB_STATE/bucket/marker"
+    ;;
+  s3api:get-object)
+    output=''
+    while (( $# > 0 )); do
+      case "$1" in
+        --bucket|--key|--region) shift 2 ;;
+        *) output="$1"; shift ;;
+      esac
+    done
+    [[ -n "$output" && -f "$BUCKET_STUB_STATE/bucket/marker" ]] || exit 1
+    cp "$BUCKET_STUB_STATE/bucket/marker" "$output"
+    ;;
+  *) exit 9 ;;
+esac
+STUB
+chmod +x "$TMP/bucket-bin/aws"
+# shellcheck source=v2/tests/live/bucket-ownership.sh
+source "$SCRIPT_DIR/live/bucket-ownership.sh"
+if PATH="$TMP/bucket-bin:/usr/bin:/bin" BUCKET_STUB_STATE="$TMP/bucket-state" \
+    BUCKET_SCENARIO=success hivemind_live_bucket_preflight \
+    fixture-bucket us-east-1 "$TMP/east-preflight.log"; then
+  echo 'FAIL: us-east-1 preflight unexpectedly passed' >&2; exit 1
+fi
+run_bucket_case() {
+  local scenario="$1"
+  rm -rf "$TMP/bucket-state" "$TMP/bucket-raw"
+  mkdir -p "$TMP/bucket-state" "$TMP/bucket-raw"
+  : >"$TMP/bucket-state/calls"
+  : >"$TMP/bucket-status"
+  PATH="$TMP/bucket-bin:/usr/bin:/bin" BUCKET_STUB_STATE="$TMP/bucket-state" \
+    BUCKET_SCENARIO="$scenario" HIVEMIND_LIVE_STATUS_FILE="$TMP/bucket-status" \
+    hivemind_live_bucket_acquire fixture-bucket us-test-1 exact-token "$TMP/bucket-raw"
+}
+run_bucket_case success
+PATH="$TMP/bucket-bin:/usr/bin:/bin" BUCKET_STUB_STATE="$TMP/bucket-state" \
+  BUCKET_SCENARIO=success hivemind_live_bucket_verify_owned \
+  fixture-bucket us-test-1 exact-token "$TMP/bucket-raw" "$TMP/bucket-verified"
+grep -Fq -- "--if-none-match *" "$TMP/bucket-state/calls"
+[[ "$(cat "$TMP/bucket-raw/s3-ownership-claim")" == exact-token ]]
+rm -rf "$TMP/bucket-state" "$TMP/bucket-raw"
+mkdir -p "$TMP/bucket-state" "$TMP/bucket-raw"
+: >"$TMP/bucket-state/calls"; : >"$TMP/bucket-status"
+if PATH="$TMP/bucket-bin:/usr/bin:/bin" BUCKET_STUB_STATE="$TMP/bucket-state" \
+  BUCKET_SCENARIO=success HIVEMIND_LIVE_STATUS_FILE="$TMP/bucket-status" \
+  hivemind_live_bucket_acquire fixture-bucket us-east-1 exact-token "$TMP/bucket-raw"; then
+  echo 'FAIL: us-east-1 legacy bucket semantics were accepted' >&2; exit 1
+fi
+[[ ! -s "$TMP/bucket-state/calls" ]]
+
+if run_bucket_case preexisting; then echo 'FAIL: pre-existing bucket was acquired' >&2; exit 1; fi
+if grep -Eq 'create-bucket|put-object' "$TMP/bucket-state/calls"; then echo 'FAIL: pre-existing bucket triggered mutation' >&2; exit 1; fi
+[[ ! -e "$TMP/bucket-raw/s3-ownership-claim" ]]
+if run_bucket_case ambiguous-create; then echo 'FAIL: ambiguous create was acquired' >&2; exit 1; fi
+if grep -q 'put-object' "$TMP/bucket-state/calls"; then echo 'FAIL: ambiguous create attempted marker adoption' >&2; exit 1; fi
+[[ ! -e "$TMP/bucket-raw/s3-ownership-claim" ]]
+if run_bucket_case marker-race; then echo 'FAIL: foreign marker was acquired' >&2; exit 1; fi
+[[ ! -e "$TMP/bucket-raw/s3-ownership-claim" ]]
+
+run_bucket_case success
+printf 'changed' >"$TMP/bucket-state/bucket/marker"
+if PATH="$TMP/bucket-bin:/usr/bin:/bin" BUCKET_STUB_STATE="$TMP/bucket-state" \
+  BUCKET_SCENARIO=success hivemind_live_bucket_verify_owned \
+  fixture-bucket us-test-1 exact-token "$TMP/bucket-raw" "$TMP/bucket-verified"; then
+  echo 'FAIL: changed remote marker retained cleanup authority' >&2; exit 1
+fi
+
 validator="$SCRIPT_DIR/live/validate-reviewed-plan.py"
 cat >"$TMP/valid-plan.json" <<'JSON'
 {"resource_changes":[{"address":"aws_instance.replica[0]","mode":"managed","type":"aws_instance","change":{"actions":["create"],"before":null,"after":{"tags":{"HivemindRunToken":"fixture-token"}}}}]}
@@ -77,6 +185,61 @@ if python3 "$validator" "$TMP/action-plan.json" fixture-token fixture-ecr >"$TMP
   echo "FAIL: unknown managed Terraform action accepted" >&2; exit 1
 fi
 grep -q 'unsupported managed action set' "$TMP/action-plan.out"
+
+state_validator="$SCRIPT_DIR/live/validate-owned-state.py"
+python3 - "$TMP/valid-state.json" <<'PY'
+import json, sys
+
+token = "e1fixtureabc123"
+security_group = "sg-fixture"
+resources = []
+def add(address, resource_type, values):
+    values["tags_all"] = {**values.get("tags_all", {}), "HivemindRunToken": token}
+    resources.append({"address": address, "mode": "managed", "type": resource_type, "values": values})
+add("aws_ecr_repository.workloads", "aws_ecr_repository", {"name": f"hm-{token}"})
+add("aws_key_pair.poc", "aws_key_pair", {"key_name": f"hivemind-{token}-deployer"})
+add("aws_security_group.hivemind", "aws_security_group", {"id": security_group})
+for index in range(5):
+    add(f"aws_instance.replica[{index}]", "aws_instance", {
+        "key_name": f"hivemind-{token}-deployer",
+        "vpc_security_group_ids": [security_group],
+        "tags_all": {"Name": f"hivemind-{token}-replica-{index}", "Role": "replica"},
+    })
+for suffix in ("cpu", "gpu"):
+    add(f"aws_instance.worker_{suffix}", "aws_instance", {
+        "key_name": f"hivemind-{token}-deployer",
+        "vpc_security_group_ids": [security_group],
+        "tags_all": {"Name": f"hivemind-{token}-worker-{suffix}", "Role": "worker"},
+    })
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    json.dump({"values": {"root_module": {"resources": resources}}}, output)
+PY
+python3 "$state_validator" "$TMP/valid-state.json" e1fixtureabc123 hm-e1fixtureabc123
+python3 - "$TMP/valid-state.json" "$TMP/extra-state.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source: state = json.load(source)
+state["values"]["root_module"]["resources"].append({
+    "address": "aws_s3_bucket.foreign", "mode": "managed", "type": "aws_s3_bucket",
+    "values": {"tags_all": {"HivemindRunToken": "e1fixtureabc123"}},
+})
+with open(sys.argv[2], "w", encoding="utf-8") as output: json.dump(state, output)
+PY
+if python3 "$state_validator" "$TMP/extra-state.json" e1fixtureabc123 hm-e1fixtureabc123 >"$TMP/extra-state.out" 2>&1; then
+  echo "FAIL: extra Terraform state resource accepted for cleanup" >&2; exit 1
+fi
+grep -q 'addresses differ from the exact guarded topology' "$TMP/extra-state.out"
+python3 - "$TMP/valid-state.json" "$TMP/mismatched-state.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source: state = json.load(source)
+for resource in state["values"]["root_module"]["resources"]:
+    if resource["address"] == "aws_instance.worker_gpu":
+        resource["values"]["vpc_security_group_ids"] = ["sg-foreign"]
+with open(sys.argv[2], "w", encoding="utf-8") as output: json.dump(state, output)
+PY
+if python3 "$state_validator" "$TMP/mismatched-state.json" e1fixtureabc123 hm-e1fixtureabc123 >"$TMP/mismatched-state.out" 2>&1; then
+  echo "FAIL: mismatched Terraform state relationship accepted for cleanup" >&2; exit 1
+fi
+grep -q 'security-group relationship differs' "$TMP/mismatched-state.out"
 
 base_env=(
   HIVEMIND_ALLOW_LIVE=1 HIVEMIND_LIVE_FIXTURE_MODE=1 HIVEMIND_AWS_ACCOUNT_ALLOWLIST="$FIXTURE_ACCOUNT"
@@ -142,10 +305,25 @@ if grep -q '^executor' "$FIXTURE_LOG"; then
   echo "FAIL: preflight-only invoked executor" >&2; exit 1
 fi
 grep -q 'KEEP_INFRA=0' "$TMP/preflight.out"
+[[ ! -e "$TMP/evidence" ]]
+grep -q 's3api head-bucket' "$FIXTURE_LOG"
 
-: >"$FIXTURE_LOG"; rm -rf "$TMP/evidence"
+for bucket_scenario in preexisting unavailable; do
+  : >"$FIXTURE_LOG"; rm -rf "$TMP/evidence"
+  if env "${base_env[@]}" HIVEMIND_LIVE_PREFLIGHT_ONLY=1 \
+      PREFLIGHT_BUCKET_SCENARIO="$bucket_scenario" "$RUNNER" \
+      >"$TMP/preflight-$bucket_scenario.out" 2>&1; then
+    echo "FAIL: $bucket_scenario bucket preflight unexpectedly passed" >&2; exit 1
+  fi
+  if grep -Eq '^(executor|cleanup)$' "$FIXTURE_LOG"; then
+    echo "FAIL: failed bucket preflight invoked mutation hooks" >&2; exit 1
+  fi
+  [[ ! -e "$TMP/evidence" ]]
+done
+
+: >"$FIXTURE_LOG"
 env "${base_env[@]}" "$RUNNER" >"$TMP/success.out"
-[[ "$(cat "$FIXTURE_LOG")" == $'aws:sts get-caller-identity --query Account --output text --region us-test-1\nexecutor\ncleanup' ]]
+[[ "$(cat "$FIXTURE_LOG")" == $'aws:sts get-caller-identity --query Account --output text --region us-test-1\naws:s3api head-bucket --bucket hm-e1fixtureabc123 --region us-test-1\nexecutor\ncleanup' ]]
 grep -q '^instances=0$' "$TMP/evidence/post-apply-inventory.txt"
 grep -q '^instances=0$' "$TMP/evidence/pre-cleanup-inventory.txt"
 grep -q '^instances=0$' "$TMP/evidence/post-cleanup-inventory.txt"

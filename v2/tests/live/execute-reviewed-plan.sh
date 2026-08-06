@@ -39,6 +39,8 @@ PLAN_SHA="${HIVEMIND_APPROVED_PLAN_SHA256:?}"
 REVIEW_RECORD="${HIVEMIND_PLAN_REVIEW_RECORD:?}"
 SSH_KEY="${SSH_KEY:?SSH_KEY is required}"
 STATUS_FILE="${HIVEMIND_LIVE_STATUS_FILE:?}"
+# shellcheck source=v2/tests/live/bucket-ownership.sh
+source "$ROOT_DIR/tests/live/bucket-ownership.sh"
 record_success() { printf '%s\t0\n' "$1" >>"$STATUS_FILE"; }
 run_recorded() {
     local phase="$1" status
@@ -70,42 +72,7 @@ HIVEMIND_REDACTION_TOKEN="$RUN_TOKEN" "$ROOT_DIR/tests/live/publish-redacted.sh"
 record_success reviewed_plan_validation
 
 # Ownership starts only after the parent wrapper's cleanup trap and zero inventory.
-claim_file="$RAW_DIR/s3-ownership-claim"
-marker_file="$RAW_DIR/s3-ownership-marker"
-install -m 600 /dev/null "$claim_file"
-printf '%s' "$RUN_TOKEN" >"$claim_file"
-install -m 600 /dev/null "$marker_file"
-printf '%s' "$RUN_TOKEN" >"$marker_file"
-precreate_check="$RAW_DIR/s3-precreate-check.log"
-set +e
-timeout --foreground --kill-after=2s 30s aws s3api head-bucket --bucket "$BUCKET" \
-    >"$precreate_check" 2>&1
-precreate_status=$?
-set -e
-if [[ "$precreate_status" == 0 ]]; then
-    echo "FAIL: refusing to claim a bucket that existed before this run" >&2
-    exit 1
-fi
-if ! grep -Eq '(404|Not Found|NoSuchBucket)' "$precreate_check"; then
-    echo "FAIL: bucket absence could not be proven before creation" >&2
-    exit 1
-fi
-set +e
-timeout --foreground --kill-after=5s 120s aws s3 mb "s3://$BUCKET" --region "$REGION"
-bucket_create_status=$?
-set -e
-# Reconcile an ambiguous create against the exact pre-recorded claim before any later side effect.
-timeout --foreground --kill-after=2s 30s aws s3api head-bucket --bucket "$BUCKET" >/dev/null
-timeout --foreground --kill-after=2s 30s aws s3api put-object --bucket "$BUCKET" --key .hivemind-owner \
-    --body "$marker_file" --region "$REGION" >/dev/null
-verified_marker="$RAW_DIR/s3-ownership-marker.verified"
-timeout --foreground --kill-after=2s 30s aws s3api get-object --bucket "$BUCKET" \
-    --key .hivemind-owner "$verified_marker" >/dev/null
-[[ "$(cat "$verified_marker")" == "$RUN_TOKEN" ]] || {
-    echo "FAIL: bucket ownership marker reconciliation failed" >&2
-    exit 1
-}
-printf 'bucket_create\t%s\n' "$bucket_create_status" >>"$STATUS_FILE"
+hivemind_live_bucket_acquire "$BUCKET" "$REGION" "$RUN_TOKEN" "$RAW_DIR"
 record_success bucket_ownership
 
 set +e
