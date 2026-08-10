@@ -1,4 +1,0 @@
-api=http://13.222.13.5:8080 cpu_worker=3.237.23.208 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428115836 dep=drill-b-target-b-none-fixed-20260428124244
-ready_attempt=2
-stopped_cpu_worker
-RESULT=FAIL_CPU_STOP_STILL_SERVED

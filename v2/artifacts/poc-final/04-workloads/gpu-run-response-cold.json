@@ -1,1 +1,0 @@
-{"model":"poc-gpu-torch-mlp-v1","device":"Tesla T4","cuda":"12.4","input":[0.05,0.15,0.25,0.35,0.45,0.55,0.65,0.75],"probabilities":[0.25,0.25,0.25,0.25],"class_id":0}

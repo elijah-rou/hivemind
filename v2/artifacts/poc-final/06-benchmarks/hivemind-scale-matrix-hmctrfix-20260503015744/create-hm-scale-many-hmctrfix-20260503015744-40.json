@@ -1,1 +1,0 @@
-{"name":"hm-scale-many-hmctrfix-20260503015744-40","image":"docker.io/library/nginx:1.27-alpine","replicas":1,"cpu":10,"memory":16,"gpu_type":"none","gpu_count":0}

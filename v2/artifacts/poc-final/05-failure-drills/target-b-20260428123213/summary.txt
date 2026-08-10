@@ -1,6 +1,0 @@
-api=http://3.222.251.153:8080 cpu_worker=3.237.23.208 gpu_worker=3.214.216.28 image=288552132534.dkr.ecr.us-east-1.amazonaws.com/hivemind-poc:cpu-poc-20260428115836 dep=drill-b-target-b-20260428123213
-ready_attempt=2
--- before stop cpu ctr --
-stopped_cpu_worker
-started_cpu_worker
-RESULT=FAIL

@@ -1,7 +1,0 @@
-hivemind core: node=0 replicas=1 worker_port=9013 client_port=9023 peer_port=0 data_dir=
-hivemind core: metrics on :9223
-hivemind core: gossip peer aws-us-east-1 at 127.0.0.1:9321
-hivemind core: gossip peer crusoe-us-east-1 at 127.0.0.1:9322
-hivemind core: gossip peer aws-eu-west-2 at 127.0.0.1:9324
-hivemind core: gossip on :9323 origin=crusoe-texas provider=crusoe region=texas locality=us-central continent=na
-hivemind core: listening on worker_port=9013 client_port=9023 peer_port=0

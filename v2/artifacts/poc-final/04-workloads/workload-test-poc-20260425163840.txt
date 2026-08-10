@@ -1,6 +1,0 @@
-{"id":11693034620340510321,"name":"poc-cpu-1777150398"}
-ready: poc-cpu-1777150398 attempt=1
-waiting for run: poc-cpu-1777150398 attempt=1/36
-run ready: poc-cpu-1777150398 attempt=2
-waiting for run: poc-cpu-1777150398 attempt=1/36
-run ready: poc-cpu-1777150398 attempt=2

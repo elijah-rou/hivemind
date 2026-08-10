@@ -1,4 +1,0 @@
-leader_before=100.54.141.226
-leader_after=172.31.3.123:9001
-pre_kill_run={"model":"poc-cpu-hash-embedder-v1","device":"cpu","input_chars":8,"embedding":[-0.305368,0.158165,-0.148769,-0.223937,0.029754,0.26152,0.120581,0.33982,0.129977,0.330424,-0.104921,-0.396196,0.286576,-0.361744,0.045414,-0.317896],"classification":{"label":"model","score":0.429972,"scores":{"inference":-0.157695,"routing":-0.313516,"gpu":-0.036068,"cpu":0.031389,"serverless":0.283466,"model":0.429972}}}
-post_kill_run={"model":"poc-cpu-hash-embedder-v1","device":"cpu","input_chars":9,"embedding":[0.399903,-0.064375,0.142404,0.220434,0.310168,-0.079981,0.403804,0.349183,-0.001951,-0.356986,-0.290661,0.173616,0.103389,-0.247745,-0.255548,0.005852],"classification":{"label":"model","score":0.20426,"scores":{"inference":0.174347,"routing":0.135351,"gpu":0.077064,"cpu":0.111045,"serverless":-0.077343,"model":0.20426}}}

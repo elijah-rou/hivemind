@@ -1,4 +1,0 @@
-cpu_worker=44.200.44.190
-pre_kill={"model":"poc-cpu-hash-embedder-v1","device":"cpu","input_chars":15,"embedding":[-0.169748,-0.166318,-0.214328,0.063441,-0.090875,-0.080587,-0.29663,-0.300059,-0.4338,0.303488,0.169748,-0.193752,0.080587,-0.104592,-0.43037,0.389219],"classification":{"label":"serverless","score":0.305697,"scores":{"inference":-0.507031,"routing":0.019605,"gpu":-0.220075,"cpu":0.26149,"serverless":0.305697,"model":-0.48724}}}
-no_worker=timeout_or_error
-recovered={"model":"poc-cpu-hash-embedder-v1","device":"cpu","input_chars":9,"embedding":[0.385844,0.314211,0.092798,0.236065,0.102566,0.017908,0.301186,0.268626,-0.320723,0.079774,-0.017908,-0.167688,-0.1742,0.369564,-0.200248,0.411893],"classification":{"label":"cpu","score":0.56189,"scores":{"inference":-0.219756,"routing":0.222992,"gpu":0.337178,"cpu":0.56189,"serverless":-0.022771,"model":0.015627}}}

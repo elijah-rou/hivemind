@@ -1,7 +1,0 @@
-.{
-    .name = .hivemind_core,
-    .version = "0.2.0",
-    .fingerprint = 0x15c8eb7237ff9281,
-    .minimum_zig_version = "0.16.0",
-    .paths = .{""},
-}

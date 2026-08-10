@@ -1,6 +1,0 @@
-label=leader-loss-recovered-1777422213-28030
-timestamp=2026-04-29T00:24:11Z
-api_url=http://100.54.141.226:8080
-public_api_health={"connected":true,"leader":"172.31.3.123:9001"}
-killed_leader_addr=172.31.4.75:9001
-leader_stopped_ip=100.54.141.226
