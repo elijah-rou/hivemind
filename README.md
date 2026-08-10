@@ -1,6 +1,6 @@
 # Hivemind v2
 
-Hivemind v2 is the active deterministic workload-orchestration development line. POC v1 evidence is historical and does not establish v2 parity or readiness.
+Hivemind is deterministic workload-orchestration system prototype to drive serverless platforms.
 
 ## Start here
 
